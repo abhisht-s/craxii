@@ -1,6 +1,7 @@
 # Craxii
 
-Craxii V0.0.01 is currently documentation-first. Application implementation has not started yet.
+Craxii V0.0.01 implementation has begun. The repository currently contains the
+minimal Rust backend foundation.
 
 ## Sources of truth
 
@@ -10,3 +11,10 @@ Craxii V0.0.01 is currently documentation-first. Application implementation has 
 
 See [`AGENTS.md`](AGENTS.md) for repository conventions and local validation commands.
 
+## Verification
+
+The baseline local verification command is:
+
+```sh
+scripts/verify
+```

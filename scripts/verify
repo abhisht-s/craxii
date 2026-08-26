@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd -- "${script_dir}/.." && pwd)"
+cd "${repository_root}"
+
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH:-}"
+if ! command -v cargo >/dev/null 2>&1; then
+  cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+  export PATH="${cargo_bin_dir}:${PATH}"
+fi
+
+require_command() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: mandatory executable is unavailable: $1" >&2
+    exit 127
+  fi
+}
+
+require_command cargo
+require_command node
+require_command npx
+
+if ! cargo fmt --version >/dev/null 2>&1; then
+  echo "error: mandatory Cargo subcommand is unavailable: cargo fmt" >&2
+  exit 127
+fi
+
+if ! cargo clippy --version >/dev/null 2>&1; then
+  echo "error: mandatory Cargo subcommand is unavailable: cargo clippy" >&2
+  exit 127
+fi
+
+if ! npx --yes markdownlint-cli2@0.22.1 --version >/dev/null; then
+  echo "error: mandatory tool is unavailable: markdownlint-cli2@0.22.1" >&2
+  exit 127
+fi
+
+echo "Checking Rust formatting"
+cargo fmt --all --check
+
+echo "Checking Rust targets"
+cargo check --locked --workspace --all-targets
+
+echo "Linting Rust targets"
+cargo clippy --locked --workspace --all-targets -- -D warnings
+
+echo "Testing Rust workspace"
+cargo test --locked --workspace --all-targets
+
+echo "Inspecting Cargo dependency tree"
+cargo tree --locked --workspace --edges normal,build,dev
+
+echo "Checking repository invariants"
+node scripts/check-repository.mjs
+
+echo "Linting Markdown"
+npx --yes markdownlint-cli2@0.22.1 '**/*.md'
+
+echo "Checking documentation renderer syntax"
+node --check docs/scripts/render-implementation-plan.mjs

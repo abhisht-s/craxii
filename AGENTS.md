@@ -6,7 +6,7 @@ Implement Craxii V0.0.01 from `docs/craxii-v0.0.01-architecture.md`; its MUST/MU
 
 ## Project structure and module organization
 
-The repository is currently documentation-first. Keep design records in `docs/` and rendering utilities in `docs/scripts/`. Generated HTML files are companions; edit their Markdown sources and regenerate them rather than hand-editing HTML.
+The repository is documentation-led and contains the minimal Rust backend foundation. Keep design records in `docs/` and rendering utilities in `docs/scripts/`. Generated HTML files are companions; edit their Markdown sources and regenerate them rather than hand-editing HTML.
 
 As implementation stages begin, use these ownership boundaries:
 
@@ -20,17 +20,15 @@ Create directories only with their first real file. Do not add speculative empty
 
 ## Build, test, and development commands
 
-For current documentation work, run:
+For normal repository changes, run the authoritative baseline local gate:
 
 ```sh
-rg '^#{1,6} ' docs/
-rg 'TODO|FIXME|TBD' docs/
-export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"
-npx markdownlint-cli2 'docs/**/*.md'
-node docs/scripts/render-implementation-plan.mjs
+scripts/verify
 ```
 
-When Stage 1 adds Rust, the baseline gate must include `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo check --workspace --all-targets`, and `cargo test --workspace`. Run macOS and Ubuntu-specific suites only on environments whose semantics they claim.
+The gate supplies `/opt/homebrew/bin` and `/opt/homebrew/sbin`, then falls back to the configured Cargo home when needed. It includes the current locked Cargo format, check, Clippy, test, and dependency-tree commands plus structured repository and documentation checks. Run the implementation-plan renderer separately only when intentionally regenerating its timestamped HTML companion. Run macOS and Ubuntu-specific suites only on environments whose semantics they claim.
+
+Before manually invoking Node or npm tooling, run `export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"`. Do not treat a shell PATH miss as a project failure.
 
 ## Coding and testing conventions
 
@@ -38,6 +36,6 @@ Use sentence-case Markdown headings, one H1, fenced blocks with language tags, r
 
 ## Commits, pull requests, and security
 
-No Git history exists yet, so use short imperative subjects such as `docs: clarify replay contract`. Keep commits stage-focused. Pull requests must identify the implementation-plan stage, architecture consequences, validation performed, unresolved questions, and primary-source links; include screenshots for layout-sensitive UI or generated documents.
+Use short imperative subjects such as `docs: clarify replay contract`. Preserve real repository history and do not manufacture revision metadata. Keep commits stage-focused. Pull requests must identify the implementation-plan stage, architecture consequences, validation performed, unresolved questions, and primary-source links; include screenshots for layout-sensitive UI or generated documents.
 
 Never commit credentials, local databases/WAL files, artifacts, test evidence containing secrets, Terraform state, or build output. Redact tokens, content, commands, outputs, and headers from logs and review artifacts by default.

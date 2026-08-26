@@ -22,7 +22,7 @@ let bodyHtml;
 try {
   execFileSync(
     'npx',
-    ['--yes', 'marked', '-i', sourcePath, '-o', bodyPath, '--gfm', '--no-breaks'],
+    ['--yes', 'marked@18.0.11', '-i', sourcePath, '-o', bodyPath, '--gfm', '--no-breaks'],
     { env: { ...process.env, PATH: `/opt/homebrew/bin:/opt/homebrew/sbin:${process.env.PATH || ''}` } },
   );
   bodyHtml = readFileSync(bodyPath, 'utf8');
