@@ -1,0 +1,64 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Editors and IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.mobileprovision
+
+# Node.js tooling
+node_modules/
+.npm/
+.eslintcache
+coverage/
+
+# Rust
+target/
+**/*.rs.bk
+
+# Swift and Xcode
+.build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xccheckout
+*.xcscmblueprint
+
+# SQLite runtime data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Logs, test output, and local artifacts
+*.log
+artifacts/
+test-results/
+playwright-report/
+
+# Infrastructure and deployment state
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+
+# Local Firecrawl state
+.firecrawl/
