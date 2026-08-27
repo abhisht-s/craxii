@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "approved_direct_cargo_dependencies": [
+    {
+      "package": "serde",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^1.0",
+      "enabled_features": ["derive"],
+      "default_features": true,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/serde.md"
+    },
+    {
+      "package": "sha2",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.11",
+      "enabled_features": [],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/sha2.md"
+    },
+    {
+      "package": "toml",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^1.1",
+      "enabled_features": ["parse", "serde"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/toml.md"
+    },
+    {
+      "package": "url",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^2.5",
+      "enabled_features": [],
+      "default_features": true,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/url.md"
+    }
+  ]
+}

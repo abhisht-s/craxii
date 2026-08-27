@@ -51,6 +51,9 @@ where applicable.
 
 ## Rust version and source policy
 
+- For an approved dependency purpose, select the latest stable sensible compatible
+  release established by audit unless a recorded compatibility, security, maturity,
+  architecture, or operational constraint justifies an older line.
 - Use normal explicit compatible SemVer requirements by default.
 - The committed `Cargo.lock` is the resolved application pin and is reviewed with
   every deliberate dependency update.
@@ -60,14 +63,20 @@ where applicable.
 - Dependency updates are deliberate changes; they include the manifest, lockfile,
   upstream-change, advisory, and license review appropriate to the dependency.
 
-The approved Rust and Swift dependency registries are currently empty. No record may
-claim approval for a dependency that has not been added and human-reviewed.
+The machine-readable approved Rust direct-dependency registry is
+[`dependency-registry.json`](dependency-registry.json). It contains the owner-approved
+`serde`, `sha2`, `toml`, and `url` requirements and declaration metadata. The approved
+Swift dependency registry remains empty. No record may claim approval for a dependency
+that has not been added and human-reviewed.
 
-The first external Rust dependency activates supply-chain enforcement. That change
-must add `cargo-deny` at an exact tested version and add `deny.toml`; advisory, license,
-bans, and source checks then become mandatory. Do not also add overlapping
-`cargo-audit` or `cargo-license` checks unless a concrete uncovered gap is documented.
-Until then, `scripts/check-repository.mjs` enforces zero direct Cargo dependencies.
+The first external Rust dependency has activated supply-chain enforcement with
+`cargo-deny` exactly versioned by its decision record and `scripts/verify`, plus the
+repository's `deny.toml`. Advisory, license, bans, and source checks are mandatory and
+may not silently skip. Do not also add overlapping `cargo-audit` or `cargo-license`
+checks unless a concrete uncovered gap is documented. `scripts/check-repository.mjs`
+enforces every direct Cargo declaration against the machine-readable registry. Future
+direct dependencies still require human review; Codex cannot expand or self-approve
+the registry.
 
 ## Repository tooling records
 
@@ -154,6 +163,7 @@ requires human review under this policy.
   project owner approval before it is treated as human-approved. Codex is not the
   approver.
 
-These records establish repository-tooling scope only and do not add or approve a
-Rust or Swift runtime dependency. The approved Rust and Swift external dependency
-registries remain empty.
+These records establish repository-tooling scope only and do not expand the approved
+Rust or Swift runtime dependencies. The approved Rust direct dependencies are defined
+only by `dependency-registry.json`; the approved Swift external dependency registry
+remains empty.

@@ -6,3 +6,7 @@ rust-version = "1.98"
 publish = false
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"] }
+sha2 = { version = "0.11", default-features = false }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
+url = "2.5"

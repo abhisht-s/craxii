@@ -5,11 +5,8 @@ script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repository_root="$(cd -- "${script_dir}/.." && pwd)"
 cd "${repository_root}"
 
-export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH:-}"
-if ! command -v cargo >/dev/null 2>&1; then
-  cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
-  export PATH="${cargo_bin_dir}:${PATH}"
-fi
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -19,8 +16,16 @@ require_command() {
 }
 
 require_command cargo
+require_command cargo-deny
 require_command node
 require_command npx
+
+expected_cargo_deny_version="cargo-deny 0.20.2"
+actual_cargo_deny_version="$(cargo-deny --version)"
+if [[ "${actual_cargo_deny_version}" != "${expected_cargo_deny_version}" ]]; then
+  echo "error: mandatory cargo-deny version is ${expected_cargo_deny_version}; found ${actual_cargo_deny_version}" >&2
+  exit 1
+fi
 
 if ! cargo fmt --version >/dev/null 2>&1; then
   echo "error: mandatory Cargo subcommand is unavailable: cargo fmt" >&2
@@ -51,6 +56,12 @@ cargo test --locked --workspace --all-targets
 
 echo "Inspecting Cargo dependency tree"
 cargo tree --locked --workspace --edges normal,build,dev
+
+echo "Checking Rust dependency advisories"
+cargo deny --locked check advisories -D warnings
+
+echo "Checking Rust dependency licenses, bans, and sources"
+cargo deny --locked check licenses bans sources
 
 echo "Checking repository invariants"
 node scripts/check-repository.mjs

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -34,6 +34,148 @@ function cargoMetadata() {
   } catch (error) {
     throw new Error(`cargo metadata returned invalid JSON: ${error.message}`);
   }
+}
+
+function dependencyRegistry() {
+  const registryPath = join(repositoryRoot, 'docs', 'dependency-registry.json');
+  let registry;
+
+  try {
+    registry = JSON.parse(readFileSync(registryPath, 'utf8'));
+  } catch (error) {
+    throw new Error(`dependency registry is invalid: ${error.message}`);
+  }
+
+  assert(registry?.schema_version === 1, 'dependency registry schema_version must be 1');
+  assert(
+    Array.isArray(registry.approved_direct_cargo_dependencies),
+    'dependency registry must contain approved_direct_cargo_dependencies',
+  );
+  return registry.approved_direct_cargo_dependencies;
+}
+
+function dependencyKind(dependency) {
+  return dependency.kind ?? 'normal';
+}
+
+function dependencyKey(dependency) {
+  return [
+    dependency.package ?? dependency.name,
+    dependency.dependency_kind ?? dependencyKind(dependency),
+    dependency.target_restriction ?? dependency.target ?? 'all-targets',
+  ].join('|');
+}
+
+function sortedStrings(values) {
+  return [...values].sort((left, right) => left.localeCompare(right));
+}
+
+function equalStringArrays(left, right) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function verifyDirectDependencies(metadata, workspacePackages) {
+  const registryEntries = dependencyRegistry();
+  const registryByKey = new Map();
+
+  for (const entry of registryEntries) {
+    assert(typeof entry.package === 'string' && entry.package.length > 0, 'registry package is required');
+    assert(typeof entry.source === 'string' && entry.source.length > 0, `${entry.package} registry source is required`);
+    assert(
+      ['normal', 'dev', 'build'].includes(entry.dependency_kind),
+      `${entry.package} has invalid dependency kind ${entry.dependency_kind}`,
+    );
+    assert(
+      typeof entry.approved_compatible_requirement === 'string' &&
+        entry.approved_compatible_requirement.length > 0,
+      `${entry.package} approved compatible requirement is required`,
+    );
+    assert(Array.isArray(entry.enabled_features), `${entry.package} enabled_features must be an array`);
+    assert(
+      entry.enabled_features.every((feature) => typeof feature === 'string'),
+      `${entry.package} enabled_features must contain only strings`,
+    );
+    assert(typeof entry.default_features === 'boolean', `${entry.package} default_features must be boolean`);
+    assert(typeof entry.optional === 'boolean', `${entry.package} optional must be boolean`);
+    assert(
+      entry.target_restriction === null || typeof entry.target_restriction === 'string',
+      `${entry.package} target_restriction must be null or a string`,
+    );
+    assert(entry.approval_status === 'approved', `${entry.package} is not approved`);
+    assert(
+      typeof entry.approver_role === 'string' && entry.approver_role.length > 0,
+      `${entry.package} approver role is required`,
+    );
+    assert(
+      /^\d{4}-\d{2}-\d{2}$/.test(entry.approval_date),
+      `${entry.package} approval date must use YYYY-MM-DD`,
+    );
+    assert(
+      typeof entry.decision_record_path === 'string' && entry.decision_record_path.length > 0,
+      `${entry.package} decision record path is required`,
+    );
+    assert(
+      existsSync(join(repositoryRoot, entry.decision_record_path)),
+      `${entry.package} decision record is absent: ${entry.decision_record_path}`,
+    );
+
+    const key = dependencyKey(entry);
+    assert(!registryByKey.has(key), `duplicate dependency registry entry ${key}`);
+    registryByKey.set(key, entry);
+  }
+
+  const declarations = workspacePackages.flatMap((workspacePackage) =>
+    workspacePackage.dependencies.map((dependency) => ({
+      ...dependency,
+      workspacePackage: workspacePackage.name,
+    })),
+  );
+  const declarationsByKey = new Map();
+
+  for (const declaration of declarations) {
+    const kind = dependencyKind(declaration);
+    assert(
+      ['normal', 'dev', 'build'].includes(kind),
+      `${declaration.workspacePackage} declares unsupported dependency kind ${kind}`,
+    );
+
+    const key = dependencyKey(declaration);
+    assert(!declarationsByKey.has(key), `duplicate Cargo dependency declaration ${key}`);
+    declarationsByKey.set(key, declaration);
+
+    const approved = registryByKey.get(key);
+    assert(approved, `${declaration.workspacePackage} declares unlisted direct dependency ${key}`);
+    assert(
+      declaration.source === approved.source,
+      `${key} source ${declaration.source ?? 'path'} does not match registry ${approved.source}`,
+    );
+    assert(
+      declaration.req === approved.approved_compatible_requirement,
+      `${key} requirement ${declaration.req} does not match registry ${approved.approved_compatible_requirement}`,
+    );
+    assert(
+      equalStringArrays(sortedStrings(declaration.features), sortedStrings(approved.enabled_features)),
+      `${key} features do not match the dependency registry`,
+    );
+    assert(
+      declaration.uses_default_features === approved.default_features,
+      `${key} default-features setting does not match the dependency registry`,
+    );
+    assert(
+      declaration.optional === approved.optional,
+      `${key} optional setting does not match the dependency registry`,
+    );
+    assert(
+      (declaration.target ?? null) === approved.target_restriction,
+      `${key} target restriction does not match the dependency registry`,
+    );
+  }
+
+  for (const key of registryByKey.keys()) {
+    assert(declarationsByKey.has(key), `dependency registry entry is absent from Cargo manifests: ${key}`);
+  }
+
+  return declarations.length;
 }
 
 function attribute(tag, name) {
@@ -100,10 +242,10 @@ try {
     'craxii-server library and binary targets must be distinct',
   );
 
-  assert(
-    workspacePackage.dependencies.length === 0,
-    `expected zero direct Cargo dependencies across normal, dev, and build kinds, found ${workspacePackage.dependencies.length}`,
+  const workspacePackages = metadata.packages.filter((candidate) =>
+    metadata.workspace_members.includes(candidate.id),
   );
+  const directDependencyCount = verifyDirectDependencies(metadata, workspacePackages);
 
   verifyGeneratedCompanion(
     'craxii-v0.0.01-architecture.md',
@@ -115,7 +257,7 @@ try {
   );
 
   console.log(
-    'Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, 0 direct Cargo dependencies, 2 generated HTML source hashes',
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, ${directDependencyCount} approved direct Cargo dependencies, 2 generated HTML source hashes`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
