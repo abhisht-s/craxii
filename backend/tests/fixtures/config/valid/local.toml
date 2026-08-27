@@ -1,0 +1,119 @@
+configuration_version = 1
+failpoint_mode = "disabled"
+
+[server]
+bind_address = "127.0.0.1:8080"
+public_base_url = "http://127.0.0.1:8080"
+
+[paths]
+state_root = "/tmp/craxii-dev/state"
+artifact_root = "/tmp/craxii-dev/state/artifacts"
+primary_workspace_root = "/tmp/craxii-dev/workspaces/primary"
+
+[sqlite]
+pool_connections = 4
+busy_timeout_ms = 5000
+wal_autocheckpoint_pages = 1000
+
+[workstation]
+identity_source = "state_store"
+initial_generation = 1
+primary_workspace_logical_name = "primary"
+
+[credentials]
+source = "local_directory"
+directory = "/tmp/craxii-dev/credentials"
+declared = ["openai_primary", "openai_secondary"]
+
+[models]
+default_target = "primary"
+
+[[models.targets]]
+id = "primary"
+config_version = 1
+enabled = true
+provider = "openai"
+provider_model_id = "fixture-primary-model"
+endpoint = "https://api.openai.example.invalid/v1"
+credential = "openai_primary"
+token_estimator = "conservative_v1"
+context_window_tokens = 128000
+max_output_tokens = 16384
+requested_output_tokens = 8192
+reasoning_continuation = true
+
+[models.targets.capabilities]
+text_input = true
+text_output = true
+custom_tool_calling = true
+streaming = true
+ordered_output_items = true
+structured_output = true
+reasoning_continuation = true
+
+[[models.targets]]
+id = "secondary"
+config_version = 1
+enabled = false
+provider = "openai"
+provider_model_id = "fixture-secondary-model"
+endpoint = "https://api.openai.example.invalid/v1"
+credential = "openai_secondary"
+token_estimator = "conservative_v1"
+context_window_tokens = 128000
+max_output_tokens = 16384
+requested_output_tokens = 4096
+reasoning_continuation = false
+
+[models.targets.capabilities]
+text_input = true
+text_output = true
+custom_tool_calling = true
+streaming = true
+ordered_output_items = true
+structured_output = false
+reasoning_continuation = false
+
+[model_gateway]
+max_attempts_per_invocation = 3
+invocation_timeout_ms = 300000
+response_idle_timeout_ms = 60000
+
+[limits.agent]
+max_model_steps_per_work = 16
+max_model_attempts_per_work = 32
+max_tool_calls_per_work = 32
+max_ordered_output_items_per_response = 64
+max_raw_tool_argument_bytes = 65536
+max_work_item_duration_ms = 1800000
+
+[limits.tools]
+read_file_default_bytes = 1048576
+read_file_max_bytes = 8388608
+run_shell_command_max_bytes = 65536
+run_shell_default_timeout_ms = 120000
+run_shell_max_timeout_ms = 900000
+stdout_capture_bytes = 8388608
+stderr_capture_bytes = 8388608
+inline_model_result_bytes = 65536
+per_stream_projection_bytes = 32768
+
+[limits.protocol]
+websocket_durable_payload_bytes = 262144
+user_text_message_bytes = 65536
+
+[shell]
+executable = "/bin/bash"
+environment_policy = "clean"
+inherited_variables = []
+administrative_enabled = false
+
+[device_auth]
+source = "provisioned_sqlite"
+
+[tracing]
+format = "pretty"
+filter = "info"
+
+[shutdown]
+grace_period_ms = 10000
