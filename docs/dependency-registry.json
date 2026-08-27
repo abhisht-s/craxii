@@ -30,6 +30,20 @@
       "decision_record_path": "docs/dependencies/sha2.md"
     },
     {
+      "package": "time",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.3",
+      "enabled_features": ["std", "formatting"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/time.md"
+    },
+    {
       "package": "toml",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -44,6 +58,34 @@
       "decision_record_path": "docs/dependencies/toml.md"
     },
     {
+      "package": "tracing",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.1",
+      "enabled_features": ["std"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/tracing.md"
+    },
+    {
+      "package": "tracing-subscriber",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.3",
+      "enabled_features": ["fmt", "ansi", "json", "time"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/tracing-subscriber.md"
+    },
+    {
       "package": "url",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -56,6 +98,20 @@
       "approver_role": "repository/project owner",
       "approval_date": "2026-08-27",
       "decision_record_path": "docs/dependencies/url.md"
+    },
+    {
+      "package": "serde_json",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "dev",
+      "approved_compatible_requirement": "^1.0",
+      "enabled_features": [],
+      "default_features": true,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/serde-json.md"
     }
   ]
 }
