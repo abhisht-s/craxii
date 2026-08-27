@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="da5d4ce93b1b89feb77c312b2c8299bfbc8d51e66734972844228669550b95d9">
+  <meta name="craxii-source-sha256" content="3b9ef06b39501f53a89d358824becf719f4a71a32c4a51248412a5876ae7f56a">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>332</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>da5d4ce93b1b89fe…</code></p>
+        <p>Source SHA-256:<br><code>3b9ef06b39501f53…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -497,7 +497,7 @@ th { background: #f0f2f4; }
     <div><dt>Trust domain</dt><dd>The area in which compromise can reach the other assets. In V0, the whole VM is deliberately one such area.</dd></div>
     <div><dt>Regenerable</dt><dd>State that can be recreated from authoritative sources, such as a build cache or rendered context.</dd></div>
   </dl>
-</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 1<br><strong>Last updated:</strong> 2026-08-24<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
+</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 2<br><strong>Last updated:</strong> 2026-08-27<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
 <p>This document is the normative architecture for implementing Craxii V0.0.01. It is not a tutorial, product pitch, or survey of alternatives. It defines what the version must prove, where every important responsibility lives, which state is authoritative, how commands and side effects are ordered, how failures are represented, and which seams must survive later extraction of Craxii&#39;s durable core from its first workstation.</p>
 <p>The separate credential and identity architecture remains the long-term direction for authority and identity. Where that mature design asks for external control-plane services or project isolation that V0.0.01 explicitly defers, this document governs the V0 implementation.</p>
 <h2>How to read this document</h2>
@@ -1586,9 +1586,11 @@ Artifact
 <li><code>artifact_id</code>;</li>
 <li><code>device_id</code>;</li>
 <li><code>client_command_id</code> or idempotency key;</li>
+<li><code>correlation_id</code>;</li>
 <li><code>draft_id</code> for ephemeral output.</li>
 </ul>
 <p>The Rust domain MUST use newtypes so a work ID cannot be accidentally passed where a conversation ID is expected.</p>
+<p><code>correlation_id</code> MUST be represented by the distinct canonical UUIDv7 <code>CorrelationId</code> newtype. It is not interchangeable with any entity ID type, and its embedded timestamp or lexical order MUST NOT be used as FIFO, causality, replay, lifecycle, attempt, journal, or work ordering authority.</p>
 <p>Global and stream ordering use SQLite integers:</p>
 <ul>
 <li><code>journal_offset</code> is the global durable replay cursor.</li>
@@ -2188,7 +2190,7 @@ cancel_requested ------------------------&gt; interrupted
   conversation_id?        UUIDv7
   work_id?                UUIDv7
   causation_event_id?     UUIDv7
-  correlation_id          UUIDv7 or stable opaque ID
+  correlation_id          distinct canonical UUIDv7 CorrelationId
   actor_kind              user | craxii | model | tool | runtime | client
   actor_id?               stable actor identifier
   runtime_instance_id?    UUIDv7
@@ -5285,6 +5287,7 @@ backup
   source_status?         redacted provider/OS code
 </code></pre>
 <p>Retryability never implies automatic tool retry. It states what the owning application policy may do.</p>
+<p>The complete generic stable-code vocabulary owned by Stage 3 is <code>domain_validation</code> plus the fourteen category literals below: <code>authentication_error</code>, <code>client_protocol_error</code>, <code>idempotency_error</code>, <code>storage_error</code>, <code>state_conflict</code>, <code>context_error</code>, <code>model_selection_error</code>, <code>provider_error</code>, <code>tool_validation_error</code>, <code>authority_error</code>, <code>workstation_error</code>, <code>artifact_error</code>, <code>cancellation_error</code>, and <code>internal_invariant_error</code>. Later leaf codes such as timeout, context-limit, provider-exhaustion, or unknown-tool distinctions remain deferred to their owning implementation stages and MUST NOT be added to the generic Stage 3 vocabulary early.</p>
 <h3>Categories</h3>
 <aside class="explain-card level-3" data-source-heading="Categories">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -6960,7 +6963,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-24T14:39:03+05:30 · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>da5d4ce93b1b89feb77c312b2c8299bfbc8d51e66734972844228669550b95d9</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T12:13:09.927Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>3b9ef06b39501f53a89d358824becf719f4a71a32c4a51248412a5876ae7f56a</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

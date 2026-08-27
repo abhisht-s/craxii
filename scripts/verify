@@ -54,6 +54,9 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 echo "Testing Rust workspace"
 cargo test --locked --workspace --all-targets
 
+echo "Testing Rust documentation examples"
+cargo test --locked --workspace --doc
+
 echo "Checking Rust targets with test failpoints"
 cargo check --locked --workspace --all-targets --features test-failpoints
 

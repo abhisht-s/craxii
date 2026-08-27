@@ -2,17 +2,20 @@
 
 - Package or tool: `serde` from crates.io.
 - Dependency kind: Direct normal Cargo dependency.
-- Owning subsystem: Bootstrap configuration decoding.
+- Owning subsystem: Bootstrap configuration decoding and canonical domain value
+  serialization.
 - Responsible maintainer or owner role: Repository or project owner.
-- Primitive supplied: Data-model deserialization and derive support for private,
-  typed bootstrap configuration structures.
+- Primitive supplied: Data-model serialization/deserialization, derive support for
+  private typed bootstrap configuration structures, and manual canonical Serde
+  boundaries for domain scalars.
 - Why the standard library or current approved dependencies are insufficient:
   Rust's standard library has no general data-model deserialization framework.
   Hand-writing a parallel visitor and derive system would add a large, security-sensitive
   parsing surface without improving Craxii's contracts.
-- Permitted layer or scope: Bootstrap and adapter-local configuration representations
-  only. Serde traits, attributes, and helper types must not enter domain or application
-  APIs.
+- Permitted layer or scope: Bootstrap and adapter-local configuration representations,
+  plus canonical domain serialization/deserialization. Domain scalar implementations
+  use manual Serde visitors where their wire form is stricter than an implementation
+  type; Serde helper types must not become application behavior or storage codecs.
 - Alternatives considered: Manual field decoding and a higher-level configuration
   framework. Manual decoding duplicates a mature primitive, while a configuration
   framework would own layering, source-merging, and defaults beyond V0 needs.
@@ -33,14 +36,15 @@
   uses in formatting/serialization internals. The enabled `derive` feature adds a
   proc-macro toolchain, but the resolved application graph has no package with a
   native `links` declaration.
-- Secrets, parsing, and persistence implications: This dependency will decode the
-  non-secret TOML configuration and logical credential references at the bootstrap
-  trust boundary. It must never receive secret material for fingerprinting and has
-  no persistence role. Unknown-key rejection and semantic validation remain
-  Craxii-owned configuration behavior.
-- Removal or migration cost: Moderate. Replace derives and deserialization adapters,
-  preserve every accepted/rejected configuration fixture, and prove the public
-  validated configuration contract unchanged.
+- Secrets, parsing, and persistence implications: This dependency decodes non-secret
+  TOML configuration and logical credential references at the bootstrap trust
+  boundary and enforces the scalar JSON forms owned by the domain. It must never
+  receive secret material for fingerprinting. Canonical validation, unknown-key
+  rejection, and persistence codecs remain Craxii-owned behavior.
+- Removal or migration cost: High once public scalar JSON contracts exist. Replace
+  derives, visitors, and configuration adapters; preserve every accepted/rejected
+  configuration and scalar fixture; and prove public canonical representations
+  unchanged.
 - Approved version requirement: Compatible `1.0` line with default features and
   the `derive` feature enabled.
 - Resolved and tested version: `1.0.229` from crates.io.

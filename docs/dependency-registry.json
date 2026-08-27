@@ -34,7 +34,7 @@
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
       "approved_compatible_requirement": "^0.3",
-      "enabled_features": ["std", "formatting"],
+      "enabled_features": ["std", "formatting", "parsing"],
       "default_features": false,
       "optional": false,
       "target_restriction": null,
@@ -98,6 +98,20 @@
       "approver_role": "repository/project owner",
       "approval_date": "2026-08-27",
       "decision_record_path": "docs/dependencies/url.md"
+    },
+    {
+      "package": "uuid",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^1.26",
+      "enabled_features": ["std", "v7"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/uuid.md"
     },
     {
       "package": "serde_json",

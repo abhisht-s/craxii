@@ -4,8 +4,8 @@
 
 **Status:** Authoritative implementation source of truth  
 **Architecture version:** V0.0.01  
-**Document revision:** 1  
-**Last updated:** 2026-08-24  
+**Document revision:** 2\
+**Last updated:** 2026-08-27\
 **Audience:** Craxii engineering, Codex, ChatGPT, reviewers, and future contributors  
 **Supersedes for V0.0.01:** `CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md` and the V0 recommendations in `docs/temp/craxii-v0.0.01-architecture-review.md`
 
@@ -736,9 +736,12 @@ Required typed identifiers include:
 - `artifact_id`;
 - `device_id`;
 - `client_command_id` or idempotency key;
+- `correlation_id`;
 - `draft_id` for ephemeral output.
 
 The Rust domain MUST use newtypes so a work ID cannot be accidentally passed where a conversation ID is expected.
+
+`correlation_id` MUST be represented by the distinct canonical UUIDv7 `CorrelationId` newtype. It is not interchangeable with any entity ID type, and its embedded timestamp or lexical order MUST NOT be used as FIFO, causality, replay, lifecycle, attempt, journal, or work ordering authority.
 
 Global and stream ordering use SQLite integers:
 
@@ -1212,7 +1215,7 @@ JournalEvent
   conversation_id?        UUIDv7
   work_id?                UUIDv7
   causation_event_id?     UUIDv7
-  correlation_id          UUIDv7 or stable opaque ID
+  correlation_id          distinct canonical UUIDv7 CorrelationId
   actor_kind              user | craxii | model | tool | runtime | client
   actor_id?               stable actor identifier
   runtime_instance_id?    UUIDv7
@@ -3840,6 +3843,8 @@ NormalizedError
 ```
 
 Retryability never implies automatic tool retry. It states what the owning application policy may do.
+
+The complete generic stable-code vocabulary owned by Stage 3 is `domain_validation` plus the fourteen category literals below: `authentication_error`, `client_protocol_error`, `idempotency_error`, `storage_error`, `state_conflict`, `context_error`, `model_selection_error`, `provider_error`, `tool_validation_error`, `authority_error`, `workstation_error`, `artifact_error`, `cancellation_error`, and `internal_invariant_error`. Later leaf codes such as timeout, context-limit, provider-exhaustion, or unknown-tool distinctions remain deferred to their owning implementation stages and MUST NOT be added to the generic Stage 3 vocabulary early.
 
 ### Categories
 

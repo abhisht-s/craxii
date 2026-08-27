@@ -2,17 +2,20 @@
 
 - Package or tool: `sha2` from crates.io.
 - Dependency kind: Direct normal Cargo dependency.
-- Owning subsystem: Bootstrap configuration compatibility metadata.
+- Owning subsystem: Bootstrap configuration compatibility metadata and canonical
+  domain digests.
 - Responsible maintainer or owner role: Repository or project owner.
 - Primitive supplied: Stable SHA-256 hashing for the non-secret configuration
-  fingerprint, using the `Digest` trait and `Sha256` type.
+  fingerprint, canonical domain SHA-256 values, and later canonical content hashing,
+  using the `Digest` trait and `Sha256` type.
 - Why the standard library or current approved dependencies are insufficient:
   Rust's `DefaultHasher` is not a stable cross-version fingerprint contract, and the
   standard library has no SHA-256 implementation. A repository-owned cryptographic
   hash implementation would be inappropriate.
-- Permitted layer and architecture boundary: Bootstrap configuration fingerprinting
-  only. Hash-library traits and output types must not enter domain or application
-  APIs, and the digest is not an authentication primitive.
+- Permitted layer and architecture boundary: Bootstrap configuration fingerprinting,
+  canonical domain SHA-256 values, and later canonical content hashing. Hash-library
+  traits and output types remain private implementation details, and the digest is
+  not an authentication primitive.
 - Alternatives considered: `DefaultHasher`, a hand-written SHA-256 implementation,
   and a broader crypto framework. The first is unstable by contract; the latter two
   add either unsafe maintenance risk or unnecessary surface.
@@ -51,14 +54,14 @@
   queries and target-specific OS FFI. Disabling default features does not remove
   these optimized backends, so the absence of a native system library must not be
   described as an absence of unsafe code.
-- Secrets, parsing, and persistence implications: Only a canonical non-secret
-  configuration representation may be hashed. The fingerprint must never include
-  loaded credential material and is evidence/identity metadata, not password hashing,
-  signing, encryption, or durable state persistence.
-- Removal or migration cost: Effectively zero now because fingerprint code and
-  fixtures do not exist. Once fingerprints are emitted as deployment or trace
-  evidence, migration would require an explicit algorithm/version transition and
-  compatibility tests.
+- Secrets, parsing, and persistence implications: Canonical non-secret configuration,
+  domain bytes, and later canonical content representations may be hashed. Loaded
+  credential material must never enter the configuration fingerprint. SHA-256 values
+  are evidence/content identity metadata, not password hashing, signing, or encryption;
+  persistence representation remains owned by later adapters.
+- Removal or migration cost: High once canonical digests are stored or exchanged.
+  Migration requires an explicit algorithm/version transition plus configuration,
+  digest, content-hash, and compatibility fixtures.
 - Approved version requirement: Compatible `0.11` line with default features
   disabled and no additional features.
 - Resolved and tested version: `0.11.0` from crates.io.

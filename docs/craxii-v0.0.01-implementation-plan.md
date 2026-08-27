@@ -3,8 +3,9 @@
 <!-- markdownlint-disable MD013 MD024 -->
 
 **Status:** Authoritative pre-implementation plan  
-**Plan revision:** 1  
+**Plan revision:** 2\
 **Prepared:** 2026-08-26  
+**Last amended:** 2026-08-27\
 **Primary architecture:** `docs/craxii-v0.0.01-architecture.md`  
 **Implementation state at preparation:** Documentation only; no application implementation exists
 
@@ -19,7 +20,7 @@ The read-only audit covered the repository root at `/Users/abhisht/Documents/cra
 The authority order used for this plan is:
 
 1. `docs/craxii-v0.0.01-architecture.md` and the user's planning instructions.
-2. Any explicit later owner-approved amendment. None was found.
+2. Any explicit later owner-approved amendment. The 2026-08-27 `CorrelationId` and Stage 3 stable-code amendments are incorporated below.
 3. Long-term seams in `docs/craxii-identity-credential-architecture.md` where V0 does not explicitly defer or supersede them.
 4. The superseded deep draft and prior architecture review as decision history only.
 5. The annotated HTML as a teaching/rendering companion only.
@@ -31,8 +32,8 @@ The repository-level `AGENTS.md` still describes the identity/credential documen
 | Path | Audit finding | Implementation significance |
 | --- | --- | --- |
 | `AGENTS.md` | Repository guidance; states the workspace is documentation-only and records the Homebrew Node/npm PATH requirement. | Governs future local commands. It confirms there is no existing build or test system. |
-| `docs/craxii-v0.0.01-architecture.md` | 4,876 lines; revision 1; last updated 2026-08-24; explicitly normative and superseding. | Primary source for every V0 domain, persistence, protocol, workstation, provider, client, deployment, recovery, and acceptance contract. |
-| `docs/craxii-v0.0.01-architecture-annotated.html` | Generated 2026-08-24 from SHA-256 `da5d4ce9...`; that hash matches the current architecture Markdown. It adds explanations, a flowchart, and a worked story and states that they are non-normative. | Useful explanatory material, but not a later amendment and not an implementation source when wording differs. |
+| `docs/craxii-v0.0.01-architecture.md` | 4,881 lines; revision 2; last updated 2026-08-27; explicitly normative and superseding. | Primary source for every V0 domain, persistence, protocol, workstation, provider, client, deployment, recovery, and acceptance contract. |
+| `docs/craxii-v0.0.01-architecture-annotated.html` | Generated 2026-08-27 from SHA-256 `3b9ef06b...`; that hash matches the current architecture Markdown. It adds explanations, a flowchart, and a worked story and states that they are non-normative. | Useful explanatory material, but not a later amendment and not an implementation source when wording differs. |
 | `docs/temp/craxii-v0.0.01-architecture-review.md` | Prior review that identified work-item identity, causal context, journal, security, cancellation, replay, and crash-test corrections. | Decision history. Most amendments are incorporated in the frozen architecture. Its separate-executor recommendation is expressly superseded by the frozen one-user LocalWorkstation decision. |
 | `CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md` | Older 2,055-line deep draft. | Superseded for V0. It must not drive old turn-centric schemas, WebSocket command submission, or optional cancellation. |
 | `docs/craxii-identity-credential-architecture.md` | Long-term identity, workload authority, provider credential, and project-isolation architecture. | Preserves the future external identity/Authority Service/RemoteWorkstation direction. Its mature services and multi-project VMs are explicit V0 deferrals. |
@@ -661,8 +662,9 @@ The domain module exists and UUID/hash dependencies have approved records.
 
 ##### Exact implementation work
 
-- Add UUIDv7 newtypes for every required durable/public identity: Craxii, conversation, message, work, workstation, workspace, runtime, event, invocation/logical invocation, context manifest, tool execution, artifact, device, client command/message, execution, and draft.
+- Add UUIDv7 newtypes for every required durable/public identity: Craxii, conversation, message, work, workstation, workspace, runtime, event, invocation/logical invocation, context manifest, tool execution, artifact, device, client command/message, execution, draft, and the distinct correlation ID.
 - Parse/serialize lowercase canonical strings; reject noncanonical or wrong-version inputs at boundaries where required.
+- Keep UUIDv7 time/lexical order as inspection convenience only; correlation and all other UUID types are forbidden as ordering authority.
 - Add positive integer wrappers for journal offset, stream sequence, work ordinal, agent step, tool ordinal, and attempt number with checked increments.
 - Add UTC RFC 3339 microsecond timestamp value and monotonic-duration types; forbid duration reconstruction from persisted wall time.
 - Add SHA-256 digest and canonical byte-count types with bounded conversions.
@@ -757,7 +759,7 @@ Core IDs/value types exist for correlation.
 
 ##### Exact implementation work
 
-- Define architecture categories, stable codes, `never|bounded|user_action|operator_action`, and `definite|outcome_unknown` certainty.
+- Define architecture categories, `never|bounded|user_action|operator_action`, and `definite|outcome_unknown` certainty. The complete generic Stage 3 stable-code vocabulary is `domain_validation` plus `authentication_error`, `client_protocol_error`, `idempotency_error`, `storage_error`, `state_conflict`, `context_error`, `model_selection_error`, `provider_error`, `tool_validation_error`, `authority_error`, `workstation_error`, `artifact_error`, `cancellation_error`, and `internal_invariant_error`; later leaf codes remain deferred to their owning stages.
 - Separate safe user/client message, structured source status, and internal trace-only detail.
 - Add constructors/mappers for validation, state conflict, storage, context, selection, provider, tool, authority, workstation, artifact, cancellation, protocol, authentication, and invariant failures.
 - Make error serialization omit causes/backtraces/secrets by default.

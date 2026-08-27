@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="dc5c8b7d23e81ef492f6404bd7445f409214a3c1c9a5e7a1b28d829140871ebb">
+  <meta name="craxii-source-sha256" content="2cb9abb822aed7703b4ff94a88b77d7fccaf29d43737a617c16f27a6ad9c4e99">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,14 +180,14 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-26T19:01:18.561Z</p>
-        <p>Source SHA-256:<br><code>dc5c8b7d23e81ef4…</code></p>
+        <p>Generated 2026-08-27T12:13:09.160Z</p>
+        <p>Source SHA-256:<br><code>2cb9abb822aed770…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
     <main id="content">
 <h1>Craxii V0.0.01 Implementation Plan</h1>
-<!-- markdownlint-disable MD013 MD024 --><p><strong>Status:</strong> Authoritative pre-implementation plan<br><strong>Plan revision:</strong> 1<br><strong>Prepared:</strong> 2026-08-26<br><strong>Primary architecture:</strong> <code>docs/craxii-v0.0.01-architecture.md</code><br><strong>Implementation state at preparation:</strong> Documentation only; no application implementation exists</p>
+<!-- markdownlint-disable MD013 MD024 --><p><strong>Status:</strong> Authoritative pre-implementation plan<br><strong>Plan revision:</strong> 2<br><strong>Prepared:</strong> 2026-08-26<br><strong>Last amended:</strong> 2026-08-27<br><strong>Primary architecture:</strong> <code>docs/craxii-v0.0.01-architecture.md</code><br><strong>Implementation state at preparation:</strong> Documentation only; no application implementation exists</p>
 <p>This plan is the chronological implementation source of truth for Craxii V0.0.01. It translates the frozen architecture into small, dependency-ordered, verifiable construction stages. It does not authorize work outside V0.0.01 and does not replace the architecture&#39;s normative semantics. If implementation evidence invalidates a foundational decision, stop and use the architecture change standard before changing a durable contract.</p>
 <h2>1. Current repository audit</h2>
 <h3>1.1 Audit scope and authority</h3>
@@ -195,7 +195,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <p>The authority order used for this plan is:</p>
 <ol>
 <li><code>docs/craxii-v0.0.01-architecture.md</code> and the user&#39;s planning instructions.</li>
-<li>Any explicit later owner-approved amendment. None was found.</li>
+<li>Any explicit later owner-approved amendment. The 2026-08-27 <code>CorrelationId</code> and Stage 3 stable-code amendments are incorporated below.</li>
 <li>Long-term seams in <code>docs/craxii-identity-credential-architecture.md</code> where V0 does not explicitly defer or supersede them.</li>
 <li>The superseded deep draft and prior architecture review as decision history only.</li>
 <li>The annotated HTML as a teaching/rendering companion only.</li>
@@ -217,12 +217,12 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </tr>
 <tr>
 <td><code>docs/craxii-v0.0.01-architecture.md</code></td>
-<td>4,876 lines; revision 1; last updated 2026-08-24; explicitly normative and superseding.</td>
+<td>4,881 lines; revision 2; last updated 2026-08-27; explicitly normative and superseding.</td>
 <td>Primary source for every V0 domain, persistence, protocol, workstation, provider, client, deployment, recovery, and acceptance contract.</td>
 </tr>
 <tr>
 <td><code>docs/craxii-v0.0.01-architecture-annotated.html</code></td>
-<td>Generated 2026-08-24 from SHA-256 <code>da5d4ce9...</code>; that hash matches the current architecture Markdown. It adds explanations, a flowchart, and a worked story and states that they are non-normative.</td>
+<td>Generated 2026-08-27 from SHA-256 <code>3b9ef06b...</code>; that hash matches the current architecture Markdown. It adds explanations, a flowchart, and a worked story and states that they are non-normative.</td>
 <td>Useful explanatory material, but not a later amendment and not an implementation source when wording differs.</td>
 </tr>
 <tr>
@@ -826,8 +826,9 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <p>The domain module exists and UUID/hash dependencies have approved records.</p>
 <h5>Exact implementation work</h5>
 <ul>
-<li>Add UUIDv7 newtypes for every required durable/public identity: Craxii, conversation, message, work, workstation, workspace, runtime, event, invocation/logical invocation, context manifest, tool execution, artifact, device, client command/message, execution, and draft.</li>
+<li>Add UUIDv7 newtypes for every required durable/public identity: Craxii, conversation, message, work, workstation, workspace, runtime, event, invocation/logical invocation, context manifest, tool execution, artifact, device, client command/message, execution, draft, and the distinct correlation ID.</li>
 <li>Parse/serialize lowercase canonical strings; reject noncanonical or wrong-version inputs at boundaries where required.</li>
+<li>Keep UUIDv7 time/lexical order as inspection convenience only; correlation and all other UUID types are forbidden as ordering authority.</li>
 <li>Add positive integer wrappers for journal offset, stream sequence, work ordinal, agent step, tool ordinal, and attempt number with checked increments.</li>
 <li>Add UTC RFC 3339 microsecond timestamp value and monotonic-duration types; forbid duration reconstruction from persisted wall time.</li>
 <li>Add SHA-256 digest and canonical byte-count types with bounded conversions.</li>
@@ -888,7 +889,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <p>Core IDs/value types exist for correlation.</p>
 <h5>Exact implementation work</h5>
 <ul>
-<li>Define architecture categories, stable codes, <code>never|bounded|user_action|operator_action</code>, and <code>definite|outcome_unknown</code> certainty.</li>
+<li>Define architecture categories, <code>never|bounded|user_action|operator_action</code>, and <code>definite|outcome_unknown</code> certainty. The complete generic Stage 3 stable-code vocabulary is <code>domain_validation</code> plus <code>authentication_error</code>, <code>client_protocol_error</code>, <code>idempotency_error</code>, <code>storage_error</code>, <code>state_conflict</code>, <code>context_error</code>, <code>model_selection_error</code>, <code>provider_error</code>, <code>tool_validation_error</code>, <code>authority_error</code>, <code>workstation_error</code>, <code>artifact_error</code>, <code>cancellation_error</code>, and <code>internal_invariant_error</code>; later leaf codes remain deferred to their owning stages.</li>
 <li>Separate safe user/client message, structured source status, and internal trace-only detail.</li>
 <li>Add constructors/mappers for validation, state conflict, storage, context, selection, provider, tool, authority, workstation, artifact, cancellation, protocol, authentication, and invariant failures.</li>
 <li>Make error serialization omit causes/backtraces/secrets by default.</li>
@@ -6131,7 +6132,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-26T19:01:18.561Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>dc5c8b7d23e81ef492f6404bd7445f409214a3c1c9a5e7a1b28d829140871ebb</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-27T12:13:09.160Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>2cb9abb822aed7703b4ff94a88b77d7fccaf29d43737a617c16f27a6ad9c4e99</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>
