@@ -241,6 +241,18 @@ try {
       binaryTargets.every((binary) => library.src_path !== binary.src_path)),
     'craxii-server library and binary targets must be distinct',
   );
+  assert(
+    Array.isArray(workspacePackage.features?.default) && workspacePackage.features.default.length === 0,
+    'craxii-server default feature set must be empty',
+  );
+  assert(
+    Array.isArray(workspacePackage.features?.['test-failpoints']),
+    'craxii-server must define the test-failpoints feature',
+  );
+  assert(
+    workspacePackage.features['test-failpoints'].length === 0,
+    'craxii-server test-failpoints feature must enable no dependencies',
+  );
 
   const workspacePackages = metadata.packages.filter((candidate) =>
     metadata.workspace_members.includes(candidate.id),
@@ -257,7 +269,7 @@ try {
   );
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, ${directDependencyCount} approved direct Cargo dependencies, 2 generated HTML source hashes`,
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 generated HTML source hashes`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

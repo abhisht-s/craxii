@@ -11,7 +11,21 @@ use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
 
 pub fn run_from_env() -> Result<ApplicationShell, StartupError> {
-    run(std::env::args_os())
+    let arguments: Vec<_> = std::env::args_os().collect();
+
+    #[cfg(all(feature = "test-failpoints", unix))]
+    if arguments
+        .get(1)
+        .is_some_and(|argument| argument == OsStr::new(crate::test_failpoints::CONTROL_ARGUMENT))
+    {
+        if arguments.len() != 2 {
+            return Err(StartupError::TestControl);
+        }
+        crate::test_failpoints::run_controlled_startup().map_err(|_| StartupError::TestControl)?;
+        return Err(StartupError::TestControl);
+    }
+
+    run(arguments)
 }
 
 pub fn run(
@@ -66,6 +80,8 @@ pub enum StartupError {
     BuildMetadata,
     Clock,
     Telemetry(TelemetryError),
+    #[cfg(all(feature = "test-failpoints", unix))]
+    TestControl,
 }
 
 impl StartupError {
@@ -79,6 +95,8 @@ impl StartupError {
                 "telemetry_subscriber_conflict"
             }
             Self::Telemetry(TelemetryError::SinkFailure) => "telemetry_sink_failure",
+            #[cfg(all(feature = "test-failpoints", unix))]
+            Self::TestControl => "invalid_test_control",
         }
     }
 }

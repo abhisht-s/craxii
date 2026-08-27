@@ -81,6 +81,15 @@ fn config_argument_is_required() {
     }
 }
 
+#[cfg(not(feature = "test-failpoints"))]
+#[test]
+fn default_binary_does_not_recognize_hidden_test_control() {
+    let output = run(&["--test-failpoint-control-v1"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(text(&output.stderr), "craxii fatal: invalid_cli\n");
+}
+
 #[test]
 fn invalid_config_is_redacted_and_exits_nonzero() {
     let config = TempConfig::new(&format!(

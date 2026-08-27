@@ -54,6 +54,42 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 echo "Testing Rust workspace"
 cargo test --locked --workspace --all-targets
 
+echo "Checking Rust targets with test failpoints"
+cargo check --locked --workspace --all-targets --features test-failpoints
+
+echo "Linting Rust targets with test failpoints"
+cargo clippy --locked --workspace --all-targets --features test-failpoints -- -D warnings
+
+echo "Testing Rust workspace with test failpoints"
+cargo test --locked --workspace --all-targets --features test-failpoints
+
+echo "Building standard release without default features"
+cargo build --locked --release --no-default-features
+
+echo "Checking release exclusion for test failpoints"
+release_guard_output="$(mktemp -t craxii-release-failpoints.XXXXXX)"
+trap 'rm -f -- "${release_guard_output}"' EXIT
+if cargo check --locked --release --features test-failpoints >"${release_guard_output}" 2>&1; then
+  echo "error: release build unexpectedly accepted test-failpoints" >&2
+  exit 1
+fi
+if ! grep -Fxq 'error: test-failpoints cannot be enabled when debug assertions are disabled' "${release_guard_output}"; then
+  echo "error: release test-failpoints check failed without the expected exclusion diagnostic" >&2
+  sed -n '1,160p' "${release_guard_output}" >&2
+  exit 1
+fi
+release_guard_error_lines="$(grep -Ec '^error:' "${release_guard_output}" || true)"
+if [[ "${release_guard_error_lines}" != "2" ]] || grep -Eq '^error\[E[0-9]+\]' "${release_guard_output}"; then
+  echo "error: release test-failpoints check had an unexpected compilation failure" >&2
+  sed -n '1,160p' "${release_guard_output}" >&2
+  exit 1
+fi
+rm -f -- "${release_guard_output}"
+trap - EXIT
+
+echo "Inspecting standard release failpoint exclusion"
+node scripts/check-release-failpoints.mjs
+
 echo "Inspecting Cargo dependency tree"
 cargo tree --locked --workspace --edges normal,build,dev
 
