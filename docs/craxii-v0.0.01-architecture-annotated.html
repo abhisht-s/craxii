@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="d43479c2069aae7ec6d47e9172c2ad1a1f059947effc6212572dcedc5c2175bc">
+  <meta name="craxii-source-sha256" content="6c36fe1456af8a6535f424299359fbc1a9f8d2cb0618db68f5c1b314aec47b70">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -454,8 +454,8 @@ th { background: #f0f2f4; }
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p><strong>332</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>d43479c2069aae7e…</code></p>
+        <p><strong>333</strong> source sections carry companion explanations.</p>
+        <p>Source SHA-256:<br><code>6c36fe1456af8a6…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 270 detailed subsections, and 333 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 271 detailed subsections, and 334 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -3126,6 +3126,31 @@ PRAGMA temp_store = MEMORY;
 <li><code>SQLITE_BUSY</code> after <code>busy_timeout</code> is a storage error and metric; an internal transaction may retry only before any external effect.</li>
 <li>The database file, WAL, and shared-memory files remain on the same local EBS filesystem. Network filesystems are forbidden.</li>
 </ul>
+<h3>Stage 5 SQLite runtime contract</h3>
+<aside class="explain-card level-3" data-source-heading="Stage 5 SQLite runtime contract">
+  <div class="explain-card-label">Subsection guide · plain-English companion</div>
+  <p><strong>Plain-English significance:</strong> This freezes the safe foundation beneath later persistence: one local owner, one reviewed SQLite build, exact durability settings, and a version-zero boundary that cannot accidentally create product data.</p>
+  <p class="real-life-example"><strong>Real-life example:</strong> Before installing records in a vault, verify the room, lock, fireproofing, access policy, and inventory ledger. Stage 5 proves that shell while deliberately leaving the records shelves empty for Stage 6.</p>
+</aside><p>The V0 implementation uses SQLx <code>0.9</code> with only <code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, and <code>macros</code>; Tokio <code>1.53</code> with only <code>macros</code>, <code>rt-multi-thread</code>, <code>sync</code>, and <code>time</code>; and nix <code>0.31</code> with only <code>fs</code>. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside <code>adapters/sqlite</code>; neither application nor the <code>StateStore</code> port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work.</p>
+<p>The database path is exactly <code>&lt;state_root&gt;/db/craxii.sqlite3</code> and the process-lock path is exactly <code>&lt;state_root&gt;/locks/craxii.lock</code>. <code>state_root</code> MUST preexist; Stage 5 may create only its <code>db/</code> and <code>locks/</code> children. Those directories are mode <code>0700</code>, and new database and lock files are mode <code>0600</code>. Production provisioning owns <code>state_root</code>, user ownership, and any <code>chown</code>; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production <code>:memory:</code> mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.</p>
+<p>The mounted filesystem MUST be locally classified before use. Linux V0 allows ext2/3/4, XFS, Btrfs, tmpfs, and overlayfs. macOS V0 allows APFS and HFS/HFS+. Known remote classes including NFS, SMB/CIFS, 9p, Ceph, and identifiable network-style FUSE mounts are rejected, and unknown classes fail closed. This classification does not prove EBS backing.</p>
+<p>In addition to the required pragmas above, every connection MUST apply and verify:</p>
+<pre><code class="language-text">PRAGMA wal_autocheckpoint = 1000;
+PRAGMA locking_mode = NORMAL;
+PRAGMA trusted_schema = OFF;
+PRAGMA recursive_triggers = OFF;
+PRAGMA secure_delete = OFF;
+PRAGMA mmap_size = 0;
+PRAGMA cache_size = -2000;
+PRAGMA journal_size_limit = -1;
+PRAGMA fullfsync = ON;
+</code></pre>
+<p><code>fullfsync</code> is semantically verified where supported; Linux MUST NOT be rejected merely because the Apple-specific durability behavior is a no-op when SQLite reports the documented platform-neutral value. Any other unknown or mismatched correctness PRAGMA fails startup. The validated pool maximum is <code>1..=4</code>, default four; its minimum equals its maximum for eager validation, acquisition timeout is five seconds, and idle timeout and maximum lifetime are disabled. Replacement connections receive the same initialization and verification.</p>
+<p>One in-process Tokio <code>WriteCoordinator</code> serializes Craxii writes. Lock order is coordinator, pooled connection, then <code>BEGIN IMMEDIATE</code>. Writes are short bounded SQLite-only transactions with explicit commit/rollback and rollback-on-drop. There is no generic retry loop, nested/savepoint public surface, or escaped transaction handle. Provider/network calls, workstation/process calls, filesystem content reads, artifact rename, client delivery, and unrelated sleeps or waits MUST NOT occur inside a SQLite transaction.</p>
+<p><code>MAX_SUPPORTED_SCHEMA_VERSION</code> remains zero in Stage 5. The embedded SQLx migration set contains zero Craxii migrations and may create only SQLx-owned migration metadata. There is no <code>user_version</code>, Craxii schema-version table, fake migration <code>0000</code>, or Craxii domain table. Stage 6 owns migration <code>0001</code> and the canonical schema. Preflight classifies a database as <code>empty</code>, <code>migrated_uninitialized</code>, <code>newer_schema</code>, <code>corrupt</code>, or <code>inconsistent</code>; only the first two may proceed. A positive applied migration is newer, while failed/malformed/contradictory metadata or any unexpected version-zero user object is inconsistent.</p>
+<p>Startup opens and verifies WAL on a dedicated connection, acquires a nonblocking exclusive Unix advisory lock held for the runtime lifetime, eagerly validates the pool, performs compatibility plus <code>quick_check</code> and <code>foreign_key_check</code> before migration mutation, applies the empty forward migration harness, and repeats applicable postflight checks. It never auto-repairs. The returned bootstrap guard owns the pool and lifetime lock, while successful Stage 5 startup remains <code>live_unready</code> until Stage 7 bootstrap and Stage 10 recovery are implemented.</p>
+<p>Safe database errors expose only fixed storage, newer-schema, already-owned, corruption, inconsistency, state-conflict, or internal-invariant categories. Raw paths, SQL, bind values, SQLx/SQLite messages, content, and secrets MUST NOT enter Display, Debug, serialized normalized errors, startup diagnostics, source chains, or traces. Sanitized numeric SQLite codes are diagnostic only and MUST NOT be put in <code>SourceStatus::os_errno</code>. A passive checkpoint report is observational, not a backup; shutdown closes the pool and MUST NOT force <code>TRUNCATE</code>.</p>
+<p>A successful <code>FULL</code>/WAL commit is treated as durable across process crash and conforming local-storage crash boundaries. This does not promise protection from filesystem or storage failure, EBS volume loss, account or Availability Zone loss, or absent backup.</p>
 <h3>WAL checkpointing</h3>
 <aside class="explain-card level-3" data-source-heading="WAL checkpointing">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -7190,7 +7215,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-27T14:22:20.407Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>d43479c2069aae7ec6d47e9172c2ad1a1f059947effc6212572dcedc5c2175bc</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T18:16:36.000Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>6c36fe1456af8a6535f424299359fbc1a9f8d2cb0618db68f5c1b314aec47b70</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

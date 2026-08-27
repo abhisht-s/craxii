@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="5dcd7d88c29beef66185b5150e26dd3b3ecbdfca976e6093e582efe2a603c9e4">
+  <meta name="craxii-source-sha256" content="cdaa7cd947cb9b68d4e4dec6a00432c8a928812ed9dfb53b2bb58ebf1d069bb0">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,8 +180,8 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-27T15:42:36.331Z</p>
-        <p>Source SHA-256:<br><code>5dcd7d88c29beef6…</code></p>
+        <p>Generated 2026-08-27T18:17:25.759Z</p>
+        <p>Source SHA-256:<br><code>cdaa7cd947cb9b68…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
@@ -1055,6 +1055,13 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <li>Execute Substages 5.1–5.3.</li>
 <li>Use real temporary database files for integration tests; reserve in-memory SQLite only for pure query experiments that make no WAL claim.</li>
 <li>Keep the service unready until migrations, integrity, bootstrap, and later recovery finish.</li>
+<li>Use SQLx <code>0.9</code> (<code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, <code>macros</code>), Tokio <code>1.53</code> (<code>macros</code>, <code>rt-multi-thread</code>, <code>sync</code>, <code>time</code>), and nix <code>0.31</code> (<code>fs</code>) with default features disabled. Keep SQLx names and types inside <code>adapters/sqlite</code>.</li>
+<li>Derive only <code>&lt;state_root&gt;/db/craxii.sqlite3</code> and <code>&lt;state_root&gt;/locks/craxii.lock</code>; require a preexisting private local-filesystem <code>state_root</code>; create only private <code>db/</code> and <code>locks/</code> children and private database/lock files; reject SQLite URLs, production memory databases, symlink/type/permission/hard-link hazards, remote filesystems, and unknown filesystem classes.</li>
+<li>Apply and verify on every connection <code>WAL</code>, <code>FULL</code>, foreign keys, 5000 ms busy timeout, memory temp store, 1000-page autocheckpoint, normal locking, untrusted schema, recursive triggers off, secure delete off, mmap zero, cache <code>-2000</code>, unlimited journal size, and full fsync with the documented platform qualification.</li>
+<li>Use an eager pool with validated maximum <code>1..=4</code>, minimum equal to maximum, five-second acquisition timeout, no idle/lifetime reaping, and one Tokio WriteCoordinator. Acquire coordinator then connection then <code>BEGIN IMMEDIATE</code>; expose no generic transaction/retry/callback API and perform no external I/O inside a transaction.</li>
+<li>Keep maximum schema version zero and the embedded Craxii migration set empty. Allow only SQLx migration metadata; classify empty/migrated-uninitialized/newer/corrupt/inconsistent before and after the harness; Stage 6 owns migration <code>0001</code> and every domain table.</li>
+<li>Hold one nonblocking Unix advisory process lock for the bootstrap guard lifetime. Run WAL verification, compatibility preflight, <code>quick_check</code>, and <code>foreign_key_check</code>; return only fixed redacted startup categories; keep successful startup <code>live_unready</code>; offer only a lightweight probe and passive checkpoint report.</li>
+<li>Treat successful FULL/WAL commit as durable across process crash and conforming local-storage crash boundaries, without claiming protection from filesystem/storage/EBS/account/AZ loss or missing backup.</li>
 </ul>
 <h3>Data/state introduced</h3>
 <p>Database file/WAL/SHM, schema-version history, startup lock, database-open classification, and persistence test fixtures.</p>
@@ -6140,7 +6147,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-27T15:42:36.331Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>5dcd7d88c29beef66185b5150e26dd3b3ecbdfca976e6093e582efe2a603c9e4</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-27T18:17:25.759Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>cdaa7cd947cb9b68d4e4dec6a00432c8a928812ed9dfb53b2bb58ebf1d069bb0</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>

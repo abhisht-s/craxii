@@ -1011,6 +1011,13 @@ Stages 1–4 pass, including state-machine tests and validated configuration.
 - Execute Substages 5.1–5.3.
 - Use real temporary database files for integration tests; reserve in-memory SQLite only for pure query experiments that make no WAL claim.
 - Keep the service unready until migrations, integrity, bootstrap, and later recovery finish.
+- Use SQLx `0.9` (`sqlite-bundled`, `runtime-tokio`, `migrate`, `macros`), Tokio `1.53` (`macros`, `rt-multi-thread`, `sync`, `time`), and nix `0.31` (`fs`) with default features disabled. Keep SQLx names and types inside `adapters/sqlite`.
+- Derive only `<state_root>/db/craxii.sqlite3` and `<state_root>/locks/craxii.lock`; require a preexisting private local-filesystem `state_root`; create only private `db/` and `locks/` children and private database/lock files; reject SQLite URLs, production memory databases, symlink/type/permission/hard-link hazards, remote filesystems, and unknown filesystem classes.
+- Apply and verify on every connection `WAL`, `FULL`, foreign keys, 5000 ms busy timeout, memory temp store, 1000-page autocheckpoint, normal locking, untrusted schema, recursive triggers off, secure delete off, mmap zero, cache `-2000`, unlimited journal size, and full fsync with the documented platform qualification.
+- Use an eager pool with validated maximum `1..=4`, minimum equal to maximum, five-second acquisition timeout, no idle/lifetime reaping, and one Tokio WriteCoordinator. Acquire coordinator then connection then `BEGIN IMMEDIATE`; expose no generic transaction/retry/callback API and perform no external I/O inside a transaction.
+- Keep maximum schema version zero and the embedded Craxii migration set empty. Allow only SQLx migration metadata; classify empty/migrated-uninitialized/newer/corrupt/inconsistent before and after the harness; Stage 6 owns migration `0001` and every domain table.
+- Hold one nonblocking Unix advisory process lock for the bootstrap guard lifetime. Run WAL verification, compatibility preflight, `quick_check`, and `foreign_key_check`; return only fixed redacted startup categories; keep successful startup `live_unready`; offer only a lightweight probe and passive checkpoint report.
+- Treat successful FULL/WAL commit as durable across process crash and conforming local-storage crash boundaries, without claiming protection from filesystem/storage/EBS/account/AZ loss or missing backup.
 
 ### Data/state introduced
 

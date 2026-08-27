@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -210,6 +210,87 @@ function verifyGeneratedCompanion(sourceName, htmlName) {
     recordedHash === actualHash,
     `${relative(repositoryRoot, htmlPath)} source hash does not match ${relative(repositoryRoot, sourcePath)}`,
   );
+  assert(
+    html.split(actualHash).length >= 3,
+    `${relative(repositoryRoot, htmlPath)} must show the complete source hash visibly as well as in metadata`,
+  );
+}
+
+function walkFiles(root) {
+  if (!existsSync(root)) return [];
+  return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(root, entry.name);
+    return entry.isDirectory() ? walkFiles(path) : [path];
+  });
+}
+
+function trackedFiles() {
+  const result = spawnSync('git', ['ls-files', '-z'], {
+    cwd: repositoryRoot,
+    encoding: 'utf8',
+  });
+  if (result.error) {
+    throw new Error(`git ls-files could not start: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    throw new Error(`git ls-files failed with exit status ${result.status}`);
+  }
+  return result.stdout.split('\0').filter(Boolean);
+}
+
+function verifyStage5Boundaries() {
+  const rustRoot = join(repositoryRoot, 'backend', 'src');
+  const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
+  const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
+  const sqlxLeaks = [];
+  const productionSqliteLocationLeaks = [];
+
+  for (const path of rustFiles) {
+    const source = readFileSync(path, 'utf8');
+    const pathName = relative(repositoryRoot, path);
+    if (!path.startsWith(`${sqliteRoot}/`) && /\bsqlx\s*::|\bextern\s+crate\s+sqlx\b/.test(source)) {
+      sqlxLeaks.push(pathName);
+    }
+    if (/["'](?:sqlite:[^"']*|:memory:)["']/.test(source)) {
+      productionSqliteLocationLeaks.push(pathName);
+    }
+  }
+
+  assert(
+    sqlxLeaks.length === 0,
+    `SQLx crate references escaped backend/src/adapters/sqlite: ${sqlxLeaks.join(', ')}`,
+  );
+  assert(
+    productionSqliteLocationLeaks.length === 0,
+    `production-style SQLite URLs or memory locations are forbidden: ${productionSqliteLocationLeaks.join(', ')}`,
+  );
+
+  const migrationRoot = join(repositoryRoot, 'backend', 'migrations');
+  const migrationFiles = walkFiles(migrationRoot).map((path) => relative(migrationRoot, path));
+  assert(
+    migrationFiles.length === 1 && migrationFiles[0] === 'README.md',
+    `Stage 5 migrations must contain only README.md; found ${migrationFiles.join(', ') || 'nothing'}`,
+  );
+
+  const sqliteArtifacts = trackedFiles().filter((path) =>
+    /(?:\.sqlite3?|\.db)(?:-(?:wal|shm))?$/i.test(path),
+  );
+  assert(
+    sqliteArtifacts.length === 0,
+    `tracked SQLite database artifacts are forbidden: ${sqliteArtifacts.join(', ')}`,
+  );
+
+  const stateStore = readFileSync(join(rustRoot, 'ports', 'state_store.rs'), 'utf8');
+  assert(!/\bsqlx\s*::/.test(stateStore), 'StateStore must remain free of SQLx crate types');
+  assert(
+    !/fn\s+\w*transaction|fn\s+transaction|with_transaction|begin_transaction/.test(stateStore),
+    'StateStore must not expose a generic transaction operation',
+  );
+
+  return {
+    rustFileCount: rustFiles.length,
+    migrationFileCount: migrationFiles.length,
+  };
 }
 
 try {
@@ -267,9 +348,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
+  const stage5 = verifyStage5Boundaries();
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 generated HTML source hashes`,
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage5.rustFileCount} Rust files, ${stage5.migrationFileCount} Stage 5 migration harness file, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

@@ -2060,6 +2060,40 @@ Do not add performance pragmas without documenting durability effects.
 - `SQLITE_BUSY` after `busy_timeout` is a storage error and metric; an internal transaction may retry only before any external effect.
 - The database file, WAL, and shared-memory files remain on the same local EBS filesystem. Network filesystems are forbidden.
 
+### Stage 5 SQLite runtime contract
+
+The V0 implementation uses SQLx `0.9` with only `sqlite-bundled`, `runtime-tokio`, `migrate`, and `macros`; Tokio `1.53` with only `macros`, `rt-multi-thread`, `sync`, and `time`; and nix `0.31` with only `fs`. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside `adapters/sqlite`; neither application nor the `StateStore` port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work.
+
+The database path is exactly `<state_root>/db/craxii.sqlite3` and the process-lock path is exactly `<state_root>/locks/craxii.lock`. `state_root` MUST preexist; Stage 5 may create only its `db/` and `locks/` children. Those directories are mode `0700`, and new database and lock files are mode `0600`. Production provisioning owns `state_root`, user ownership, and any `chown`; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production `:memory:` mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.
+
+The mounted filesystem MUST be locally classified before use. Linux V0 allows ext2/3/4, XFS, Btrfs, tmpfs, and overlayfs. macOS V0 allows APFS and HFS/HFS+. Known remote classes including NFS, SMB/CIFS, 9p, Ceph, and identifiable network-style FUSE mounts are rejected, and unknown classes fail closed. This classification does not prove EBS backing.
+
+In addition to the required pragmas above, every connection MUST apply and verify:
+
+```text
+PRAGMA wal_autocheckpoint = 1000;
+PRAGMA locking_mode = NORMAL;
+PRAGMA trusted_schema = OFF;
+PRAGMA recursive_triggers = OFF;
+PRAGMA secure_delete = OFF;
+PRAGMA mmap_size = 0;
+PRAGMA cache_size = -2000;
+PRAGMA journal_size_limit = -1;
+PRAGMA fullfsync = ON;
+```
+
+`fullfsync` is semantically verified where supported; Linux MUST NOT be rejected merely because the Apple-specific durability behavior is a no-op when SQLite reports the documented platform-neutral value. Any other unknown or mismatched correctness PRAGMA fails startup. The validated pool maximum is `1..=4`, default four; its minimum equals its maximum for eager validation, acquisition timeout is five seconds, and idle timeout and maximum lifetime are disabled. Replacement connections receive the same initialization and verification.
+
+One in-process Tokio `WriteCoordinator` serializes Craxii writes. Lock order is coordinator, pooled connection, then `BEGIN IMMEDIATE`. Writes are short bounded SQLite-only transactions with explicit commit/rollback and rollback-on-drop. There is no generic retry loop, nested/savepoint public surface, or escaped transaction handle. Provider/network calls, workstation/process calls, filesystem content reads, artifact rename, client delivery, and unrelated sleeps or waits MUST NOT occur inside a SQLite transaction.
+
+`MAX_SUPPORTED_SCHEMA_VERSION` remains zero in Stage 5. The embedded SQLx migration set contains zero Craxii migrations and may create only SQLx-owned migration metadata. There is no `user_version`, Craxii schema-version table, fake migration `0000`, or Craxii domain table. Stage 6 owns migration `0001` and the canonical schema. Preflight classifies a database as `empty`, `migrated_uninitialized`, `newer_schema`, `corrupt`, or `inconsistent`; only the first two may proceed. A positive applied migration is newer, while failed/malformed/contradictory metadata or any unexpected version-zero user object is inconsistent.
+
+Startup opens and verifies WAL on a dedicated connection, acquires a nonblocking exclusive Unix advisory lock held for the runtime lifetime, eagerly validates the pool, performs compatibility plus `quick_check` and `foreign_key_check` before migration mutation, applies the empty forward migration harness, and repeats applicable postflight checks. It never auto-repairs. The returned bootstrap guard owns the pool and lifetime lock, while successful Stage 5 startup remains `live_unready` until Stage 7 bootstrap and Stage 10 recovery are implemented.
+
+Safe database errors expose only fixed storage, newer-schema, already-owned, corruption, inconsistency, state-conflict, or internal-invariant categories. Raw paths, SQL, bind values, SQLx/SQLite messages, content, and secrets MUST NOT enter Display, Debug, serialized normalized errors, startup diagnostics, source chains, or traces. Sanitized numeric SQLite codes are diagnostic only and MUST NOT be put in `SourceStatus::os_errno`. A passive checkpoint report is observational, not a backup; shutdown closes the pool and MUST NOT force `TRUNCATE`.
+
+A successful `FULL`/WAL commit is treated as durable across process crash and conforming local-storage crash boundaries. This does not promise protection from filesystem or storage failure, EBS volume loss, account or Availability Zone loss, or absent backup.
+
 ### WAL checkpointing
 
 - Configure `wal_autocheckpoint` explicitly, initially 1000 pages.

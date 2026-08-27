@@ -2,6 +2,22 @@
   "schema_version": 1,
   "approved_direct_cargo_dependencies": [
     {
+      "package": "nix",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.31",
+      "enabled_features": [
+        "fs"
+      ],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/nix.md"
+    },
+    {
       "package": "serde",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -30,6 +46,25 @@
       "decision_record_path": "docs/dependencies/sha2.md"
     },
     {
+      "package": "sqlx",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.9",
+      "enabled_features": [
+        "sqlite-bundled",
+        "runtime-tokio",
+        "migrate",
+        "macros"
+      ],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/sqlx.md"
+    },
+    {
       "package": "time",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -42,6 +77,25 @@
       "approver_role": "repository/project owner",
       "approval_date": "2026-08-27",
       "decision_record_path": "docs/dependencies/time.md"
+    },
+    {
+      "package": "tokio",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^1.53",
+      "enabled_features": [
+        "macros",
+        "rt-multi-thread",
+        "sync",
+        "time"
+      ],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-27",
+      "decision_record_path": "docs/dependencies/tokio.md"
     },
     {
       "package": "toml",
