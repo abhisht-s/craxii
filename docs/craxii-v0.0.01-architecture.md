@@ -1532,6 +1532,70 @@ V0 startup reads current-state tables after integrity verification for speed. Te
 
 The following schema is normative in entities, relationships, uniqueness, and state constraints. Migration SQL may use different names only with an architecture update.
 
+### Stage 6 canonical storage contract
+
+Stage 6 is SQLx migration `0001`, version `1`, description `core durable schema`. It creates exactly
+nine product tables: `craxii_principals`, `workstations`, `workspaces`, `conversations`,
+`runtime_instances`, `client_devices`, `work_items`, `messages`, and `client_commands`. All nine use
+`STRICT, WITHOUT ROWID`. SQLx migration metadata remains authoritative; `PRAGMA user_version`
+remains zero, there is no Craxii schema-version table, migrations are forward-only, and Stage 6
+inserts no product rows.
+
+Every UUID column stores a lowercase canonical hyphenated UUIDv7 as `TEXT` and SQL checks its exact
+36-character hyphen/version/variant/lowercase-hex shape. Every timestamp stores canonical UTC RFC
+3339 text with exactly six fractional digits and a trailing `Z` (27 bytes); SQL checks the shape and
+the Rust codec performs full calendar validation. Every SHA-256 value is 64 lowercase hexadecimal
+characters. JSON is `TEXT` guarded by `json_valid` and decoded through versioned adapter-private
+DTOs that deny unknown fields. All foreign keys use `ON UPDATE RESTRICT ON DELETE RESTRICT`; V0 has
+no cascade, set-null, or physical-deletion behavior.
+
+The exact runtime states are `running`, `stopping`, and `stopped`; exact stop reasons are
+`graceful_shutdown` and `startup_failure`. A stopping row has no `stopped_at` and may have no reason
+or `graceful_shutdown`; `startup_failure` is terminal-only. A stopped row requires both terminal
+fields, and a running row permits neither. Exact client command types are `message` and `cancel`.
+
+Work terminal-reason codes are exactly `answered`, `refused`, `definite_normalized_error`,
+`provider_exhausted`, `invalid_model_output`, `lifecycle_limit`, `user_request`,
+`graceful_shutdown`, `runtime_ownership_lost`, `provider_outcome_unknown`,
+`tool_interrupted_before_dispatch`, `tool_outcome_unknown`, and `cleanup_unconfirmed`.
+`cancellation_reason_code` is exactly `user_request` or `graceful_shutdown` while cancellation is
+active. SQL enforces the complete Stage 4 owner/current-attempt/timestamp/cancellation/terminal
+shape. Direct queued cancellation remains legal with `started_at = NULL`.
+
+Message `content_json` V1 has exactly this storage shape, with one or more blocks and exact,
+unnormalized UTF-8 text:
+
+```json
+{
+  "version": 1,
+  "blocks": [
+    {
+      "type": "text",
+      "text": "..."
+    }
+  ]
+}
+```
+
+The JSON representation is never hash input. Decode reconstructs `MessageContent`, regenerates the
+Stage 3 canonical binary bytes, recomputes SHA-256, and requires equality with `content_sha256`.
+`ix_messages_conversation` supports membership lookup only: canonical message ordering remains
+journal-derived. Neither timestamp order nor UUIDv7 order is a message-order contract.
+
+For a valid schema-version-1 database, startup validates the SQLx metadata table, the exact
+migration-version set and embedded 48-byte SQLx checksum, `user_version = 0`, exact product table
+and named-index sets, absence of triggers/views/unexpected objects, and a deterministic structural
+manifest containing normalized `sqlite_schema` SQL plus `table_xinfo`, `foreign_key_list`,
+`index_list`, `index_xinfo`, strictness, and without-rowid state. Drift, gaps, dirty or malformed
+metadata, and checksum mismatch are inconsistent and are never repaired. A valid contiguous
+migration history above version 1 is newer schema.
+
+Stage 7 owns `work_item_inputs`, journal tables, projection reconstruction, and initial principal/
+workstation/workspace/conversation bootstrap. Stage 8 owns model/tool/context/artifact/authority/
+evidence tables. Consequently `current_model_invocation_id` and `current_tool_execution_id` have no
+Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10
+owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.
+
 ### `craxii_principals`
 
 ```sql
@@ -1544,7 +1608,12 @@ craxii_principals (
   default_workspace_id         TEXT,
   created_at                   TEXT NOT NULL,
   architecture_revision        TEXT NOT NULL,
-  schema_revision              INTEGER NOT NULL CHECK (schema_revision >= 1)
+  schema_revision              INTEGER NOT NULL CHECK (schema_revision >= 1),
+  FOREIGN KEY (primary_conversation_id) REFERENCES conversations
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  FOREIGN KEY (default_workspace_id) REFERENCES workspaces
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CHECK ((primary_conversation_id IS NULL) = (default_workspace_id IS NULL))
 )
 ```
 
@@ -1576,10 +1645,11 @@ messages (
   content_json           TEXT NOT NULL,
   content_sha256         TEXT NOT NULL,
   produced_by_work_id    TEXT REFERENCES work_items,
-  client_device_id       TEXT,
+  client_device_id       TEXT REFERENCES client_devices,
   client_message_id      TEXT,
   committed_at           TEXT NOT NULL,
-  UNIQUE (client_device_id, client_message_id)
+  UNIQUE (client_device_id, client_message_id),
+  UNIQUE (produced_by_work_id)
 )
 ```
 
@@ -1591,8 +1661,8 @@ The unique client fields are nullable only for assistant/system messages. Applic
 work_items (
   work_id                       TEXT PRIMARY KEY,
   craxii_id                     TEXT NOT NULL REFERENCES craxii_principals,
-  conversation_id               TEXT REFERENCES conversations,
-  conversation_work_ordinal     INTEGER,
+  conversation_id               TEXT NOT NULL REFERENCES conversations,
+  conversation_work_ordinal     INTEGER NOT NULL,
   kind                          TEXT NOT NULL CHECK (kind = 'conversational'),
   state                         TEXT NOT NULL,
   state_version                 INTEGER NOT NULL DEFAULT 1,
@@ -1606,6 +1676,7 @@ work_items (
   queued_at                     TEXT NOT NULL,
   started_at                    TEXT,
   cancel_requested_at           TEXT,
+  cancellation_reason_code      TEXT,
   terminal_at                   TEXT,
   terminal_reason_code          TEXT,
   terminal_detail_json          TEXT,
@@ -1738,6 +1809,8 @@ workstations (
   generation            INTEGER NOT NULL CHECK (generation >= 1),
   hosting_provider      TEXT NOT NULL,
   provider_instance_id  TEXT,
+  provider_image_id     TEXT,
+  provisioning_revision TEXT,
   architecture          TEXT NOT NULL,
   os_release            TEXT NOT NULL,
   capabilities_json     TEXT NOT NULL,
@@ -2087,6 +2160,11 @@ PRAGMA fullfsync = ON;
 One in-process Tokio `WriteCoordinator` serializes Craxii writes. Lock order is coordinator, pooled connection, then `BEGIN IMMEDIATE`. Writes are short bounded SQLite-only transactions with explicit commit/rollback and rollback-on-drop. There is no generic retry loop, nested/savepoint public surface, or escaped transaction handle. Provider/network calls, workstation/process calls, filesystem content reads, artifact rename, client delivery, and unrelated sleeps or waits MUST NOT occur inside a SQLite transaction.
 
 `MAX_SUPPORTED_SCHEMA_VERSION` remains zero in Stage 5. The embedded SQLx migration set contains zero Craxii migrations and may create only SQLx-owned migration metadata. There is no `user_version`, Craxii schema-version table, fake migration `0000`, or Craxii domain table. Stage 6 owns migration `0001` and the canonical schema. Preflight classifies a database as `empty`, `migrated_uninitialized`, `newer_schema`, `corrupt`, or `inconsistent`; only the first two may proceed. A positive applied migration is newer, while failed/malformed/contradictory metadata or any unexpected version-zero user object is inconsistent.
+
+Stage 6 advances the compatibility ceiling to `1` and adds the `current` disposition. Fresh and
+Stage 5 metadata-only databases apply migration `0001` and become current; version-1 databases
+reopen idempotently. Stage 5's WAL, PRAGMA, filesystem, locking, integrity, transaction, and safe
+error contracts remain unchanged.
 
 Startup opens and verifies WAL on a dedicated connection, acquires a nonblocking exclusive Unix advisory lock held for the runtime lifetime, eagerly validates the pool, performs compatibility plus `quick_check` and `foreign_key_check` before migration mutation, applies the empty forward migration harness, and repeats applicable postflight checks. It never auto-repairs. The returned bootstrap guard owns the pool and lifetime lock, while successful Stage 5 startup remains `live_unready` until Stage 7 bootstrap and Stage 10 recovery are implemented.
 

@@ -238,7 +238,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage5Boundaries() {
+function verifyStage6Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -268,8 +268,116 @@ function verifyStage5Boundaries() {
   const migrationRoot = join(repositoryRoot, 'backend', 'migrations');
   const migrationFiles = walkFiles(migrationRoot).map((path) => relative(migrationRoot, path));
   assert(
-    migrationFiles.length === 1 && migrationFiles[0] === 'README.md',
-    `Stage 5 migrations must contain only README.md; found ${migrationFiles.join(', ') || 'nothing'}`,
+    migrationFiles.length === 1 && migrationFiles[0] === '0001_core_durable_schema.sql',
+    `Stage 6 must contain only migration 0001_core_durable_schema.sql; found ${migrationFiles.join(', ') || 'nothing'}`,
+  );
+
+  const migration = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
+  const expectedTables = [
+    'client_commands',
+    'client_devices',
+    'conversations',
+    'craxii_principals',
+    'messages',
+    'runtime_instances',
+    'work_items',
+    'workspaces',
+    'workstations',
+  ];
+  const actualTables = [...migration.matchAll(/\bCREATE\s+TABLE\s+([a-z][a-z0-9_]*)/gi)]
+    .map((match) => match[1])
+    .sort();
+  assert(
+    equalStringArrays(actualTables, expectedTables),
+    `Stage 6 production table inventory differs: ${actualTables.join(', ')}`,
+  );
+  const forbiddenTables = [
+    'work_item_inputs',
+    'journal_events',
+    'stream_heads',
+    'context_manifests',
+    'context_manifest_sources',
+    'model_invocations',
+    'tool_executions',
+    'artifacts',
+    'authority_evidence',
+    'schema_versions',
+  ];
+  for (const table of forbiddenTables) {
+    assert(
+      !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migration),
+      `Stage 7/8 or custom-version table is premature in migration 0001: ${table}`,
+    );
+  }
+
+  const expectedIndexes = [
+    'ix_messages_conversation',
+    'ix_runtime_instances_craxii_state',
+    'ix_work_items_nonterminal_by_runtime',
+    'ix_work_items_queued_fifo',
+    'ix_workspaces_craxii_id',
+    'ix_workstations_craxii_id',
+    'ux_client_devices_token_hash',
+    'ux_conversations_craxii_kind',
+    'ux_messages_client_identity',
+    'ux_messages_produced_by_work',
+    'ux_work_items_conversation_ordinal',
+    'ux_work_items_current_model_invocation',
+    'ux_work_items_current_tool_execution',
+    'ux_work_items_one_active_per_conversation',
+    'ux_workspaces_workstation_logical_name',
+  ];
+  const actualIndexes = [...migration.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+([a-z][a-z0-9_]*)/gi)]
+    .map((match) => match[1])
+    .sort();
+  assert(
+    equalStringArrays(actualIndexes, expectedIndexes),
+    `Stage 6 named index inventory differs: ${actualIndexes.join(', ')}`,
+  );
+  assert(
+    !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migration),
+    'migration 0001 must not contain a raw bearer-token persistence column',
+  );
+  assert(
+    /CREATE\s+INDEX\s+ix_messages_conversation\s+ON\s+messages\s*\(conversation_id\)/i.test(migration),
+    'message membership index must contain only conversation_id; ordering remains journal-derived',
+  );
+  const messageIndexColumns = [
+    ...migration.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX[^;]*?ON\s+messages\s*\(([^)]*)\)/gi),
+  ].map((match) => match[1]);
+  assert(
+    messageIndexColumns.every((columns) =>
+      !/(?:^|,)\s*(?:committed_at|message_id)\s*(?:,|$)/i.test(columns)),
+    'message indexes must not create timestamp/UUID ordering authority',
+  );
+  assert(
+    !/\b(?:provider_response_id|provider_request_json|provider_response_json|openai_|responses_api)\b/i.test(migration),
+    'provider wire types must not enter migration 0001',
+  );
+
+  const sqliteSource = walkFiles(sqliteRoot)
+    .filter((path) => path.endsWith('.rs'))
+    .map((path) => readFileSync(path, 'utf8'))
+    .join('\n');
+  assert(!/\bquery(?:_as)?!\s*\(/.test(sqliteSource), 'SQLx query macros are forbidden in Stage 6 codecs');
+  assert(!/derive\([^)]*FromRow/.test(sqliteSource), 'SQLx FromRow derives are forbidden on Stage 6 rows');
+  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 6');
+
+  const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
+  assert(
+    /^serde_json\s*=\s*"1\.0"$/m.test(cargoManifest) &&
+      !/\[dev-dependencies\][\s\S]*^serde_json\s*=/m.test(cargoManifest),
+    'serde_json must be one normal direct production dependency, not dev-only',
+  );
+  const compatibility = readFileSync(join(rustRoot, 'bootstrap', 'compatibility.rs'), 'utf8');
+  const schema = readFileSync(join(sqliteRoot, 'schema.rs'), 'utf8');
+  assert(
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*1;/.test(compatibility),
+    'bootstrap schema compatibility ceiling must be 1',
+  );
+  assert(
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*1;/.test(schema),
+    'SQLite schema compatibility ceiling must be 1',
   );
 
   const sqliteArtifacts = trackedFiles().filter((path) =>
@@ -348,10 +456,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage5 = verifyStage5Boundaries();
+  const stage6 = verifyStage6Boundaries();
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage5.rustFileCount} Rust files, ${stage5.migrationFileCount} Stage 5 migration harness file, 0 tracked SQLite artifacts`,
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage6.rustFileCount} Rust files, ${stage6.migrationFileCount} exact Stage 6 migration, 9 product tables, 15 named indexes, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

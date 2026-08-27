@@ -106,6 +106,12 @@ impl Debug for SqliteAdapterError {
 
 impl std::error::Error for SqliteAdapterError {}
 
+impl From<sqlx::Error> for SqliteAdapterError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::schema_query(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

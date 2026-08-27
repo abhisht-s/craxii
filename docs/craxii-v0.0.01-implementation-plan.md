@@ -1214,6 +1214,13 @@ Stage 5 passes on real file-backed databases.
 - Execute Substages 6.1–6.3 in migration order.
 - Match the architecture's entities, relationships, uniqueness, and state constraints; deviations require an architecture change, not a convenient column omission.
 - Add indexes from known queries, not speculative analytics.
+- Add forward-only SQLx migration `0001_core_durable_schema.sql`, advance the schema ceiling to 1,
+  and classify an exact version-1 schema as `current` without using `user_version` or a custom
+  version table.
+- Use canonical UUIDv7/timestamp/digest checks, `json_valid`, restrictive foreign keys, and
+  `STRICT, WITHOUT ROWID` for all nine Stage 6 product tables.
+- Validate current-schema drift through the embedded SQLx checksum plus exact object inventory and
+  deterministic structural introspection; do not auto-repair.
 
 ### Data/state introduced
 
@@ -1221,7 +1228,9 @@ Stage 5 passes on real file-backed databases.
 
 ### Contracts/interfaces introduced
 
-SQL row codecs contained in the adapter, guarded version updates, uniqueness for work ordinals/device commands/active work, and current-state query shapes.
+SQL row codecs contained in the adapter, strict V1 message-content and safe terminal-detail DTOs,
+guarded version updates, uniqueness for work ordinals/device commands/active work, and current-state
+query shapes. Message order remains journal-derived and never timestamp- or UUID-derived.
 
 ### Failure behavior
 
@@ -1240,7 +1249,10 @@ Migrate from empty, inspect table/index/foreign-key definitions, exercise every 
 
 ### What is deliberately NOT implemented yet
 
-Journal/input relations, evidence tables, repository business transactions, seed identity, scheduler logic, or general query APIs.
+Journal/input relations, evidence/attempt/context/artifact tables, repository business transactions,
+seed identity, scheduler/runtime behavior, device authentication/idempotency behavior, or general
+query APIs. Current model/tool links intentionally have no foreign key until Stage 8 owns their
+tables.
 
 ### Substages
 

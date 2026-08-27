@@ -31,7 +31,7 @@ fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
         "architecture_version=\"V0.0.01\"",
         "protocol_version=1",
         "configuration_version=1",
-        "max_supported_schema_version=0",
+        "max_supported_schema_version=1",
         "configuration_fingerprint=\"sha256:",
         "health_state=\"live_unready\"",
         "live=true",

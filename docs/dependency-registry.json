@@ -170,7 +170,7 @@
     {
       "package": "serde_json",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "dependency_kind": "dev",
+      "dependency_kind": "normal",
       "approved_compatible_requirement": "^1.0",
       "enabled_features": [],
       "default_features": true,
@@ -178,7 +178,7 @@
       "target_restriction": null,
       "approval_status": "approved",
       "approver_role": "repository/project owner",
-      "approval_date": "2026-08-27",
+      "approval_date": "2026-08-28",
       "decision_record_path": "docs/dependencies/serde-json.md"
     }
   ]

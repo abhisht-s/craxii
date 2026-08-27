@@ -8,15 +8,15 @@ use std::time::{Duration, Instant};
 
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::statfs;
-use sqlx::migrate::Migrator;
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqliteLockingMode, SqlitePoolOptions,
     SqliteSynchronous,
 };
-use sqlx::{ConnectOptions, Connection, Row, SqliteConnection, SqlitePool};
+use sqlx::{ConnectOptions, Connection, SqliteConnection, SqlitePool};
 use tokio::sync::Mutex;
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
+use super::schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION, MIGRATOR, classify_schema};
 
 const DATABASE_DIRECTORY: &str = "db";
 const LOCK_DIRECTORY: &str = "locks";
@@ -27,34 +27,6 @@ const FILE_MODE: u32 = 0o600;
 const MAX_POOL_CONNECTIONS: u32 = 4;
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5_000);
-
-/// Stage 5 understands migration metadata but no Craxii schema migration.
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 0;
-
-static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
-
-/// Stage 5 database lifecycle states. These names are fixed if later serialized.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum DatabaseDisposition {
-    Empty,
-    MigratedUninitialized,
-    NewerSchema,
-    Corrupt,
-    Inconsistent,
-}
-
-impl DatabaseDisposition {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Empty => "empty",
-            Self::MigratedUninitialized => "migrated_uninitialized",
-            Self::NewerSchema => "newer_schema",
-            Self::Corrupt => "corrupt",
-            Self::Inconsistent => "inconsistent",
-        }
-    }
-}
 
 /// Sanitized result from `PRAGMA wal_checkpoint(PASSIVE)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -274,7 +246,9 @@ impl SqliteRuntimeGuard {
         let preflight = classify_schema(&mut bootstrap).await?;
         trace_integrity("preflight", preflight_started.elapsed(), preflight);
         match preflight {
-            DatabaseDisposition::Empty | DatabaseDisposition::MigratedUninitialized => {}
+            DatabaseDisposition::Empty
+            | DatabaseDisposition::MigratedUninitialized
+            | DatabaseDisposition::Current => {}
             DatabaseDisposition::NewerSchema => {
                 return Err(SqliteAdapterError::new(SqliteFailureKind::NewerSchema));
             }
@@ -298,7 +272,7 @@ impl SqliteRuntimeGuard {
             operation = "migrate",
             current_version = MAX_SUPPORTED_SCHEMA_VERSION,
             max_supported_version = MAX_SUPPORTED_SCHEMA_VERSION,
-            applied_count = 0_u64,
+            applied_count = if preflight == DatabaseDisposition::Current { 0_u64 } else { 1_u64 },
             duration_micros = u64::try_from(migration_started.elapsed().as_micros()).unwrap_or(u64::MAX)
         );
 
@@ -306,7 +280,7 @@ impl SqliteRuntimeGuard {
         run_integrity_checks(&mut bootstrap).await?;
         let disposition = classify_schema(&mut bootstrap).await?;
         trace_integrity("postflight", postflight_started.elapsed(), disposition);
-        if disposition != DatabaseDisposition::MigratedUninitialized {
+        if disposition != DatabaseDisposition::Current {
             return Err(SqliteAdapterError::new(match disposition {
                 DatabaseDisposition::NewerSchema => SqliteFailureKind::NewerSchema,
                 DatabaseDisposition::Corrupt => SqliteFailureKind::Corrupt,
@@ -654,96 +628,6 @@ async fn run_integrity_checks(connection: &mut SqliteConnection) -> Result<(), S
         .map_err(SqliteAdapterError::from_sqlx)
 }
 
-async fn classify_schema(
-    connection: &mut SqliteConnection,
-) -> Result<DatabaseDisposition, SqliteAdapterError> {
-    let objects = sqlx::query_as::<_, (String, String)>(
-        "SELECT name, type FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name, type",
-    )
-    .fetch_all(&mut *connection)
-    .await
-    .map_err(SqliteAdapterError::schema_query)?;
-
-    if objects.is_empty() {
-        return Ok(DatabaseDisposition::Empty);
-    }
-
-    let has_migration_table = objects
-        .iter()
-        .any(|(name, object_type)| name == "_sqlx_migrations" && object_type == "table");
-    if has_migration_table {
-        validate_migration_table_shape(connection).await?;
-        let versions = sqlx::query_as::<_, (i64, i64)>(
-            "SELECT version, success FROM _sqlx_migrations ORDER BY version",
-        )
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(SqliteAdapterError::schema_query)?;
-        if versions.iter().any(|(_, success)| *success != 1)
-            || versions
-                .iter()
-                .any(|(version, _)| *version <= MAX_SUPPORTED_SCHEMA_VERSION)
-        {
-            return Ok(DatabaseDisposition::Inconsistent);
-        }
-        if versions
-            .iter()
-            .any(|(version, _)| *version > MAX_SUPPORTED_SCHEMA_VERSION)
-        {
-            return Ok(DatabaseDisposition::NewerSchema);
-        }
-    }
-
-    if objects.as_slice() == [("_sqlx_migrations".to_owned(), "table".to_owned())] {
-        Ok(DatabaseDisposition::MigratedUninitialized)
-    } else {
-        Ok(DatabaseDisposition::Inconsistent)
-    }
-}
-
-async fn validate_migration_table_shape(
-    connection: &mut SqliteConnection,
-) -> Result<(), SqliteAdapterError> {
-    let rows = sqlx::query("PRAGMA table_info('_sqlx_migrations')")
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(SqliteAdapterError::schema_query)?;
-    let shape = rows
-        .iter()
-        .map(|row| {
-            Ok((
-                row.try_get::<String, _>("name")?,
-                row.try_get::<String, _>("type")?,
-                row.try_get::<i64, _>("notnull")?,
-                row.try_get::<Option<String>, _>("dflt_value")?,
-                row.try_get::<i64, _>("pk")?,
-            ))
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(SqliteAdapterError::schema_query)?;
-    if shape
-        != [
-            ("version".to_owned(), "BIGINT".to_owned(), 0, None, 1),
-            ("description".to_owned(), "TEXT".to_owned(), 1, None, 0),
-            (
-                "installed_on".to_owned(),
-                "TIMESTAMP".to_owned(),
-                1,
-                Some("CURRENT_TIMESTAMP".to_owned()),
-                0,
-            ),
-            ("success".to_owned(), "BOOLEAN".to_owned(), 1, None, 0),
-            ("checksum".to_owned(), "BLOB".to_owned(), 1, None, 0),
-            ("execution_time".to_owned(), "BIGINT".to_owned(), 1, None, 0),
-        ]
-    {
-        return Err(SqliteAdapterError::new(
-            SqliteFailureKind::InconsistentSchema,
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 pub(super) mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
@@ -867,10 +751,7 @@ pub(super) mod tests {
                 assert_eq!(metadata.nlink(), 1);
             }
         }
-        assert_eq!(
-            guard.disposition(),
-            DatabaseDisposition::MigratedUninitialized
-        );
+        assert_eq!(guard.disposition(), DatabaseDisposition::Current);
         guard.shutdown().await;
 
         let linked = root.path().join("db/linked.sqlite3");
@@ -1211,44 +1092,56 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_zero_classification_and_object_scan_are_exact() {
+    async fn migration_version_one_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
-        assert_eq!(
-            guard.disposition(),
-            DatabaseDisposition::MigratedUninitialized
-        );
+        assert_eq!(guard.disposition(), DatabaseDisposition::Current);
         let mut connection = guard.runtime().acquire().await.unwrap();
-        let objects = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+        let tables = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
         )
         .fetch_all(&mut *connection)
         .await
         .unwrap();
-        assert_eq!(objects, ["_sqlx_migrations"]);
+        let expected_tables = std::iter::once("_sqlx_migrations".to_owned())
+            .chain(
+                crate::adapters::sqlite::schema::PRODUCT_TABLES
+                    .iter()
+                    .map(|value| (*value).to_owned()),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(tables, expected_tables);
         for forbidden in [
-            "craxii",
-            "conversation",
-            "message",
-            "work_item",
-            "journal_event",
+            "work_item_inputs",
+            "journal_events",
+            "stream_heads",
+            "context_manifests",
+            "model_invocations",
+            "tool_executions",
+            "artifacts",
         ] {
-            assert!(!objects.iter().any(|object| object == forbidden));
+            assert!(!tables.iter().any(|object| object == forbidden));
+        }
+        for table in crate::adapters::sqlite::schema::PRODUCT_TABLES {
+            let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table}"
+            )))
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+            assert_eq!(count, 0, "{table}");
         }
         drop(connection);
         guard.shutdown().await;
 
         let reopened = runtime(&root, 1).await;
-        assert_eq!(
-            reopened.disposition(),
-            DatabaseDisposition::MigratedUninitialized
-        );
+        assert_eq!(reopened.disposition(), DatabaseDisposition::Current);
         reopened.shutdown().await;
     }
 
     #[tokio::test]
-    async fn fresh_database_is_empty_before_the_zero_migration_harness_runs() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 0);
+    async fn fresh_database_is_empty_before_migration_one_runs() {
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 1);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1275,7 +1168,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (1, 'future', 1, X'00', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (2, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await
@@ -1285,7 +1178,11 @@ pub(super) mod tests {
         );
 
         let dirty = TestRoot::new();
-        mutate_database(&dirty, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (1, 'dirty', 0, X'00', 0)").await;
+        mutate_database(
+            &dirty,
+            "UPDATE _sqlx_migrations SET success = 0 WHERE version = 1",
+        )
+        .await;
         assert_eq!(
             SqliteRuntimeGuard::start(dirty.path(), 1)
                 .await
@@ -1359,7 +1256,11 @@ pub(super) mod tests {
         );
 
         let contradictory = TestRoot::new();
-        mutate_database(&contradictory, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (1, 'invalid-success', 2, X'00', 0)").await;
+        mutate_database(
+            &contradictory,
+            "UPDATE _sqlx_migrations SET success = 2 WHERE version = 1",
+        )
+        .await;
         assert_eq!(
             SqliteRuntimeGuard::start(contradictory.path(), 1)
                 .await

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="6c36fe1456af8a6535f424299359fbc1a9f8d2cb0618db68f5c1b314aec47b70">
+  <meta name="craxii-source-sha256" content="67ce6595a0ab27bf2d12cf4571dbc0ef950295a7749b3650fdaffcc553184701">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>333</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>6c36fe1456af8a6…</code></p>
+        <p>Source SHA-256:<br><code>67ce6595a0ab27bf…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -2577,6 +2577,29 @@ runtime:&lt;runtime_instance_id&gt;
   <p><strong>Plain-English significance:</strong> This section turns domain objects into concrete relational tables, keys, constraints, and evidence records. Schema mistakes around identity and causality are expensive to migrate, so the shape is explicit before code.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> This is the filing-cabinet plan: separate folders exist for people, conversations, job tickets, specialist calls, tool operations, and stored evidence, all cross-referenced by durable IDs.</p>
 </aside><p>The following schema is normative in entities, relationships, uniqueness, and state constraints. Migration SQL may use different names only with an architecture update.</p>
+<h3>Stage 6 canonical storage contract</h3>
+<aside class="explain-card level-3" data-source-heading="Stage 6 canonical storage contract">
+  <div class="explain-card-label">Subsection guide · plain-English companion</div>
+  <p><strong>Plain-English significance:</strong> Stage 6 freezes the first real product schema and its corruption boundary without creating bootstrap, journal, attempt, scheduler, or authentication behavior early.</p>
+  <p class="real-life-example"><strong>Real-life example:</strong> The filing cabinets, labels, cross-references, and lock rules now exist, but Stage 7 still owns placing the first identity records and journal ledger inside them.</p>
+</aside><p>Stage 6 is SQLx migration <code>0001</code>, version <code>1</code>, description <code>core durable schema</code>. It creates exactly nine product tables: <code>craxii_principals</code>, <code>workstations</code>, <code>workspaces</code>, <code>conversations</code>, <code>runtime_instances</code>, <code>client_devices</code>, <code>work_items</code>, <code>messages</code>, and <code>client_commands</code>. All nine use <code>STRICT, WITHOUT ROWID</code>. SQLx migration metadata remains authoritative; <code>PRAGMA user_version</code> remains zero, there is no Craxii schema-version table, migrations are forward-only, and Stage 6 inserts no product rows.</p>
+<p>Every UUID column stores a lowercase canonical hyphenated UUIDv7 as <code>TEXT</code> and SQL checks its exact 36-character hyphen/version/variant/lowercase-hex shape. Every timestamp stores canonical UTC RFC 3339 text with exactly six fractional digits and a trailing <code>Z</code> (27 bytes); SQL checks the shape and the Rust codec performs full calendar validation. Every SHA-256 value is 64 lowercase hexadecimal characters. JSON is <code>TEXT</code> guarded by <code>json_valid</code> and decoded through versioned adapter-private DTOs that deny unknown fields. All foreign keys use <code>ON UPDATE RESTRICT ON DELETE RESTRICT</code>; V0 has no cascade, set-null, or physical-deletion behavior.</p>
+<p>The exact runtime states are <code>running</code>, <code>stopping</code>, and <code>stopped</code>; exact stop reasons are <code>graceful_shutdown</code> and <code>startup_failure</code>. A stopping row has no <code>stopped_at</code> and may have no reason or <code>graceful_shutdown</code>; <code>startup_failure</code> is terminal-only. A stopped row requires both terminal fields, and a running row permits neither. Exact client command types are <code>message</code> and <code>cancel</code>.</p>
+<p>Work terminal-reason codes are exactly <code>answered</code>, <code>refused</code>, <code>definite_normalized_error</code>, <code>provider_exhausted</code>, <code>invalid_model_output</code>, <code>lifecycle_limit</code>, <code>user_request</code>, <code>graceful_shutdown</code>, <code>runtime_ownership_lost</code>, <code>provider_outcome_unknown</code>, <code>tool_interrupted_before_dispatch</code>, <code>tool_outcome_unknown</code>, and <code>cleanup_unconfirmed</code>. <code>cancellation_reason_code</code> is exactly <code>user_request</code> or <code>graceful_shutdown</code> while cancellation is active. SQL enforces the complete Stage 4 owner/current-attempt/timestamp/cancellation/terminal shape. Direct queued cancellation remains legal with <code>started_at = NULL</code>.</p>
+<p>Message <code>content_json</code> V1 has exactly this storage shape, with one or more blocks and exact, unnormalized UTF-8 text:</p>
+<pre><code class="language-json">{
+  &quot;version&quot;: 1,
+  &quot;blocks&quot;: [
+    {
+      &quot;type&quot;: &quot;text&quot;,
+      &quot;text&quot;: &quot;...&quot;
+    }
+  ]
+}
+</code></pre>
+<p>The JSON representation is never hash input. Decode reconstructs <code>MessageContent</code>, regenerates the Stage 3 canonical binary bytes, recomputes SHA-256, and requires equality with <code>content_sha256</code>. <code>ix_messages_conversation</code> supports membership lookup only: canonical message ordering remains journal-derived. Neither timestamp order nor UUIDv7 order is a message-order contract.</p>
+<p>For a valid schema-version-1 database, startup validates the SQLx metadata table, the exact migration-version set and embedded 48-byte SQLx checksum, <code>user_version = 0</code>, exact product table and named-index sets, absence of triggers/views/unexpected objects, and a deterministic structural manifest containing normalized <code>sqlite_schema</code> SQL plus <code>table_xinfo</code>, <code>foreign_key_list</code>, <code>index_list</code>, <code>index_xinfo</code>, strictness, and without-rowid state. Drift, gaps, dirty or malformed metadata, and checksum mismatch are inconsistent and are never repaired. A valid contiguous migration history above version 1 is newer schema.</p>
+<p>Stage 7 owns <code>work_item_inputs</code>, journal tables, projection reconstruction, and initial principal/workstation/workspace/conversation bootstrap. Stage 8 owns model/tool/context/artifact/authority/evidence tables. Consequently <code>current_model_invocation_id</code> and <code>current_tool_execution_id</code> have no Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10 owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.</p>
 <h3><code>craxii_principals</code></h3>
 <aside class="explain-card level-3" data-source-heading="craxii_principals">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -2591,7 +2614,12 @@ runtime:&lt;runtime_instance_id&gt;
   default_workspace_id         TEXT,
   created_at                   TEXT NOT NULL,
   architecture_revision        TEXT NOT NULL,
-  schema_revision              INTEGER NOT NULL CHECK (schema_revision &gt;= 1)
+  schema_revision              INTEGER NOT NULL CHECK (schema_revision &gt;= 1),
+  FOREIGN KEY (primary_conversation_id) REFERENCES conversations
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  FOREIGN KEY (default_workspace_id) REFERENCES workspaces
+    ON UPDATE RESTRICT ON DELETE RESTRICT,
+  CHECK ((primary_conversation_id IS NULL) = (default_workspace_id IS NULL))
 )
 </code></pre>
 <p>Only one row is permitted in V0 by application invariant.</p>
@@ -2624,10 +2652,11 @@ runtime:&lt;runtime_instance_id&gt;
   content_json           TEXT NOT NULL,
   content_sha256         TEXT NOT NULL,
   produced_by_work_id    TEXT REFERENCES work_items,
-  client_device_id       TEXT,
+  client_device_id       TEXT REFERENCES client_devices,
   client_message_id      TEXT,
   committed_at           TEXT NOT NULL,
-  UNIQUE (client_device_id, client_message_id)
+  UNIQUE (client_device_id, client_message_id),
+  UNIQUE (produced_by_work_id)
 )
 </code></pre>
 <p>The unique client fields are nullable only for assistant/system messages. Application validation requires both or neither.</p>
@@ -2639,8 +2668,8 @@ runtime:&lt;runtime_instance_id&gt;
 </aside><pre><code class="language-sql">work_items (
   work_id                       TEXT PRIMARY KEY,
   craxii_id                     TEXT NOT NULL REFERENCES craxii_principals,
-  conversation_id               TEXT REFERENCES conversations,
-  conversation_work_ordinal     INTEGER,
+  conversation_id               TEXT NOT NULL REFERENCES conversations,
+  conversation_work_ordinal     INTEGER NOT NULL,
   kind                          TEXT NOT NULL CHECK (kind = &#39;conversational&#39;),
   state                         TEXT NOT NULL,
   state_version                 INTEGER NOT NULL DEFAULT 1,
@@ -2654,6 +2683,7 @@ runtime:&lt;runtime_instance_id&gt;
   queued_at                     TEXT NOT NULL,
   started_at                    TEXT,
   cancel_requested_at           TEXT,
+  cancellation_reason_code      TEXT,
   terminal_at                   TEXT,
   terminal_reason_code          TEXT,
   terminal_detail_json          TEXT,
@@ -2787,6 +2817,8 @@ WHERE state IN (
   generation            INTEGER NOT NULL CHECK (generation &gt;= 1),
   hosting_provider      TEXT NOT NULL,
   provider_instance_id  TEXT,
+  provider_image_id     TEXT,
+  provisioning_revision TEXT,
   architecture          TEXT NOT NULL,
   os_release            TEXT NOT NULL,
   capabilities_json     TEXT NOT NULL,
@@ -3148,6 +3180,7 @@ PRAGMA fullfsync = ON;
 <p><code>fullfsync</code> is semantically verified where supported; Linux MUST NOT be rejected merely because the Apple-specific durability behavior is a no-op when SQLite reports the documented platform-neutral value. Any other unknown or mismatched correctness PRAGMA fails startup. The validated pool maximum is <code>1..=4</code>, default four; its minimum equals its maximum for eager validation, acquisition timeout is five seconds, and idle timeout and maximum lifetime are disabled. Replacement connections receive the same initialization and verification.</p>
 <p>One in-process Tokio <code>WriteCoordinator</code> serializes Craxii writes. Lock order is coordinator, pooled connection, then <code>BEGIN IMMEDIATE</code>. Writes are short bounded SQLite-only transactions with explicit commit/rollback and rollback-on-drop. There is no generic retry loop, nested/savepoint public surface, or escaped transaction handle. Provider/network calls, workstation/process calls, filesystem content reads, artifact rename, client delivery, and unrelated sleeps or waits MUST NOT occur inside a SQLite transaction.</p>
 <p><code>MAX_SUPPORTED_SCHEMA_VERSION</code> remains zero in Stage 5. The embedded SQLx migration set contains zero Craxii migrations and may create only SQLx-owned migration metadata. There is no <code>user_version</code>, Craxii schema-version table, fake migration <code>0000</code>, or Craxii domain table. Stage 6 owns migration <code>0001</code> and the canonical schema. Preflight classifies a database as <code>empty</code>, <code>migrated_uninitialized</code>, <code>newer_schema</code>, <code>corrupt</code>, or <code>inconsistent</code>; only the first two may proceed. A positive applied migration is newer, while failed/malformed/contradictory metadata or any unexpected version-zero user object is inconsistent.</p>
+<p>Stage 6 advances the compatibility ceiling to <code>1</code> and adds the <code>current</code> disposition. Fresh and Stage 5 metadata-only databases apply migration <code>0001</code> and become current; version-1 databases reopen idempotently. Stage 5&#x27;s WAL, PRAGMA, filesystem, locking, integrity, transaction, and safe error contracts remain unchanged.</p>
 <p>Startup opens and verifies WAL on a dedicated connection, acquires a nonblocking exclusive Unix advisory lock held for the runtime lifetime, eagerly validates the pool, performs compatibility plus <code>quick_check</code> and <code>foreign_key_check</code> before migration mutation, applies the empty forward migration harness, and repeats applicable postflight checks. It never auto-repairs. The returned bootstrap guard owns the pool and lifetime lock, while successful Stage 5 startup remains <code>live_unready</code> until Stage 7 bootstrap and Stage 10 recovery are implemented.</p>
 <p>Safe database errors expose only fixed storage, newer-schema, already-owned, corruption, inconsistency, state-conflict, or internal-invariant categories. Raw paths, SQL, bind values, SQLx/SQLite messages, content, and secrets MUST NOT enter Display, Debug, serialized normalized errors, startup diagnostics, source chains, or traces. Sanitized numeric SQLite codes are diagnostic only and MUST NOT be put in <code>SourceStatus::os_errno</code>. A passive checkpoint report is observational, not a backup; shutdown closes the pool and MUST NOT force <code>TRUNCATE</code>.</p>
 <p>A successful <code>FULL</code>/WAL commit is treated as durable across process crash and conforming local-storage crash boundaries. This does not promise protection from filesystem or storage failure, EBS volume loss, account or Availability Zone loss, or absent backup.</p>
@@ -7215,7 +7248,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-27T18:16:36.000Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>6c36fe1456af8a6535f424299359fbc1a9f8d2cb0618db68f5c1b314aec47b70</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-28T00:00:00.000Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>67ce6595a0ab27bf2d12cf4571dbc0ef950295a7749b3650fdaffcc553184701</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

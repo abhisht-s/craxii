@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="cdaa7cd947cb9b68d4e4dec6a00432c8a928812ed9dfb53b2bb58ebf1d069bb0">
+  <meta name="craxii-source-sha256" content="55fceda05f53fe46effc4093733822f0f196c3bfd9c53e1a7f1bb74783f11132">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,8 +180,8 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-27T18:17:25.759Z</p>
-        <p>Source SHA-256:<br><code>cdaa7cd947cb9b68…</code></p>
+        <p>Generated 2026-08-27T19:56:11.128Z</p>
+        <p>Source SHA-256:<br><code>55fceda05f53fe46…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
@@ -1189,11 +1189,20 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <li>Execute Substages 6.1–6.3 in migration order.</li>
 <li>Match the architecture&#39;s entities, relationships, uniqueness, and state constraints; deviations require an architecture change, not a convenient column omission.</li>
 <li>Add indexes from known queries, not speculative analytics.</li>
+<li>Add forward-only SQLx migration <code>0001_core_durable_schema.sql</code>, advance the schema ceiling to 1,
+and classify an exact version-1 schema as <code>current</code> without using <code>user_version</code> or a custom
+version table.</li>
+<li>Use canonical UUIDv7/timestamp/digest checks, <code>json_valid</code>, restrictive foreign keys, and
+<code>STRICT, WITHOUT ROWID</code> for all nine Stage 6 product tables.</li>
+<li>Validate current-schema drift through the embedded SQLx checksum plus exact object inventory and
+deterministic structural introspection; do not auto-repair.</li>
 </ul>
 <h3>Data/state introduced</h3>
 <p><code>craxii_principals</code>, <code>conversations</code>, <code>messages</code>, <code>work_items</code>, <code>client_devices</code>, <code>client_commands</code>, <code>runtime_instances</code>, <code>workstations</code>, and <code>workspaces</code>, plus their constraints/indexes. <code>work_item_inputs</code> waits for the journal table in Stage 7 so its event foreign key is real from first creation.</p>
 <h3>Contracts/interfaces introduced</h3>
-<p>SQL row codecs contained in the adapter, guarded version updates, uniqueness for work ordinals/device commands/active work, and current-state query shapes.</p>
+<p>SQL row codecs contained in the adapter, strict V1 message-content and safe terminal-detail DTOs,
+guarded version updates, uniqueness for work ordinals/device commands/active work, and current-state
+query shapes. Message order remains journal-derived and never timestamp- or UUID-derived.</p>
 <h3>Failure behavior</h3>
 <p>Constraint or decode failures normalize to conflict/invariant/storage errors. The adapter never loosens a constraint or maps an unknown stored enum to a default.</p>
 <h3>Validation</h3>
@@ -1206,7 +1215,10 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <li><input disabled="" type="checkbox"> No bootstrap rows exist before Stage 7&#39;s journal-aware transaction.</li>
 </ul>
 <h3>What is deliberately NOT implemented yet</h3>
-<p>Journal/input relations, evidence tables, repository business transactions, seed identity, scheduler logic, or general query APIs.</p>
+<p>Journal/input relations, evidence/attempt/context/artifact tables, repository business transactions,
+seed identity, scheduler/runtime behavior, device authentication/idempotency behavior, or general
+query APIs. Current model/tool links intentionally have no foreign key until Stage 8 owns their
+tables.</p>
 <h3>Substages</h3>
 <h4>Substage 6.1: Create identity, workstation, workspace, conversation, and runtime tables</h4>
 <h5>Objective</h5>
@@ -6147,7 +6159,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-27T18:17:25.759Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>cdaa7cd947cb9b68d4e4dec6a00432c8a928812ed9dfb53b2bb58ebf1d069bb0</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-27T19:56:11.128Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>55fceda05f53fe46effc4093733822f0f196c3bfd9c53e1a7f1bb74783f11132</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>
