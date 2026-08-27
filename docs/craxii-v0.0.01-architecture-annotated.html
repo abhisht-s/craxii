@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="67ce6595a0ab27bf2d12cf4571dbc0ef950295a7749b3650fdaffcc553184701">
+  <meta name="craxii-source-sha256" content="5640c4d6973bb7b76fc96d364caa7fcb901a5426c041f13e9d957824ca760e95">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -454,8 +454,8 @@ th { background: #f0f2f4; }
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p><strong>333</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>67ce6595a0ab27bf…</code></p>
+        <p><strong>334</strong> source sections carry companion explanations.</p>
+        <p>Source SHA-256:<br><code>5640c4d6973bb7b7…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 271 detailed subsections, and 334 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 271 detailed subsections, and 335 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -2600,6 +2600,117 @@ runtime:&lt;runtime_instance_id&gt;
 <p>The JSON representation is never hash input. Decode reconstructs <code>MessageContent</code>, regenerates the Stage 3 canonical binary bytes, recomputes SHA-256, and requires equality with <code>content_sha256</code>. <code>ix_messages_conversation</code> supports membership lookup only: canonical message ordering remains journal-derived. Neither timestamp order nor UUIDv7 order is a message-order contract.</p>
 <p>For a valid schema-version-1 database, startup validates the SQLx metadata table, the exact migration-version set and embedded 48-byte SQLx checksum, <code>user_version = 0</code>, exact product table and named-index sets, absence of triggers/views/unexpected objects, and a deterministic structural manifest containing normalized <code>sqlite_schema</code> SQL plus <code>table_xinfo</code>, <code>foreign_key_list</code>, <code>index_list</code>, <code>index_xinfo</code>, strictness, and without-rowid state. Drift, gaps, dirty or malformed metadata, and checksum mismatch are inconsistent and are never repaired. A valid contiguous migration history above version 1 is newer schema.</p>
 <p>Stage 7 owns <code>work_item_inputs</code>, journal tables, projection reconstruction, and initial principal/workstation/workspace/conversation bootstrap. Stage 8 owns model/tool/context/artifact/authority/evidence tables. Consequently <code>current_model_invocation_id</code> and <code>current_tool_execution_id</code> have no Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10 owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.</p>
+<h3>Stage 7 canonical journal and bootstrap contract</h3>
+<aside class="explain-card level-3" data-source-heading="Stage 7 canonical journal and bootstrap contract">
+  <div class="explain-card-label">Subsection guide · plain-English companion</div>
+  <p><strong>Plain-English significance:</strong> Stage 7 adds the append-only ledger, deterministic checker, and one-time root identity transaction while keeping later attempt, command, runtime, and client protocol behavior out of scope.</p>
+  <p class="real-life-example"><strong>Real-life example:</strong> The filing room now receives a numbered, tamper-evident ledger and its first two linked entries. Reopening checks the ledger against the identity cards instead of quietly rewriting either one.</p>
+</aside>
+<p>Stage 7 is SQLx migration <code>0002</code>, version <code>2</code>, description <code>journal and work inputs</code>. The maximum
+supported schema version is <code>2</code>. A valid version-1 database retains its frozen Stage 6 structural
+fingerprint and migrates forward through <code>0002</code>; a fresh database applies <code>0001</code> then <code>0002</code>.
+Migration <code>0002</code> creates exactly <code>journal_events</code>, <code>stream_heads</code>, and <code>work_item_inputs</code>. It creates
+no bootstrap metadata/checkpoint table, projector checkpoint, trigger, view, hash chain, public
+visibility column, or Stage 8-or-later table. Migration-only state has zero product rows.</p>
+<p><code>journal_events.journal_offset</code> is the global positive SQLite
+<code>INTEGER PRIMARY KEY AUTOINCREMENT</code> cursor. <code>event_id</code> is the event&#39;s canonical UUIDv7 identity,
+and <code>stream_seq</code> is its positive contiguous position within one typed aggregate stream. These three
+values are distinct contracts. Committed global cursors strictly increase, but gaps are legal and
+MUST NOT be treated as corruption. Streams have exactly one of these canonical forms:
+<code>craxii:&lt;uuidv7&gt;</code>, <code>conversation:&lt;uuidv7&gt;</code>, <code>work:&lt;uuidv7&gt;</code>, or <code>runtime:&lt;uuidv7&gt;</code>. Lowercase
+prefixes, exactly one colon, and a canonical lowercase UUIDv7 are required. <code>stream_heads</code> allocates
+sequence numbers inside the caller&#39;s existing <code>BEGIN IMMEDIATE</code> write transaction using one
+<code>INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING</code> statement. The first sequence is one; later
+sequences are the previous value plus one; overflow fails. <code>SELECT MAX(...) + 1</code>, allocator-owned
+transactions, and allocator commits are forbidden.</p>
+<p>The exact stored journal envelope is <code>journal_offset</code>, <code>event_id</code>, <code>craxii_id</code>, <code>stream_id</code>,
+<code>stream_seq</code>, <code>event_type</code>, <code>event_version</code>, optional <code>conversation_id</code>, optional <code>work_id</code>, optional
+<code>causation_event_id</code>, <code>correlation_id</code>, <code>actor_kind</code>, optional <code>actor_id</code>, optional
+<code>runtime_instance_id</code>, <code>payload_json</code>, <code>payload_sha256</code>, <code>recorded_at</code>, and optional <code>occurred_at</code>.
+There is no persisted visibility or public-payload field. <code>actor_kind</code> is exactly <code>user</code>, <code>craxii</code>,
+<code>model</code>, <code>tool</code>, <code>runtime</code>, or <code>client</code>; a present actor ID is a typed canonical UUIDv7, and
+event-specific validation binds it to the payload identity where the contract is exact. Causation
+names one already-observed lower-offset event and never self or forward; correlation groups only
+the event families whose contract requires continuity. The two bootstrap events share one
+correlation, and <code>conversation.created</code> is caused by <code>craxii.initialized</code>.</p>
+<p>Payload V1 is an adapter-private, unknown-field-denying object encoding of a typed domain payload.
+The envelope alone carries event type and version. <code>payload_sha256</code> is lowercase SHA-256 of the
+exact UTF-8 bytes stored in <code>payload_json</code>; load recomputes and compares that digest before typed
+decode and never hashes reserialized data. Payloads are JSON objects no larger than 256 KiB. An
+event type retains stable meaning, while incompatible required-field, unit, or enum changes require
+a new event version. Every initial registered kind supports only version one. An unknown type or
+unsupported version needed for state fails closed. A future evidence-only version may be retained
+as a structured warning only after a later architecture revision explicitly declares it skippable;
+no current unknown is silently skipped.</p>
+<p>Every Work-lifecycle V1 payload carries the Work ID, from/to states, expected projection version,
+expected runtime owner/current attempt/cancellation reason, resulting projection version, resulting
+runtime owner/current attempt/cancellation and terminal classifications, and transition timestamp.
+Replay compares every expected fact with the reconstructed current projection before applying the
+shared Stage 4 legal-transition rule; stream sequence is independent of projection version.</p>
+<p>The exact 26-kind registry is the Required domain events table above. Its typed registry also
+freezes current version, state-bearing classification, primary stream family, first-emitting stage,
+and internal public-candidate metadata without defining Stage 11 wire payloads. Stage 7 production
+code emits only <code>craxii.initialized</code> and <code>conversation.created</code>. Model, tool, context, artifact,
+runtime, command, scheduler, recovery, HTTP, WebSocket, and public replay behavior remain owned by
+Stages 8, 9, 10, and 11 as assigned elsewhere in this document.</p>
+<p><code>work_item_inputs</code> stores <code>(work_id, input_event_id, relationship, ordinal_within_work, attached_at, attached_by_actor)</code>, with primary key <code>(work_id, input_event_id)</code> and a unique
+<code>(work_id, ordinal_within_work)</code> access path. Relationships are exactly <code>trigger</code>, <code>steering</code>,
+<code>supplemental</code>, <code>scheduled_trigger</code>, <code>external_trigger</code>, and <code>recovery_instruction</code>; input actors
+are exactly <code>user</code>, <code>craxii</code>, <code>system</code>, and <code>recovery</code>. It has no <code>message_id</code>. The V0 conversational
+causal-isolation rule is exactly one user-attached <code>trigger</code> at ordinal one whose input is the
+same-conversation <code>message.accepted</code> event with the Work correlation. Later conversation messages
+are never implicit Work inputs. Canonical conversation message order includes only
+<code>message.accepted</code> and <code>assistant.message_committed</code> and follows their conversation <code>stream_seq</code>,
+never timestamp, UUID order, or cross-stream global-offset relationships.</p>
+<p>The Stage 7 projector lives in the application layer and consumes trusted typed events in global
+offset order. It is pure and deterministic: no SQLx, I/O, clock, randomness, logging dependency,
+global mutable state, or persistence mutation. It reuses the Stage 4 Work transition matrix and
+reconstructs root initialization, the primary conversation, canonical message order, Work creation
+and lifecycle/version/current-attempt state, and registered model/tool/artifact/runtime references
+without inventing Stage 8 rows. Duplicate event identity, non-increasing global offset, per-stream
+sequence gaps, missing or forward causation, required correlation mismatch, stream/link/actor
+mismatch, illegal or stale Work transition, terminal resurrection, or duplicate root topology
+fails closed. Global offset gaps alone do not.</p>
+<p>Startup compares journal reconstruction with persisted state inside one bounded deferred read
+snapshot. The journal is authoritative for transition/order evidence, immutable rows for detailed
+canonical evidence bytes, and mutable rows for current truth. Any contradiction fails readiness;
+Stage 7 performs no automatic journal rewrite, projection rebuild, or repair. Every stream with
+events has exactly one head, and each head agrees with a sequence starting at one whose count,
+maximum, and recorded head are equal. Append and input insertion primitives are adapter-private,
+require the caller&#39;s existing write transaction, return committed positions/receipts only after
+the owning transaction commits, and expose no update/delete/raw-JSON/generic-CRUD path. Append-only
+enforcement is by port shape, adapter visibility, startup invariants, and permanent repository
+tests; the schema deliberately has zero mutation triggers.</p>
+<p>On the first runtime bootstrap, candidate <code>CraxiiId</code>, <code>WorkstationId</code>, <code>WorkspaceId</code>,
+<code>ConversationId</code>, two event IDs, and one correlation ID are generated before the write transaction.
+One <code>BEGIN IMMEDIATE</code> transaction inserts exactly one active principal (initially with both roots
+null), one local workstation, one active default workspace, and one active primary conversation;
+sets both principal roots together; then appends <code>craxii.initialized</code> on the Craxii stream and
+<code>conversation.created</code> on the conversation stream, each at stream sequence one and in that global
+order. Both use actor <code>craxii</code> with the principal ID. Principal defaults are display name <code>Craxii</code>,
+owner label <code>local-owner</code>, architecture revision <code>V0.0.01</code>, and schema revision <code>2</code>; the conversation
+starts at next work ordinal one and state version one. No runtime, device, Work, message, command,
+or input row is created. The initialization payload freezes principal/root IDs, revision facts,
+workstation generation/architecture/OS fact, capability digest, logical workspace name/root, and
+creation time; <code>conversation.created</code> freezes the complete initial conversation projection.</p>
+<p>The workstation observation is captured before the transaction from validated configuration and
+portable runtime facts only. V0 records a local workstation, the configured initial generation,
+configured shell/capability bounds and logical workspace, runtime architecture and OS-family fact,
+and provider <code>unclassified</code>; provider instance/image/provisioning fields remain null. It does not
+query cloud metadata, use hostname/PID/state-root as identity, fabricate execution capabilities, or
+create a runtime. Stage 7 leaves <code>last_seen_at</code> unchanged on reopen. A complete reopen loads the
+persisted IDs, appends nothing, changes no generation/version/ordinal/root link, and requires the
+current observation/configuration to agree. Empty state bootstraps; any nonempty partial,
+contradictory, duplicated, or mismatched root/event/head state fails closed without repair.</p>
+<p>The persistence port is split into intent-specific capability traits. Stage 7&#39;s SQLite facade
+implements only bootstrap identity, snapshot loading, and consistency verification; command,
+scheduler, model, tool, completion, replay, and recovery capabilities remain independently
+expressible and unimplemented until their owning stages. No trait exposes SQLx, generic CRUD,
+transactions, callbacks, unsupported methods, or panic placeholders. After migration/lock,
+startup gathers the observation, constructs that facade, loads or creates identity, performs pure
+consistency replay, loads the immutable bootstrap snapshot into <code>ApplicationShell</code>, and remains
+<code>live_unready</code>. It creates no runtime, scheduler, provider/tool work, recovery action, or readiness
+transition.</p>
 <h3><code>craxii_principals</code></h3>
 <aside class="explain-card level-3" data-source-heading="craxii_principals">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -7248,7 +7359,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-28T00:00:00.000Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>67ce6595a0ab27bf2d12cf4571dbc0ef950295a7749b3650fdaffcc553184701</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T22:53:55.960Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>5640c4d6973bb7b76fc96d364caa7fcb901a5426c041f13e9d957824ca760e95</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

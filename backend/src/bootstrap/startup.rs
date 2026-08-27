@@ -3,13 +3,22 @@ use std::fmt::{Debug, Display, Formatter};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard};
+use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
 use crate::bootstrap::config;
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
+use crate::domain::{
+    ConversationId, CorrelationId, CraxiiId, JournalEventId, UtcTimestamp, WorkspaceId,
+    WorkstationGeneration, WorkstationId,
+};
+use crate::ports::clock::Clock;
+use crate::ports::state_store::{
+    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, StateStoreErrorKind,
+    V0IdentityReference,
+};
 
 pub async fn run_from_env() -> Result<RunningBootstrap, StartupError> {
     let arguments: Vec<_> = std::env::args_os().collect();
@@ -47,17 +56,85 @@ pub async fn run(
     )
     .await
     .map_err(StartupError::from_sqlite)?;
+    let observation = bootstrap_observation(&config)?;
+    let created_at =
+        UtcTimestamp::from_offset_datetime(clock.utc_now().map_err(|_| StartupError::Clock)?)
+            .map_err(|_| StartupError::Clock)?;
+    let state_store = SqliteStateStore::new(sqlite_runtime.runtime().clone());
+    let bootstrap = state_store
+        .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
+            proposed: V0IdentityReference {
+                craxii_id: CraxiiId::generate(),
+                conversation_id: ConversationId::generate(),
+                workstation_id: WorkstationId::generate(),
+                workspace_id: WorkspaceId::generate(),
+            },
+            initialized_event_id: JournalEventId::generate(),
+            conversation_created_event_id: JournalEventId::generate(),
+            correlation_id: CorrelationId::generate(),
+            created_at,
+            observation,
+        })
+        .await
+        .map_err(StartupError::from_state_store)?;
+    let _consistency = state_store
+        .verify_application_consistency()
+        .await
+        .map_err(StartupError::from_state_store)?;
+    let snapshot = state_store
+        .load_bootstrap_snapshot()
+        .await
+        .map_err(StartupError::from_state_store)?;
+    if snapshot.identity != bootstrap.identity {
+        return Err(StartupError::DatabaseIntegrity);
+    }
     telemetry
         .emit_startup_evidence(&process, &health)
         .map_err(StartupError::Telemetry)?;
 
     Ok(RunningBootstrap {
-        application: ApplicationShell::new(process, health),
+        application: ApplicationShell::new(process, health, snapshot),
         sqlite_runtime,
     })
 }
 
-/// Successful Stage 5 bootstrap ownership.
+fn bootstrap_observation(
+    config: &config::ValidatedConfig,
+) -> Result<BootstrapObservation, StartupError> {
+    let workspace_root = config
+        .paths()
+        .primary_workspace_root()
+        .to_str()
+        .ok_or(StartupError::Configuration)?
+        .to_owned();
+    let default_shell = config
+        .shell()
+        .executable()
+        .to_str()
+        .ok_or(StartupError::Configuration)?
+        .to_owned();
+    let generation = i64::try_from(config.workstation().initial_generation())
+        .map_err(|_| StartupError::Configuration)?;
+    Ok(BootstrapObservation {
+        initial_generation: WorkstationGeneration::try_new(generation)
+            .map_err(|_| StartupError::Configuration)?,
+        architecture: std::env::consts::ARCH.to_owned(),
+        os_release: std::env::consts::OS.to_owned(),
+        default_shell,
+        workspace_logical_name: config
+            .workstation()
+            .primary_workspace_logical_name()
+            .to_owned(),
+        workspace_logical_root: workspace_root.clone(),
+        workspace_resolved_root: workspace_root,
+        max_execution_timeout_ms: config.limits().tools().run_shell_max_timeout_ms(),
+        max_stdout_bytes: config.limits().tools().stdout_capture_bytes(),
+        max_stderr_bytes: config.limits().tools().stderr_capture_bytes(),
+        administrative_enabled: config.shell().administrative_enabled(),
+    })
+}
+
+/// Successful Stage 7 bootstrap ownership.
 ///
 /// This guard keeps the database pool and process lock alive without making the application layer
 /// depend on an outward adapter. Its application remains live but deliberately unready.
@@ -133,6 +210,15 @@ impl StartupError {
                 Self::DatabaseIntegrity
             }
             _ => Self::DatabaseLifecycle,
+        }
+    }
+
+    const fn from_state_store(error: crate::ports::state_store::StateStoreError) -> Self {
+        match error.kind() {
+            StateStoreErrorKind::InternalInvariant | StateStoreErrorKind::StateConflict => {
+                Self::DatabaseIntegrity
+            }
+            StateStoreErrorKind::Storage => Self::DatabaseLifecycle,
         }
     }
 

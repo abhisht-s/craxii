@@ -262,6 +262,16 @@ impl SqliteRuntimeGuard {
             }
         }
 
+        let existing_migration_count = match preflight {
+            DatabaseDisposition::Empty => 0_i64,
+            DatabaseDisposition::MigratedUninitialized | DatabaseDisposition::Current => {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+                    .fetch_one(&mut bootstrap)
+                    .await
+                    .map_err(SqliteAdapterError::schema_query)?
+            }
+            _ => unreachable!("non-migratable dispositions returned above"),
+        };
         let migration_started = Instant::now();
         MIGRATOR
             .run(&mut bootstrap)
@@ -272,7 +282,7 @@ impl SqliteRuntimeGuard {
             operation = "migrate",
             current_version = MAX_SUPPORTED_SCHEMA_VERSION,
             max_supported_version = MAX_SUPPORTED_SCHEMA_VERSION,
-            applied_count = if preflight == DatabaseDisposition::Current { 0_u64 } else { 1_u64 },
+            applied_count = MAX_SUPPORTED_SCHEMA_VERSION.saturating_sub(existing_migration_count),
             duration_micros = u64::try_from(migration_started.elapsed().as_micros()).unwrap_or(u64::MAX)
         );
 
@@ -1092,7 +1102,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_one_inventory_is_exact_and_reopen_is_idempotent() {
+    async fn migration_version_two_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
         assert_eq!(guard.disposition(), DatabaseDisposition::Current);
@@ -1112,9 +1122,6 @@ pub(super) mod tests {
             .collect::<Vec<_>>();
         assert_eq!(tables, expected_tables);
         for forbidden in [
-            "work_item_inputs",
-            "journal_events",
-            "stream_heads",
             "context_manifests",
             "model_invocations",
             "tool_executions",
@@ -1140,8 +1147,8 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_database_is_empty_before_migration_one_runs() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 1);
+    async fn fresh_database_is_empty_before_migrations_run() {
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 2);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1168,7 +1175,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (2, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (3, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

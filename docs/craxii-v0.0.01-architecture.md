@@ -1596,6 +1596,126 @@ evidence tables. Consequently `current_model_invocation_id` and `current_tool_ex
 Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10
 owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.
 
+### Stage 7 canonical journal and bootstrap contract
+
+Stage 7 is SQLx migration `0002`, version `2`, description `journal and work inputs`. The maximum
+supported schema version is `2`. A valid version-1 database retains its frozen Stage 6 structural
+fingerprint and migrates forward through `0002`; a fresh database applies `0001` then `0002`.
+Migration `0002` creates exactly `journal_events`, `stream_heads`, and `work_item_inputs`. It creates
+no bootstrap metadata/checkpoint table, projector checkpoint, trigger, view, hash chain, public
+visibility column, or Stage 8-or-later table. Migration-only state has zero product rows.
+
+`journal_events.journal_offset` is the global positive SQLite
+`INTEGER PRIMARY KEY AUTOINCREMENT` cursor. `event_id` is the event's canonical UUIDv7 identity,
+and `stream_seq` is its positive contiguous position within one typed aggregate stream. These three
+values are distinct contracts. Committed global cursors strictly increase, but gaps are legal and
+MUST NOT be treated as corruption. Streams have exactly one of these canonical forms:
+`craxii:<uuidv7>`, `conversation:<uuidv7>`, `work:<uuidv7>`, or `runtime:<uuidv7>`. Lowercase
+prefixes, exactly one colon, and a canonical lowercase UUIDv7 are required. `stream_heads` allocates
+sequence numbers inside the caller's existing `BEGIN IMMEDIATE` write transaction using one
+`INSERT ... ON CONFLICT ... DO UPDATE ... RETURNING` statement. The first sequence is one; later
+sequences are the previous value plus one; overflow fails. `SELECT MAX(...) + 1`, allocator-owned
+transactions, and allocator commits are forbidden.
+
+The exact stored journal envelope is `journal_offset`, `event_id`, `craxii_id`, `stream_id`,
+`stream_seq`, `event_type`, `event_version`, optional `conversation_id`, optional `work_id`, optional
+`causation_event_id`, `correlation_id`, `actor_kind`, optional `actor_id`, optional
+`runtime_instance_id`, `payload_json`, `payload_sha256`, `recorded_at`, and optional `occurred_at`.
+There is no persisted visibility or public-payload field. `actor_kind` is exactly `user`, `craxii`,
+`model`, `tool`, `runtime`, or `client`; a present actor ID is a typed canonical UUIDv7, and
+event-specific validation binds it to the payload identity where the contract is exact. Causation
+names one already-observed lower-offset event and never self or forward; correlation groups only
+the event families whose contract requires continuity. The two bootstrap events share one
+correlation, and `conversation.created` is caused by `craxii.initialized`.
+
+Payload V1 is an adapter-private, unknown-field-denying object encoding of a typed domain payload.
+The envelope alone carries event type and version. `payload_sha256` is lowercase SHA-256 of the
+exact UTF-8 bytes stored in `payload_json`; load recomputes and compares that digest before typed
+decode and never hashes reserialized data. Payloads are JSON objects no larger than 256 KiB. An
+event type retains stable meaning, while incompatible required-field, unit, or enum changes require
+a new event version. Every initial registered kind supports only version one. An unknown type or
+unsupported version needed for state fails closed. A future evidence-only version may be retained
+as a structured warning only after a later architecture revision explicitly declares it skippable;
+no current unknown is silently skipped.
+
+Every Work-lifecycle V1 payload carries the Work ID, from/to states, expected projection version,
+expected runtime owner/current attempt/cancellation reason, resulting projection version, resulting
+runtime owner/current attempt/cancellation and terminal classifications, and transition timestamp.
+Replay compares every expected fact with the reconstructed current projection before applying the
+shared Stage 4 legal-transition rule; stream sequence is independent of projection version.
+
+The exact 26-kind registry is the Required domain events table above. Its typed registry also
+freezes current version, state-bearing classification, primary stream family, first-emitting stage,
+and internal public-candidate metadata without defining Stage 11 wire payloads. Stage 7 production
+code emits only `craxii.initialized` and `conversation.created`. Model, tool, context, artifact,
+runtime, command, scheduler, recovery, HTTP, WebSocket, and public replay behavior remain owned by
+Stages 8, 9, 10, and 11 as assigned elsewhere in this document.
+
+`work_item_inputs` stores `(work_id, input_event_id, relationship, ordinal_within_work,
+attached_at, attached_by_actor)`, with primary key `(work_id, input_event_id)` and a unique
+`(work_id, ordinal_within_work)` access path. Relationships are exactly `trigger`, `steering`,
+`supplemental`, `scheduled_trigger`, `external_trigger`, and `recovery_instruction`; input actors
+are exactly `user`, `craxii`, `system`, and `recovery`. It has no `message_id`. The V0 conversational
+causal-isolation rule is exactly one user-attached `trigger` at ordinal one whose input is the
+same-conversation `message.accepted` event with the Work correlation. Later conversation messages
+are never implicit Work inputs. Canonical conversation message order includes only
+`message.accepted` and `assistant.message_committed` and follows their conversation `stream_seq`,
+never timestamp, UUID order, or cross-stream global-offset relationships.
+
+The Stage 7 projector lives in the application layer and consumes trusted typed events in global
+offset order. It is pure and deterministic: no SQLx, I/O, clock, randomness, logging dependency,
+global mutable state, or persistence mutation. It reuses the Stage 4 Work transition matrix and
+reconstructs root initialization, the primary conversation, canonical message order, Work creation
+and lifecycle/version/current-attempt state, and registered model/tool/artifact/runtime references
+without inventing Stage 8 rows. Duplicate event identity, non-increasing global offset, per-stream
+sequence gaps, missing or forward causation, required correlation mismatch, stream/link/actor
+mismatch, illegal or stale Work transition, terminal resurrection, or duplicate root topology
+fails closed. Global offset gaps alone do not.
+
+Startup compares journal reconstruction with persisted state inside one bounded deferred read
+snapshot. The journal is authoritative for transition/order evidence, immutable rows for detailed
+canonical evidence bytes, and mutable rows for current truth. Any contradiction fails readiness;
+Stage 7 performs no automatic journal rewrite, projection rebuild, or repair. Every stream with
+events has exactly one head, and each head agrees with a sequence starting at one whose count,
+maximum, and recorded head are equal. Append and input insertion primitives are adapter-private,
+require the caller's existing write transaction, return committed positions/receipts only after
+the owning transaction commits, and expose no update/delete/raw-JSON/generic-CRUD path. Append-only
+enforcement is by port shape, adapter visibility, startup invariants, and permanent repository
+tests; the schema deliberately has zero mutation triggers.
+
+On the first runtime bootstrap, candidate `CraxiiId`, `WorkstationId`, `WorkspaceId`,
+`ConversationId`, two event IDs, and one correlation ID are generated before the write transaction.
+One `BEGIN IMMEDIATE` transaction inserts exactly one active principal (initially with both roots
+null), one local workstation, one active default workspace, and one active primary conversation;
+sets both principal roots together; then appends `craxii.initialized` on the Craxii stream and
+`conversation.created` on the conversation stream, each at stream sequence one and in that global
+order. Both use actor `craxii` with the principal ID. Principal defaults are display name `Craxii`,
+owner label `local-owner`, architecture revision `V0.0.01`, and schema revision `2`; the conversation
+starts at next work ordinal one and state version one. No runtime, device, Work, message, command,
+or input row is created. The initialization payload freezes principal/root IDs, revision facts,
+workstation generation/architecture/OS fact, capability digest, logical workspace name/root, and
+creation time; `conversation.created` freezes the complete initial conversation projection.
+
+The workstation observation is captured before the transaction from validated configuration and
+portable runtime facts only. V0 records a local workstation, the configured initial generation,
+configured shell/capability bounds and logical workspace, runtime architecture and OS-family fact,
+and provider `unclassified`; provider instance/image/provisioning fields remain null. It does not
+query cloud metadata, use hostname/PID/state-root as identity, fabricate execution capabilities, or
+create a runtime. Stage 7 leaves `last_seen_at` unchanged on reopen. A complete reopen loads the
+persisted IDs, appends nothing, changes no generation/version/ordinal/root link, and requires the
+current observation/configuration to agree. Empty state bootstraps; any nonempty partial,
+contradictory, duplicated, or mismatched root/event/head state fails closed without repair.
+
+The persistence port is split into intent-specific capability traits. Stage 7's SQLite facade
+implements only bootstrap identity, snapshot loading, and consistency verification; command,
+scheduler, model, tool, completion, replay, and recovery capabilities remain independently
+expressible and unimplemented until their owning stages. No trait exposes SQLx, generic CRUD,
+transactions, callbacks, unsupported methods, or panic placeholders. After migration/lock,
+startup gathers the observation, constructs that facade, loads or creates identity, performs pure
+consistency replay, loads the immutable bootstrap snapshot into `ApplicationShell`, and remains
+`live_unready`. It creates no runtime, scheduler, provider/tool work, recovery action, or readiness
+transition.
+
 ### `craxii_principals`
 
 ```sql

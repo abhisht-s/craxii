@@ -3,14 +3,16 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 1;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 2;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
+pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
+pub(super) const JOURNAL_MIGRATION_DESCRIPTION: &str = "journal and work inputs";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
-pub(super) const PRODUCT_TABLES: &[&str] = &[
+pub(super) const V1_PRODUCT_TABLES: &[&str] = &[
     "client_commands",
     "client_devices",
     "conversations",
@@ -22,7 +24,7 @@ pub(super) const PRODUCT_TABLES: &[&str] = &[
     "workstations",
 ];
 
-pub(super) const PRODUCT_INDEXES: &[&str] = &[
+pub(super) const V1_PRODUCT_INDEXES: &[&str] = &[
     "ix_messages_conversation",
     "ix_runtime_instances_craxii_state",
     "ix_work_items_nonterminal_by_runtime",
@@ -40,10 +42,50 @@ pub(super) const PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
-// Filled from the deterministic Stage 6 structural manifest after applying migration 0001 with
-// the bundled SQLite engine. The generation test fails closed if this value ever becomes stale.
-const CURRENT_SCHEMA_FINGERPRINT: &str =
+pub(super) const PRODUCT_TABLES: &[&str] = &[
+    "client_commands",
+    "client_devices",
+    "conversations",
+    "craxii_principals",
+    "journal_events",
+    "messages",
+    "runtime_instances",
+    "stream_heads",
+    "work_item_inputs",
+    "work_items",
+    "workspaces",
+    "workstations",
+];
+
+pub(super) const PRODUCT_INDEXES: &[&str] = &[
+    "ix_journal_events_conversation_offset",
+    "ix_journal_events_work_offset",
+    "ix_messages_conversation",
+    "ix_runtime_instances_craxii_state",
+    "ix_work_items_nonterminal_by_runtime",
+    "ix_work_items_queued_fifo",
+    "ix_workspaces_craxii_id",
+    "ix_workstations_craxii_id",
+    "ux_client_devices_token_hash",
+    "ux_conversations_craxii_kind",
+    "ux_journal_events_event_id",
+    "ux_journal_events_stream_sequence",
+    "ux_messages_client_identity",
+    "ux_messages_produced_by_work",
+    "ux_work_item_inputs_work_ordinal",
+    "ux_work_items_conversation_ordinal",
+    "ux_work_items_current_model_invocation",
+    "ux_work_items_current_tool_execution",
+    "ux_work_items_one_active_per_conversation",
+    "ux_workspaces_workstation_logical_name",
+];
+
+// Filled from deterministic structural manifests produced by the bundled SQLite engine. The
+// generation test fails closed if either frozen value ever becomes stale.
+const V1_SCHEMA_FINGERPRINT: &str =
     "f4636df22c635c90ac469f49f2ac3a9ccb38956f1670d26ab566140a137f5521";
+const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "391d9bfb54cf771de1815a3bf54ee4d7d16f1b877acf629cf783ca12dbd37d4d";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseDisposition {
@@ -118,14 +160,29 @@ pub(super) async fn classify_schema(
     {
         return Ok(DatabaseDisposition::NewerSchema);
     }
-    if migrations.len() != 1 || migrations[0].version != CORE_MIGRATION_VERSION {
-        return Ok(DatabaseDisposition::Inconsistent);
+    match migrations.last().map(|row| row.version) {
+        Some(CORE_MIGRATION_VERSION) => {
+            if migrations.len() != 1
+                || !has_exact_objects(&objects, V1_PRODUCT_TABLES, V1_PRODUCT_INDEXES)
+                || !schema_matches(connection, V1_PRODUCT_TABLES, V1_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::MigratedUninitialized)
+            }
+        }
+        Some(JOURNAL_MIGRATION_VERSION) => {
+            if migrations.len() != 2
+                || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
+                || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::Current)
+            }
+        }
+        _ => Ok(DatabaseDisposition::Inconsistent),
     }
-
-    if !has_exact_current_objects(&objects) || !current_schema_matches(connection).await? {
-        return Ok(DatabaseDisposition::Inconsistent);
-    }
-    Ok(DatabaseDisposition::Current)
 }
 
 struct MigrationRow {
@@ -173,15 +230,17 @@ async fn load_migration_rows(
 }
 
 fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
-    let Some(embedded) = MIGRATOR
-        .iter()
-        .find(|migration| migration.version == CORE_MIGRATION_VERSION)
-    else {
-        return false;
-    };
-    if embedded.description.as_ref() != CORE_MIGRATION_DESCRIPTION
-        || embedded.checksum.len() != SQLX_CHECKSUM_LENGTH
-    {
+    let embedded_contracts = [
+        (CORE_MIGRATION_VERSION, CORE_MIGRATION_DESCRIPTION),
+        (JOURNAL_MIGRATION_VERSION, JOURNAL_MIGRATION_DESCRIPTION),
+    ];
+    if embedded_contracts.iter().any(|(version, description)| {
+        !MIGRATOR.iter().any(|migration| {
+            migration.version == *version
+                && migration.description.as_ref() == *description
+                && migration.checksum.len() == SQLX_CHECKSUM_LENGTH
+        })
+    }) {
         return false;
     }
 
@@ -192,16 +251,23 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
             && row.storage_types_valid
             && row.checksum.len() == SQLX_CHECKSUM_LENGTH
             && !row.description.is_empty()
-            && (row.version != CORE_MIGRATION_VERSION
-                || (row.description == embedded.description
-                    && row.checksum.as_slice() == embedded.checksum.as_ref()))
+            && (row.version > MAX_SUPPORTED_SCHEMA_VERSION
+                || MIGRATOR.iter().any(|migration| {
+                    row.version == migration.version
+                        && row.description == migration.description
+                        && row.checksum.as_slice() == migration.checksum.as_ref()
+                }))
     })
 }
 
-fn has_exact_current_objects(objects: &[(String, String)]) -> bool {
+fn has_exact_objects(
+    objects: &[(String, String)],
+    product_tables: &[&str],
+    product_indexes: &[&str],
+) -> bool {
     let expected = std::iter::once(("_sqlx_migrations", "table"))
-        .chain(PRODUCT_TABLES.iter().copied().map(|name| (name, "table")))
-        .chain(PRODUCT_INDEXES.iter().copied().map(|name| (name, "index")))
+        .chain(product_tables.iter().copied().map(|name| (name, "table")))
+        .chain(product_indexes.iter().copied().map(|name| (name, "index")))
         .map(|(name, object_type)| (name.to_owned(), object_type.to_owned()))
         .collect::<std::collections::BTreeSet<_>>();
     objects
@@ -212,16 +278,26 @@ fn has_exact_current_objects(objects: &[(String, String)]) -> bool {
         && objects.len() == expected.len()
 }
 
-async fn current_schema_matches(
+async fn schema_matches(
     connection: &mut SqliteConnection,
+    product_tables: &[&str],
+    expected_fingerprint: &str,
 ) -> Result<bool, SqliteAdapterError> {
-    let manifest = structural_manifest(connection).await?;
+    let manifest = structural_manifest_for_tables(connection, product_tables).await?;
     let fingerprint = sha256_hex(manifest.as_bytes());
-    Ok(fingerprint == CURRENT_SCHEMA_FINGERPRINT)
+    Ok(fingerprint == expected_fingerprint)
 }
 
+#[allow(dead_code)] // The frozen manifest is exercised directly by schema tests and probes.
 pub(super) async fn structural_manifest(
     connection: &mut SqliteConnection,
+) -> Result<String, SqliteAdapterError> {
+    structural_manifest_for_tables(connection, PRODUCT_TABLES).await
+}
+
+async fn structural_manifest_for_tables(
+    connection: &mut SqliteConnection,
+    product_tables: &[&str],
 ) -> Result<String, SqliteAdapterError> {
     let mut manifest = String::new();
 
@@ -253,7 +329,7 @@ pub(super) async fn structural_manifest(
     let mut product_table_list = Vec::new();
     for row in table_list {
         let name: String = row.try_get("name")?;
-        if PRODUCT_TABLES.contains(&name.as_str()) {
+        if product_tables.contains(&name.as_str()) {
             product_table_list.push((
                 name,
                 row.try_get::<String, _>("type")?,
@@ -264,7 +340,7 @@ pub(super) async fn structural_manifest(
         }
     }
     product_table_list.sort_by(|left, right| left.0.cmp(&right.0));
-    if product_table_list.len() != PRODUCT_TABLES.len() {
+    if product_table_list.len() != product_tables.len() {
         return Ok("missing-product-table".to_owned());
     }
     for (name, object_type, columns, without_rowid, strict) in product_table_list {
@@ -456,6 +532,12 @@ async fn validate_migration_table_shape(
 #[cfg(test)]
 pub(super) fn expected_schema_fingerprint() -> &'static str {
     CURRENT_SCHEMA_FINGERPRINT
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn v1_schema_fingerprint() -> &'static str {
+    V1_SCHEMA_FINGERPRINT
 }
 
 #[cfg(test)]

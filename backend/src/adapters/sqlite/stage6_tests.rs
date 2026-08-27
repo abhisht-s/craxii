@@ -26,9 +26,7 @@ use super::projection::{
     advance_conversation_ordinal, guarded_work_update,
 };
 use super::runtime::{SqliteRuntime, SqliteRuntimeGuard};
-use super::schema::{
-    CORE_MIGRATION_DESCRIPTION, MIGRATOR, PRODUCT_INDEXES, PRODUCT_TABLES, SQLX_CHECKSUM_LENGTH,
-};
+use super::schema::{MIGRATOR, PRODUCT_INDEXES, PRODUCT_TABLES, SQLX_CHECKSUM_LENGTH};
 use super::transaction::WriteTransaction;
 
 const NOW: &str = "2026-08-28T01:02:03.456789Z";
@@ -380,25 +378,27 @@ async fn delete_work(runtime: &SqliteRuntime, work_id: &str) {
 async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     let (_root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
-    let migration = sqlx::query(
+    let migrations = sqlx::query(
         "SELECT version, description, success, length(checksum) AS checksum_length, checksum, \
          execution_time FROM _sqlx_migrations",
     )
-    .fetch_one(&mut *connection)
+    .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migration.get::<i64, _>("version"), 1);
-    assert_eq!(
-        migration.get::<String, _>("description"),
-        CORE_MIGRATION_DESCRIPTION
-    );
-    assert_eq!(migration.get::<i64, _>("success"), 1);
-    assert_eq!(migration.get::<i64, _>("checksum_length"), 48);
-    assert!(migration.get::<i64, _>("execution_time") >= 0);
-    let checksum = migration.get::<Vec<u8>, _>("checksum");
-    let embedded = MIGRATOR.iter().next().unwrap();
-    assert_eq!(checksum.len(), SQLX_CHECKSUM_LENGTH);
-    assert_eq!(checksum.as_slice(), embedded.checksum.as_ref());
+    assert_eq!(migrations.len(), 2);
+    for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
+        assert_eq!(migration.get::<i64, _>("version"), embedded.version);
+        assert_eq!(
+            migration.get::<String, _>("description"),
+            embedded.description
+        );
+        assert_eq!(migration.get::<i64, _>("success"), 1);
+        assert_eq!(migration.get::<i64, _>("checksum_length"), 48);
+        assert!(migration.get::<i64, _>("execution_time") >= 0);
+        let checksum = migration.get::<Vec<u8>, _>("checksum");
+        assert_eq!(checksum.len(), SQLX_CHECKSUM_LENGTH);
+        assert_eq!(checksum.as_slice(), embedded.checksum.as_ref());
+    }
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA user_version")
             .fetch_one(&mut *connection)
@@ -417,7 +417,11 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
             .find(|row| row.get::<String, _>("name") == *table)
             .unwrap();
         assert_eq!(row.get::<i64, _>("strict"), 1, "{table}");
-        assert_eq!(row.get::<i64, _>("wr"), 1, "{table}");
+        assert_eq!(
+            row.get::<i64, _>("wr"),
+            i64::from(*table != "journal_events"),
+            "{table}"
+        );
         let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table}"
         )))
@@ -461,10 +465,13 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
 }
 
 #[tokio::test]
-async fn stage5_metadata_only_database_migrates_forward_to_current_version_one() {
+async fn stage5_metadata_only_database_migrates_forward_to_current_version_two() {
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
+        "work_item_inputs",
+        "stream_heads",
+        "journal_events",
         "messages",
         "client_commands",
         "work_items",
@@ -494,11 +501,11 @@ async fn stage5_metadata_only_database_migrates_forward_to_current_version_one()
     );
     let mut connection = migrated.runtime().acquire().await.unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 1")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        1
+        2
     );
     drop(connection);
     migrated.shutdown().await;
@@ -1731,10 +1738,7 @@ async fn current_schema_drift_mutations_all_fail_closed() {
         &["UPDATE _sqlx_migrations SET checksum = 'malformed' WHERE version = 1"],
         &["UPDATE _sqlx_migrations SET installed_on = X'00' WHERE version = 1"],
         &["UPDATE _sqlx_migrations SET execution_time = -1 WHERE version = 1"],
-        &[
-            "DELETE FROM _sqlx_migrations WHERE version = 1",
-            "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (2, 'gapped', 1, zeroblob(48), 0)",
-        ],
+        &["DELETE FROM _sqlx_migrations WHERE version = 1"],
     ];
     for statements in cases {
         assert_eq!(
@@ -1779,7 +1783,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (2, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (3, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

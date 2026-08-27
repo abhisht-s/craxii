@@ -166,6 +166,7 @@ mod entities;
 mod error;
 mod evidence;
 mod ids;
+mod journal;
 mod lifecycle;
 mod path;
 mod sequence;
@@ -202,6 +203,14 @@ pub use ids::{
     ArtifactId, ClientCommandId, ClientMessageId, ContextManifestId, ConversationId, CorrelationId,
     CraxiiId, DeviceId, DraftId, ExecutionId, JournalEventId, LogicalInvocationId, MessageId,
     ModelInvocationId, RuntimeInstanceId, ToolExecutionId, WorkId, WorkspaceId, WorkstationId,
+};
+pub use journal::{
+    ArtifactRecordedV1, ConversationCreatedV1, CraxiiInitializedV1, JournalActor,
+    JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventKind,
+    JournalEventPayload, JournalRuntimeState, JournalStageOwner, JournalStreamFamily,
+    JournalStreamId, JournalVersionResolution, JournalWorkTerminalReason, MessageCommittedV1,
+    ModelInvocationEventV1, RuntimeEventV1, ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1,
+    WorkTransitionV1, resolve_event_version,
 };
 pub use lifecycle::{
     CancellationCheckpoint, CancellationChildOutcome, CancellationDecision, CleanupStatus,

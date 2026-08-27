@@ -10,11 +10,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::domain::{
-    ClientCommandId, ClientMessageId, ConversationId, CorrelationId, CraxiiId, CurrentWorkAttempt,
-    DeviceId, JournalEventId, JournalOffset, Message, MessageId, ModelAttemptReference,
-    ModelInvocationId, ModelInvocationState, ProjectionVersion, RuntimeInstanceId, ToolExecutionId,
-    ToolExecutionState, ToolLifecycleReference, UtcTimestamp, WorkId, WorkItem,
-    WorkLifecycleSnapshot, WorkState, WorkspaceId, WorkstationId,
+    ClientCommandId, ClientMessageId, Conversation, ConversationId, CorrelationId, CraxiiId,
+    CraxiiPrincipal, CurrentWorkAttempt, DeviceId, JournalEventId, JournalOffset, Message,
+    MessageId, ModelAttemptReference, ModelInvocationId, ModelInvocationState, ProjectionVersion,
+    RuntimeInstanceId, ToolExecutionId, ToolExecutionState, ToolLifecycleReference, UtcTimestamp,
+    WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId, WorkspaceIdentity,
+    WorkstationCapabilities, WorkstationGeneration, WorkstationId, WorkstationIdentity,
 };
 
 /// Boxed future used by the port without an async-trait or adapter dependency.
@@ -124,7 +125,7 @@ pub struct EventIntent {
     pub causation_event_id: Option<JournalEventId>,
 }
 
-/// Stable identity references created or loaded by the later Stage 7 bootstrap transaction.
+/// Stable identity references created or loaded by the Stage 7 bootstrap transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V0IdentityReference {
     pub craxii_id: CraxiiId,
@@ -133,10 +134,29 @@ pub struct V0IdentityReference {
     pub workspace_id: WorkspaceId,
 }
 
-/// Inputs Stage 7 will use to atomically load or create V0 identity.
+/// Inputs Stage 7 uses to atomically load or create V0 identity.
 pub struct LoadOrBootstrapIdentityRequest {
     pub proposed: V0IdentityReference,
+    pub initialized_event_id: JournalEventId,
+    pub conversation_created_event_id: JournalEventId,
+    pub correlation_id: CorrelationId,
     pub created_at: UtcTimestamp,
+    pub observation: BootstrapObservation,
+}
+
+/// Truthful configuration/runtime facts captured before the bootstrap write transaction.
+pub struct BootstrapObservation {
+    pub initial_generation: WorkstationGeneration,
+    pub architecture: String,
+    pub os_release: String,
+    pub default_shell: String,
+    pub workspace_logical_name: String,
+    pub workspace_logical_root: String,
+    pub workspace_resolved_root: String,
+    pub max_execution_timeout_ms: u64,
+    pub max_stdout_bytes: u64,
+    pub max_stderr_bytes: u64,
+    pub administrative_enabled: bool,
 }
 
 pub struct LoadOrBootstrapIdentityReceipt {
@@ -242,11 +262,17 @@ pub struct CommitAssistantCompletionRequest {
     pub work_next: WorkLifecycleSnapshot,
 }
 
-/// Narrow bootstrap read snapshot until Stage 6/7 records exist.
+/// Stable verified V0 bootstrap state available to the application shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BootstrapSnapshot {
+    pub principal: CraxiiPrincipal,
+    pub workstation: WorkstationIdentity,
+    pub workstation_capabilities: WorkstationCapabilities,
+    pub workspace: WorkspaceIdentity,
+    pub primary_conversation: Conversation,
     pub identity: V0IdentityReference,
-    pub work_ids: Vec<WorkId>,
-    pub journal_head: Option<JournalOffset>,
+    pub journal_head: JournalOffset,
+    pub consistency: ApplicationConsistencyReceipt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,16 +311,31 @@ pub struct ApplicationConsistencyReceipt {
     pub journal_head: Option<JournalOffset>,
 }
 
-/// One method per architecture-level durable intent.
-pub trait StateStore: Send + Sync {
+/// Stage 7 identity/bootstrap and read-only consistency capability.
+pub trait BootstrapStateStore: Send + Sync {
     fn load_or_bootstrap_v0_identity(
         &self,
         request: LoadOrBootstrapIdentityRequest,
     ) -> StateStoreFuture<'_, LoadOrBootstrapIdentityReceipt>;
+    fn load_bootstrap_snapshot(&self) -> StateStoreFuture<'_, BootstrapSnapshot>;
+    fn verify_application_consistency(&self)
+    -> StateStoreFuture<'_, ApplicationConsistencyReceipt>;
+}
+
+/// Stage 9 client command capability.
+pub trait CommandStateStore: Send + Sync {
     fn accept_user_message_and_create_work(
         &self,
         request: AcceptUserMessageRequest,
     ) -> StateStoreFuture<'_, AcceptUserMessageReceipt>;
+    fn request_cancellation(
+        &self,
+        request: RequestCancellationRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+}
+
+/// Stage 10 scheduler/work-transition capability.
+pub trait SchedulerStateStore: Send + Sync {
     fn claim_next_work(
         &self,
         request: ClaimNextWorkRequest,
@@ -303,14 +344,14 @@ pub trait StateStore: Send + Sync {
         &self,
         request: TransitionWorkRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
-    fn request_cancellation(
-        &self,
-        request: RequestCancellationRequest,
-    ) -> StateStoreFuture<'_, CommitReceipt>;
     fn finish_cancellation(
         &self,
         request: FinishCancellationRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
+}
+
+/// Stage 8 model-attempt capability.
+pub trait ModelStateStore: Send + Sync {
     fn begin_model_invocation(
         &self,
         request: BeginModelInvocationRequest,
@@ -319,6 +360,10 @@ pub trait StateStore: Send + Sync {
         &self,
         request: FinishModelInvocationRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
+}
+
+/// Stage 8 Tool-attempt capability.
+pub trait ToolStateStore: Send + Sync {
     fn request_tool_execution(
         &self,
         request: RequestToolExecutionRequest,
@@ -331,21 +376,55 @@ pub trait StateStore: Send + Sync {
         &self,
         request: FinishToolExecutionRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
+}
+
+/// Stage 8 terminal assistant completion capability.
+pub trait CompletionStateStore: Send + Sync {
     fn commit_assistant_completion(
         &self,
         request: CommitAssistantCompletionRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
-    fn load_bootstrap_snapshot(&self) -> StateStoreFuture<'_, BootstrapSnapshot>;
+}
+
+/// Stage 11 internal-to-public replay candidate capability.
+pub trait ReplayStateStore: Send + Sync {
     fn list_public_journal_replay_candidates(
         &self,
         request: ListPublicJournalRequest,
     ) -> StateStoreFuture<'_, Vec<PublicJournalCandidate>>;
+}
+
+/// Stage 10 stale-runtime recovery capability.
+pub trait RecoveryStateStore: Send + Sync {
     fn recover_stale_runtime_ownership(
         &self,
         request: RecoverStaleRuntimeRequest,
     ) -> StateStoreFuture<'_, RecoveryReceipt>;
-    fn verify_application_consistency(&self)
-    -> StateStoreFuture<'_, ApplicationConsistencyReceipt>;
+}
+
+/// Future full assembly marker; staged adapters implement only capabilities they honestly own.
+pub trait StateStore:
+    BootstrapStateStore
+    + CommandStateStore
+    + SchedulerStateStore
+    + ModelStateStore
+    + ToolStateStore
+    + CompletionStateStore
+    + ReplayStateStore
+    + RecoveryStateStore
+{
+}
+
+impl<T> StateStore for T where
+    T: BootstrapStateStore
+        + CommandStateStore
+        + SchedulerStateStore
+        + ModelStateStore
+        + ToolStateStore
+        + CompletionStateStore
+        + ReplayStateStore
+        + RecoveryStateStore
+{
 }
 
 #[cfg(test)]
@@ -413,19 +492,39 @@ mod tests {
         }
     }
 
-    impl StateStore for FakeStateStore {
+    impl BootstrapStateStore for FakeStateStore {
         fn load_or_bootstrap_v0_identity(
             &self,
             _: LoadOrBootstrapIdentityRequest,
         ) -> StateStoreFuture<'_, LoadOrBootstrapIdentityReceipt> {
             self.fail(Intent::LoadOrBootstrapIdentity)
         }
+        fn load_bootstrap_snapshot(&self) -> StateStoreFuture<'_, BootstrapSnapshot> {
+            self.fail(Intent::LoadBootstrap)
+        }
+        fn verify_application_consistency(
+            &self,
+        ) -> StateStoreFuture<'_, ApplicationConsistencyReceipt> {
+            self.fail(Intent::VerifyConsistency)
+        }
+    }
+
+    impl CommandStateStore for FakeStateStore {
         fn accept_user_message_and_create_work(
             &self,
             _: AcceptUserMessageRequest,
         ) -> StateStoreFuture<'_, AcceptUserMessageReceipt> {
             self.fail(Intent::AcceptMessage)
         }
+        fn request_cancellation(
+            &self,
+            _: RequestCancellationRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::RequestCancellation)
+        }
+    }
+
+    impl SchedulerStateStore for FakeStateStore {
         fn claim_next_work(
             &self,
             _: ClaimNextWorkRequest,
@@ -438,18 +537,15 @@ mod tests {
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::TransitionWork)
         }
-        fn request_cancellation(
-            &self,
-            _: RequestCancellationRequest,
-        ) -> StateStoreFuture<'_, CommitReceipt> {
-            self.fail(Intent::RequestCancellation)
-        }
         fn finish_cancellation(
             &self,
             _: FinishCancellationRequest,
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::FinishCancellation)
         }
+    }
+
+    impl ModelStateStore for FakeStateStore {
         fn begin_model_invocation(
             &self,
             _: BeginModelInvocationRequest,
@@ -462,6 +558,9 @@ mod tests {
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::FinishModel)
         }
+    }
+
+    impl ToolStateStore for FakeStateStore {
         fn request_tool_execution(
             &self,
             _: RequestToolExecutionRequest,
@@ -480,31 +579,32 @@ mod tests {
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::FinishTool)
         }
+    }
+
+    impl CompletionStateStore for FakeStateStore {
         fn commit_assistant_completion(
             &self,
             _: CommitAssistantCompletionRequest,
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::CommitAssistant)
         }
-        fn load_bootstrap_snapshot(&self) -> StateStoreFuture<'_, BootstrapSnapshot> {
-            self.fail(Intent::LoadBootstrap)
-        }
+    }
+
+    impl ReplayStateStore for FakeStateStore {
         fn list_public_journal_replay_candidates(
             &self,
             _: ListPublicJournalRequest,
         ) -> StateStoreFuture<'_, Vec<PublicJournalCandidate>> {
             self.fail(Intent::ListJournal)
         }
+    }
+
+    impl RecoveryStateStore for FakeStateStore {
         fn recover_stale_runtime_ownership(
             &self,
             _: RecoverStaleRuntimeRequest,
         ) -> StateStoreFuture<'_, RecoveryReceipt> {
             self.fail(Intent::RecoverRuntime)
-        }
-        fn verify_application_consistency(
-            &self,
-        ) -> StateStoreFuture<'_, ApplicationConsistencyReceipt> {
-            self.fail(Intent::VerifyConsistency)
         }
     }
 

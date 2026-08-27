@@ -1,9 +1,12 @@
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::ProcessMetadata;
 use crate::domain::{
-    Conversation, CraxiiPrincipal, DomainValidationError, DomainValidationKind,
+    Conversation, CraxiiPrincipal, DomainValidationError, DomainValidationKind, WorkInputActor,
     WorkInputRelationship, WorkItem, WorkItemInput, WorkspaceIdentity,
 };
+use crate::ports::state_store::BootstrapSnapshot;
+
+pub mod projector;
 
 /// Validates the complete in-memory V0 principal/conversation/default-workspace topology.
 ///
@@ -59,6 +62,7 @@ pub fn validate_v0_conversational_work_inputs(
     if input.work_id() != work.work_id()
         || input.relationship() != WorkInputRelationship::Trigger
         || input.ordinal_within_work().get() != 1
+        || input.actor() != WorkInputActor::User
     {
         return Err(DomainValidationError::new(
             DomainValidationKind::InvalidWorkInput,
@@ -71,13 +75,19 @@ pub fn validate_v0_conversational_work_inputs(
 pub struct ApplicationShell {
     process_metadata: ProcessMetadata,
     health: Health,
+    bootstrap_snapshot: BootstrapSnapshot,
 }
 
 impl ApplicationShell {
-    pub(crate) fn new(process_metadata: ProcessMetadata, health: Health) -> Self {
+    pub(crate) fn new(
+        process_metadata: ProcessMetadata,
+        health: Health,
+        bootstrap_snapshot: BootstrapSnapshot,
+    ) -> Self {
         Self {
             process_metadata,
             health,
+            bootstrap_snapshot,
         }
     }
 
@@ -87,6 +97,10 @@ impl ApplicationShell {
 
     pub fn health(&self) -> &Health {
         &self.health
+    }
+
+    pub fn bootstrap_snapshot(&self) -> &BootstrapSnapshot {
+        &self.bootstrap_snapshot
     }
 }
 
@@ -174,6 +188,17 @@ mod tests {
             WorkInputOrdinal::try_new(ordinal).unwrap(),
             now(),
             WorkInputActor::User,
+        )
+    }
+
+    fn work_input_with_actor(work_id: WorkId, actor: WorkInputActor) -> WorkItemInput {
+        WorkItemInput::new(
+            work_id,
+            id::<JournalEventId>(V7),
+            WorkInputRelationship::Trigger,
+            WorkInputOrdinal::try_new(1).unwrap(),
+            now(),
+            actor,
         )
     }
 
@@ -287,6 +312,19 @@ mod tests {
                 validate_v0_conversational_work_inputs(
                     &work,
                     &[work_input(work.work_id(), relationship, 1)]
+                )
+                .is_err()
+            );
+        }
+        for actor in [
+            WorkInputActor::Craxii,
+            WorkInputActor::System,
+            WorkInputActor::Recovery,
+        ] {
+            assert!(
+                validate_v0_conversational_work_inputs(
+                    &work,
+                    &[work_input_with_actor(work.work_id(), actor)]
                 )
                 .is_err()
             );

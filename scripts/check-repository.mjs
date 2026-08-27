@@ -238,7 +238,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage6Boundaries() {
+function verifyStage7Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -255,7 +255,6 @@ function verifyStage6Boundaries() {
       productionSqliteLocationLeaks.push(pathName);
     }
   }
-
   assert(
     sqlxLeaks.length === 0,
     `SQLx crate references escaped backend/src/adapters/sqlite: ${sqlxLeaks.join(', ')}`,
@@ -266,14 +265,21 @@ function verifyStage6Boundaries() {
   );
 
   const migrationRoot = join(repositoryRoot, 'backend', 'migrations');
-  const migrationFiles = walkFiles(migrationRoot).map((path) => relative(migrationRoot, path));
+  const migrationFiles = walkFiles(migrationRoot)
+    .map((path) => relative(migrationRoot, path))
+    .sort();
   assert(
-    migrationFiles.length === 1 && migrationFiles[0] === '0001_core_durable_schema.sql',
-    `Stage 6 must contain only migration 0001_core_durable_schema.sql; found ${migrationFiles.join(', ') || 'nothing'}`,
+    equalStringArrays(migrationFiles, [
+      '0001_core_durable_schema.sql',
+      '0002_journal_and_work_inputs.sql',
+    ]),
+    `Stage 7 must contain exactly migrations 0001 and 0002; found ${migrationFiles.join(', ') || 'nothing'}`,
   );
+  const migration1 = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
+  const migration2 = readFileSync(join(migrationRoot, migrationFiles[1]), 'utf8');
+  const migrations = `${migration1}\n${migration2}`;
 
-  const migration = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
-  const expectedTables = [
+  const expectedStage6Tables = [
     'client_commands',
     'client_devices',
     'conversations',
@@ -284,17 +290,28 @@ function verifyStage6Boundaries() {
     'workspaces',
     'workstations',
   ];
-  const actualTables = [...migration.matchAll(/\bCREATE\s+TABLE\s+([a-z][a-z0-9_]*)/gi)]
+  const actualStage6Tables = [...migration1.matchAll(/\bCREATE\s+TABLE\s+([a-z][a-z0-9_]*)/gi)]
     .map((match) => match[1])
     .sort();
   assert(
-    equalStringArrays(actualTables, expectedTables),
-    `Stage 6 production table inventory differs: ${actualTables.join(', ')}`,
+    equalStringArrays(actualStage6Tables, expectedStage6Tables),
+    `migration 0001 table inventory differs: ${actualStage6Tables.join(', ')}`,
   );
-  const forbiddenTables = [
-    'work_item_inputs',
-    'journal_events',
-    'stream_heads',
+  const expectedStage7Tables = ['journal_events', 'stream_heads', 'work_item_inputs'];
+  const actualStage7Tables = [...migration2.matchAll(/\bCREATE\s+TABLE\s+([a-z][a-z0-9_]*)/gi)]
+    .map((match) => match[1])
+    .sort();
+  assert(
+    equalStringArrays(actualStage7Tables, expectedStage7Tables),
+    `migration 0002 table inventory differs: ${actualStage7Tables.join(', ')}`,
+  );
+  for (const table of expectedStage7Tables) {
+    assert(
+      !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migration1),
+      `Stage 7 table is premature in migration 0001: ${table}`,
+    );
+  }
+  for (const table of [
     'context_manifests',
     'context_manifest_sources',
     'model_invocations',
@@ -302,15 +319,16 @@ function verifyStage6Boundaries() {
     'artifacts',
     'authority_evidence',
     'schema_versions',
-  ];
-  for (const table of forbiddenTables) {
+  ]) {
     assert(
-      !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migration),
-      `Stage 7/8 or custom-version table is premature in migration 0001: ${table}`,
+      !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migrations),
+      `Stage 8+ or custom-version table is premature: ${table}`,
     );
   }
 
   const expectedIndexes = [
+    'ix_journal_events_conversation_offset',
+    'ix_journal_events_work_offset',
     'ix_messages_conversation',
     'ix_runtime_instances_craxii_state',
     'ix_work_items_nonterminal_by_runtime',
@@ -319,31 +337,34 @@ function verifyStage6Boundaries() {
     'ix_workstations_craxii_id',
     'ux_client_devices_token_hash',
     'ux_conversations_craxii_kind',
+    'ux_journal_events_event_id',
+    'ux_journal_events_stream_sequence',
     'ux_messages_client_identity',
     'ux_messages_produced_by_work',
+    'ux_work_item_inputs_work_ordinal',
     'ux_work_items_conversation_ordinal',
     'ux_work_items_current_model_invocation',
     'ux_work_items_current_tool_execution',
     'ux_work_items_one_active_per_conversation',
     'ux_workspaces_workstation_logical_name',
   ];
-  const actualIndexes = [...migration.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+([a-z][a-z0-9_]*)/gi)]
+  const actualIndexes = [...migrations.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+([a-z][a-z0-9_]*)/gi)]
     .map((match) => match[1])
     .sort();
   assert(
     equalStringArrays(actualIndexes, expectedIndexes),
-    `Stage 6 named index inventory differs: ${actualIndexes.join(', ')}`,
+    `Stage 7 named index inventory differs: ${actualIndexes.join(', ')}`,
   );
   assert(
-    !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migration),
-    'migration 0001 must not contain a raw bearer-token persistence column',
+    !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migrations),
+    'migrations must not contain a raw bearer-token persistence column',
   );
   assert(
-    /CREATE\s+INDEX\s+ix_messages_conversation\s+ON\s+messages\s*\(conversation_id\)/i.test(migration),
+    /CREATE\s+INDEX\s+ix_messages_conversation\s+ON\s+messages\s*\(conversation_id\)/i.test(migration1),
     'message membership index must contain only conversation_id; ordering remains journal-derived',
   );
   const messageIndexColumns = [
-    ...migration.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX[^;]*?ON\s+messages\s*\(([^)]*)\)/gi),
+    ...migration1.matchAll(/CREATE\s+(?:UNIQUE\s+)?INDEX[^;]*?ON\s+messages\s*\(([^)]*)\)/gi),
   ].map((match) => match[1]);
   assert(
     messageIndexColumns.every((columns) =>
@@ -351,17 +372,37 @@ function verifyStage6Boundaries() {
     'message indexes must not create timestamp/UUID ordering authority',
   );
   assert(
-    !/\b(?:provider_response_id|provider_request_json|provider_response_json|openai_|responses_api)\b/i.test(migration),
-    'provider wire types must not enter migration 0001',
+    !/\b(?:provider_response_id|provider_request_json|provider_response_json|openai_|responses_api)\b/i.test(migrations),
+    'provider wire types must not enter migrations',
+  );
+  assert(!/\bCREATE\s+TRIGGER\b/i.test(migrations), 'production trigger inventory must remain zero');
+  assert(!/\bCREATE\s+VIEW\b/i.test(migrations), 'production view inventory must remain zero');
+  assert(
+    !/\b(?:visibility|public_payload)\b/i.test(migration2),
+    'journal migration must not persist public replay shape',
   );
 
-  const sqliteSource = walkFiles(sqliteRoot)
-    .filter((path) => path.endsWith('.rs'))
-    .map((path) => readFileSync(path, 'utf8'))
+  const sqliteFiles = walkFiles(sqliteRoot).filter((path) => path.endsWith('.rs'));
+  const sqliteSource = sqliteFiles.map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert(!/\bquery(?:_as)?!\s*\(/.test(sqliteSource), 'SQLx query macros are forbidden in persistence codecs');
+  assert(!/derive\([^)]*FromRow/.test(sqliteSource), 'SQLx FromRow derives are forbidden on persistence rows');
+  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 7');
+  const productionSqliteSource = sqliteFiles
+    .filter((path) => !/_tests\.rs$/.test(path))
+    .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
     .join('\n');
-  assert(!/\bquery(?:_as)?!\s*\(/.test(sqliteSource), 'SQLx query macros are forbidden in Stage 6 codecs');
-  assert(!/derive\([^)]*FromRow/.test(sqliteSource), 'SQLx FromRow derives are forbidden on Stage 6 rows');
-  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 6');
+  assert(
+    !/\b(?:UPDATE\s+journal_events|DELETE\s+FROM\s+journal_events)\b/i.test(productionSqliteSource),
+    'production adapters must not mutate committed journal rows',
+  );
+  assert(
+    !/\b(?:UPDATE\s+work_item_inputs|DELETE\s+FROM\s+work_item_inputs)\b/i.test(productionSqliteSource),
+    'production adapters must not mutate Work input rows',
+  );
+  assert(
+    !/impl\s+ReplayStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 11 public replay capability must remain unimplemented',
+  );
 
   const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
   assert(
@@ -372,12 +413,12 @@ function verifyStage6Boundaries() {
   const compatibility = readFileSync(join(rustRoot, 'bootstrap', 'compatibility.rs'), 'utf8');
   const schema = readFileSync(join(sqliteRoot, 'schema.rs'), 'utf8');
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*1;/.test(compatibility),
-    'bootstrap schema compatibility ceiling must be 1',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*2;/.test(compatibility),
+    'bootstrap schema compatibility ceiling must be 2',
   );
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*1;/.test(schema),
-    'SQLite schema compatibility ceiling must be 1',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*2;/.test(schema),
+    'SQLite schema compatibility ceiling must be 2',
   );
 
   const sqliteArtifacts = trackedFiles().filter((path) =>
@@ -387,17 +428,25 @@ function verifyStage6Boundaries() {
     sqliteArtifacts.length === 0,
     `tracked SQLite database artifacts are forbidden: ${sqliteArtifacts.join(', ')}`,
   );
-
   const stateStore = readFileSync(join(rustRoot, 'ports', 'state_store.rs'), 'utf8');
   assert(!/\bsqlx\s*::/.test(stateStore), 'StateStore must remain free of SQLx crate types');
   assert(
     !/fn\s+\w*transaction|fn\s+transaction|with_transaction|begin_transaction/.test(stateStore),
     'StateStore must not expose a generic transaction operation',
   );
+  assert(!/payload_json/.test(stateStore), 'StateStore must not expose raw journal payload JSON');
+  const journalDomain = readFileSync(join(rustRoot, 'domain', 'journal.rs'), 'utf8');
+  assert(!/payload_json/.test(journalDomain), 'trusted journal domain types must not expose raw JSON');
+  const projector = readFileSync(join(rustRoot, 'application', 'projector.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  assert(!/\bsqlx\s*::/.test(projector), 'pure projector must remain SQLx-free');
+  assert(/stream_seq/.test(projector), 'projector must retain journal-derived stream ordering');
 
   return {
     rustFileCount: rustFiles.length,
     migrationFileCount: migrationFiles.length,
+    tableCount: actualStage6Tables.length + actualStage7Tables.length,
+    indexCount: actualIndexes.length,
   };
 }
 
@@ -456,10 +505,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage6 = verifyStage6Boundaries();
+  const stage7 = verifyStage7Boundaries();
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage6.rustFileCount} Rust files, ${stage6.migrationFileCount} exact Stage 6 migration, 9 product tables, 15 named indexes, 0 tracked SQLite artifacts`,
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage7.rustFileCount} Rust files, ${stage7.migrationFileCount} exact migrations, ${stage7.tableCount} product tables, ${stage7.indexCount} named indexes, 0 triggers/views, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
