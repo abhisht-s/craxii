@@ -711,11 +711,11 @@ Substage 3.1 types exist.
 
 ##### Exact implementation work
 
-- Define `CraxiiPrincipal`, primary `Conversation`, immutable `Message`, versioned text `ContentBlock`, `WorkItem`, and `WorkItemInput` with the architecture fields and V0 enum constraints.
-- Define `WorkstationIdentity`, generation, capabilities snapshot, `WorkspaceIdentity`, logical root/path reference, and physical resolved-path evidence separated from identity.
-- Define artifact metadata/reference, provider/model target reference, model/tool attempt reference, authority-decision snapshot, and runtime-instance metadata without adapter-specific payloads.
-- Enforce one primary conversation/kind and V0 one `trigger` input in application constructors while retaining relation-shaped types for future inputs.
-- Define canonical content hashing from length-prefixed normalized blocks so idempotency does not depend on JSON key order.
+- Define the immutable `CraxiiPrincipal` and exactly-one-primary `Conversation` snapshots; immutable `Message` with exact user/assistant/system provenance; structural creation/topology-only `WorkItem`; and relation-shaped `WorkItemInput` with all six frozen relationship literals and the closed four-value provenance actor vocabulary.
+- Define text-only `ContentVersion = 1`, nonempty ordered text blocks with a 65,536-byte combined limit and identity normalization, and the exact `craxii.content`/version/u32-count/u8-tag/u64-length big-endian canonical byte grammar. Hash only those canonical bytes with SHA-256, never JSON.
+- Define distinct positive `WorkstationGeneration`, immutable local `WorkstationIdentity`, V1 capabilities snapshot with duplicate-workspace rejection, immutable `WorkspaceIdentity`, lexical POSIX logical path references, and redacted physical resolved-path evidence separated from identity and authority.
+- Define the frozen bounded provider/model/tool/reason reference grammars; neutral provider/model capability reference; immutable artifact metadata/provenance reference; authority-decision snapshot; model/tool attempt linkage; and runtime-start evidence without adapter-specific behavior or payloads.
+- Add pure application validators for the one-principal/one-primary/default-workspace topology and exact one-trigger/ordinal-one/matching-work V0 conversational input invariant. Do not couple them to `ApplicationShell`, persistence, or journal-event semantic lookup.
 
 ##### Data/state introduced
 
@@ -731,17 +731,18 @@ Missing paired client fields, invalid role/content, unsupported work kind/relati
 
 ##### Validation
 
-Constructor tests for every invariant, content hash fixtures shared later with Swift, and negative tests showing absolute paths/EC2 IDs cannot substitute for logical IDs.
+Constructor tests for every frozen invariant; exact canonical-byte and SHA-256 golden fixtures shared later with Swift; path normalization/bound/redaction tests; evidence/provenance separation tests; and representative Rustdoc compile-fail tests for semantic type separation.
 
 ##### Exit criteria
 
-- [ ] One-message-one-work can be expressed without storing a message ID directly as the sole work input.
-- [ ] Future work triggers remain schema-capable but protocol-inaccessible.
-- [ ] Physical and logical workstation concepts are separate.
+- [ ] One-message-one-work is expressible through `JournalEventId` input evidence without a triggering `MessageId` field on `WorkItem`.
+- [ ] The V0 application helper accepts only one matching trigger input at ordinal one while future relationships remain structurally representable.
+- [ ] Content hashing matches the frozen binary grammar and is independent of message/provenance/timestamp/JSON representation.
+- [ ] Physical hosting/path/runtime observations remain evidence and cannot substitute for logical Craxii/workstation/workspace/attempt identities.
 
 ##### What is deliberately NOT implemented yet
 
-Multiple visible conversations, steering, schedules, background work, remote workstations, images/files, or memory.
+Multiple visible/hidden conversations, display/title metadata, steering, schedules, background work, lifecycle state machines, persistence, remote workstations, filesystem/process/provider/tool behavior, images/files/multimodal content, or memory.
 
 #### Substage 3.3: Define normalized errors, certainty, retryability, and safe detail
 

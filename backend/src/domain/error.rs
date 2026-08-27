@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-/// The closed scalar validation distinctions owned by Substage 3.1.
+/// The closed validation distinctions owned through Substage 3.2.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum DomainValidationKind {
     /// UUID text is not the exact canonical lowercase hyphenated form.
@@ -23,6 +23,26 @@ pub enum DomainValidationKind {
     InvalidDigest,
     /// A byte count is outside `0..=i64::MAX`.
     InvalidByteCount,
+    /// A text block is empty or otherwise violates the V0 text contract.
+    InvalidText,
+    /// Ordered message content violates the V1 block/count/combined-size contract.
+    InvalidContent,
+    /// The V0 primary-conversation topology is inconsistent.
+    InvalidPrimaryConversation,
+    /// Message role and immutable provenance fields do not match.
+    InvalidMessageProvenance,
+    /// Work input shape or the V0 one-trigger invariant is invalid.
+    InvalidWorkInput,
+    /// A workstation generation is outside `1..=i64::MAX`.
+    InvalidWorkstationGeneration,
+    /// A logical POSIX path is malformed or outside its canonical bound.
+    InvalidLogicalPath,
+    /// A bounded domain identifier/reference violates its exact grammar.
+    InvalidBoundedIdentifier,
+    /// A capability snapshot violates its V1 bounds or uniqueness rules.
+    InvalidCapabilitySnapshot,
+    /// An immutable evidence reference is structurally invalid.
+    InvalidEvidenceReference,
 }
 
 /// A safe, typed scalar-validation failure.
@@ -73,6 +93,26 @@ impl fmt::Display for DomainValidationError {
             DomainValidationKind::InvalidByteCount => {
                 "byte count must fit a nonnegative signed 64-bit integer"
             }
+            DomainValidationKind::InvalidText => "invalid V0 text block",
+            DomainValidationKind::InvalidContent => "invalid V1 message content",
+            DomainValidationKind::InvalidPrimaryConversation => {
+                "invalid V0 primary-conversation topology"
+            }
+            DomainValidationKind::InvalidMessageProvenance => {
+                "invalid committed-message provenance"
+            }
+            DomainValidationKind::InvalidWorkInput => "invalid V0 work input",
+            DomainValidationKind::InvalidWorkstationGeneration => {
+                "workstation generation must be a positive signed 64-bit integer"
+            }
+            DomainValidationKind::InvalidLogicalPath => "invalid logical POSIX path",
+            DomainValidationKind::InvalidBoundedIdentifier => "invalid bounded domain identifier",
+            DomainValidationKind::InvalidCapabilitySnapshot => {
+                "invalid V1 workstation capability snapshot"
+            }
+            DomainValidationKind::InvalidEvidenceReference => {
+                "invalid immutable evidence reference"
+            }
         };
         formatter.write_str(message)
     }
@@ -109,6 +149,16 @@ mod tests {
             DomainValidationKind::TimestampOutOfRange,
             DomainValidationKind::InvalidDigest,
             DomainValidationKind::InvalidByteCount,
+            DomainValidationKind::InvalidText,
+            DomainValidationKind::InvalidContent,
+            DomainValidationKind::InvalidPrimaryConversation,
+            DomainValidationKind::InvalidMessageProvenance,
+            DomainValidationKind::InvalidWorkInput,
+            DomainValidationKind::InvalidWorkstationGeneration,
+            DomainValidationKind::InvalidLogicalPath,
+            DomainValidationKind::InvalidBoundedIdentifier,
+            DomainValidationKind::InvalidCapabilitySnapshot,
+            DomainValidationKind::InvalidEvidenceReference,
         ];
 
         for kind in kinds {

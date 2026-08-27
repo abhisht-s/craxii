@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="2cb9abb822aed7703b4ff94a88b77d7fccaf29d43737a617c16f27a6ad9c4e99">
+  <meta name="craxii-source-sha256" content="f3b016ad9e4347ef16c7751094c4e501ae1c71b13997058304c33d3dcb5b527a">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,8 +180,8 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-27T12:13:09.160Z</p>
-        <p>Source SHA-256:<br><code>2cb9abb822aed770…</code></p>
+        <p>Generated 2026-08-27T13:17:44.895Z</p>
+        <p>Source SHA-256:<br><code>f3b016ad9e4347ef…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
@@ -858,11 +858,11 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <p>Substage 3.1 types exist.</p>
 <h5>Exact implementation work</h5>
 <ul>
-<li>Define <code>CraxiiPrincipal</code>, primary <code>Conversation</code>, immutable <code>Message</code>, versioned text <code>ContentBlock</code>, <code>WorkItem</code>, and <code>WorkItemInput</code> with the architecture fields and V0 enum constraints.</li>
-<li>Define <code>WorkstationIdentity</code>, generation, capabilities snapshot, <code>WorkspaceIdentity</code>, logical root/path reference, and physical resolved-path evidence separated from identity.</li>
-<li>Define artifact metadata/reference, provider/model target reference, model/tool attempt reference, authority-decision snapshot, and runtime-instance metadata without adapter-specific payloads.</li>
-<li>Enforce one primary conversation/kind and V0 one <code>trigger</code> input in application constructors while retaining relation-shaped types for future inputs.</li>
-<li>Define canonical content hashing from length-prefixed normalized blocks so idempotency does not depend on JSON key order.</li>
+<li>Define the immutable <code>CraxiiPrincipal</code> and exactly-one-primary <code>Conversation</code> snapshots; immutable <code>Message</code> with exact user/assistant/system provenance; structural creation/topology-only <code>WorkItem</code>; and relation-shaped <code>WorkItemInput</code> with all six frozen relationship literals and the closed four-value provenance actor vocabulary.</li>
+<li>Define text-only <code>ContentVersion = 1</code>, nonempty ordered text blocks with a 65,536-byte combined limit and identity normalization, and the exact <code>craxii.content</code>/version/u32-count/u8-tag/u64-length big-endian canonical byte grammar. Hash only those canonical bytes with SHA-256, never JSON.</li>
+<li>Define distinct positive <code>WorkstationGeneration</code>, immutable local <code>WorkstationIdentity</code>, V1 capabilities snapshot with duplicate-workspace rejection, immutable <code>WorkspaceIdentity</code>, lexical POSIX logical path references, and redacted physical resolved-path evidence separated from identity and authority.</li>
+<li>Define the frozen bounded provider/model/tool/reason reference grammars; neutral provider/model capability reference; immutable artifact metadata/provenance reference; authority-decision snapshot; model/tool attempt linkage; and runtime-start evidence without adapter-specific behavior or payloads.</li>
+<li>Add pure application validators for the one-principal/one-primary/default-workspace topology and exact one-trigger/ordinal-one/matching-work V0 conversational input invariant. Do not couple them to <code>ApplicationShell</code>, persistence, or journal-event semantic lookup.</li>
 </ul>
 <h5>Data/state introduced</h5>
 <p>In-memory immutable aggregate/value representations and canonical hashes.</p>
@@ -871,15 +871,16 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <h5>Failure behavior</h5>
 <p>Missing paired client fields, invalid role/content, unsupported work kind/relationship, inconsistent workstation generation, or invalid logical path fails construction.</p>
 <h5>Validation</h5>
-<p>Constructor tests for every invariant, content hash fixtures shared later with Swift, and negative tests showing absolute paths/EC2 IDs cannot substitute for logical IDs.</p>
+<p>Constructor tests for every frozen invariant; exact canonical-byte and SHA-256 golden fixtures shared later with Swift; path normalization/bound/redaction tests; evidence/provenance separation tests; and representative Rustdoc compile-fail tests for semantic type separation.</p>
 <h5>Exit criteria</h5>
 <ul>
-<li><input disabled="" type="checkbox"> One-message-one-work can be expressed without storing a message ID directly as the sole work input.</li>
-<li><input disabled="" type="checkbox"> Future work triggers remain schema-capable but protocol-inaccessible.</li>
-<li><input disabled="" type="checkbox"> Physical and logical workstation concepts are separate.</li>
+<li><input disabled="" type="checkbox"> One-message-one-work is expressible through <code>JournalEventId</code> input evidence without a triggering <code>MessageId</code> field on <code>WorkItem</code>.</li>
+<li><input disabled="" type="checkbox"> The V0 application helper accepts only one matching trigger input at ordinal one while future relationships remain structurally representable.</li>
+<li><input disabled="" type="checkbox"> Content hashing matches the frozen binary grammar and is independent of message/provenance/timestamp/JSON representation.</li>
+<li><input disabled="" type="checkbox"> Physical hosting/path/runtime observations remain evidence and cannot substitute for logical Craxii/workstation/workspace/attempt identities.</li>
 </ul>
 <h5>What is deliberately NOT implemented yet</h5>
-<p>Multiple visible conversations, steering, schedules, background work, remote workstations, images/files, or memory.</p>
+<p>Multiple visible/hidden conversations, display/title metadata, steering, schedules, background work, lifecycle state machines, persistence, remote workstations, filesystem/process/provider/tool behavior, images/files/multimodal content, or memory.</p>
 <h4>Substage 3.3: Define normalized errors, certainty, retryability, and safe detail</h4>
 <h5>Objective</h5>
 <p>Create one stable error vocabulary before SQLx, provider, OS, or HTTP errors appear.</p>
@@ -6132,7 +6133,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-27T12:13:09.160Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>2cb9abb822aed7703b4ff94a88b77d7fccaf29d43737a617c16f27a6ad9c4e99</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-27T13:17:44.895Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>f3b016ad9e4347ef16c7751094c4e501ae1c71b13997058304c33d3dcb5b527a</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>

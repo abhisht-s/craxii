@@ -4,7 +4,7 @@
 
 **Status:** Authoritative implementation source of truth  
 **Architecture version:** V0.0.01  
-**Document revision:** 2\
+**Document revision:** 3\
 **Last updated:** 2026-08-27\
 **Audience:** Craxii engineering, Codex, ChatGPT, reviewers, and future contributors  
 **Supersedes for V0.0.01:** `CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md` and the V0 recommendations in `docs/temp/craxii-v0.0.01-architecture-review.md`
@@ -762,18 +762,19 @@ No order relies on timestamps.
 
 ### Craxii principal
 
-The V0 principal is one row with an immutable `craxii_id`. It is created once during initial database bootstrap, before the primary conversation.
+The V0 principal is one immutable domain snapshot with an immutable `craxii_id`. It is created once during initial database bootstrap, before the primary conversation.
 
-The row contains:
+The snapshot contains:
 
 - immutable `craxii_id`;
-- mutable display name;
-- creation timestamp;
-- local owner label or owner ID placeholder;
+- `display_name` and `owner_label`, each preserving exact internal UTF-8 spacing while requiring 1..=128 UTF-8 bytes, no NUL or control characters, and no leading or trailing whitespace;
 - lifecycle state `active`;
-- primary conversation ID;
-- default workspace ID;
-- architecture/schema revision at creation.
+- `primary_conversation_id`;
+- `default_workspace_id`;
+- `created_at`;
+- `architecture_revision` and positive `schema_revision` at creation.
+
+The Stage 3.2 snapshot is immutable. V0 display-name changes, if later supported, produce a new guarded projection rather than mutating this value in place.
 
 The V0 principal has no permanent private key. Its continuity is currently the continuity of the SQLite row and its recoverable backups. This is explicitly weaker than mature Craxii identity.
 
@@ -790,25 +791,24 @@ When the workstation is replaced later, the same `craxii_id` is assigned to a ne
 
 ### Conversation
 
-V0 exposes one primary conversation. The schema supports more than one because multiple devices and future surfaces must not require changing message/work identity.
+Exactly one visible primary conversation exists per Craxii principal in V0. `primary` is the only V0 `ConversationKind`, and `active` is the only V0 conversation lifecycle value. Stage 3.2 creates no hidden or system conversations. Application topology validation enforces the singleton primary relationship; later schema/bootstrap stages enforce database uniqueness. Schema extensibility does not guarantee multiple-conversation behavior in V0.
 
 A conversation owns:
 
 - a stable ID and `craxii_id`;
-- a kind, initially `primary`;
-- lifecycle state, initially `active`;
-- creation time;
+- kind `primary`;
+- lifecycle state `active`;
+- `created_at`;
 - `next_work_ordinal`, allocated transactionally;
-- optional display metadata;
-- a projection version for guarded updates.
+- a positive `projection_version` for guarded updates.
 
 A conversation does not own model-provider session state. It is not the execution primitive. It is a durable product surface that orders accepted messages and associated work.
 
-There is no thread-picker or conversation-management user interface in V0.
+Conversation title/display metadata, multiple visible conversations, a thread picker, and conversation-management behavior are deferred.
 
 ### Message
 
-A message is committed user-visible conversation content. V0 supports text content while using a content-block envelope that can later add images, files, or structured attachments.
+A message is committed user-visible conversation content. V0 content is text-only and uses `ContentVersion = 1`. `ContentBlock` has exactly one V0 variant, `Text(String)`. A message contains at least one block; each text block contains at least one UTF-8 byte; whitespace-only text is valid and is not trimmed; block order is significant; and the combined UTF-8 text payload across all blocks is at most 65,536 bytes. Text normalization is identity: no Unicode, newline, whitespace, or case normalization occurs. Images, files, structured blocks, and multimodal blocks are deferred.
 
 Conceptual content:
 
@@ -828,6 +828,10 @@ Message
 
 Rules:
 
+- Exact roles are `user`, `assistant`, and `system`; there is no developer or tool message role.
+- A user message requires paired `DeviceId` and `ClientMessageId` values and has no `produced_by_work_id`.
+- An assistant message has neither client provenance value and requires `produced_by_work_id = Some(WorkId)`.
+- A system message has neither client provenance value and no `produced_by_work_id`.
 - A user message is committed only inside the message/work creation transaction.
 - An assistant message is committed only when the agent runtime decides the work has a terminal user-facing response.
 - Streaming deltas are not messages.
@@ -835,36 +839,47 @@ Rules:
 - Message rows are immutable after commit. Corrections append a later message/event.
 - User content MUST NOT be duplicated in context as both transcript history and a separate current prompt.
 - The unique pair `(device_id, client_message_id)` prevents the same client message from creating two domain messages.
+- A message has no reply linkage, message `CorrelationId`, or separate `created_at`.
+
+#### Canonical content bytes and hash
+
+The storage-neutral canonical byte grammar is frozen exactly as follows. All integer fields use unsigned big-endian binary encoding:
+
+```text
+ASCII "craxii.content"
+u8 content_version = 0x01
+u32 block_count
+for each block in order:
+  u8 block_type = 0x01        # text
+  u64 utf8_byte_length
+  exact UTF-8 bytes
+```
+
+No terminator is appended. The content hash is `SHA256(canonical_bytes)`. The explicit version byte, block count, block type, and byte-length prefixes are collision-separation fields. Serde JSON MUST NOT be used as hash input.
+
+`content_sha256` digests content blocks only. It excludes `MessageId`, `CraxiiId`, `ConversationId`, role, `committed_at`, work/client/device/correlation identifiers, JSON/object ordering, and storage metadata.
 
 ### Work item
 
 `work_item` is the internal unit of responsibility, scheduling, execution, cancellation, and recovery.
 
-Conceptual fields:
+The immutable Stage 3.2 structural reference contains creation/topology fields only:
 
 ```text
 WorkItem
   work_id
   craxii_id
-  conversation_id?
-  conversation_work_ordinal?
+  conversation_id
+  conversation_work_ordinal
   kind = conversational
-  state
-  state_version
   priority = 0
-  runtime_instance_id?
   workspace_id
+  correlation_id
   created_at
   queued_at
-  started_at?
-  cancel_requested_at?
-  terminal_at?
-  current_model_invocation_id?
-  current_tool_execution_id?
-  terminal_reason_code?
-  terminal_detail?
-  correlation_id
 ```
+
+Stage 4 owns lifecycle/state fields and transitions. `WorkItem` contains no triggering `MessageId` foreign-key field.
 
 The work item is deliberately distinct from:
 
@@ -889,20 +904,72 @@ WorkItemInput
   relationship
   ordinal_within_work
   attached_at
-  attached_by_actor
+  actor
 ```
 
-Allowed relationship values are versioned. V0 creates exactly one `trigger` relationship pointing to the `message.accepted` event.
+The exact relationship values are `trigger`, `steering`, `supplemental`, `scheduled_trigger`, `external_trigger`, and `recovery_instruction`. The closed Stage 3.2 `WorkInputActor` vocabulary is `user`, `craxii`, `system`, and `recovery`; it records relationship provenance and is not automatically identical to a later journal actor DTO.
 
-Reserved future relationships include:
+The V0 conversational-work application constructor requires exactly one input total, relationship `trigger`, `ordinal_within_work = 1`, and a `WorkId` matching its `WorkItem`. The event's semantic type `message.accepted` is verified only in later persistence/application transaction stages because Stage 3.2 cannot infer an event type from `JournalEventId` alone.
 
-- `steering`;
-- `supplemental`;
-- `scheduled_trigger`;
-- `external_trigger`;
-- `recovery_instruction`.
+Reserved relationships remain structurally representable but are rejected by the V0 application constructor and client path.
 
-V0 MUST reject attempts to create these future relationships through the client protocol. The schema seam prevents a future one-input-to-many migration without implementing steering now.
+### Workstation, workspace, and path identity
+
+`WorkstationGeneration` is a distinct positive integer in `1..=i64::MAX` with numeric Serde, semantic equality/order/hash, and checked increment. A process restart does not change it. Replacement, restore, or reprovision does change it. It is scoped with `WorkstationId` and MUST NOT reuse another sequence wrapper.
+
+The immutable `WorkstationIdentity` contains `WorkstationId`, `CraxiiId`, kind `local`, `WorkstationGeneration`, a bounded opaque `HostingProvider`, optional provider instance/image/provisioning revision evidence, CPU architecture, OS release, and `created_at`. Hosting evidence does not define identity. PID and hostname are excluded.
+
+`WorkstationCapabilitiesVersion` is exactly `1`. The immutable snapshot contains workstation ID/generation/kind, CPU architecture, OS release, default shell, booleans for filesystem read, foreground execute, cancellation, inspection, user/admin privilege, process-group cleanup, and cgroup cleanup; nonnegative signed-64-bit-safe maximum execution timeout/stdout/stderr bounds; and an ordered `Vec<WorkspaceCapabilityRef>` of workspace ID and logical root. Duplicate workspace IDs are invalid. Capabilities describe machine ability and never grant authority. Stage 3.2 adds no generic network capability and freezes no public canonical JSON for the aggregate.
+
+The immutable `WorkspaceIdentity` contains `WorkspaceId`, `CraxiiId`, `WorkstationId`, stable logical name/root, lifecycle `active`, and `created_at`. Workspace identity survives generation changes; a resolved machine root is not workspace identity.
+
+#### Logical path grammar
+
+Stage 3.2 paths are POSIX-oriented because the V0 workstation is Ubuntu/Linux. `LogicalPathReference` preserves an explicit kind (`workspace_relative` or `absolute`) and a canonical UTF-8 string of at most 4,096 bytes. NUL and backslash are rejected. Canonical identity MUST NOT use `PathBuf`, filesystem access, symlink resolution, or filesystem canonicalization.
+
+Workspace-relative input MUST NOT start with `/`. Repeated `/` collapses, `.` segments are removed, and `..` pops one prior normal segment; escaping above the workspace root is invalid. At least one normal segment must remain. The result joins segments with `/` and has no trailing slash.
+
+Absolute input MUST start with `/`. Repeated `/` collapses, `.` segments are removed, and `..` pops one prior normal segment; `..` at filesystem root remains clamped at root. Canonical root is `/`; every other canonical absolute path starts with `/` and has no trailing slash.
+
+Existing-target and symlink resolution belong to the later Workstation adapter. `ResolvedPathEvidence` is only adapter-observed physical evidence: `WorkstationId`, `WorkstationGeneration`, `WorkspaceId`, requested `LogicalPathReference`, and a redacted physical UTF-8 `resolved_absolute_path`. The physical value must be syntactically absolute POSIX text, contain no NUL, and be at most 4,096 bytes. It has no timestamp, inode/device/symlink-chain data, authority semantics, or Stage 3.2 Serde contract; safe `Debug` output MUST redact the physical path. It never replaces the workspace ID/requested path.
+
+### Bounded domain references and immutable evidence
+
+Stage 3.2 uses narrow concrete bounded-string types, not a public generic stringly typed identifier.
+
+- `ProviderId`, `ModelTargetId`, and `ToolName` are 1..=64 ASCII bytes, lowercase, start alphanumeric, and thereafter contain only lowercase alphanumeric, `.`, `_`, or `-`.
+- `ProviderModelId` is 1..=128 UTF-8 bytes, has no leading/trailing whitespace or ASCII control character, and is preserved exactly without normalization.
+- `ToolVersion` is 1..=64 visible ASCII bytes with no whitespace/control characters.
+- `SchemaVersion` is a distinct positive signed-64-bit-safe numeric wrapper.
+- `AuthorityReasonCode` is 1..=64 lowercase ASCII bytes, starts alphabetic, and thereafter contains only lowercase alphanumeric or `_`.
+
+These grammars are canonical domain references and MUST NOT be derived from bootstrap configuration enums.
+
+#### Provider/model reference
+
+`ProviderModelReference` is neutral evidence, not Stage 15 target configuration. It contains `ModelTargetId`, `ProviderId`, `ProviderModelId`, a positive target-configuration version, and an immutable `ModelCapabilitySnapshot`. The capability snapshot contains booleans for text input/output, custom tool calling, streaming, ordered output items, structured output, and reasoning continuation, plus positive signed-64-bit-safe context-window and maximum-output token counts. It contains no pricing, credential/account reference, provider wire ID, or provider SDK type.
+
+#### Artifact reference
+
+`ArtifactReference` is immutable metadata only: `ArtifactId`, `CraxiiId`, optional producing `WorkId`, one `ArtifactProducer`, storage backend `local`, opaque storage key, `Sha256Digest`, canonical byte length, optional observed length, MIME type, optional encoding/logical name, retention, truncation flag, optional compression, and `created_at`.
+
+`ArtifactProducer` is exactly `none`, `model(ModelInvocationId)`, or `tool(ToolExecutionId)`, preventing simultaneous model/tool identity. Broader work provenance may coexist with a specific producer; there is no XOR with `producing_work_id`. Retention is `canonical_evidence`, `diagnostic`, or `regenerable`. The storage key is opaque preserved UTF-8 text of 1..=512 bytes with no NUL/control character and is not a client URI/path. Stage 3.2 performs no filesystem I/O.
+
+#### Authority and attempt references
+
+`AuthorityDecision` is `allow` or `deny`; `PrivilegeMode` is `user` or `administrative`. `AuthorityDecisionSnapshot` contains the decision, effective privilege, policy version exactly `v0-development-workstation`, and `AuthorityReasonCode`. It has no token/secret/credential, argument payload, evaluator, or Stage 3.2 public Serde contract. Stage 14 owns evaluation and richer structured evidence.
+
+`ModelAttemptReference` contains `LogicalInvocationId`, `ModelInvocationId`, `WorkId`, `RuntimeInstanceId`, `ContextManifestId`, `AgentStepNo`, `AttemptNo`, `ProviderModelReference`, and optional `retry_of: ModelInvocationId`. It has no state, outcome, provider request/response ID, usage, or lifecycle timestamps.
+
+`ToolAttemptReference` contains `ToolExecutionId`, `ExecutionId`, `WorkId`, `RuntimeInstanceId`, source `ModelInvocationId`, `AgentStepNo`, `ToolOrdinal`, `ToolName`, `ToolVersion`, `SchemaVersion`, `WorkstationId`, `WorkstationGeneration`, `WorkspaceId`, optional requested `LogicalPathReference`, and `AuthorityDecisionSnapshot`. Provider-native tool-call ID, PID, process state, and outcome are excluded.
+
+`RuntimeStartEvidence` contains `RuntimeInstanceId`, `CraxiiId`, `WorkstationId`, `WorkstationGeneration`, optional bounded Linux boot ID and diagnostic PID, bounded package version and git revision, `SchemaVersion`, and `started_at`. `RuntimeInstanceId` is canonical identity; PID/boot ID are diagnostic only. Hostname, heartbeat/state/stopped fields, persistence behavior, PID lookup, and boot-ID reads are excluded. Domain code MUST NOT import bootstrap build metadata wholesale.
+
+### Stage 3.2 application invariants
+
+The pure V0 topology constructor/validator accepts one `CraxiiPrincipal`, requires exactly one `Conversation`, requires its ID to equal `primary_conversation_id`, requires matching Craxii ownership, and requires exactly one matching default `WorkspaceIdentity` with the same Craxii ownership. It uses no persistence, global singleton, or startup coupling.
+
+The pure V0 conversational input constructor/validator requires exactly one `WorkItemInput`, relationship `trigger`, ordinal one, and matching `WorkId`. It rejects every reserved relationship and does not yet verify journal-event semantic type.
 
 ### One-message-one-work rule
 
@@ -1362,7 +1429,8 @@ craxii_principals (
   primary_conversation_id      TEXT,
   default_workspace_id         TEXT,
   created_at                   TEXT NOT NULL,
-  created_architecture_version TEXT NOT NULL
+  architecture_revision        TEXT NOT NULL,
+  schema_revision              INTEGER NOT NULL CHECK (schema_revision >= 1)
 )
 ```
 

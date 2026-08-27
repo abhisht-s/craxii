@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="3b9ef06b39501f53a89d358824becf719f4a71a32c4a51248412a5876ae7f56a">
+  <meta name="craxii-source-sha256" content="53a28fca0fb1a6cd7b8891933939d8b3ebc1d42cf19e1eab336f7306e3d46bc1">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>332</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>3b9ef06b39501f53…</code></p>
+        <p>Source SHA-256:<br><code>53a28fca0fb1a6cd…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -497,7 +497,7 @@ th { background: #f0f2f4; }
     <div><dt>Trust domain</dt><dd>The area in which compromise can reach the other assets. In V0, the whole VM is deliberately one such area.</dd></div>
     <div><dt>Regenerable</dt><dd>State that can be recreated from authoritative sources, such as a build cache or rendered context.</dd></div>
   </dl>
-</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 2<br><strong>Last updated:</strong> 2026-08-27<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
+</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 3<br><strong>Last updated:</strong> 2026-08-27<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
 <p>This document is the normative architecture for implementing Craxii V0.0.01. It is not a tutorial, product pitch, or survey of alternatives. It defines what the version must prove, where every important responsibility lives, which state is authoritative, how commands and side effects are ordered, how failures are represented, and which seams must survive later extraction of Craxii&#39;s durable core from its first workstation.</p>
 <p>The separate credential and identity architecture remains the long-term direction for authority and identity. Where that mature design asks for external control-plane services or project isolation that V0.0.01 explicitly defers, this document governs the V0 implementation.</p>
 <h2>How to read this document</h2>
@@ -1616,18 +1616,19 @@ Artifact
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Craxii principal gives a stable name or ordering rule to something that must outlive one process or machine observation. Durable identity prevents hostnames, timestamps, provider IDs, or UI positions from accidentally becoming product identity.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> An employee number survives office moves and laptop replacements. A desk label or current room number does not, so it cannot serve as the person&#x27;s identity.</p>
-</aside><p>The V0 principal is one row with an immutable <code>craxii_id</code>. It is created once during initial database bootstrap, before the primary conversation.</p>
-<p>The row contains:</p>
+</aside>
+<p>The V0 principal is one immutable domain snapshot with an immutable <code>craxii_id</code>. It is created once during initial database bootstrap, before the primary conversation.</p>
+<p>The snapshot contains:</p>
 <ul>
 <li>immutable <code>craxii_id</code>;</li>
-<li>mutable display name;</li>
-<li>creation timestamp;</li>
-<li>local owner label or owner ID placeholder;</li>
+<li><code>display_name</code> and <code>owner_label</code>, each preserving exact internal UTF-8 spacing while requiring 1..=128 UTF-8 bytes, no NUL or control characters, and no leading or trailing whitespace;</li>
 <li>lifecycle state <code>active</code>;</li>
-<li>primary conversation ID;</li>
-<li>default workspace ID;</li>
-<li>architecture/schema revision at creation.</li>
+<li><code>primary_conversation_id</code>;</li>
+<li><code>default_workspace_id</code>;</li>
+<li><code>created_at</code>;</li>
+<li><code>architecture_revision</code> and positive <code>schema_revision</code> at creation.</li>
 </ul>
+<p>The Stage 3.2 snapshot is immutable. V0 display-name changes, if later supported, produce a new guarded projection rather than mutating this value in place.</p>
 <p>The V0 principal has no permanent private key. Its continuity is currently the continuity of the SQLite row and its recoverable backups. This is explicitly weaker than mature Craxii identity.</p>
 <p>The following MUST NOT define identity:</p>
 <ul>
@@ -1644,25 +1645,26 @@ Artifact
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Conversation clarifies which product concept owns a piece of user intent or execution state. Separating relationship, communication, and responsibility allows Craxii to feel continuous while each job remains recoverable and auditable.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A founder keeps one ongoing chat with an engineer, but &#x27;fix signup&#x27; and &#x27;count tests&#x27; are separate job tickets. The chat is the relationship; tickets are the work.</p>
-</aside><p>V0 exposes one primary conversation. The schema supports more than one because multiple devices and future surfaces must not require changing message/work identity.</p>
+</aside>
+<p>Exactly one visible primary conversation exists per Craxii principal in V0. <code>primary</code> is the only V0 <code>ConversationKind</code>, and <code>active</code> is the only V0 conversation lifecycle value. Stage 3.2 creates no hidden or system conversations. Application topology validation enforces the singleton primary relationship; later schema/bootstrap stages enforce database uniqueness. Schema extensibility does not guarantee multiple-conversation behavior in V0.</p>
 <p>A conversation owns:</p>
 <ul>
 <li>a stable ID and <code>craxii_id</code>;</li>
-<li>a kind, initially <code>primary</code>;</li>
-<li>lifecycle state, initially <code>active</code>;</li>
-<li>creation time;</li>
+<li>kind <code>primary</code>;</li>
+<li>lifecycle state <code>active</code>;</li>
+<li><code>created_at</code>;</li>
 <li><code>next_work_ordinal</code>, allocated transactionally;</li>
-<li>optional display metadata;</li>
-<li>a projection version for guarded updates.</li>
+<li>a positive <code>projection_version</code> for guarded updates.</li>
 </ul>
 <p>A conversation does not own model-provider session state. It is not the execution primitive. It is a durable product surface that orders accepted messages and associated work.</p>
-<p>There is no thread-picker or conversation-management user interface in V0.</p>
+<p>Conversation title/display metadata, multiple visible conversations, a thread picker, and conversation-management behavior are deferred.</p>
 <h3>Message</h3>
 <aside class="explain-card level-3" data-source-heading="Message">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Message clarifies which product concept owns a piece of user intent or execution state. Separating relationship, communication, and responsibility allows Craxii to feel continuous while each job remains recoverable and auditable.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A founder keeps one ongoing chat with an engineer, but &#x27;fix signup&#x27; and &#x27;count tests&#x27; are separate job tickets. The chat is the relationship; tickets are the work.</p>
-</aside><p>A message is committed user-visible conversation content. V0 supports text content while using a content-block envelope that can later add images, files, or structured attachments.</p>
+</aside>
+<p>A message is committed user-visible conversation content. V0 content is text-only and uses <code>ContentVersion = 1</code>. <code>ContentBlock</code> has exactly one V0 variant, <code>Text(String)</code>. A message contains at least one block; each text block contains at least one UTF-8 byte; whitespace-only text is valid and is not trimmed; block order is significant; and the combined UTF-8 text payload across all blocks is at most 65,536 bytes. Text normalization is identity: no Unicode, newline, whitespace, or case normalization occurs. Images, files, structured blocks, and multimodal blocks are deferred.</p>
 <p>Conceptual content:</p>
 <pre><code class="language-text">Message
   message_id
@@ -1678,6 +1680,10 @@ Artifact
 </code></pre>
 <p>Rules:</p>
 <ul>
+<li>Exact roles are <code>user</code>, <code>assistant</code>, and <code>system</code>; there is no developer or tool message role.</li>
+<li>A user message requires paired <code>DeviceId</code> and <code>ClientMessageId</code> values and has no <code>produced_by_work_id</code>.</li>
+<li>An assistant message has neither client provenance value and requires <code>produced_by_work_id = Some(WorkId)</code>.</li>
+<li>A system message has neither client provenance value and no <code>produced_by_work_id</code>.</li>
 <li>A user message is committed only inside the message/work creation transaction.</li>
 <li>An assistant message is committed only when the agent runtime decides the work has a terminal user-facing response.</li>
 <li>Streaming deltas are not messages.</li>
@@ -1685,36 +1691,41 @@ Artifact
 <li>Message rows are immutable after commit. Corrections append a later message/event.</li>
 <li>User content MUST NOT be duplicated in context as both transcript history and a separate current prompt.</li>
 <li>The unique pair <code>(device_id, client_message_id)</code> prevents the same client message from creating two domain messages.</li>
+<li>A message has no reply linkage, message <code>CorrelationId</code>, or separate <code>created_at</code>.</li>
 </ul>
+<h4>Canonical content bytes and hash</h4>
+<p>The storage-neutral canonical byte grammar is frozen exactly as follows. All integer fields use unsigned big-endian binary encoding:</p>
+<pre><code class="language-text">ASCII &quot;craxii.content&quot;
+u8 content_version = 0x01
+u32 block_count
+for each block in order:
+  u8 block_type = 0x01        # text
+  u64 utf8_byte_length
+  exact UTF-8 bytes
+</code></pre>
+<p>No terminator is appended. The content hash is <code>SHA256(canonical_bytes)</code>. The explicit version byte, block count, block type, and byte-length prefixes are collision-separation fields. Serde JSON MUST NOT be used as hash input.</p>
+<p><code>content_sha256</code> digests content blocks only. It excludes <code>MessageId</code>, <code>CraxiiId</code>, <code>ConversationId</code>, role, <code>committed_at</code>, work/client/device/correlation identifiers, JSON/object ordering, and storage metadata.</p>
 <h3>Work item</h3>
 <aside class="explain-card level-3" data-source-heading="Work item">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Work item clarifies which product concept owns a piece of user intent or execution state. Separating relationship, communication, and responsibility allows Craxii to feel continuous while each job remains recoverable and auditable.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A founder keeps one ongoing chat with an engineer, but &#x27;fix signup&#x27; and &#x27;count tests&#x27; are separate job tickets. The chat is the relationship; tickets are the work.</p>
-</aside><p><code>work_item</code> is the internal unit of responsibility, scheduling, execution, cancellation, and recovery.</p>
-<p>Conceptual fields:</p>
+</aside>
+<p><code>work_item</code> is the internal unit of responsibility, scheduling, execution, cancellation, and recovery.</p>
+<p>The immutable Stage 3.2 structural reference contains creation/topology fields only:</p>
 <pre><code class="language-text">WorkItem
   work_id
   craxii_id
-  conversation_id?
-  conversation_work_ordinal?
+  conversation_id
+  conversation_work_ordinal
   kind = conversational
-  state
-  state_version
   priority = 0
-  runtime_instance_id?
   workspace_id
+  correlation_id
   created_at
   queued_at
-  started_at?
-  cancel_requested_at?
-  terminal_at?
-  current_model_invocation_id?
-  current_tool_execution_id?
-  terminal_reason_code?
-  terminal_detail?
-  correlation_id
 </code></pre>
+<p>Stage 4 owns lifecycle/state fields and transitions. <code>WorkItem</code> contains no triggering <code>MessageId</code> foreign-key field.</p>
 <p>The work item is deliberately distinct from:</p>
 <ul>
 <li>the user message that triggered it;</li>
@@ -1731,25 +1742,52 @@ Artifact
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Work-item inputs clarifies which product concept owns a piece of user intent or execution state. Separating relationship, communication, and responsibility allows Craxii to feel continuous while each job remains recoverable and auditable.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A founder keeps one ongoing chat with an engineer, but &#x27;fix signup&#x27; and &#x27;count tests&#x27; are separate job tickets. The chat is the relationship; tickets are the work.</p>
-</aside><p>Inputs are modeled as a relation, not a single non-null <code>user_message_id</code> column on <code>work_items</code>.</p>
+</aside>
+<p>Inputs are modeled as a relation, not a single non-null <code>user_message_id</code> column on <code>work_items</code>.</p>
 <pre><code class="language-text">WorkItemInput
   work_id
   input_event_id
   relationship
   ordinal_within_work
   attached_at
-  attached_by_actor
+  actor
 </code></pre>
-<p>Allowed relationship values are versioned. V0 creates exactly one <code>trigger</code> relationship pointing to the <code>message.accepted</code> event.</p>
-<p>Reserved future relationships include:</p>
+<p>The exact relationship values are <code>trigger</code>, <code>steering</code>, <code>supplemental</code>, <code>scheduled_trigger</code>, <code>external_trigger</code>, and <code>recovery_instruction</code>. The closed Stage 3.2 <code>WorkInputActor</code> vocabulary is <code>user</code>, <code>craxii</code>, <code>system</code>, and <code>recovery</code>; it records relationship provenance and is not automatically identical to a later journal actor DTO.</p>
+<p>The V0 conversational-work application constructor requires exactly one input total, relationship <code>trigger</code>, <code>ordinal_within_work = 1</code>, and a <code>WorkId</code> matching its <code>WorkItem</code>. The event&#39;s semantic type <code>message.accepted</code> is verified only in later persistence/application transaction stages because Stage 3.2 cannot infer an event type from <code>JournalEventId</code> alone.</p>
+<p>Reserved relationships remain structurally representable but are rejected by the V0 application constructor and client path.</p>
+<h3>Workstation, workspace, and path identity</h3>
+<p><code>WorkstationGeneration</code> is a distinct positive integer in <code>1..=i64::MAX</code> with numeric Serde, semantic equality/order/hash, and checked increment. A process restart does not change it. Replacement, restore, or reprovision does change it. It is scoped with <code>WorkstationId</code> and MUST NOT reuse another sequence wrapper.</p>
+<p>The immutable <code>WorkstationIdentity</code> contains <code>WorkstationId</code>, <code>CraxiiId</code>, kind <code>local</code>, <code>WorkstationGeneration</code>, a bounded opaque <code>HostingProvider</code>, optional provider instance/image/provisioning revision evidence, CPU architecture, OS release, and <code>created_at</code>. Hosting evidence does not define identity. PID and hostname are excluded.</p>
+<p><code>WorkstationCapabilitiesVersion</code> is exactly <code>1</code>. The immutable snapshot contains workstation ID/generation/kind, CPU architecture, OS release, default shell, booleans for filesystem read, foreground execute, cancellation, inspection, user/admin privilege, process-group cleanup, and cgroup cleanup; nonnegative signed-64-bit-safe maximum execution timeout/stdout/stderr bounds; and an ordered <code>Vec&lt;WorkspaceCapabilityRef&gt;</code> of workspace ID and logical root. Duplicate workspace IDs are invalid. Capabilities describe machine ability and never grant authority. Stage 3.2 adds no generic network capability and freezes no public canonical JSON for the aggregate.</p>
+<p>The immutable <code>WorkspaceIdentity</code> contains <code>WorkspaceId</code>, <code>CraxiiId</code>, <code>WorkstationId</code>, stable logical name/root, lifecycle <code>active</code>, and <code>created_at</code>. Workspace identity survives generation changes; a resolved machine root is not workspace identity.</p>
+<h4>Logical path grammar</h4>
+<p>Stage 3.2 paths are POSIX-oriented because the V0 workstation is Ubuntu/Linux. <code>LogicalPathReference</code> preserves an explicit kind (<code>workspace_relative</code> or <code>absolute</code>) and a canonical UTF-8 string of at most 4,096 bytes. NUL and backslash are rejected. Canonical identity MUST NOT use <code>PathBuf</code>, filesystem access, symlink resolution, or filesystem canonicalization.</p>
+<p>Workspace-relative input MUST NOT start with <code>/</code>. Repeated <code>/</code> collapses, <code>.</code> segments are removed, and <code>..</code> pops one prior normal segment; escaping above the workspace root is invalid. At least one normal segment must remain. The result joins segments with <code>/</code> and has no trailing slash.</p>
+<p>Absolute input MUST start with <code>/</code>. Repeated <code>/</code> collapses, <code>.</code> segments are removed, and <code>..</code> pops one prior normal segment; <code>..</code> at filesystem root remains clamped at root. Canonical root is <code>/</code>; every other canonical absolute path starts with <code>/</code> and has no trailing slash.</p>
+<p>Existing-target and symlink resolution belong to the later Workstation adapter. <code>ResolvedPathEvidence</code> is only adapter-observed physical evidence: <code>WorkstationId</code>, <code>WorkstationGeneration</code>, <code>WorkspaceId</code>, requested <code>LogicalPathReference</code>, and a redacted physical UTF-8 <code>resolved_absolute_path</code>. The physical value must be syntactically absolute POSIX text, contain no NUL, and be at most 4,096 bytes. It has no timestamp, inode/device/symlink-chain data, authority semantics, or Stage 3.2 Serde contract; safe <code>Debug</code> output MUST redact the physical path. It never replaces the workspace ID/requested path.</p>
+<h3>Bounded domain references and immutable evidence</h3>
+<p>Stage 3.2 uses narrow concrete bounded-string types, not a public generic stringly typed identifier.</p>
 <ul>
-<li><code>steering</code>;</li>
-<li><code>supplemental</code>;</li>
-<li><code>scheduled_trigger</code>;</li>
-<li><code>external_trigger</code>;</li>
-<li><code>recovery_instruction</code>.</li>
+<li><code>ProviderId</code>, <code>ModelTargetId</code>, and <code>ToolName</code> are 1..=64 ASCII bytes, lowercase, start alphanumeric, and thereafter contain only lowercase alphanumeric, <code>.</code>, <code>_</code>, or <code>-</code>.</li>
+<li><code>ProviderModelId</code> is 1..=128 UTF-8 bytes, has no leading/trailing whitespace or ASCII control character, and is preserved exactly without normalization.</li>
+<li><code>ToolVersion</code> is 1..=64 visible ASCII bytes with no whitespace/control characters.</li>
+<li><code>SchemaVersion</code> is a distinct positive signed-64-bit-safe numeric wrapper.</li>
+<li><code>AuthorityReasonCode</code> is 1..=64 lowercase ASCII bytes, starts alphabetic, and thereafter contains only lowercase alphanumeric or <code>_</code>.</li>
 </ul>
-<p>V0 MUST reject attempts to create these future relationships through the client protocol. The schema seam prevents a future one-input-to-many migration without implementing steering now.</p>
+<p>These grammars are canonical domain references and MUST NOT be derived from bootstrap configuration enums.</p>
+<h4>Provider/model reference</h4>
+<p><code>ProviderModelReference</code> is neutral evidence, not Stage 15 target configuration. It contains <code>ModelTargetId</code>, <code>ProviderId</code>, <code>ProviderModelId</code>, a positive target-configuration version, and an immutable <code>ModelCapabilitySnapshot</code>. The capability snapshot contains booleans for text input/output, custom tool calling, streaming, ordered output items, structured output, and reasoning continuation, plus positive signed-64-bit-safe context-window and maximum-output token counts. It contains no pricing, credential/account reference, provider wire ID, or provider SDK type.</p>
+<h4>Artifact reference</h4>
+<p><code>ArtifactReference</code> is immutable metadata only: <code>ArtifactId</code>, <code>CraxiiId</code>, optional producing <code>WorkId</code>, one <code>ArtifactProducer</code>, storage backend <code>local</code>, opaque storage key, <code>Sha256Digest</code>, canonical byte length, optional observed length, MIME type, optional encoding/logical name, retention, truncation flag, optional compression, and <code>created_at</code>.</p>
+<p><code>ArtifactProducer</code> is exactly <code>none</code>, <code>model(ModelInvocationId)</code>, or <code>tool(ToolExecutionId)</code>, preventing simultaneous model/tool identity. Broader work provenance may coexist with a specific producer; there is no XOR with <code>producing_work_id</code>. Retention is <code>canonical_evidence</code>, <code>diagnostic</code>, or <code>regenerable</code>. The storage key is opaque preserved UTF-8 text of 1..=512 bytes with no NUL/control character and is not a client URI/path. Stage 3.2 performs no filesystem I/O.</p>
+<h4>Authority and attempt references</h4>
+<p><code>AuthorityDecision</code> is <code>allow</code> or <code>deny</code>; <code>PrivilegeMode</code> is <code>user</code> or <code>administrative</code>. <code>AuthorityDecisionSnapshot</code> contains the decision, effective privilege, policy version exactly <code>v0-development-workstation</code>, and <code>AuthorityReasonCode</code>. It has no token/secret/credential, argument payload, evaluator, or Stage 3.2 public Serde contract. Stage 14 owns evaluation and richer structured evidence.</p>
+<p><code>ModelAttemptReference</code> contains <code>LogicalInvocationId</code>, <code>ModelInvocationId</code>, <code>WorkId</code>, <code>RuntimeInstanceId</code>, <code>ContextManifestId</code>, <code>AgentStepNo</code>, <code>AttemptNo</code>, <code>ProviderModelReference</code>, and optional <code>retry_of: ModelInvocationId</code>. It has no state, outcome, provider request/response ID, usage, or lifecycle timestamps.</p>
+<p><code>ToolAttemptReference</code> contains <code>ToolExecutionId</code>, <code>ExecutionId</code>, <code>WorkId</code>, <code>RuntimeInstanceId</code>, source <code>ModelInvocationId</code>, <code>AgentStepNo</code>, <code>ToolOrdinal</code>, <code>ToolName</code>, <code>ToolVersion</code>, <code>SchemaVersion</code>, <code>WorkstationId</code>, <code>WorkstationGeneration</code>, <code>WorkspaceId</code>, optional requested <code>LogicalPathReference</code>, and <code>AuthorityDecisionSnapshot</code>. Provider-native tool-call ID, PID, process state, and outcome are excluded.</p>
+<p><code>RuntimeStartEvidence</code> contains <code>RuntimeInstanceId</code>, <code>CraxiiId</code>, <code>WorkstationId</code>, <code>WorkstationGeneration</code>, optional bounded Linux boot ID and diagnostic PID, bounded package version and git revision, <code>SchemaVersion</code>, and <code>started_at</code>. <code>RuntimeInstanceId</code> is canonical identity; PID/boot ID are diagnostic only. Hostname, heartbeat/state/stopped fields, persistence behavior, PID lookup, and boot-ID reads are excluded. Domain code MUST NOT import bootstrap build metadata wholesale.</p>
+<h3>Stage 3.2 application invariants</h3>
+<p>The pure V0 topology constructor/validator accepts one <code>CraxiiPrincipal</code>, requires exactly one <code>Conversation</code>, requires its ID to equal <code>primary_conversation_id</code>, requires matching Craxii ownership, and requires exactly one matching default <code>WorkspaceIdentity</code> with the same Craxii ownership. It uses no persistence, global singleton, or startup coupling.</p>
+<p>The pure V0 conversational input constructor/validator requires exactly one <code>WorkItemInput</code>, relationship <code>trigger</code>, ordinal one, and matching <code>WorkId</code>. It rejects every reserved relationship and does not yet verify journal-event semantic type.</p>
 <h3>One-message-one-work rule</h3>
 <aside class="explain-card level-3" data-source-heading="One-message-one-work rule">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -2499,7 +2537,8 @@ runtime:&lt;runtime_instance_id&gt;
   primary_conversation_id      TEXT,
   default_workspace_id         TEXT,
   created_at                   TEXT NOT NULL,
-  created_architecture_version TEXT NOT NULL
+  architecture_revision        TEXT NOT NULL,
+  schema_revision              INTEGER NOT NULL CHECK (schema_revision &gt;= 1)
 )
 </code></pre>
 <p>Only one row is permitted in V0 by application invariant.</p>
@@ -6963,7 +7002,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-27T12:13:09.927Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>3b9ef06b39501f53a89d358824becf719f4a71a32c4a51248412a5876ae7f56a</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T13:17:46.210Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>53a28fca0fb1a6cd7b8891933939d8b3ebc1d42cf19e1eab336f7306e3d46bc1</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>
