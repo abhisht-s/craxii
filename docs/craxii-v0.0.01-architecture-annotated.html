@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="53a28fca0fb1a6cd7b8891933939d8b3ebc1d42cf19e1eab336f7306e3d46bc1">
+  <meta name="craxii-source-sha256" content="cecd0db10ccf5b4984cf7eb6b252d675493747368a3ff31c6b677f6687a515f8">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>332</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>53a28fca0fb1a6cd…</code></p>
+        <p>Source SHA-256:<br><code>cecd0db10ccf5b49…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -5315,18 +5315,55 @@ backup
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Normalized error envelope defines a client/server delivery rule that remains correct when connections duplicate, lag, or disappear. The client is a window, so commands and durable events must survive independently of socket lifetime.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> Registered mail establishes the instruction and receipt; a live phone call supplies progress. If the call drops, the instruction remains filed and missed updates can be replayed from the last receipt number.</p>
-</aside><p>Every subsystem converts implementation-specific failures into a stable domain category plus redacted detail:</p>
+</aside><p>Every subsystem converts implementation-specific failures into a stable, dependency-neutral domain category plus redacted detail:</p>
 <pre><code class="language-text">NormalizedError
   category
   code
   retryability = never | bounded | user_action | operator_action
   certainty = definite | outcome_unknown
   safe_message
-  internal_detail?       tracing only
   source_status?         redacted provider/OS code
+  internal_detail?       tracing only
 </code></pre>
-<p>Retryability never implies automatic tool retry. It states what the owning application policy may do.</p>
+<p>The fields are private. <code>NormalizedError</code> retains no raw source error, and <code>std::error::Error::source()</code> returns <code>None</code>. <code>Display</code> emits only <code>safe_message</code>. Its custom <code>Debug</code> includes only category, code, retryability, certainty, safe message, and safe source status. Serialization uses the exact field names <code>category</code>, <code>code</code>, <code>retryability</code>, <code>certainty</code>, <code>safe_message</code>, and optional <code>source_status</code>, omitting <code>source_status</code> when absent. Display, Debug, serialization, and <code>source()</code> MUST NOT expose internal detail, a cause, a backtrace, a provider body, a path, or other raw input. Semantic equality compares every safe field, including source status, and ignores internal detail. Stage 3 does not require <code>Hash</code>.</p>
+<p>Retryability is advisory classification only and never authorizes execution, replay, or automatic tool retry. <code>bounded</code> does not imply idempotency; actual retry count, backoff, and policy belong to later owning stages. Certainty is orthogonal to category, code, and retryability and MUST NOT be derived by matching error text. Validation failures are always <code>definite</code>. <code>outcome_unknown</code> is legal when an external action may have crossed its side-effect boundary but its terminal outcome is not known; retry and recovery behavior remain later-owned.</p>
 <p>The complete generic stable-code vocabulary owned by Stage 3 is <code>domain_validation</code> plus the fourteen category literals below: <code>authentication_error</code>, <code>client_protocol_error</code>, <code>idempotency_error</code>, <code>storage_error</code>, <code>state_conflict</code>, <code>context_error</code>, <code>model_selection_error</code>, <code>provider_error</code>, <code>tool_validation_error</code>, <code>authority_error</code>, <code>workstation_error</code>, <code>artifact_error</code>, <code>cancellation_error</code>, and <code>internal_invariant_error</code>. Later leaf codes such as timeout, context-limit, provider-exhaustion, or unknown-tool distinctions remain deferred to their owning implementation stages and MUST NOT be added to the generic Stage 3 vocabulary early.</p>
+<p><code>ErrorCode</code> is an opaque allowlisted stable-code value, not a public arbitrary string and not a closed exhaustive enum. It serializes as an approved lowercase ASCII snake-case string of at most 64 ASCII bytes. It has no public unchecked constructor, <code>From&lt;String&gt;</code>, or arbitrary adapter-supplied-code path. Deserialization accepts only the explicitly registered Stage 3 constants above; it rejects unknown, uppercase, and otherwise unapproved strings. A later owning stage may add an explicit stable constant and extend the allowlist, and callers MUST NOT depend on exhaustive enum matching.</p>
+<p><code>SafeMessage</code> is an allowlisted approved static message value with no arbitrary public <code>String</code> or <code>&amp;str</code> constructor. It contains no user content, paths, provider bodies, SQL, commands, stdout/stderr, raw adapter text, or secret, token, or header material. Localization and final client wording remain later-owned.</p>
+<p><code>InternalDetail</code> is trace-only sanitized diagnostic metadata. Construction is crate-private and accepts only approved already-sanitized static or closed diagnostic values; it MUST NOT be built from <code>error.to_string()</code>. It implements none of <code>Serialize</code>, <code>Deserialize</code>, <code>Display</code>, or <code>Debug</code>, is not returned through <code>source()</code>, and has no public raw getter. It never contains a raw path, content, provider body, SQL, command, output, token, backtrace, or rejected input.</p>
+<h3>Structured source status</h3>
+<p><code>SourceStatus</code> is an optional structured and redacted origin status with exactly two Stage 3 variants:</p>
+<table>
+<thead>
+<tr>
+<th>Kind</th>
+<th>Field and bound</th>
+<th>Canonical serialized form</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>provider_http</code></td>
+<td>integer <code>code</code>, <code>100..=599</code></td>
+<td><code>{&quot;kind&quot;:&quot;provider_http&quot;,&quot;code&quot;:429}</code></td>
+</tr>
+<tr>
+<td><code>os_errno</code></td>
+<td>integer <code>code</code>, <code>1..=i32::MAX</code></td>
+<td><code>{&quot;kind&quot;:&quot;os_errno&quot;,&quot;code&quot;:13}</code></td>
+</tr>
+</tbody></table>
+<p>The exact field names are <code>kind</code> and <code>code</code>, and the kind literals are exact lowercase strings. Unknown kinds, invalid numeric bounds, and additional fields are rejected. Provider response bodies and textual status/reason strings, OS error messages, and filesystem paths are forbidden. Craxii&#39;s own future public-API HTTP status is not source status; Stage 11 owns that transport projection. Process exit codes and signals remain structured execution evidence. Raw provider-native string codes are deferred to the owning provider stage and require an explicit later durable contract. Source status participates in <code>NormalizedError</code> semantic equality and is safe for Display, Debug, and Serde because it contains only these approved structured numeric fields.</p>
+<h3>Client validation projection</h3>
+<p><code>DomainValidationError</code> remains the precise local constructor/validation error. There MUST NOT be <code>From&lt;DomainValidationError&gt; for NormalizedError</code> or any equivalent context-free automatic conversion. At a client-input or client-protocol boundary only, the explicit named <code>NormalizedError::from_client_validation(...)</code> mapper produces exactly:</p>
+<pre><code class="language-text">category       = client_protocol_error
+code           = domain_validation
+retryability   = never
+certainty      = definite
+safe_message   = The supplied value is invalid.
+source_status  = None
+internal_detail = closed sanitized DomainValidationKind diagnostic only
+</code></pre>
+<p>Rejected raw input is never retained. The same validation error may map differently when it originated in persisted corrupt data, provider/tool data, or an internal trusted invariant, so context determines category.</p>
 <h3>Categories</h3>
 <aside class="explain-card level-3" data-source-heading="Categories">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -5411,6 +5448,104 @@ backup
 <td>Fail readiness/stop affected work; never guess</td>
 </tr>
 </tbody></table>
+<p>The category vocabulary is exactly these fourteen literals. Generic Stage 3 constructors use the category literal as their code, except the client validation mapper above, and use these fixed safe messages and conservative classifications:</p>
+<table>
+<thead>
+<tr>
+<th>Generic category</th>
+<th>Retryability</th>
+<th>Certainty</th>
+<th>Safe message</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>authentication_error</code></td>
+<td><code>user_action</code></td>
+<td><code>definite</code></td>
+<td><code>Authentication is required.</code></td>
+</tr>
+<tr>
+<td><code>client_protocol_error</code></td>
+<td><code>never</code></td>
+<td><code>definite</code></td>
+<td><code>The request is invalid.</code></td>
+</tr>
+<tr>
+<td><code>idempotency_error</code></td>
+<td><code>user_action</code></td>
+<td><code>definite</code></td>
+<td><code>The request conflicts with an earlier request.</code></td>
+</tr>
+<tr>
+<td><code>storage_error</code></td>
+<td><code>operator_action</code></td>
+<td><code>definite</code> unless a later owning boundary explicitly supplies otherwise</td>
+<td><code>A storage operation failed.</code></td>
+</tr>
+<tr>
+<td><code>state_conflict</code></td>
+<td><code>bounded</code></td>
+<td><code>definite</code></td>
+<td><code>The requested operation conflicts with the current state.</code></td>
+</tr>
+<tr>
+<td><code>context_error</code></td>
+<td><code>never</code></td>
+<td><code>definite</code></td>
+<td><code>The requested context cannot be processed.</code></td>
+</tr>
+<tr>
+<td><code>model_selection_error</code></td>
+<td><code>operator_action</code></td>
+<td><code>definite</code></td>
+<td><code>No suitable model is currently available.</code></td>
+</tr>
+<tr>
+<td><code>provider_error</code></td>
+<td>generic unknown defaults to <code>never</code>; an explicit controlled classification may select <code>bounded</code></td>
+<td>caller explicitly supplies certainty where request-send state matters</td>
+<td><code>The model provider request failed.</code></td>
+</tr>
+<tr>
+<td><code>tool_validation_error</code></td>
+<td><code>never</code></td>
+<td><code>definite</code></td>
+<td><code>The tool request is invalid.</code></td>
+</tr>
+<tr>
+<td><code>authority_error</code></td>
+<td><code>never</code></td>
+<td><code>definite</code></td>
+<td><code>The requested operation is not permitted.</code></td>
+</tr>
+<tr>
+<td><code>workstation_error</code></td>
+<td>generic unknown defaults to <code>never</code></td>
+<td>caller explicitly supplies certainty where dispatch state matters</td>
+<td><code>The workstation operation failed.</code></td>
+</tr>
+<tr>
+<td><code>artifact_error</code></td>
+<td><code>operator_action</code></td>
+<td>caller may explicitly supply certainty for side-effect-boundary cases</td>
+<td><code>The artifact operation failed.</code></td>
+</tr>
+<tr>
+<td><code>cancellation_error</code></td>
+<td><code>never</code></td>
+<td>caller explicitly supplies certainty</td>
+<td><code>The operation could not be confirmed as cancelled.</code></td>
+</tr>
+<tr>
+<td><code>internal_invariant_error</code></td>
+<td><code>operator_action</code></td>
+<td><code>definite</code></td>
+<td><code>An internal consistency error occurred.</code></td>
+</tr>
+</tbody></table>
+<p>For state conflicts, <code>bounded</code> means re-evaluation may be allowed, not automatic replay. Provider and workstation mappings accept caller-chosen certainty rather than infer it from text. Generic unknown provider and workstation failures remain <code>never</code>; provider <code>bounded</code> classification is possible only through an explicit controlled constructor. Storage and artifact failures remain their own categories, and an unknown adapter failure does not become an internal invariant.</p>
+<p><code>internal_invariant_error</code> is reserved for Craxii-trusted impossible or contradictory state: journal/projection contradiction, impossible lifecycle combinations, unclassifiable recovery state, unsupported required durable semantics, or programmer/task failure that invalidates trusted state assumptions. It is not a fallback for provider, storage, artifact, tool/client validation, stale state conflict, or OS/workstation failures.</p>
+<p>The generic Stage 3 cancellation error has category and code <code>cancellation_error</code>, retryability <code>never</code>, and caller-supplied certainty. Unconfirmed cleanup may be <code>outcome_unknown</code>. Successful cancellation is not necessarily an error; later lifecycle stages own that state. The later leaf code <code>cancelled</code> is not part of Stage 3.</p>
 <h3>Definite versus unknown</h3>
 <aside class="explain-card level-3" data-source-heading="Definite versus unknown">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -7002,7 +7137,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-27T13:17:46.210Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>53a28fca0fb1a6cd7b8891933939d8b3ebc1d42cf19e1eab336f7306e3d46bc1</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T14:22:20.407Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>cecd0db10ccf5b4984cf7eb6b252d675493747368a3ff31c6b677f6687a515f8</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

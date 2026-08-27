@@ -82,6 +82,74 @@
 //! let tool_attempt = ToolExecutionId::generate();
 //! dispatch(tool_attempt);
 //! ```
+//!
+//! Stable normalized codes and safe messages cannot be created from arbitrary text:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::ErrorCode;
+//!
+//! let _: ErrorCode = String::from("adapter_supplied_code").into();
+//! ```
+//!
+//! ```compile_fail
+//! use craxii_server::domain::SafeMessage;
+//!
+//! let _: SafeMessage = String::from("raw provider failure").into();
+//! ```
+//!
+//! Internal trace detail has no formatting, Serde, or raw-access surface:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::InternalDetail;
+//!
+//! fn require_display<T: std::fmt::Display>() {}
+//! require_display::<InternalDetail>();
+//! ```
+//!
+//! ```compile_fail
+//! use craxii_server::domain::InternalDetail;
+//!
+//! fn require_debug<T: std::fmt::Debug>() {}
+//! require_debug::<InternalDetail>();
+//! ```
+//!
+//! ```compile_fail
+//! use craxii_server::domain::InternalDetail;
+//!
+//! fn require_serialize<T: serde::Serialize>() {}
+//! require_serialize::<InternalDetail>();
+//! ```
+//!
+//! ```compile_fail
+//! use craxii_server::domain::InternalDetail;
+//!
+//! fn require_deserialize<T: for<'de> serde::Deserialize<'de>>() {}
+//! require_deserialize::<InternalDetail>();
+//! ```
+//!
+//! ```compile_fail
+//! use craxii_server::domain::InternalDetail;
+//!
+//! fn expose_raw(detail: &InternalDetail) -> &str { detail.as_str() }
+//! ```
+//!
+//! Local validation has no context-free normalized conversion:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::{MessageId, NormalizedError};
+//!
+//! let local = "rejected".parse::<MessageId>().unwrap_err();
+//! let _: NormalizedError = local.into();
+//! ```
+//!
+//! Raw adapter errors cannot substitute for normalized domain errors:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::NormalizedError;
+//!
+//! fn handle(_: NormalizedError) {}
+//! handle(std::fmt::Error);
+//! ```
 
 mod content;
 mod digest;
@@ -105,7 +173,10 @@ pub use entities::{
     WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits, WorkstationGeneration,
     WorkstationIdentity, WorkstationIdentityInput, WorkstationKind,
 };
-pub use error::{DomainValidationError, DomainValidationKind};
+pub use error::{
+    Certainty, DomainValidationError, DomainValidationKind, ErrorCategory, ErrorCode,
+    InternalDetail, NormalizedError, Retryability, SafeMessage, SourceStatus,
+};
 pub use evidence::{
     ArtifactCompression, ArtifactEncoding, ArtifactLogicalName, ArtifactMimeType, ArtifactProducer,
     ArtifactReference, ArtifactReferenceInput, ArtifactRetention, ArtifactStorageBackend,

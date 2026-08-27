@@ -3897,7 +3897,7 @@ V0 does not require Prometheus, OpenTelemetry collectors, or an evaluation platf
 
 ### Normalized error envelope
 
-Every subsystem converts implementation-specific failures into a stable domain category plus redacted detail:
+Every subsystem converts implementation-specific failures into a stable, dependency-neutral domain category plus redacted detail:
 
 ```text
 NormalizedError
@@ -3906,13 +3906,48 @@ NormalizedError
   retryability = never | bounded | user_action | operator_action
   certainty = definite | outcome_unknown
   safe_message
-  internal_detail?       tracing only
   source_status?         redacted provider/OS code
+  internal_detail?       tracing only
 ```
 
-Retryability never implies automatic tool retry. It states what the owning application policy may do.
+The fields are private. `NormalizedError` retains no raw source error, and `std::error::Error::source()` returns `None`. `Display` emits only `safe_message`. Its custom `Debug` includes only category, code, retryability, certainty, safe message, and safe source status. Serialization uses the exact field names `category`, `code`, `retryability`, `certainty`, `safe_message`, and optional `source_status`, omitting `source_status` when absent. Display, Debug, serialization, and `source()` MUST NOT expose internal detail, a cause, a backtrace, a provider body, a path, or other raw input. Semantic equality compares every safe field, including source status, and ignores internal detail. Stage 3 does not require `Hash`.
+
+Retryability is advisory classification only and never authorizes execution, replay, or automatic tool retry. `bounded` does not imply idempotency; actual retry count, backoff, and policy belong to later owning stages. Certainty is orthogonal to category, code, and retryability and MUST NOT be derived by matching error text. Validation failures are always `definite`. `outcome_unknown` is legal when an external action may have crossed its side-effect boundary but its terminal outcome is not known; retry and recovery behavior remain later-owned.
 
 The complete generic stable-code vocabulary owned by Stage 3 is `domain_validation` plus the fourteen category literals below: `authentication_error`, `client_protocol_error`, `idempotency_error`, `storage_error`, `state_conflict`, `context_error`, `model_selection_error`, `provider_error`, `tool_validation_error`, `authority_error`, `workstation_error`, `artifact_error`, `cancellation_error`, and `internal_invariant_error`. Later leaf codes such as timeout, context-limit, provider-exhaustion, or unknown-tool distinctions remain deferred to their owning implementation stages and MUST NOT be added to the generic Stage 3 vocabulary early.
+
+`ErrorCode` is an opaque allowlisted stable-code value, not a public arbitrary string and not a closed exhaustive enum. It serializes as an approved lowercase ASCII snake-case string of at most 64 ASCII bytes. It has no public unchecked constructor, `From<String>`, or arbitrary adapter-supplied-code path. Deserialization accepts only the explicitly registered Stage 3 constants above; it rejects unknown, uppercase, and otherwise unapproved strings. A later owning stage may add an explicit stable constant and extend the allowlist, and callers MUST NOT depend on exhaustive enum matching.
+
+`SafeMessage` is an allowlisted approved static message value with no arbitrary public `String` or `&str` constructor. It contains no user content, paths, provider bodies, SQL, commands, stdout/stderr, raw adapter text, or secret, token, or header material. Localization and final client wording remain later-owned.
+
+`InternalDetail` is trace-only sanitized diagnostic metadata. Construction is crate-private and accepts only approved already-sanitized static or closed diagnostic values; it MUST NOT be built from `error.to_string()`. It implements none of `Serialize`, `Deserialize`, `Display`, or `Debug`, is not returned through `source()`, and has no public raw getter. It never contains a raw path, content, provider body, SQL, command, output, token, backtrace, or rejected input.
+
+### Structured source status
+
+`SourceStatus` is an optional structured and redacted origin status with exactly two Stage 3 variants:
+
+| Kind | Field and bound | Canonical serialized form |
+| --- | --- | --- |
+| `provider_http` | integer `code`, `100..=599` | `{"kind":"provider_http","code":429}` |
+| `os_errno` | integer `code`, `1..=i32::MAX` | `{"kind":"os_errno","code":13}` |
+
+The exact field names are `kind` and `code`, and the kind literals are exact lowercase strings. Unknown kinds, invalid numeric bounds, and additional fields are rejected. Provider response bodies and textual status/reason strings, OS error messages, and filesystem paths are forbidden. Craxii's own future public-API HTTP status is not source status; Stage 11 owns that transport projection. Process exit codes and signals remain structured execution evidence. Raw provider-native string codes are deferred to the owning provider stage and require an explicit later durable contract. Source status participates in `NormalizedError` semantic equality and is safe for Display, Debug, and Serde because it contains only these approved structured numeric fields.
+
+### Client validation projection
+
+`DomainValidationError` remains the precise local constructor/validation error. There MUST NOT be `From<DomainValidationError> for NormalizedError` or any equivalent context-free automatic conversion. At a client-input or client-protocol boundary only, the explicit named `NormalizedError::from_client_validation(...)` mapper produces exactly:
+
+```text
+category       = client_protocol_error
+code           = domain_validation
+retryability   = never
+certainty      = definite
+safe_message   = The supplied value is invalid.
+source_status  = None
+internal_detail = closed sanitized DomainValidationKind diagnostic only
+```
+
+Rejected raw input is never retained. The same validation error may map differently when it originated in persisted corrupt data, provider/tool data, or an internal trusted invariant, so context determines category.
 
 ### Categories
 
@@ -3932,6 +3967,31 @@ The complete generic stable-code vocabulary owned by Stage 3 is `domain_validati
 | `artifact_error` | capture/rename/hash failure | Do not commit terminal result referencing missing bytes |
 | `cancellation_error` | process tree not confirmed dead | Tool unknown, work interrupted |
 | `internal_invariant_error` | journal/projection disagreement | Fail readiness/stop affected work; never guess |
+
+The category vocabulary is exactly these fourteen literals. Generic Stage 3 constructors use the category literal as their code, except the client validation mapper above, and use these fixed safe messages and conservative classifications:
+
+| Generic category | Retryability | Certainty | Safe message |
+| --- | --- | --- | --- |
+| `authentication_error` | `user_action` | `definite` | `Authentication is required.` |
+| `client_protocol_error` | `never` | `definite` | `The request is invalid.` |
+| `idempotency_error` | `user_action` | `definite` | `The request conflicts with an earlier request.` |
+| `storage_error` | `operator_action` | `definite` unless a later owning boundary explicitly supplies otherwise | `A storage operation failed.` |
+| `state_conflict` | `bounded` | `definite` | `The requested operation conflicts with the current state.` |
+| `context_error` | `never` | `definite` | `The requested context cannot be processed.` |
+| `model_selection_error` | `operator_action` | `definite` | `No suitable model is currently available.` |
+| `provider_error` | generic unknown defaults to `never`; an explicit controlled classification may select `bounded` | caller explicitly supplies certainty where request-send state matters | `The model provider request failed.` |
+| `tool_validation_error` | `never` | `definite` | `The tool request is invalid.` |
+| `authority_error` | `never` | `definite` | `The requested operation is not permitted.` |
+| `workstation_error` | generic unknown defaults to `never` | caller explicitly supplies certainty where dispatch state matters | `The workstation operation failed.` |
+| `artifact_error` | `operator_action` | caller may explicitly supply certainty for side-effect-boundary cases | `The artifact operation failed.` |
+| `cancellation_error` | `never` | caller explicitly supplies certainty | `The operation could not be confirmed as cancelled.` |
+| `internal_invariant_error` | `operator_action` | `definite` | `An internal consistency error occurred.` |
+
+For state conflicts, `bounded` means re-evaluation may be allowed, not automatic replay. Provider and workstation mappings accept caller-chosen certainty rather than infer it from text. Generic unknown provider and workstation failures remain `never`; provider `bounded` classification is possible only through an explicit controlled constructor. Storage and artifact failures remain their own categories, and an unknown adapter failure does not become an internal invariant.
+
+`internal_invariant_error` is reserved for Craxii-trusted impossible or contradictory state: journal/projection contradiction, impossible lifecycle combinations, unclassifiable recovery state, unsupported required durable semantics, or programmer/task failure that invalidates trusted state assumptions. It is not a fallback for provider, storage, artifact, tool/client validation, stale state conflict, or OS/workstation failures.
+
+The generic Stage 3 cancellation error has category and code `cancellation_error`, retryability `never`, and caller-supplied certainty. Unconfirmed cleanup may be `outcome_unknown`. Successful cancellation is not necessarily an error; later lifecycle stages own that state. The later leaf code `cancelled` is not part of Stage 3.
 
 ### Definite versus unknown
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="f3b016ad9e4347ef16c7751094c4e501ae1c71b13997058304c33d3dcb5b527a">
+  <meta name="craxii-source-sha256" content="e1fe744b87bfa9f3d53776184cb0f2c42602df783761c8b316fbe33fea12c9c8">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,8 +180,8 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-27T13:17:44.895Z</p>
-        <p>Source SHA-256:<br><code>f3b016ad9e4347ef…</code></p>
+        <p>Generated 2026-08-27T14:22:09.479Z</p>
+        <p>Source SHA-256:<br><code>e1fe744b87bfa9f3…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
@@ -890,28 +890,34 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 <p>Core IDs/value types exist for correlation.</p>
 <h5>Exact implementation work</h5>
 <ul>
-<li>Define architecture categories, <code>never|bounded|user_action|operator_action</code>, and <code>definite|outcome_unknown</code> certainty. The complete generic Stage 3 stable-code vocabulary is <code>domain_validation</code> plus <code>authentication_error</code>, <code>client_protocol_error</code>, <code>idempotency_error</code>, <code>storage_error</code>, <code>state_conflict</code>, <code>context_error</code>, <code>model_selection_error</code>, <code>provider_error</code>, <code>tool_validation_error</code>, <code>authority_error</code>, <code>workstation_error</code>, <code>artifact_error</code>, <code>cancellation_error</code>, and <code>internal_invariant_error</code>; later leaf codes remain deferred to their owning stages.</li>
-<li>Separate safe user/client message, structured source status, and internal trace-only detail.</li>
-<li>Add constructors/mappers for validation, state conflict, storage, context, selection, provider, tool, authority, workstation, artifact, cancellation, protocol, authentication, and invariant failures.</li>
-<li>Make error serialization omit causes/backtraces/secrets by default.</li>
-<li>Document that retryability is advice to the owning policy and never implies automatic side-effect retry.</li>
+<li>Define exactly the fourteen architecture categories, exact <code>never|bounded|user_action|operator_action</code> retryability literals, and exact <code>definite|outcome_unknown</code> certainty literals. Retryability is advisory, <code>bounded</code> does not imply idempotency, and certainty is never inferred from error text.</li>
+<li>Implement <code>ErrorCode</code> as an opaque allowlisted stable value rather than a public arbitrary string or exhaustive enum. The current allowlist is exactly <code>domain_validation</code> plus <code>authentication_error</code>, <code>client_protocol_error</code>, <code>idempotency_error</code>, <code>storage_error</code>, <code>state_conflict</code>, <code>context_error</code>, <code>model_selection_error</code>, <code>provider_error</code>, <code>tool_validation_error</code>, <code>authority_error</code>, <code>workstation_error</code>, <code>artifact_error</code>, <code>cancellation_error</code>, and <code>internal_invariant_error</code>; unknown values are rejected and later leaf codes remain deferred to their owning stages.</li>
+<li>Implement <code>SafeMessage</code> as an allowlisted static safe value and <code>InternalDetail</code> as crate-private, non-Display, non-Debug, non-Serde trace metadata containing only closed sanitized diagnostics.</li>
+<li>Implement exact <code>SourceStatus</code> variants <code>provider_http { code: 100..=599 }</code> and <code>os_errno { code: 1..=i32::MAX }</code> with strict <code>kind</code>/<code>code</code> serialization, bounds, unknown-kind rejection, and no bodies, reason strings, OS messages, paths, public-API HTTP status, exit code, or signal.</li>
+<li>Keep precise <code>DomainValidationError</code> local. Add only the explicit client-boundary <code>NormalizedError::from_client_validation(...)</code> projection to <code>client_protocol_error</code>/<code>domain_validation</code>/<code>never</code>/<code>definite</code>/<code>The supplied value is invalid.</code> with no source status and only a closed kind-derived internal diagnostic. Add no blanket or context-free conversion.</li>
+<li>Add controlled generic constructors for every category. Use the category literal as the generic code, fixed allowlisted safe messages, and the architecture&#39;s conservative classifications. Provider/workstation certainty and artifact/cancellation certainty are caller-selected at relevant boundaries; generic provider/workstation retryability defaults to <code>never</code>, with provider <code>bounded</code> available only through explicit controlled classification.</li>
+<li>Give <code>NormalizedError</code> private safe fields plus optional internal detail, no raw cause, <code>source() == None</code>, safe-message-only Display, safe-fields-only custom Debug, safe-fields-only serialization with absent source status omitted, and semantic equality over safe fields including source status but excluding internal detail.</li>
+<li>Reserve <code>internal_invariant_error</code> for trusted impossible/contradictory state, never as the generic adapter fallback. Keep generic cancellation at code <code>cancellation_error</code>, retryability <code>never</code>, explicit certainty, with success state and later <code>cancelled</code> leaf code deferred.</li>
 </ul>
 <h5>Data/state introduced</h5>
 <p>Normalized error values suitable for detailed rows, journal payload references, protocol projection, and tracing.</p>
 <h5>Contracts/interfaces introduced</h5>
 <p>Adapters translate external failures once; application decisions use category/code/certainty rather than library error types.</p>
 <h5>Failure behavior</h5>
-<p>Unknown adapter errors map to a conservative internal/provider/workstation code with definite versus unknown chosen from the action boundary, not guessed from text.</p>
+<p>Unknown adapter errors remain in their actual provider, workstation, storage, artifact, or other boundary category. Definite versus unknown is chosen from the action boundary, never guessed from text; unknown adapter failures do not become internal invariants.</p>
 <h5>Validation</h5>
-<p>Golden serialization tests; sentinel secret/backtrace redaction; exhaustive category mapping; tests that <code>bounded</code> provider retry and <code>outcome_unknown</code> tool results lead to different policies.</p>
+<p>Exact-vocabulary and golden serialization tests; <code>SourceStatus</code> bound/shape/unknown-field tests; sentinel secret/path/body/SQL/command/output/user/backtrace redaction across Display, Debug, serialization, and <code>source()</code>; explicit validation projection coverage for every local validation kind; semantic equality tests; conservative definite/unknown provider, workstation, artifact, and cancellation construction tests; and compile-fail API-surface tests where useful. No retry or recovery policy is implemented here.</p>
 <h5>Exit criteria</h5>
 <ul>
 <li><input disabled="" type="checkbox"> All architecture categories are represented.</li>
 <li><input disabled="" type="checkbox"> Safe and internal detail cannot be confused by API types.</li>
 <li><input disabled="" type="checkbox"> Certainty is mandatory where side effects may exist.</li>
+<li><input disabled="" type="checkbox"> Source status has only the two frozen structured numeric forms and rejects unsafe or unapproved shapes.</li>
+<li><input disabled="" type="checkbox"> No context-free <code>DomainValidationError</code> conversion or arbitrary code/message construction exists.</li>
+<li><input disabled="" type="checkbox"> Display, Debug, Serde, equality, and <code>source()</code> satisfy the frozen safe-detail contract.</li>
 </ul>
 <h5>What is deliberately NOT implemented yet</h5>
-<p>Localized messages, automatic remediation, generic error-string matching, or client display decisions.</p>
+<p>Localized messages, automatic remediation, retry/recovery loops, generic error-string matching, client display decisions, HTTP status/envelope projection, provider-native string codes, process exit/signal evidence, later leaf codes, or lifecycle transitions.</p>
 <h2>Stage 4: Lifecycle state machines and terminal decision rules</h2>
 <h3>Objective</h3>
 <p>Make work, model invocation, tool execution, cancellation, and terminal-output legality executable and exhaustively tested before persistence mutates them.</p>
@@ -6133,7 +6139,7 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-27T13:17:44.895Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>f3b016ad9e4347ef16c7751094c4e501ae1c71b13997058304c33d3dcb5b527a</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-27T14:22:09.479Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>e1fe744b87bfa9f3d53776184cb0f2c42602df783761c8b316fbe33fea12c9c8</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>

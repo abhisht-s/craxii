@@ -760,11 +760,14 @@ Core IDs/value types exist for correlation.
 
 ##### Exact implementation work
 
-- Define architecture categories, `never|bounded|user_action|operator_action`, and `definite|outcome_unknown` certainty. The complete generic Stage 3 stable-code vocabulary is `domain_validation` plus `authentication_error`, `client_protocol_error`, `idempotency_error`, `storage_error`, `state_conflict`, `context_error`, `model_selection_error`, `provider_error`, `tool_validation_error`, `authority_error`, `workstation_error`, `artifact_error`, `cancellation_error`, and `internal_invariant_error`; later leaf codes remain deferred to their owning stages.
-- Separate safe user/client message, structured source status, and internal trace-only detail.
-- Add constructors/mappers for validation, state conflict, storage, context, selection, provider, tool, authority, workstation, artifact, cancellation, protocol, authentication, and invariant failures.
-- Make error serialization omit causes/backtraces/secrets by default.
-- Document that retryability is advice to the owning policy and never implies automatic side-effect retry.
+- Define exactly the fourteen architecture categories, exact `never|bounded|user_action|operator_action` retryability literals, and exact `definite|outcome_unknown` certainty literals. Retryability is advisory, `bounded` does not imply idempotency, and certainty is never inferred from error text.
+- Implement `ErrorCode` as an opaque allowlisted stable value rather than a public arbitrary string or exhaustive enum. The current allowlist is exactly `domain_validation` plus `authentication_error`, `client_protocol_error`, `idempotency_error`, `storage_error`, `state_conflict`, `context_error`, `model_selection_error`, `provider_error`, `tool_validation_error`, `authority_error`, `workstation_error`, `artifact_error`, `cancellation_error`, and `internal_invariant_error`; unknown values are rejected and later leaf codes remain deferred to their owning stages.
+- Implement `SafeMessage` as an allowlisted static safe value and `InternalDetail` as crate-private, non-Display, non-Debug, non-Serde trace metadata containing only closed sanitized diagnostics.
+- Implement exact `SourceStatus` variants `provider_http { code: 100..=599 }` and `os_errno { code: 1..=i32::MAX }` with strict `kind`/`code` serialization, bounds, unknown-kind rejection, and no bodies, reason strings, OS messages, paths, public-API HTTP status, exit code, or signal.
+- Keep precise `DomainValidationError` local. Add only the explicit client-boundary `NormalizedError::from_client_validation(...)` projection to `client_protocol_error`/`domain_validation`/`never`/`definite`/`The supplied value is invalid.` with no source status and only a closed kind-derived internal diagnostic. Add no blanket or context-free conversion.
+- Add controlled generic constructors for every category. Use the category literal as the generic code, fixed allowlisted safe messages, and the architecture's conservative classifications. Provider/workstation certainty and artifact/cancellation certainty are caller-selected at relevant boundaries; generic provider/workstation retryability defaults to `never`, with provider `bounded` available only through explicit controlled classification.
+- Give `NormalizedError` private safe fields plus optional internal detail, no raw cause, `source() == None`, safe-message-only Display, safe-fields-only custom Debug, safe-fields-only serialization with absent source status omitted, and semantic equality over safe fields including source status but excluding internal detail.
+- Reserve `internal_invariant_error` for trusted impossible/contradictory state, never as the generic adapter fallback. Keep generic cancellation at code `cancellation_error`, retryability `never`, explicit certainty, with success state and later `cancelled` leaf code deferred.
 
 ##### Data/state introduced
 
@@ -776,21 +779,24 @@ Adapters translate external failures once; application decisions use category/co
 
 ##### Failure behavior
 
-Unknown adapter errors map to a conservative internal/provider/workstation code with definite versus unknown chosen from the action boundary, not guessed from text.
+Unknown adapter errors remain in their actual provider, workstation, storage, artifact, or other boundary category. Definite versus unknown is chosen from the action boundary, never guessed from text; unknown adapter failures do not become internal invariants.
 
 ##### Validation
 
-Golden serialization tests; sentinel secret/backtrace redaction; exhaustive category mapping; tests that `bounded` provider retry and `outcome_unknown` tool results lead to different policies.
+Exact-vocabulary and golden serialization tests; `SourceStatus` bound/shape/unknown-field tests; sentinel secret/path/body/SQL/command/output/user/backtrace redaction across Display, Debug, serialization, and `source()`; explicit validation projection coverage for every local validation kind; semantic equality tests; conservative definite/unknown provider, workstation, artifact, and cancellation construction tests; and compile-fail API-surface tests where useful. No retry or recovery policy is implemented here.
 
 ##### Exit criteria
 
 - [ ] All architecture categories are represented.
 - [ ] Safe and internal detail cannot be confused by API types.
 - [ ] Certainty is mandatory where side effects may exist.
+- [ ] Source status has only the two frozen structured numeric forms and rejects unsafe or unapproved shapes.
+- [ ] No context-free `DomainValidationError` conversion or arbitrary code/message construction exists.
+- [ ] Display, Debug, Serde, equality, and `source()` satisfy the frozen safe-detail contract.
 
 ##### What is deliberately NOT implemented yet
 
-Localized messages, automatic remediation, generic error-string matching, or client display decisions.
+Localized messages, automatic remediation, retry/recovery loops, generic error-string matching, client display decisions, HTTP status/envelope projection, provider-native string codes, process exit/signal evidence, later leaf codes, or lifecycle transitions.
 
 ## Stage 4: Lifecycle state machines and terminal decision rules
 
