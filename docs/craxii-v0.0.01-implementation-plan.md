@@ -817,6 +817,7 @@ Stage 3 domain primitives and normalized errors are complete.
 - Execute Substages 4.1–4.3.
 - Express transitions as pure decisions returning next state plus required semantic effects, not performing I/O.
 - Generate a reviewed transition matrix used by unit and later repository tests.
+- Use the exact state, reason, limit, result, cleanup, event, recovery, conflict, and invariant literals frozen in the architecture's Stage 4 lifecycle contract; do not introduce aliases or later-stage leaf codes.
 
 ### Data/state introduced
 

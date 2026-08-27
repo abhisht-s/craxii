@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="cecd0db10ccf5b4984cf7eb6b252d675493747368a3ff31c6b677f6687a515f8">
+  <meta name="craxii-source-sha256" content="d43479c2069aae7ec6d47e9172c2ad1a1f059947effc6212572dcedc5c2175bc">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>332</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>cecd0db10ccf5b49…</code></p>
+        <p>Source SHA-256:<br><code>d43479c2069aae7e…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 269 detailed subsections, and 332 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 270 detailed subsections, and 333 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -1921,6 +1921,59 @@ cancel_requested ------------------------&gt; interrupted
 <li><code>cancelled</code> requires cleanup to be confirmed. If cleanup cannot be confirmed, use <code>interrupted</code>.</li>
 <li><code>completed</code> requires an assistant message and <code>assistant.message_committed</code> event in the same transaction.</li>
 </ul>
+<h3>Stage 4 frozen lifecycle contract</h3>
+<aside class="explain-card level-3" data-source-heading="Stage 4 frozen lifecycle contract">
+  <div class="explain-card-label">Subsection guide · plain-English companion</div>
+  <p><strong>Plain-English significance:</strong> This section gives later database, scheduler, provider, and process stages one exact lifecycle vocabulary and transition authority. Unknown external outcomes stay explicit, and no later adapter may silently invent a retry or terminal result.</p>
+  <p class="real-life-example"><strong>Real-life example:</strong> A parcel ledger records the exact difference between not dispatched, dispatched with a known result, and dispatched with an unknown result; a restart cannot relabel the third case as safe to send again.</p>
+</aside><p>Stage 4 freezes the exact durable lifecycle vocabularies below. Existing literals are compatibility-sensitive and MUST NOT be renamed without an architecture change:</p>
+<ul>
+<li>Work states: <code>queued</code>, <code>running</code>, <code>waiting_on_model</code>, <code>waiting_on_tool</code>, <code>cancel_requested</code>, <code>completed</code>, <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code>.</li>
+<li>Model invocation states: <code>requesting</code>, <code>streaming</code>, <code>completed</code>, <code>failed</code>, <code>cancelled_locally</code>, and <code>provider_outcome_unknown</code>.</li>
+<li>Tool execution states: <code>requested</code>, <code>dispatching</code>, <code>completed</code>, <code>interrupted_before_dispatch</code>, and <code>outcome_unknown</code>.</li>
+<li>Work completion reasons: <code>answered</code> and <code>refused</code>.</li>
+<li>Work cancellation reasons: <code>user_request</code> and <code>graceful_shutdown</code>.</li>
+<li>Work interruption reasons: <code>runtime_ownership_lost</code>, <code>provider_outcome_unknown</code>, <code>tool_interrupted_before_dispatch</code>, <code>tool_outcome_unknown</code>, and <code>cleanup_unconfirmed</code>.</li>
+<li>Lifecycle limits: <code>context</code>, <code>model_attempts</code>, <code>agent_loop_steps</code>, <code>tool_calls</code>, <code>model_output_items</code>, <code>tool_argument_bytes</code>, <code>model_invocation_time</code>, and <code>total_work_time</code>.</li>
+<li>Tool result classes: <code>success</code>, <code>validation_rejection</code>, <code>unknown_tool</code>, <code>authority_denial</code>, <code>file_error</code>, <code>process_exit</code>, <code>signal_termination</code>, <code>timeout</code>, <code>cancellation</code>, <code>spawn_failure</code>, and <code>cleanup_failure</code>.</li>
+<li>Cleanup statuses: <code>not_required</code>, <code>confirmed</code>, and <code>unconfirmed</code>.</li>
+</ul>
+<p>The exact Work transition pairs are:</p>
+<table><thead><tr><th>From</th><th>To</th></tr></thead><tbody>
+<tr><td><code>queued</code></td><td><code>running</code>, <code>cancelled</code></td></tr>
+<tr><td><code>running</code></td><td><code>waiting_on_model</code>, <code>waiting_on_tool</code>, <code>cancel_requested</code>, <code>completed</code>, <code>failed</code>, <code>interrupted</code></td></tr>
+<tr><td><code>waiting_on_model</code></td><td><code>running</code>, <code>failed</code>, <code>cancel_requested</code>, <code>interrupted</code></td></tr>
+<tr><td><code>waiting_on_tool</code></td><td><code>running</code>, <code>cancel_requested</code>, <code>interrupted</code></td></tr>
+<tr><td><code>cancel_requested</code></td><td><code>cancelled</code>, <code>interrupted</code></td></tr>
+<tr><td><code>completed</code>, <code>failed</code>, <code>cancelled</code>, <code>interrupted</code></td><td>None</td></tr>
+</tbody></table>
+<p>The exact Model transition pairs are:</p>
+<table><thead><tr><th>From</th><th>To</th></tr></thead><tbody>
+<tr><td><code>requesting</code></td><td><code>streaming</code>, <code>completed</code>, <code>failed</code>, <code>cancelled_locally</code>, <code>provider_outcome_unknown</code></td></tr>
+<tr><td><code>streaming</code></td><td><code>completed</code>, <code>failed</code>, <code>cancelled_locally</code>, <code>provider_outcome_unknown</code></td></tr>
+<tr><td><code>completed</code>, <code>failed</code>, <code>cancelled_locally</code>, <code>provider_outcome_unknown</code></td><td>None</td></tr>
+</tbody></table>
+<p>The exact Tool transition pairs are:</p>
+<table><thead><tr><th>From</th><th>To</th></tr></thead><tbody>
+<tr><td><code>requested</code></td><td><code>dispatching</code>, <code>completed</code>, <code>interrupted_before_dispatch</code></td></tr>
+<tr><td><code>dispatching</code></td><td><code>completed</code>, <code>outcome_unknown</code></td></tr>
+<tr><td><code>completed</code>, <code>interrupted_before_dispatch</code>, <code>outcome_unknown</code></td><td>None</td></tr>
+</tbody></table>
+<p>Lifecycle current state is an immutable validated snapshot. Only a Work snapshot carries a <code>ProjectionVersion</code>; every actual Work transition increments it exactly once, no-op decisions do not increment it, and overflow is <code>version_overflow</code>. A Work snapshot has one <code>runtime_owner</code> and one exclusive <code>current_attempt = none | model(ModelInvocationId) | tool(ToolExecutionId)</code> shape:</p>
+<ul>
+<li><code>queued</code> has neither owner nor current attempt;</li>
+<li><code>running</code> has exactly one owner and no current attempt;</li>
+<li><code>waiting_on_model</code> has exactly one owner and matching model attempt;</li>
+<li><code>waiting_on_tool</code> has exactly one owner and matching tool attempt;</li>
+<li><code>cancel_requested</code> retains exactly one owner and zero or one current attempt until cleanup is classified; and</li>
+<li>every terminal state clears owner and current attempt.</li>
+</ul>
+<p>Work failure classes are <code>definite_normalized_error</code>, <code>provider_exhausted</code>, <code>invalid_model_output</code>, and <code>lifecycle_limit</code>. Limit/failure completion requires definite external cleanup; uncertainty instead interrupts Work. Work semantic event kinds are <code>work_started</code>, <code>work_waiting_on_model</code>, <code>work_waiting_on_tool</code>, <code>work_resumed</code>, <code>work_cancel_requested</code>, <code>work_completed</code>, <code>work_failed</code>, <code>work_cancelled</code>, and <code>work_interrupted</code>. Stage 7 owns their durable journal envelopes and dotted event-type mapping.</p>
+<p>Model <code>requesting -&gt; streaming</code> occurs exactly once on the first valid provider event; later deltas are ephemeral no-ops. Model completion requires a complete normalized response to be durably observed by the owning transaction. A retry uses a new <code>ModelInvocationId</code>, the same <code>LogicalInvocationId</code>, <code>WorkId</code>, <code>ContextManifestId</code>, and <code>AgentStepNo</code>, the next consecutive <code>AttemptNo</code>, and <code>retry_of</code> naming the immediate terminal predecessor. No terminal attempt is resurrected.</p>
+<p>The narrower pre-authority Tool lifecycle identity contains only <code>ToolExecutionId</code>, <code>ExecutionId</code>, <code>WorkId</code>, <code>RuntimeInstanceId</code>, source <code>ModelInvocationId</code>, <code>AgentStepNo</code>, and <code>ToolOrdinal</code>. <code>ToolAttemptReference</code> becomes available after authority evidence exists; authority MUST NOT be fabricated to create a requested lifecycle. <code>requested</code> proves external side effects absent. <code>dispatching</code> means durable dispatch intent exists and action may have crossed the boundary. <code>completed</code> means a terminal result is durably classifiable. After dispatch, unconfirmed cleanup always becomes <code>outcome_unknown</code>; there is no path back to execution and no automatic tool retry.</p>
+<p>Cancellation is a first-committed decision. Queued cancellation commits <code>cancelled</code>; active cancellation commits <code>cancel_requested</code>; cancellation of <code>cancel_requested</code> or terminal Work is a no-op with no event/version. <code>cancel_requested</code> blocks model progression, tool dispatch, another agent-loop iteration, and final-answer commit. Confirmed local model-wait cancellation becomes <code>cancelled_locally</code>; continuity loss becomes <code>provider_outcome_unknown</code> plus interrupted Work. Requested Tool recovery becomes <code>interrupted_before_dispatch</code>; dispatched Tool cleanup uncertainty becomes <code>outcome_unknown</code> plus interrupted Work. The first observed execution-control latch is exactly <code>process_exit</code>, <code>timeout</code>, or <code>cancellation</code> and later observations cannot replace it.</p>
+<p>Recovery classifications are exactly <code>retain_queued</code>, <code>already_terminal</code>, <code>interrupt_active_work</code>, <code>mark_model_provider_outcome_unknown_and_interrupt</code>, <code>mark_tool_interrupted_before_dispatch_and_interrupt</code>, <code>mark_tool_outcome_unknown_and_interrupt</code>, <code>reconcile_committed_tool_result_without_execution</code>, and <code>finalize_cancellation</code>. Contradictory shapes are an invariant failure. Recovery never emits external dispatch/retry. A complete committed model response owned by an old runtime still interrupts Work in V0; recovery neither fabricates an assistant Message nor silently resumes the agent loop. Later model-visible uncertainty is only a semantic synthetic-status requirement at this stage, never fabricated Message content.</p>
+<p>Lifecycle conflicts are exactly <code>stale_state</code>, <code>stale_version</code>, <code>stale_owner</code>, <code>wrong_current_attempt</code>, <code>illegal_transition</code>, <code>duplicate_terminal_decision</code>, <code>duplicate_attempt_identity</code>, and <code>duplicate_attempt_number</code>, and explicitly project to the existing <code>state_conflict</code> normalized error. Lifecycle invariants are exactly <code>invalid_state_shape</code>, <code>missing_required_evidence</code>, <code>version_overflow</code>, <code>unclassifiable_recovery</code>, <code>contradictory_projection</code>, and <code>impossible_terminal_shape</code>, and explicitly project to <code>internal_invariant_error</code>. Neither surface contains raw content, provider, process, path, or tool payloads.</p>
 <h2>Scheduler semantics</h2>
 <aside class="explain-card level-2" data-source-heading="Scheduler semantics">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -7137,7 +7190,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-27T14:22:20.407Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>cecd0db10ccf5b4984cf7eb6b252d675493747368a3ff31c6b677f6687a515f8</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-27T14:22:20.407Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>d43479c2069aae7ec6d47e9172c2ad1a1f059947effc6212572dcedc5c2175bc</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

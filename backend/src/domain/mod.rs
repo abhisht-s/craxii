@@ -150,6 +150,15 @@
 //! fn handle(_: NormalizedError) {}
 //! handle(std::fmt::Error);
 //! ```
+//!
+//! Work, model, and tool lifecycle states cannot substitute for each other:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::{ModelInvocationState, WorkState};
+//!
+//! fn persist_work_state(_: WorkState) {}
+//! persist_work_state(ModelInvocationState::Requesting);
+//! ```
 
 mod content;
 mod digest;
@@ -157,6 +166,7 @@ mod entities;
 mod error;
 mod evidence;
 mod ids;
+mod lifecycle;
 mod path;
 mod sequence;
 mod time;
@@ -192,6 +202,31 @@ pub use ids::{
     ArtifactId, ClientCommandId, ClientMessageId, ContextManifestId, ConversationId, CorrelationId,
     CraxiiId, DeviceId, DraftId, ExecutionId, JournalEventId, LogicalInvocationId, MessageId,
     ModelInvocationId, RuntimeInstanceId, ToolExecutionId, WorkId, WorkspaceId, WorkstationId,
+};
+pub use lifecycle::{
+    CancellationCheckpoint, CancellationChildOutcome, CancellationDecision, CleanupStatus,
+    CurrentWorkAttempt, ExecutionControlEvent, ExecutionControlLatch,
+    ExecutionControlLatchDecision, FailpointPhysicalInterpretation, FailpointRecoveryExpectation,
+    FailpointSemanticExpectation, FinalAnswerEffect, FinalAnswerRequiredEffects,
+    FirstProviderDeltaDecision, GracefulShutdownDecision, LifecycleConflictKind,
+    LifecycleFailpoint, LifecycleInvariantKind, LifecycleLimit, LifecycleTransitionError,
+    LimitOutcome, ModelCancellationDecision, ModelCancellationEvidence, ModelInvocationLifecycle,
+    ModelInvocationState, ModelLifecycleEffect, ModelOutputFacts, ModelOutputFailure,
+    ModelResponseStatus, ModelTerminalFacts, ModelTransitionDecision, ModelTransitionRequest,
+    RecoveryAttempt, RecoveryClassification, RecoveryDecision, RecoveryInput,
+    SyntheticStatusRequirement, TerminalDecision, ToolCancellationContext,
+    ToolCancellationDecision, ToolExecutionLifecycle, ToolExecutionState, ToolLifecycleEffect,
+    ToolLifecycleReference, ToolResultClass, ToolTransitionDecision, ToolTransitionRequest,
+    WorkCancellationReason, WorkCompletionEvidence, WorkCompletionReason, WorkEventKind,
+    WorkFailureReason, WorkInterruptionReason, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput,
+    WorkProgressionAction, WorkRequiredEffect, WorkState, WorkTerminalReason,
+    WorkTransitionDecision, WorkTransitionGuard, WorkTransitionRequest, classify_recovery,
+    decide_cancellation, decide_final_answer, decide_first_provider_delta,
+    decide_graceful_shutdown, decide_latched_tool_terminal, decide_limit_outcome,
+    decide_model_cancellation, decide_model_terminal, decide_model_transition,
+    decide_next_model_attempt, decide_tool_cancellation, decide_tool_transition,
+    decide_work_transition, ensure_work_progression_allowed, failpoint_semantic_expectation,
+    is_legal_model_pair, is_legal_tool_pair, is_legal_work_pair,
 };
 pub use path::{LogicalPathKind, LogicalPathReference, MAX_LOGICAL_PATH_BYTES};
 pub use sequence::{

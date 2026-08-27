@@ -1055,6 +1055,120 @@ Terminal work never returns to a nonterminal state. Retrying or continuing termi
 - `cancelled` requires cleanup to be confirmed. If cleanup cannot be confirmed, use `interrupted`.
 - `completed` requires an assistant message and `assistant.message_committed` event in the same transaction.
 
+### Stage 4 frozen lifecycle contract
+
+Stage 4 freezes the exact durable lifecycle vocabularies below. Existing literals are
+compatibility-sensitive and MUST NOT be renamed without an architecture change:
+
+- Work states: `queued`, `running`, `waiting_on_model`, `waiting_on_tool`,
+  `cancel_requested`, `completed`, `failed`, `cancelled`, and `interrupted`.
+- Model invocation states: `requesting`, `streaming`, `completed`, `failed`,
+  `cancelled_locally`, and `provider_outcome_unknown`.
+- Tool execution states: `requested`, `dispatching`, `completed`,
+  `interrupted_before_dispatch`, and `outcome_unknown`.
+- Work completion reasons: `answered` and `refused`.
+- Work cancellation reasons: `user_request` and `graceful_shutdown`.
+- Work interruption reasons: `runtime_ownership_lost`, `provider_outcome_unknown`,
+  `tool_interrupted_before_dispatch`, `tool_outcome_unknown`, and
+  `cleanup_unconfirmed`.
+- Lifecycle limits: `context`, `model_attempts`, `agent_loop_steps`, `tool_calls`,
+  `model_output_items`, `tool_argument_bytes`, `model_invocation_time`, and
+  `total_work_time`.
+- Tool result classes: `success`, `validation_rejection`, `unknown_tool`,
+  `authority_denial`, `file_error`, `process_exit`, `signal_termination`, `timeout`,
+  `cancellation`, `spawn_failure`, and `cleanup_failure`.
+- Cleanup statuses: `not_required`, `confirmed`, and `unconfirmed`.
+
+The exact Work transition pairs are:
+
+| From | To |
+| --- | --- |
+| `queued` | `running`, `cancelled` |
+| `running` | `waiting_on_model`, `waiting_on_tool`, `cancel_requested`, `completed`, `failed`, `interrupted` |
+| `waiting_on_model` | `running`, `failed`, `cancel_requested`, `interrupted` |
+| `waiting_on_tool` | `running`, `cancel_requested`, `interrupted` |
+| `cancel_requested` | `cancelled`, `interrupted` |
+| `completed`, `failed`, `cancelled`, `interrupted` | None |
+
+The exact Model transition pairs are:
+
+| From | To |
+| --- | --- |
+| `requesting` | `streaming`, `completed`, `failed`, `cancelled_locally`, `provider_outcome_unknown` |
+| `streaming` | `completed`, `failed`, `cancelled_locally`, `provider_outcome_unknown` |
+| `completed`, `failed`, `cancelled_locally`, `provider_outcome_unknown` | None |
+
+The exact Tool transition pairs are:
+
+| From | To |
+| --- | --- |
+| `requested` | `dispatching`, `completed`, `interrupted_before_dispatch` |
+| `dispatching` | `completed`, `outcome_unknown` |
+| `completed`, `interrupted_before_dispatch`, `outcome_unknown` | None |
+
+Lifecycle current state is an immutable validated snapshot. Only a Work snapshot carries a
+`ProjectionVersion`; every actual Work transition increments it exactly once, no-op decisions do
+not increment it, and overflow is `version_overflow`. A Work snapshot has one `runtime_owner` and
+one exclusive `current_attempt = none | model(ModelInvocationId) | tool(ToolExecutionId)` shape:
+
+- `queued` has neither owner nor current attempt;
+- `running` has exactly one owner and no current attempt;
+- `waiting_on_model` has exactly one owner and matching model attempt;
+- `waiting_on_tool` has exactly one owner and matching tool attempt;
+- `cancel_requested` retains exactly one owner and zero or one current attempt until cleanup is
+  classified; and
+- every terminal state clears owner and current attempt.
+
+Work failure classes are `definite_normalized_error`, `provider_exhausted`,
+`invalid_model_output`, and `lifecycle_limit`. Limit/failure completion requires definite external
+cleanup; uncertainty instead interrupts Work. Work semantic event kinds are `work_started`,
+`work_waiting_on_model`, `work_waiting_on_tool`, `work_resumed`, `work_cancel_requested`,
+`work_completed`, `work_failed`, `work_cancelled`, and `work_interrupted`. Stage 7 owns their
+durable journal envelopes and dotted event-type mapping.
+
+Model `requesting -> streaming` occurs exactly once on the first valid provider event; later
+deltas are ephemeral no-ops. Model completion requires a complete normalized response to be
+durably observed by the owning transaction. A retry uses a new `ModelInvocationId`, the same
+`LogicalInvocationId`, `WorkId`, `ContextManifestId`, and `AgentStepNo`, the next consecutive
+`AttemptNo`, and `retry_of` naming the immediate terminal predecessor. No terminal attempt is
+resurrected.
+
+The narrower pre-authority Tool lifecycle identity contains only `ToolExecutionId`, `ExecutionId`,
+`WorkId`, `RuntimeInstanceId`, source `ModelInvocationId`, `AgentStepNo`, and `ToolOrdinal`.
+`ToolAttemptReference` becomes available after authority evidence exists; authority MUST NOT be
+fabricated to create a requested lifecycle. `requested` proves external side effects absent.
+`dispatching` means durable dispatch intent exists and action may have crossed the boundary.
+`completed` means a terminal result is durably classifiable. After dispatch, unconfirmed cleanup
+always becomes `outcome_unknown`; there is no path back to execution and no automatic tool retry.
+
+Cancellation is a first-committed decision. Queued cancellation commits `cancelled`; active
+cancellation commits `cancel_requested`; cancellation of `cancel_requested` or terminal Work is a
+no-op with no event/version. `cancel_requested` blocks model progression, tool dispatch, another
+agent-loop iteration, and final-answer commit. Confirmed local model-wait cancellation becomes
+`cancelled_locally`; continuity loss becomes `provider_outcome_unknown` plus interrupted Work.
+Requested Tool recovery becomes `interrupted_before_dispatch`; dispatched Tool cleanup uncertainty
+becomes `outcome_unknown` plus interrupted Work. The first observed execution-control latch is
+exactly `process_exit`, `timeout`, or `cancellation` and later observations cannot replace it.
+
+Recovery classifications are exactly `retain_queued`, `already_terminal`,
+`interrupt_active_work`, `mark_model_provider_outcome_unknown_and_interrupt`,
+`mark_tool_interrupted_before_dispatch_and_interrupt`,
+`mark_tool_outcome_unknown_and_interrupt`,
+`reconcile_committed_tool_result_without_execution`, and `finalize_cancellation`. Contradictory
+shapes are an invariant failure. Recovery never emits external dispatch/retry. A complete committed
+model response owned by an old runtime still interrupts Work in V0; recovery neither fabricates an
+assistant Message nor silently resumes the agent loop. Later model-visible uncertainty is only a
+semantic synthetic-status requirement at this stage, never fabricated Message content.
+
+Lifecycle conflicts are exactly `stale_state`, `stale_version`, `stale_owner`,
+`wrong_current_attempt`, `illegal_transition`, `duplicate_terminal_decision`,
+`duplicate_attempt_identity`, and `duplicate_attempt_number`, and explicitly project to the
+existing `state_conflict` normalized error. Lifecycle invariants are exactly `invalid_state_shape`,
+`missing_required_evidence`, `version_overflow`, `unclassifiable_recovery`,
+`contradictory_projection`, and `impossible_terminal_shape`, and explicitly project to
+`internal_invariant_error`. Neither surface contains raw content, provider, process, path, or tool
+payloads.
+
 ## Scheduler semantics
 
 ### Durable queue
