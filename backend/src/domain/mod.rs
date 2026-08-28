@@ -171,6 +171,7 @@ mod ids;
 mod journal;
 mod lifecycle;
 mod path;
+mod runtime;
 mod sequence;
 mod time;
 
@@ -218,10 +219,10 @@ pub use ids::{
 pub use journal::{
     ArtifactRecordedV1, ConversationCreatedV1, CraxiiInitializedV1, JournalActor,
     JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventKind,
-    JournalEventPayload, JournalRuntimeState, JournalStageOwner, JournalStreamFamily,
-    JournalStreamId, JournalVersionResolution, JournalWorkTerminalReason, MessageCommittedV1,
-    ModelInvocationEventV1, RuntimeEventV1, ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1,
-    WorkTransitionV1, resolve_event_version,
+    JournalEventPayload, JournalStageOwner, JournalStreamFamily, JournalStreamId,
+    JournalVersionResolution, JournalWorkTerminalReason, MessageCommittedV1,
+    ModelInvocationEventV1, RuntimeRecoveryPerformedV1, RuntimeStartedV1, RuntimeStoppingV1,
+    ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1, WorkTransitionV1, resolve_event_version,
 };
 pub use lifecycle::{
     CancellationCheckpoint, CancellationChildOutcome, CancellationDecision, CleanupStatus,
@@ -249,6 +250,9 @@ pub use lifecycle::{
     is_legal_model_pair, is_legal_tool_pair, is_legal_work_pair,
 };
 pub use path::{LogicalPathKind, LogicalPathReference, MAX_LOGICAL_PATH_BYTES};
+pub use runtime::{
+    RuntimeInstance, RuntimeLifecycleError, RuntimeShutdownReason, RuntimeState, RuntimeStopReason,
+};
 pub use sequence::{
     AgentStepNo, AttemptNo, ConversationWorkOrdinal, JournalOffset, StreamSeq, ToolOrdinal,
 };

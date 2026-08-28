@@ -2831,7 +2831,13 @@ pub(super) async fn verify_stage8_consistency(
             OR (w.state = 'waiting_on_tool' AND (w.current_tool_execution_id IS NULL \
              OR w.current_model_invocation_id IS NOT NULL OR t.work_id <> w.work_id \
              OR t.runtime_instance_id <> w.runtime_instance_id OR t.state NOT IN ('requested','dispatching'))) \
-            OR (w.state NOT IN ('waiting_on_model','waiting_on_tool') \
+            OR (w.state = 'cancel_requested' AND w.current_model_invocation_id IS NOT NULL \
+             AND (w.current_tool_execution_id IS NOT NULL OR m.work_id <> w.work_id \
+             OR m.runtime_instance_id <> w.runtime_instance_id)) \
+            OR (w.state = 'cancel_requested' AND w.current_tool_execution_id IS NOT NULL \
+             AND (w.current_model_invocation_id IS NOT NULL OR t.work_id <> w.work_id \
+             OR t.runtime_instance_id <> w.runtime_instance_id)) \
+            OR (w.state NOT IN ('waiting_on_model','waiting_on_tool','cancel_requested') \
              AND (w.current_model_invocation_id IS NOT NULL OR w.current_tool_execution_id IS NOT NULL))",
     )
     .fetch_one(&mut *connection)

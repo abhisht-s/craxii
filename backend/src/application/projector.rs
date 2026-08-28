@@ -5,11 +5,12 @@ use std::collections::{HashMap, HashSet};
 use crate::domain::{
     ArtifactId, ConversationCreatedV1, ConversationId, CorrelationId, CraxiiInitializedV1,
     JournalActor, JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventId,
-    JournalEventKind, JournalEventPayload, JournalRuntimeState, JournalStreamId,
-    MessageCommittedV1, ModelInvocationEventV1, ModelInvocationId, ProjectionVersion,
-    RuntimeEventV1, RuntimeInstanceId, StreamSeq, ToolExecutionEventV1, ToolExecutionId,
-    WorkCancellationReason, WorkId, WorkInputActor, WorkInputRelationship, WorkQueuedV1, WorkState,
-    WorkTransitionV1, is_legal_model_pair, is_legal_tool_pair, is_legal_work_pair,
+    JournalEventKind, JournalEventPayload, JournalStreamId, MessageCommittedV1,
+    ModelInvocationEventV1, ModelInvocationId, ProjectionVersion, RuntimeInstanceId,
+    RuntimeRecoveryPerformedV1, RuntimeStartedV1, RuntimeStoppingV1, StreamSeq,
+    ToolExecutionEventV1, ToolExecutionId, WorkCancellationReason, WorkId, WorkInputActor,
+    WorkInputRelationship, WorkQueuedV1, WorkState, WorkTransitionV1, is_legal_model_pair,
+    is_legal_tool_pair, is_legal_work_pair,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,8 +48,10 @@ pub struct ProjectedToolReference {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedRuntimeReference {
-    pub kind: JournalEventKind,
-    pub fact: RuntimeEventV1,
+    pub started_event_id: JournalEventId,
+    pub started: RuntimeStartedV1,
+    pub recovery: Option<RuntimeRecoveryPerformedV1>,
+    pub stopping: Option<RuntimeStoppingV1>,
 }
 
 /// Stage 7's journal-derived state. No backing Stage 8 row is fabricated.
@@ -194,12 +197,15 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
         (JournalEventPayload::ArtifactRecorded(payload), JournalStreamId::Work(id)) => {
             id == payload.work_id && event.work_id == Some(payload.work_id)
         }
-        (
-            JournalEventPayload::RuntimeStarted(payload)
-            | JournalEventPayload::RuntimeRecoveryPerformed(payload)
-            | JournalEventPayload::RuntimeStopping(payload),
-            JournalStreamId::Runtime(id),
-        ) => {
+        (JournalEventPayload::RuntimeStarted(payload), JournalStreamId::Runtime(id)) => {
+            id == payload.runtime_instance_id
+                && event.runtime_instance_id == Some(payload.runtime_instance_id)
+        }
+        (JournalEventPayload::RuntimeRecoveryPerformed(payload), JournalStreamId::Runtime(id)) => {
+            id == payload.runtime_instance_id
+                && event.runtime_instance_id == Some(payload.runtime_instance_id)
+        }
+        (JournalEventPayload::RuntimeStopping(payload), JournalStreamId::Runtime(id)) => {
             id == payload.runtime_instance_id
                 && event.runtime_instance_id == Some(payload.runtime_instance_id)
         }
@@ -454,45 +460,68 @@ fn apply_event(
                 return Err(JournalContractError::InconsistentProjection);
             }
         }
-        JournalEventPayload::RuntimeStarted(payload)
-        | JournalEventPayload::RuntimeRecoveryPerformed(payload)
-        | JournalEventPayload::RuntimeStopping(payload) => {
+        JournalEventPayload::RuntimeStarted(payload) => {
             if event.actor != JournalActor::Runtime(payload.runtime_instance_id)
                 || state.root.as_ref().is_none_or(|root| {
-                    root.craxii_id != event.craxii_id
+                    root.craxii_id != payload.craxii_id
+                        || root.craxii_id != event.craxii_id
                         || root.workstation_id != payload.workstation_id
                 })
+                || event.causation_event_id.is_some()
+                || state.runtimes.contains_key(&payload.runtime_instance_id)
             {
                 return Err(JournalContractError::InvalidEnvelope);
-            }
-            match event.kind() {
-                JournalEventKind::RuntimeStarted => {
-                    if payload.state != JournalRuntimeState::Running
-                        || state.runtimes.contains_key(&payload.runtime_instance_id)
-                    {
-                        return Err(JournalContractError::InconsistentProjection);
-                    }
-                }
-                JournalEventKind::RuntimeRecoveryPerformed | JournalEventKind::RuntimeStopping => {
-                    let previous = state
-                        .runtimes
-                        .get(&payload.runtime_instance_id)
-                        .ok_or(JournalContractError::InconsistentProjection)?;
-                    if previous.fact.workstation_id != payload.workstation_id
-                        || previous.fact.workstation_generation != payload.workstation_generation
-                    {
-                        return Err(JournalContractError::InconsistentProjection);
-                    }
-                }
-                _ => unreachable!(),
             }
             state.runtimes.insert(
                 payload.runtime_instance_id,
                 ProjectedRuntimeReference {
-                    kind: event.kind(),
-                    fact: payload.clone(),
+                    started_event_id: event.event_id,
+                    started: payload.clone(),
+                    recovery: None,
+                    stopping: None,
                 },
             );
+        }
+        JournalEventPayload::RuntimeRecoveryPerformed(payload) => {
+            let Some(cause) = cause else {
+                return Err(JournalContractError::InvalidCausation);
+            };
+            let runtime = state
+                .runtimes
+                .get_mut(&payload.runtime_instance_id)
+                .ok_or(JournalContractError::InconsistentProjection)?;
+            if event.actor != JournalActor::Runtime(payload.runtime_instance_id)
+                || cause.kind != JournalEventKind::RuntimeStarted
+                || event.causation_event_id != Some(runtime.started_event_id)
+                || cause.correlation_id != event.correlation_id
+                || runtime.recovery.is_some()
+                || payload.schema_version != runtime.started.schema_version
+                || payload.binary_version != runtime.started.binary_version
+            {
+                return Err(JournalContractError::InconsistentProjection);
+            }
+            runtime.recovery = Some(payload.clone());
+        }
+        JournalEventPayload::RuntimeStopping(payload) => {
+            let Some(cause) = cause else {
+                return Err(JournalContractError::InvalidCausation);
+            };
+            let runtime = state
+                .runtimes
+                .get_mut(&payload.runtime_instance_id)
+                .ok_or(JournalContractError::InconsistentProjection)?;
+            if event.actor != JournalActor::Runtime(payload.runtime_instance_id)
+                || runtime.recovery.is_none()
+                || runtime.stopping.is_some()
+                || cause.correlation_id != event.correlation_id
+                || !matches!(
+                    cause.kind,
+                    JournalEventKind::RuntimeStarted | JournalEventKind::RuntimeRecoveryPerformed
+                )
+            {
+                return Err(JournalContractError::InconsistentProjection);
+            }
+            runtime.stopping = Some(payload.clone());
         }
     }
     if !event.kind().state_bearing() {
@@ -535,6 +564,7 @@ fn apply_work_transition(
     }
     if payload.to_state.is_terminal() {
         work.terminal_at = Some(payload.transitioned_at);
+        work.cancel_requested_at = None;
     }
     work.state = payload.to_state;
     work.state_version = payload.state_version;

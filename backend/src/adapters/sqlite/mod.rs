@@ -9,6 +9,7 @@ mod journal;
 mod projection;
 mod runtime;
 mod schema;
+mod stage10;
 mod stage8;
 mod stage8_codec;
 mod stage9;
@@ -17,6 +18,8 @@ mod state_store;
 #[allow(dead_code)] // Stage 5 establishes the private primitive; Stage 6 named writes consume it.
 mod transaction;
 
+#[cfg(test)]
+mod stage10_tests;
 #[cfg(test)]
 mod stage6_tests;
 #[cfg(test)]

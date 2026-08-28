@@ -537,6 +537,10 @@ Every spawned Tokio task MUST have an owner and shutdown path.
 - No task may be intentionally detached with its result ignored.
 
 Task failure MUST propagate to its owning subsystem. A panic in an agent-loop task must mark the runtime attempt unhealthy and be observed; it must not silently remove active work from memory while leaving its database state running.
+At a graceful-shutdown deadline, the scheduler parent MUST abort its remaining runner children and
+drain every resulting join record before removing registry ownership or acknowledging scheduler
+shutdown. Aborting or dropping the scheduler parent is not a graceful child-ownership mechanism;
+unrecoverable process termination is the only catastrophic fallback.
 
 ### Runtime instance identity
 
@@ -555,6 +559,22 @@ Every backend process start creates a new `runtime_instance_id` before recovery 
 
 PIDs are never used for durable ownership because Linux reuses them. Active work and attempts carry `runtime_instance_id`; startup recovery can therefore identify state owned by a dead process.
 
+`RuntimeInstanceId` is a fresh UUIDv7 for every process start, is never reused, and is durable
+ownership identity rather than PID identity. The exact lifecycle is
+`new -> running -> stopping -> stopped(graceful_shutdown)`. With the lifetime-exclusive process
+lock held, every earlier `running` or `stopping` runtime is stale and becomes
+`stopped(startup_failure)` only after its ownership is reconciled. Staleness MUST NOT use heartbeat
+age, PID liveness/reuse, boot ID, or lease expiry. Linux reads diagnostic boot ID from
+`/proc/sys/kernel/random/boot_id`; non-Linux persists the honest sentinel
+`non_linux_not_applicable` and MUST NOT fabricate a Linux host identity.
+
+The owned heartbeat task runs every five seconds, updates only the current `running` runtime,
+never moves `last_heartbeat_at` backwards, emits no journal event, and is stopped and joined.
+Persistent heartbeat storage failure is fatal/unready and initiates controlled shutdown rather
+than silently spinning. Fatal health is terminal presentation evidence, but it does not disable
+the shutdown-controller latch: a fatal process keeps health `fatal` while it quiesces claims,
+persists stopping/closure when storage permits, and joins owned tasks.
+
 ### Readiness
 
 The process has two health concepts:
@@ -563,6 +583,12 @@ The process has two health concepts:
 - **Ready:** configuration and schema are valid, database integrity checks passed, startup recovery committed, scheduler started, and the default model/tool configuration is usable.
 
 The TLS proxy may expose liveness without authentication but MUST return no internal detail. Readiness SHOULD be restricted to loopback or authenticated callers.
+
+Application health has exactly `live_unready`, `ready`, `draining`, and `fatal`. Stage 10
+production remains `live_unready` after recovery because no production `WorkRunner` exists. A
+scripted test composition may become ready after proving recovery, scheduler, and notification
+operation. Stage 17 supplies the first real execution-readiness prerequisite; Stage 11 only
+exposes this read-only state.
 
 ## Technology decisions
 
@@ -965,6 +991,12 @@ These grammars are canonical domain references and MUST NOT be derived from boot
 
 `RuntimeStartEvidence` contains `RuntimeInstanceId`, `CraxiiId`, `WorkstationId`, `WorkstationGeneration`, optional bounded Linux boot ID and diagnostic PID, bounded package version and git revision, `SchemaVersion`, and `started_at`. `RuntimeInstanceId` is canonical identity; PID/boot ID are diagnostic only. Hostname, heartbeat/state/stopped fields, persistence behavior, PID lookup, and boot-ID reads are excluded. Domain code MUST NOT import bootstrap build metadata wholesale.
 
+The persisted Stage 10 runtime start requires both diagnostic fields: Linux supplies the actual
+kernel boot ID and non-Linux supplies `non_linux_not_applicable`; PID is the positive current
+process value. Test composition may inject either observation. The narrow runtime-observation port
+contains no hostname, path, liveness decision, operating-system handle, or process identity
+semantics.
+
 ### Stage 3.2 application invariants
 
 The pure V0 topology constructor/validator accepts one `CraxiiPrincipal`, requires exactly one `Conversation`, requires its ID to equal `primary_conversation_id`, requires matching Craxii ownership, and requires exactly one matching default `WorkspaceIdentity` with the same Craxii ownership. It uses no persistence, global singleton, or startup coupling.
@@ -1173,7 +1205,9 @@ payloads.
 
 ### Durable queue
 
-SQLite is the queue. Tokio notifications only wake the scheduler and may be lost without losing work.
+SQLite is the queue. Tokio notifications only wake the scheduler and may be lost without losing
+work. Stage 10 performs an initial scan and a one-second fallback scan; a notification implementation
+may be a no-op without affecting correctness.
 
 For each conversation, eligible work is ordered by:
 
@@ -1209,6 +1243,33 @@ The scheduler repeatedly:
 
 If the guarded update affects zero rows, another claim or cancellation won; the scheduler reloads state. It never assumes an in-memory queue entry is still valid.
 
+The claim is one `WriteCoordinator` plus `BEGIN IMMEDIATE` transaction. It reloads and validates
+the candidate state, version, owner, and exclusive current-attempt link; increments the Work state
+version exactly once; and appends `work.started` caused by the immediately prior Work-stream event
+with the current runtime actor/envelope. Only after commit may the
+`after_work_claim_commit` failpoint run and the runner be registered/spawned. Claim and cancellation
+therefore have deterministic first-committer outcomes: cancellation-first leaves no claimable row;
+claim-first makes the subsequent active cancellation `cancel_requested`.
+
+The scheduler owns its loop and every runner in a joined task collection. A registry keyed by
+`WorkId` holds only runtime ownership, cancellation observation, and join association; it is never
+recovery truth. Every task completion, start failure, panic, cancellation, and shutdown exit is
+observed before removal. A committed claim whose runner cannot start, or whose runner exits
+abnormally while Work remains active, becomes `interrupted` and is never requeued. Persistent
+storage/invariant failure sets health `fatal`, stops claims, and requests controlled shutdown.
+
+Claim admission closes through an explicit asynchronous quiescence barrier. Closing the latch
+wakes the scheduler and prevents any later `claim_next_work` call; shutdown then waits for an
+already-entered claim section to finish. That section begins before the candidate claim attempt and
+ends only after no claim committed, or after a committed claim crossed
+`after_work_claim_commit` and obtained runner-registry ownership or durable start-failure
+classification. Only the barrier acknowledgment permits `runtime.stopping` to commit.
+
+`WorkRunner` is a narrow application boundary. Stage 10 production has no implementation and MUST
+NOT pretend to run an agent loop; permanent tests may install scripted runners. Scheduler hints for
+new messages and active cancellation are lossy. A fallback database scan discovers both queued and
+current-runtime `cancel_requested` Work, and durable state always wins.
+
 ### A second message during active work
 
 If message N+1 arrives while work N is waiting on a command:
@@ -1227,15 +1288,29 @@ The user sees that the new responsibility was accepted and queued. The user is n
 
 On graceful service shutdown, the scheduler:
 
-1. Stops claiming new queued work.
+1. Closes claim admission and acknowledges that any in-flight claim section is quiescent.
 2. Marks readiness false.
 3. Requests cancellation of owned agent-loop tasks.
 4. Allows a bounded grace period for provider requests and tool children to stop.
 5. Commits `cancelled` only where cleanup is confirmed.
 6. Commits `interrupted` for active work that cannot finish or confirm cleanup before shutdown.
-7. Joins owned tasks before process exit when possible.
+7. At the deadline, freezes join reconciliation, waits for conservative durable classification,
+   aborts remaining children itself, and drains every expected cancelled, panic, or normal join
+   result before clearing the registry.
 
 On `SIGKILL`, startup recovery performs the classification instead.
+
+The application shutdown latch is idempotent. Its first request fixes both a monotonic waiting
+deadline and a persistable wall-clock deadline derived from the existing
+`shutdown.grace_period_ms`; later requests do not extend it or append another stopping event. The
+exact order is latch; mark nonfatal health `draining` while preserving already-fatal health;
+close claim admission and await quiescence; commit runtime `running -> stopping` plus
+`runtime.stopping`; run `during_graceful_shutdown`; stop heartbeat; request/reconcile owned Work
+cancellation; notify runners; and join until the original deadline. At the deadline the scheduler
+acknowledges a frozen reconciliation boundary, unresolved attempts/Work are durably classified,
+and only then does the scheduler parent abort and drain its remaining child joins. Residual durable
+classification precedes `stopped(graceful_shutdown)`. No cleanup is claimed without proof.
+SIGINT/SIGTERM wiring remains at composition; no signal type crosses domain or ports.
 
 ## Cancellation semantics
 
@@ -1305,14 +1380,24 @@ The backend MUST perform this order before readiness:
 4. Acquire the single-instance startup lock.
 5. Validate schema compatibility and apply approved migrations.
 6. Run `PRAGMA quick_check` and required application invariants.
-7. Create the new runtime-instance row and append `runtime.started`.
-8. Inspect every nonterminal work item and every nonterminal model/tool attempt.
-9. Classify old-runtime attempts and update projections plus journal atomically.
-10. Append `runtime.recovery_performed` with counts and classifications.
-11. Start durable event delivery and the scheduler.
-12. Mark readiness true.
+7. In one `BEGIN IMMEDIATE` transaction, create the new running runtime-instance row with
+   `last_heartbeat_at = started_at` and append `runtime.started`; commit before recovery.
+8. Enumerate every earlier running/stopping runtime while the lifetime-exclusive process lock is
+   held, and inspect its nonterminal Work and model/tool attempts.
+9. Classify old-runtime attempts and projections in bounded idempotent transactions per stale Work,
+   then close the reconciled stale runtime as `stopped(startup_failure)`.
+10. Append the current runtime's `runtime.recovery_performed` summary in one final transaction,
+    including when all counts are zero.
+11. Start owned heartbeat/event-delivery/scheduler tasks only after recovery commits.
+12. Evaluate readiness; Stage 10 production remains `live_unready` until Stage 17 supplies the real
+    `WorkRunner` and usable model/tool execution prerequisites.
 
 If integrity checks or recovery writes fail, the process MUST NOT become ready. It must emit a redacted fatal diagnostic and require operator intervention rather than guessing.
+
+If startup fails after the current runtime creation commit, the process preserves the original
+error and best-effort marks that runtime `stopped(startup_failure)`. Failure of that cleanup remains
+visible as a stale runtime to the next startup. Recovery never holds one write transaction across
+all stale state and performs no provider, tool, process, or cleanup side effect.
 
 ### Recovery classification
 
@@ -1329,22 +1414,53 @@ If integrity checks or recovery writes fail, the process MUST NOT become ready. 
 
 Queued work after an interrupted work item remains eligible because the interrupted item is terminal. Context for the next work MUST include an explicit synthetic status item describing unresolved `outcome_unknown` executions so the model does not assume success or failure.
 
+For `cancel_requested`, zero current attempts with no cleanup ambiguity becomes `cancelled`.
+Requesting/streaming model attempts first become `provider_outcome_unknown` and then interrupt
+Work; an already unknown model attempt is preserved and Work interrupts. Other terminal model
+attempts permit cancellation only when cleanup is confirmed or not required. Requested tools first
+become `interrupted_before_dispatch`; dispatching tools first become `outcome_unknown` with cleanup
+unconfirmed; existing pre-dispatch/unknown classifications are preserved; and the Work interrupts.
+A completed tool permits cancellation only with confirmed/no-required cleanup. Cleanup uncertainty
+always interrupts. Valid `cancel_requested` Work may retain zero or one exclusive current model or
+tool attempt, whose runtime MUST equal Work ownership.
+
+Recovery of stale waiting Work does not emit `work.resumed`: even an exactly completed attempt is
+terminal evidence, not authority for Stage 10 to invent Stage 14/17 continuation. Stale waiting
+Work is safely interrupted unless a later architecture explicitly supplies a continuation owner.
+No recovery transition returns stale Work or an ambiguous attempt to `queued`; automatic retry of
+`provider_outcome_unknown`, tool `outcome_unknown`, stale dispatch, interrupted non-idempotent side
+effects, stale running Work, and stale waiting states is permanently forbidden.
+
 ### Recovery event
 
-`runtime.recovery_performed` records counts, not sensitive payloads:
+`runtime.recovery_performed` is a strict V1 payload containing only:
 
-- old runtime instances observed;
-- queued work retained;
-- work marked interrupted;
-- model attempts interrupted;
-- tool attempts marked outcome unknown;
-- drafts abandoned;
-- orphan artifact files detected;
-- cleanup checks performed;
-- recovery duration;
-- binary and schema version.
+- `runtime_instance_id`;
+- stale runtime instances observed and closed;
+- queued Work retained and Work interrupted;
+- model attempts marked provider-outcome-unknown or preserved terminal;
+- tool attempts marked interrupted-before-dispatch, outcome-unknown, or preserved terminal;
+- drafts abandoned, orphan artifacts observed, cleanup checks, and cleanup-unconfirmed counts;
+- recovery duration in milliseconds;
+- binary version, schema version, and recovery timestamp.
 
 This event is product evidence. Detailed stack traces remain in tracing.
+
+Its recovery window is journal order strictly after the current runtime's `runtime.started` and
+strictly before its `runtime.recovery_performed`. Within that window, retained queued Work; Work
+interruptions; newly unknown model attempts; newly pre-dispatch-interrupted or unknown tool
+attempts; preserved terminal attempts; abandoned drafts; and cleanup checked/unconfirmed counts
+are exactly reconstructed from journal causation plus stable attempt rows and MUST equal the
+summary. Stale-runtime observed/closed counts, orphan-artifact observations, and recovery duration
+are observational evidence that V3 cannot independently reconstruct after mutation; they receive
+type/bound validation only, including `stale_runtimes_closed <= stale_runtimes_observed`. This
+distinction MUST NOT be presented as historical proof that V3 does not contain.
+
+The event is emitted exactly once for the current startup, is caused by that runtime's
+`runtime.started`, and uses nonnegative signed-64-bit-safe counts. Recovery crash idempotency comes
+from bounded transactions and terminal-state guards: committed units are not emitted again,
+unfinished units converge on the next startup, and each new runtime receives its own start and
+recovery events.
 
 ## Journal architecture
 
@@ -1491,6 +1607,19 @@ Every stored payload is generated from a typed domain structure. `serde_json::Va
 | `runtime.recovery_performed` | Runtime | Yes | Summarizes startup classification. |
 | `runtime.stopping` | Runtime | No | Records graceful shutdown intent when possible. |
 
+The runtime kinds retain payload version 1 but do not share a generic DTO. `runtime.started`
+contains exactly `runtime_instance_id`, `craxii_id`, `workstation_id`,
+`workstation_generation`, diagnostic `linux_boot_id` and `process_id`, `binary_version`,
+`git_revision`, `schema_version`, and `started_at`. `runtime.recovery_performed` contains exactly
+the bounded recovery facts listed above. `runtime.stopping` contains exactly
+`runtime_instance_id`, `shutdown_requested_at`, reason `graceful_shutdown`, `grace_deadline`,
+`active_work_count`, and `active_task_count`. It is atomically appended with
+`running -> stopping`; repeated shutdown requests append nothing and retain the first deadline.
+There is no runtime-stopped journal kind. Startup/projector validation requires start payload/row
+equality, coherent stopping history, exact recovery-window equality for journal/row-derivable
+counters, and bounded validation for explicitly observational counters; it never repairs one
+representation from the other.
+
 ### What is not a journal event
 
 The following normally belong in tracing or detailed rows:
@@ -1596,7 +1725,11 @@ Stage 7 owns `work_item_inputs`, journal tables, projection reconstruction, and 
 workstation/workspace/conversation bootstrap. Stage 8 owns model/tool/context/artifact/authority/
 evidence tables. Consequently `current_model_invocation_id` and `current_tool_execution_id` have no
 Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10
-owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.
+owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution. Runtime
+startup consistency additionally requires: queued Work has no owner; every active Work has an
+existing runtime owner; a current attempt has the same runtime as its Work; the exclusive attempt
+link agrees with `waiting_on_model`, `waiting_on_tool`, or valid `cancel_requested`; terminal Work
+has no owner/link; and a conversation has at most one active Work. Contradiction fails closed.
 
 ### Stage 7 canonical journal and bootstrap contract
 
@@ -1985,6 +2118,14 @@ an alternate connection reloads the winner and applies the same match/conflict r
 coordinator serializes duplicates so one same-request winner mutates once and different material
 conflicts. Post-commit scheduler/event notifications are lossy hints and never a condition of
 command durability.
+
+The Stage 10 postcommit notification boundary has an explicit no-op fallback. A truly new message
+commit reaches `after_message_transaction_commit` before its scheduler hint and caller delivery. A
+truly new active cancellation commit reaches `after_cancel_requested_commit` before its
+cancellation hint and caller delivery. `CommandOutcome::Committed|Replayed` distinguishes the
+cases without changing persisted rows, response DTOs, or canonical hashes. Replay, queued direct
+cancellation, and terminal no-op never re-trigger a new-commit crash window. The scheduler's
+one-second fallback scan makes a lost or no-op notifier correct.
 
 #### Atomic message acceptance
 
@@ -2651,7 +2792,7 @@ Do not add performance pragmas without documenting durability effects.
 
 ### Stage 5 SQLite runtime contract
 
-The V0 implementation uses SQLx `0.9` with only `sqlite-bundled`, `runtime-tokio`, `migrate`, and `macros`; Tokio `1.53` with only `macros`, `rt-multi-thread`, `sync`, and `time`; and nix `0.31` with only `fs`. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside `adapters/sqlite`; neither application nor the `StateStore` port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work.
+The V0 implementation uses SQLx `0.9` with only `sqlite-bundled`, `runtime-tokio`, `migrate`, and `macros`; Tokio `1.53` with only `macros`, `rt-multi-thread`, `sync`, `time`, and `signal`; and nix `0.31` with only `fs`. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside `adapters/sqlite`; neither application nor the `StateStore` port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio signal support is owned only by binary composition; Stage 10 adds no `tokio-util`, `futures`, or other direct async dependency.
 
 The database path is exactly `<state_root>/db/craxii.sqlite3` and the process-lock path is exactly `<state_root>/locks/craxii.lock`. `state_root` MUST preexist; Stage 5 may create only its `db/` and `locks/` children. Those directories are mode `0700`, and new database and lock files are mode `0600`. Production provisioning owns `state_root`, user ownership, and any `chown`; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production `:memory:` mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.
 
@@ -5042,6 +5183,15 @@ after_assistant_message_commit
 after_cancel_requested_commit
 during_graceful_shutdown
 ```
+
+Stage 10 activates exactly `after_message_transaction_commit`, `after_work_claim_commit`,
+`after_cancel_requested_commit`, and `during_graceful_shutdown`. They are development/test-only and
+the release compile guard remains authoritative. Message and active-cancellation failpoints fire
+only for a newly committed transaction, before hint/caller delivery; replay, queued direct
+cancellation, and terminal no-op do not re-fire them. Claim fires after its commit and before runner
+registration. Shutdown fires after claim admission closes, the in-flight claim section quiesces,
+and `runtime.stopping` commits, but before drain or classification. No additional public failpoint
+name is authorized.
 
 ### Required assertions
 

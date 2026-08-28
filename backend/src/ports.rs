@@ -3,4 +3,5 @@
 pub mod artifact_store;
 pub mod clock;
 pub mod device_credentials;
+pub mod runtime_observation;
 pub mod state_store;

@@ -17,10 +17,11 @@ use crate::domain::{
     LogicalInvocationId, LogicalPathReference, Message, MessageCommandReceipt, MessageContent,
     MessageId, ModelAttemptReference, ModelInvocationId, ModelInvocationState, NormalizedError,
     PrivilegeMode, ProjectionVersion, ProviderModelReference, ResolvedPathEvidence,
-    RuntimeInstanceId, Sha256Digest, ToolExecutionId, ToolExecutionState, ToolLifecycleReference,
-    ToolName, ToolResultClass, ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot,
-    WorkState, WorkspaceId, WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration,
-    WorkstationId, WorkstationIdentity,
+    RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeStartEvidence, RuntimeStoppingV1,
+    Sha256Digest, ToolExecutionId, ToolExecutionState, ToolLifecycleReference, ToolName,
+    ToolResultClass, ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState,
+    WorkspaceId, WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
+    WorkstationIdentity,
 };
 use crate::ports::artifact_store::FinalizedArtifact;
 
@@ -505,20 +506,14 @@ pub struct AcceptUserMessageRequest {
 pub struct ClaimNextWorkRequest {
     pub conversation_id: ConversationId,
     pub runtime_id: RuntimeInstanceId,
-    pub expected_candidate_state: WorkState,
+    pub claimed_at: UtcTimestamp,
+    pub event_id: JournalEventId,
 }
 
 pub struct ClaimedWork {
     pub work: WorkItem,
     pub lifecycle: WorkLifecycleSnapshot,
     pub commit: CommitReceipt,
-}
-
-/// Generic Work transition is still one named semantic intent, never generic row update.
-pub struct TransitionWorkRequest {
-    pub expected: WorkExpectation,
-    pub next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
 }
 
 pub struct RequestCancellationRequest {
@@ -533,9 +528,30 @@ pub struct RequestCancellationRequest {
 }
 
 pub struct FinishCancellationRequest {
-    pub expected: WorkExpectation,
-    pub next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
+    pub work_id: WorkId,
+    pub runtime_id: RuntimeInstanceId,
+    pub confirmed_at: UtcTimestamp,
+    pub event_id: JournalEventId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CancelRequestedWork {
+    pub work_id: WorkId,
+    pub current_attempt: CurrentWorkAttempt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InterruptOwnedWorkRequest {
+    pub work_id: WorkId,
+    pub runtime_id: RuntimeInstanceId,
+    pub interrupted_at: UtcTimestamp,
+    pub event_id: JournalEventId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequestOwnedCancellationRequest {
+    pub runtime_id: RuntimeInstanceId,
+    pub requested_at: UtcTimestamp,
 }
 
 pub struct BeginModelInvocationRequest {
@@ -632,14 +648,83 @@ pub struct PublicJournalCandidate {
 pub struct RecoverStaleRuntimeRequest {
     pub stale_runtime_id: RuntimeInstanceId,
     pub current_runtime_id: RuntimeInstanceId,
+    pub recovered_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClassifyShutdownWorkRequest {
+    pub runtime_id: RuntimeInstanceId,
+    pub classified_at: UtcTimestamp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RecoveryReceipt {
-    pub retained_queued: u64,
-    pub terminal_unchanged: u64,
-    pub interrupted: u64,
+    pub stale_runtime_closed: bool,
+    pub interrupted_work: u64,
+    pub model_attempts_provider_outcome_unknown: u64,
+    pub model_attempts_terminal_preserved: u64,
+    pub tool_attempts_interrupted_before_dispatch: u64,
+    pub tool_attempts_outcome_unknown: u64,
+    pub tool_attempts_terminal_preserved: u64,
+    pub drafts_abandoned: u64,
+    pub cleanup_checks_performed: u64,
+    pub cleanup_unconfirmed: u64,
     pub commit: CommitReceipt,
+}
+
+pub struct CreateRuntimeRequest {
+    pub evidence: RuntimeStartEvidence,
+    pub event_id: JournalEventId,
+    pub correlation_id: CorrelationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CreateRuntimeReceipt {
+    pub runtime_instance_id: RuntimeInstanceId,
+    pub started_event_id: JournalEventId,
+    pub commit: CommitReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatRuntimeRequest {
+    pub runtime_instance_id: RuntimeInstanceId,
+    pub observed_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeartbeatRuntimeReceipt {
+    pub persisted_at: UtcTimestamp,
+    pub advanced: bool,
+}
+
+pub struct BeginRuntimeStoppingRequest {
+    pub event: RuntimeStoppingV1,
+    pub event_id: JournalEventId,
+    pub correlation_id: CorrelationId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BeginRuntimeStoppingReceipt {
+    pub began: bool,
+    pub commit: CommitReceipt,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FinishRuntimeRequest {
+    pub runtime_instance_id: RuntimeInstanceId,
+    pub stopped_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EnumerateStaleRuntimesRequest {
+    pub current_runtime_id: RuntimeInstanceId,
+}
+
+pub struct AppendRecoverySummaryRequest {
+    pub summary: RuntimeRecoveryPerformedV1,
+    pub event_id: JournalEventId,
+    pub started_event_id: JournalEventId,
+    pub correlation_id: CorrelationId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -677,13 +762,53 @@ pub trait SchedulerStateStore: Send + Sync {
         &self,
         request: ClaimNextWorkRequest,
     ) -> StateStoreFuture<'_, Option<ClaimedWork>>;
-    fn transition_work_and_append_event(
+    fn list_current_runtime_cancel_requested(
         &self,
-        request: TransitionWorkRequest,
-    ) -> StateStoreFuture<'_, CommitReceipt>;
+        runtime_id: RuntimeInstanceId,
+    ) -> StateStoreFuture<'_, Vec<CancelRequestedWork>>;
     fn finish_cancellation(
         &self,
         request: FinishCancellationRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn interrupt_abnormal_runner(
+        &self,
+        request: InterruptOwnedWorkRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn request_owned_work_cancellation(
+        &self,
+        request: RequestOwnedCancellationRequest,
+    ) -> StateStoreFuture<'_, Vec<WorkId>>;
+}
+
+/// Stage 10 RuntimeInstance lifecycle capability.
+pub trait RuntimeStateStore: Send + Sync {
+    fn create_runtime_and_started_event(
+        &self,
+        request: CreateRuntimeRequest,
+    ) -> StateStoreFuture<'_, CreateRuntimeReceipt>;
+    fn heartbeat_runtime(
+        &self,
+        request: HeartbeatRuntimeRequest,
+    ) -> StateStoreFuture<'_, HeartbeatRuntimeReceipt>;
+    fn begin_runtime_stopping(
+        &self,
+        request: BeginRuntimeStoppingRequest,
+    ) -> StateStoreFuture<'_, BeginRuntimeStoppingReceipt>;
+    fn finish_runtime_graceful(
+        &self,
+        request: FinishRuntimeRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn mark_runtime_startup_failure(
+        &self,
+        request: FinishRuntimeRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn enumerate_stale_runtimes(
+        &self,
+        request: EnumerateStaleRuntimesRequest,
+    ) -> StateStoreFuture<'_, Vec<RuntimeInstanceId>>;
+    fn append_recovery_summary(
+        &self,
+        request: AppendRecoverySummaryRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
 }
 
@@ -737,9 +862,14 @@ pub trait ReplayStateStore: Send + Sync {
 
 /// Stage 10 stale-runtime recovery capability.
 pub trait RecoveryStateStore: Send + Sync {
+    fn count_retained_queued_work(&self) -> StateStoreFuture<'_, u64>;
     fn recover_stale_runtime_ownership(
         &self,
         request: RecoverStaleRuntimeRequest,
+    ) -> StateStoreFuture<'_, RecoveryReceipt>;
+    fn classify_unresolved_shutdown_work(
+        &self,
+        request: ClassifyShutdownWorkRequest,
     ) -> StateStoreFuture<'_, RecoveryReceipt>;
 }
 
@@ -748,6 +878,7 @@ pub trait StateStore:
     BootstrapStateStore
     + CommandStateStore
     + SchedulerStateStore
+    + RuntimeStateStore
     + ModelStateStore
     + ToolStateStore
     + CompletionStateStore
@@ -760,6 +891,7 @@ impl<T> StateStore for T where
     T: BootstrapStateStore
         + CommandStateStore
         + SchedulerStateStore
+        + RuntimeStateStore
         + ModelStateStore
         + ToolStateStore
         + CompletionStateStore
@@ -779,9 +911,18 @@ mod tests {
         LoadOrBootstrapIdentity,
         AcceptMessage,
         ClaimWork,
-        TransitionWork,
+        ListCancellation,
+        InterruptWork,
+        RequestOwnedCancellation,
         RequestCancellation,
         FinishCancellation,
+        CreateRuntime,
+        HeartbeatRuntime,
+        BeginRuntimeStopping,
+        FinishRuntime,
+        MarkRuntimeStartupFailure,
+        EnumerateStaleRuntimes,
+        AppendRecoverySummary,
         BeginModel,
         MarkModelStreaming,
         FinishModel,
@@ -791,18 +932,29 @@ mod tests {
         CommitAssistant,
         LoadBootstrap,
         ListJournal,
+        CountQueued,
         RecoverRuntime,
+        ClassifyShutdownWork,
         VerifyConsistency,
     }
 
     impl Intent {
-        const ALL: [Self; 17] = [
+        const ALL: [Self; 28] = [
             Self::LoadOrBootstrapIdentity,
             Self::AcceptMessage,
             Self::ClaimWork,
-            Self::TransitionWork,
+            Self::ListCancellation,
+            Self::InterruptWork,
+            Self::RequestOwnedCancellation,
             Self::RequestCancellation,
             Self::FinishCancellation,
+            Self::CreateRuntime,
+            Self::HeartbeatRuntime,
+            Self::BeginRuntimeStopping,
+            Self::FinishRuntime,
+            Self::MarkRuntimeStartupFailure,
+            Self::EnumerateStaleRuntimes,
+            Self::AppendRecoverySummary,
             Self::BeginModel,
             Self::MarkModelStreaming,
             Self::FinishModel,
@@ -812,7 +964,9 @@ mod tests {
             Self::CommitAssistant,
             Self::LoadBootstrap,
             Self::ListJournal,
+            Self::CountQueued,
             Self::RecoverRuntime,
+            Self::ClassifyShutdownWork,
             Self::VerifyConsistency,
         ];
     }
@@ -874,17 +1028,74 @@ mod tests {
         ) -> StateStoreFuture<'_, Option<ClaimedWork>> {
             self.fail(Intent::ClaimWork)
         }
-        fn transition_work_and_append_event(
+        fn list_current_runtime_cancel_requested(
             &self,
-            _: TransitionWorkRequest,
-        ) -> StateStoreFuture<'_, CommitReceipt> {
-            self.fail(Intent::TransitionWork)
+            _: RuntimeInstanceId,
+        ) -> StateStoreFuture<'_, Vec<CancelRequestedWork>> {
+            self.fail(Intent::ListCancellation)
         }
         fn finish_cancellation(
             &self,
             _: FinishCancellationRequest,
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::FinishCancellation)
+        }
+        fn interrupt_abnormal_runner(
+            &self,
+            _: InterruptOwnedWorkRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::InterruptWork)
+        }
+        fn request_owned_work_cancellation(
+            &self,
+            _: RequestOwnedCancellationRequest,
+        ) -> StateStoreFuture<'_, Vec<WorkId>> {
+            self.fail(Intent::RequestOwnedCancellation)
+        }
+    }
+
+    impl RuntimeStateStore for FakeStateStore {
+        fn create_runtime_and_started_event(
+            &self,
+            _: CreateRuntimeRequest,
+        ) -> StateStoreFuture<'_, CreateRuntimeReceipt> {
+            self.fail(Intent::CreateRuntime)
+        }
+        fn heartbeat_runtime(
+            &self,
+            _: HeartbeatRuntimeRequest,
+        ) -> StateStoreFuture<'_, HeartbeatRuntimeReceipt> {
+            self.fail(Intent::HeartbeatRuntime)
+        }
+        fn begin_runtime_stopping(
+            &self,
+            _: BeginRuntimeStoppingRequest,
+        ) -> StateStoreFuture<'_, BeginRuntimeStoppingReceipt> {
+            self.fail(Intent::BeginRuntimeStopping)
+        }
+        fn finish_runtime_graceful(
+            &self,
+            _: FinishRuntimeRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::FinishRuntime)
+        }
+        fn mark_runtime_startup_failure(
+            &self,
+            _: FinishRuntimeRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::MarkRuntimeStartupFailure)
+        }
+        fn enumerate_stale_runtimes(
+            &self,
+            _: EnumerateStaleRuntimesRequest,
+        ) -> StateStoreFuture<'_, Vec<RuntimeInstanceId>> {
+            self.fail(Intent::EnumerateStaleRuntimes)
+        }
+        fn append_recovery_summary(
+            &self,
+            _: AppendRecoverySummaryRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::AppendRecoverySummary)
         }
     }
 
@@ -949,11 +1160,20 @@ mod tests {
     }
 
     impl RecoveryStateStore for FakeStateStore {
+        fn count_retained_queued_work(&self) -> StateStoreFuture<'_, u64> {
+            self.fail(Intent::CountQueued)
+        }
         fn recover_stale_runtime_ownership(
             &self,
             _: RecoverStaleRuntimeRequest,
         ) -> StateStoreFuture<'_, RecoveryReceipt> {
             self.fail(Intent::RecoverRuntime)
+        }
+        fn classify_unresolved_shutdown_work(
+            &self,
+            _: ClassifyShutdownWorkRequest,
+        ) -> StateStoreFuture<'_, RecoveryReceipt> {
+            self.fail(Intent::ClassifyShutdownWork)
         }
     }
 
@@ -964,7 +1184,7 @@ mod tests {
         require_state_store::<FakeStateStore>();
         let fake = FakeStateStore::new();
         assert!(fake.calls.lock().unwrap().is_empty());
-        assert_eq!(Intent::ALL.len(), 17);
+        assert_eq!(Intent::ALL.len(), 28);
     }
 
     #[test]
@@ -999,9 +1219,18 @@ mod tests {
             "load_or_bootstrap_v0_identity",
             "accept_user_message_and_create_work",
             "claim_next_work",
-            "transition_work_and_append_event",
+            "list_current_runtime_cancel_requested",
             "request_cancellation",
             "finish_cancellation",
+            "interrupt_abnormal_runner",
+            "request_owned_work_cancellation",
+            "create_runtime_and_started_event",
+            "heartbeat_runtime",
+            "begin_runtime_stopping",
+            "finish_runtime_graceful",
+            "mark_runtime_startup_failure",
+            "enumerate_stale_runtimes",
+            "append_recovery_summary",
             "begin_model_invocation",
             "mark_model_streaming",
             "finish_model_invocation",
@@ -1012,6 +1241,8 @@ mod tests {
             "load_bootstrap_snapshot",
             "list_public_journal_replay_candidates",
             "recover_stale_runtime_ownership",
+            "classify_unresolved_shutdown_work",
+            "count_retained_queued_work",
             "verify_application_consistency",
         ];
         let unique = names.into_iter().collect::<std::collections::BTreeSet<_>>();

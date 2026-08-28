@@ -78,17 +78,45 @@ pub struct CancelWorkCommand {
     pub requested_at: UtcTimestamp,
 }
 
-pub struct CommandService<'a, S> {
-    store: &'a S,
+pub trait CommandPostCommit: Send + Sync {
+    fn message_committed(&self, work_id: WorkId);
+    fn active_cancellation_committed(&self, work_id: WorkId);
 }
 
-impl<'a, S> CommandService<'a, S>
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoopCommandPostCommit;
+
+impl CommandPostCommit for NoopCommandPostCommit {
+    fn message_committed(&self, _: WorkId) {}
+    fn active_cancellation_committed(&self, _: WorkId) {}
+}
+
+pub struct CommandService<'a, S, H = NoopCommandPostCommit> {
+    store: &'a S,
+    post_commit: H,
+}
+
+impl<'a, S> CommandService<'a, S, NoopCommandPostCommit>
 where
     S: CommandStateStore,
 {
     #[must_use]
     pub const fn new(store: &'a S) -> Self {
-        Self { store }
+        Self {
+            store,
+            post_commit: NoopCommandPostCommit,
+        }
+    }
+}
+
+impl<'a, S, H> CommandService<'a, S, H>
+where
+    S: CommandStateStore,
+    H: CommandPostCommit,
+{
+    #[must_use]
+    pub const fn with_post_commit(store: &'a S, post_commit: H) -> Self {
+        Self { store, post_commit }
     }
 
     pub async fn accept_message(
@@ -108,7 +136,8 @@ where
             command.client_message_id,
             &command.content,
         );
-        self.store
+        let outcome = self
+            .store
             .accept_user_message_and_create_work(AcceptUserMessageRequest {
                 client_message_id: command.client_message_id,
                 device_id: authenticated.device_id(),
@@ -126,7 +155,15 @@ where
                 },
             })
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        if let CommandOutcome::Committed(receipt) = &outcome {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::reach(
+                crate::test_failpoints::PhysicalHook::AfterMessageTransactionCommit,
+            );
+            self.post_commit.message_committed(receipt.work_id);
+        }
+        Ok(outcome)
     }
 
     pub async fn cancel_work(
@@ -145,7 +182,8 @@ where
             command.client_command_id,
             command.work_id,
         );
-        self.store
+        let outcome = self
+            .store
             .request_cancellation(RequestCancellationRequest {
                 client_command_id: command.client_command_id,
                 device_id: authenticated.device_id(),
@@ -157,7 +195,18 @@ where
                 event_id: JournalEventId::generate(),
             })
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        if let CommandOutcome::Committed(receipt) = &outcome
+            && receipt.resulting_work_state == crate::domain::WorkState::CancelRequested
+        {
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::reach(
+                crate::test_failpoints::PhysicalHook::AfterCancelRequestedCommit,
+            );
+            self.post_commit
+                .active_cancellation_committed(receipt.work_id);
+        }
+        Ok(outcome)
     }
 }
 

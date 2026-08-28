@@ -185,6 +185,9 @@ impl SqliteStateStore {
             super::stage8::verify_stage8_consistency(&mut transaction, &projected, &events).await?;
         let stage9_invariants =
             super::stage9::verify_stage9_consistency(&mut transaction, &events).await?;
+        let stage10_invariants =
+            super::stage10::verify_stage10_consistency(&mut transaction, &projected, &events)
+                .await?;
 
         let journal_head = events.last().map(|event| event.journal_offset);
         transaction
@@ -192,7 +195,7 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 18 + stage8_invariants + stage9_invariants,
+            checked_invariants: 18 + stage8_invariants + stage9_invariants + stage10_invariants,
             journal_head,
         })
     }

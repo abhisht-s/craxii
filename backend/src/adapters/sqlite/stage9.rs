@@ -1403,7 +1403,8 @@ fn cancellation_transition(event: &JournalEvent) -> Option<&WorkTransitionV1> {
             if matches!(
                 transition.from_state,
                 WorkState::Running | WorkState::WaitingOnModel | WorkState::WaitingOnTool
-            ) && transition.to_state == WorkState::CancelRequested =>
+            ) && transition.to_state == WorkState::CancelRequested
+                && transition.cancellation_reason == Some(WorkCancellationReason::UserRequest) =>
         {
             Some(transition)
         }

@@ -10,6 +10,8 @@ pub mod authentication;
 pub mod command_service;
 pub mod device_provisioning;
 pub mod projector;
+pub mod runtime;
+pub mod scheduler;
 
 /// Validates the complete in-memory V0 principal/conversation/default-workspace topology.
 ///

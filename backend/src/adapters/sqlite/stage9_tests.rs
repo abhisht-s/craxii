@@ -15,15 +15,17 @@ use crate::application::device_provisioning::{
 use crate::domain::{
     AuthenticatedDevice, BearerToken, CancellationCommandReceipt, ClientCommandId, ClientMessageId,
     ContentBlock, ConversationId, CorrelationId, CraxiiId, CurrentWorkAttempt, DeviceDisplayName,
-    DeviceId, IdempotencyKey, JournalActor, JournalCurrentAttempt, JournalEventId,
-    JournalEventPayload, JournalStreamId, MessageContent, ProjectionVersion, RuntimeInstanceId,
-    UtcTimestamp, WorkId, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState,
-    WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId,
+    DeviceId, DiagnosticPid, GitRevision, IdempotencyKey, JournalActor, JournalCurrentAttempt,
+    JournalEventId, JournalEventPayload, JournalStreamId, LinuxBootId, MessageContent,
+    PackageVersion, ProjectionVersion, RuntimeInstanceId, RuntimeStartEvidence,
+    RuntimeStartEvidenceInput, SchemaVersion, UtcTimestamp, WorkId, WorkLifecycleSnapshot,
+    WorkLifecycleSnapshotInput, WorkState, WorkTransitionV1, WorkspaceId, WorkstationGeneration,
+    WorkstationId,
 };
 use crate::ports::device_credentials::RevokeDeviceOutcome;
 use crate::ports::state_store::{
-    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, StateStoreErrorKind,
-    V0IdentityReference,
+    BootstrapObservation, BootstrapStateStore, CreateRuntimeRequest,
+    LoadOrBootstrapIdentityRequest, RuntimeStateStore, StateStoreErrorKind, V0IdentityReference,
 };
 
 use super::journal::{JournalAppendIntent, append_event, prepare_event};
@@ -711,22 +713,26 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
 
 async fn transition_to_running(fixture: &Fixture, work_id: WorkId) -> RuntimeInstanceId {
     let runtime_id = RuntimeInstanceId::generate();
-    let mut connection = fixture.store.runtime.acquire().await.unwrap();
-    sqlx::query(
-        "INSERT INTO runtime_instances (runtime_instance_id, craxii_id, workstation_id, \
-         workstation_generation, linux_boot_id, process_id, binary_version, git_revision, \
-         schema_version, state, started_at, last_heartbeat_at, stopped_at, stop_reason) \
-         VALUES (?, ?, ?, 1, 'stage9-test-boot', 42, '0.0.1', 'stage9-test', 3, \
-                 'running', ?, NULL, NULL, NULL)",
-    )
-    .bind(runtime_id.to_string())
-    .bind(fixture.identity.craxii_id.to_string())
-    .bind(fixture.identity.workstation_id.to_string())
-    .bind(T1)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    drop(connection);
+    fixture
+        .store
+        .create_runtime_and_started_event(CreateRuntimeRequest {
+            evidence: RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+                runtime_instance_id: runtime_id,
+                craxii_id: fixture.identity.craxii_id,
+                workstation_id: fixture.identity.workstation_id,
+                workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
+                linux_boot_id: Some(LinuxBootId::try_new("stage9-test-boot").unwrap()),
+                diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
+                package_version: PackageVersion::try_new("0.0.1").unwrap(),
+                git_revision: GitRevision::try_new("stage9-test").unwrap(),
+                schema_version: SchemaVersion::try_new(3).unwrap(),
+                started_at: timestamp(T1),
+            }),
+            event_id: JournalEventId::generate(),
+            correlation_id: CorrelationId::generate(),
+        })
+        .await
+        .unwrap();
 
     let current = WorkLifecycleSnapshot::initial(work_id);
     let next = WorkLifecycleSnapshot::try_new(WorkLifecycleSnapshotInput {

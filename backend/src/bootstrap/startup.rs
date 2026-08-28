@@ -3,24 +3,31 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::adapters::artifacts::LocalArtifactStore;
+use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
+use crate::application::runtime::{
+    HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
+};
 use crate::bootstrap::config;
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
 use crate::domain::{
-    ConversationId, CorrelationId, CraxiiId, JournalEventId, UtcTimestamp, WorkspaceId,
-    WorkstationGeneration, WorkstationId,
+    ConversationId, CorrelationId, CraxiiId, GitRevision, JournalEventId, PackageVersion,
+    RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput, SchemaVersion,
+    UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
 };
 use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
 use crate::ports::clock::Clock;
+use crate::ports::runtime_observation::RuntimeProcessObserver;
 use crate::ports::state_store::{
-    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, StateStoreErrorKind,
-    V0IdentityReference,
+    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, RuntimeStateStore,
+    StateStoreErrorKind, V0IdentityReference,
 };
 
 pub async fn run_from_env() -> Result<RunningBootstrap, StartupError> {
@@ -46,9 +53,9 @@ pub async fn run(
 ) -> Result<RunningBootstrap, StartupError> {
     let cli = Cli::parse(arguments)?;
     let config = config::load(&cli.config_path).map_err(|_| StartupError::Configuration)?;
-    let clock = SystemClock::new();
+    let clock = Arc::new(SystemClock::new());
     let build = BuildMetadata::embedded().map_err(|_| StartupError::BuildMetadata)?;
-    let process = ProcessMetadata::capture(build, config.fingerprint(), &clock)
+    let process = ProcessMetadata::capture(build, config.fingerprint(), clock.as_ref())
         .map_err(|_| StartupError::Clock)?;
     let health = Health::new();
     let telemetry =
@@ -107,15 +114,86 @@ pub async fn run(
     if snapshot.identity != bootstrap.identity {
         return Err(StartupError::DatabaseIntegrity);
     }
-    telemetry
-        .emit_startup_evidence(&process, &health)
-        .map_err(StartupError::Telemetry)?;
-
+    let observation = SystemRuntimeProcessObserver
+        .observe()
+        .map_err(|_| StartupError::RuntimeLifecycle)?;
+    let runtime_started_at =
+        UtcTimestamp::from_offset_datetime(clock.utc_now().map_err(|_| StartupError::Clock)?)
+            .map_err(|_| StartupError::Clock)?;
+    let runtime_evidence = RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+        runtime_instance_id: RuntimeInstanceId::generate(),
+        craxii_id: snapshot.identity.craxii_id,
+        workstation_id: snapshot.identity.workstation_id,
+        workstation_generation: snapshot.workstation.generation(),
+        linux_boot_id: Some(observation.linux_boot_id),
+        diagnostic_pid: Some(observation.process_id),
+        package_version: PackageVersion::try_new(process.build().package_version())
+            .map_err(|_| StartupError::BuildMetadata)?,
+        git_revision: GitRevision::try_new(process.build().git_revision())
+            .map_err(|_| StartupError::BuildMetadata)?,
+        schema_version: SchemaVersion::try_new(3).map_err(|_| StartupError::BuildMetadata)?,
+        started_at: runtime_started_at,
+    });
+    let state_store = Arc::new(state_store);
+    let runtime = bootstrap_runtime(
+        state_store.as_ref(),
+        runtime_evidence,
+        orphan_report.orphans.len() as u64,
+        clock.as_ref(),
+    )
+    .await
+    .map_err(StartupError::from_runtime)?;
+    if let Err(error) = state_store.verify_application_consistency().await {
+        if let Ok(wall_time) = clock.utc_now()
+            && let Ok(stopped_at) = UtcTimestamp::from_offset_datetime(wall_time)
+        {
+            let _ = state_store
+                .mark_runtime_startup_failure(crate::ports::state_store::FinishRuntimeRequest {
+                    runtime_instance_id: runtime.runtime_instance_id,
+                    stopped_at,
+                })
+                .await;
+        }
+        return Err(StartupError::from_state_store(error));
+    }
+    if let Err(error) = telemetry.emit_startup_evidence(&process, &health) {
+        if let Ok(wall_time) = clock.utc_now()
+            && let Ok(stopped_at) = UtcTimestamp::from_offset_datetime(wall_time)
+        {
+            let _ = state_store
+                .mark_runtime_startup_failure(crate::ports::state_store::FinishRuntimeRequest {
+                    runtime_instance_id: runtime.runtime_instance_id,
+                    stopped_at,
+                })
+                .await;
+        }
+        return Err(StartupError::Telemetry(error));
+    }
+    let (fatal, fatal_receiver) = tokio::sync::watch::channel(false);
+    let heartbeat = HeartbeatTask::start(
+        Arc::clone(&state_store),
+        Arc::clone(&clock),
+        health.clone(),
+        runtime.runtime_instance_id,
+        fatal,
+    );
+    let shutdown = Arc::new(ShutdownController::new(
+        Arc::clone(&state_store),
+        Arc::clone(&clock),
+        health.clone(),
+        runtime.runtime_instance_id,
+        runtime.correlation_id,
+        config.shutdown().grace_period_ms(),
+        heartbeat,
+    ));
     Ok(RunningBootstrap {
         application: ApplicationShell::new(process, health, snapshot),
         sqlite_runtime,
         artifact_store,
         orphan_report,
+        runtime_instance_id: runtime.runtime_instance_id,
+        shutdown,
+        fatal_receiver,
     })
 }
 
@@ -159,12 +237,14 @@ fn bootstrap_observation(
 ///
 /// This guard keeps the database pool and process lock alive without making the application layer
 /// depend on an outward adapter. Its application remains live but deliberately unready.
-#[derive(Debug)]
 pub struct RunningBootstrap {
     application: ApplicationShell,
     sqlite_runtime: SqliteRuntimeGuard,
     artifact_store: LocalArtifactStore,
     orphan_report: ArtifactOrphanReport,
+    runtime_instance_id: RuntimeInstanceId,
+    shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
+    fatal_receiver: tokio::sync::watch::Receiver<bool>,
 }
 
 impl RunningBootstrap {
@@ -188,8 +268,47 @@ impl RunningBootstrap {
         &self.orphan_report
     }
 
-    pub async fn shutdown(self) {
+    #[must_use]
+    pub const fn runtime_instance_id(&self) -> RuntimeInstanceId {
+        self.runtime_instance_id
+    }
+
+    pub async fn wait_for_shutdown_request(&mut self) -> Result<(), StartupError> {
+        #[cfg(unix)]
+        {
+            let mut terminate =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .map_err(|_| StartupError::RuntimeLifecycle)?;
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result.map_err(|_| StartupError::RuntimeLifecycle),
+                _ = terminate.recv() => Ok(()),
+                result = self.fatal_receiver.changed() => {
+                    result.map_err(|_| StartupError::RuntimeLifecycle)
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                result = tokio::signal::ctrl_c() => result.map_err(|_| StartupError::RuntimeLifecycle),
+                result = self.fatal_receiver.changed() => {
+                    result.map_err(|_| StartupError::RuntimeLifecycle)
+                }
+            }
+        }
+    }
+
+    pub async fn shutdown(self) -> Result<(), StartupError> {
+        self.shutdown
+            .request()
+            .await
+            .map_err(StartupError::from_runtime)?;
+        self.shutdown
+            .finish()
+            .await
+            .map_err(StartupError::from_runtime)?;
         self.sqlite_runtime.shutdown().await;
+        Ok(())
     }
 }
 
@@ -229,6 +348,7 @@ pub enum StartupError {
     IncompatibleSchema,
     StateRootAlreadyOwned,
     DatabaseIntegrity,
+    RuntimeLifecycle,
     Telemetry(TelemetryError),
     #[cfg(all(feature = "test-failpoints", unix))]
     TestControl,
@@ -276,6 +396,10 @@ impl StartupError {
         }
     }
 
+    const fn from_runtime(_error: RuntimeControlError) -> Self {
+        Self::RuntimeLifecycle
+    }
+
     pub const fn code(self) -> &'static str {
         match self {
             Self::Cli => "invalid_cli",
@@ -286,6 +410,7 @@ impl StartupError {
             Self::IncompatibleSchema => "incompatible_database_schema",
             Self::StateRootAlreadyOwned => "state_root_already_owned",
             Self::DatabaseIntegrity => "database_integrity_failure",
+            Self::RuntimeLifecycle => "runtime_lifecycle_failure",
             Self::Telemetry(TelemetryError::GlobalSubscriberConflict) => {
                 "telemetry_subscriber_conflict"
             }

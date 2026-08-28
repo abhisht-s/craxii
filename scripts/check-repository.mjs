@@ -238,7 +238,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage9Boundaries() {
+function verifyStage10Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -274,7 +274,7 @@ function verifyStage9Boundaries() {
       '0002_journal_and_work_inputs.sql',
       '0003_context_model_tool_artifacts.sql',
     ]),
-    `Stage 9 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
+    `Stage 10 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
   );
   const migration1 = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
   const migration2 = readFileSync(join(migrationRoot, migrationFiles[1]), 'utf8');
@@ -417,7 +417,7 @@ function verifyStage9Boundaries() {
     .sort();
   assert(
     equalStringArrays(actualIndexes, expectedIndexes),
-    `Stage 9 named index inventory differs: ${actualIndexes.join(', ')}`,
+    `Stage 10 named index inventory differs: ${actualIndexes.join(', ')}`,
   );
   assert(
     !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migrations),
@@ -613,8 +613,8 @@ function verifyStage9Boundaries() {
     'Stage 8 persistence port requested_cwd must be concrete and nonoptional',
   );
   assert(
-    !/impl\s+(?:SchedulerStateStore|RecoveryStateStore|CompletionStateStore)\s+for\s+SqliteStateStore/.test(productionSqliteSource),
-    'Stage 10 and 17 StateStore behavior must remain unimplemented',
+    !/impl\s+CompletionStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 17 completion behavior must remain unimplemented',
   );
   const canonicalPersistence = [stateStore, artifactPort, journalDomain].join('\n');
   assert(
@@ -656,6 +656,110 @@ function verifyStage9Boundaries() {
   assert(
     !/after_message_transaction_commit|after_cancel_requested_commit/.test(stage9Transactions),
     'Stage 10-owned named post-commit failpoints must have no Stage 9 callsite',
+  );
+
+  const stage10Transactions = readFileSync(join(sqliteRoot, 'stage10.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  assert(
+    /impl\s+SchedulerStateStore\s+for\s+SqliteStateStore/.test(stage10Transactions) &&
+      /impl\s+RuntimeStateStore\s+for\s+SqliteStateStore/.test(stage10Transactions) &&
+      /impl\s+RecoveryStateStore\s+for\s+SqliteStateStore/.test(stage10Transactions),
+    'Stage 10 scheduler, runtime, and recovery persistence implementations must all be present',
+  );
+  assert(
+    /BEGIN IMMEDIATE/.test(readFileSync(join(sqliteRoot, 'transaction.rs'), 'utf8')) &&
+      /ix_work_items_queued_fifo/.test(sqliteSource) &&
+      /conversation_work_ordinal ASC, w\.work_id ASC/.test(stage10Transactions),
+    'Stage 10 FIFO claim must retain BEGIN IMMEDIATE coordination and the frozen queued index/order',
+  );
+  assert(
+    /ix_work_items_nonterminal_by_runtime/.test(stage10Transactions) &&
+      /ix_model_invocations_runtime_nonterminal/.test(migrations) &&
+      /ix_tool_executions_runtime_nonterminal/.test(migrations),
+    'Stage 10 recovery must retain all three frozen runtime-recovery indexes',
+  );
+  assert(
+    !/tokio::process|std::process::Command|Command::new|reqwest|anthropic|openai/i.test(stage10Transactions),
+    'Stage 10 recovery transactions must not execute tools or call providers',
+  );
+
+  const runtimeDomain = readFileSync(join(rustRoot, 'domain', 'runtime.rs'), 'utf8');
+  assert(
+    /pub enum RuntimeState[\s\S]*Running[\s\S]*Stopping[\s\S]*Stopped/.test(runtimeDomain) &&
+      /GracefulShutdown/.test(runtimeDomain) && /StartupFailure/.test(runtimeDomain),
+    'the exact Stage 10 RuntimeInstance lifecycle is absent',
+  );
+  assert(
+    /pub struct RuntimeStartedV1/.test(journalDomain) &&
+      /pub struct RuntimeRecoveryPerformedV1/.test(journalDomain) &&
+      /pub struct RuntimeStoppingV1/.test(journalDomain) &&
+      !/pub struct RuntimeEventV1/.test(journalDomain),
+    'runtime events must use three event-specific strict V1 DTOs',
+  );
+
+  const scheduler = readFileSync(join(rustRoot, 'application', 'scheduler.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  const runtimeController = readFileSync(join(rustRoot, 'application', 'runtime.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  assert(
+    /pub trait WorkRunner/.test(scheduler) && /JoinSet/.test(scheduler) &&
+      /TaskRegistryView/.test(scheduler) && /Duration::from_secs\(1\)/.test(scheduler),
+    'Stage 10 must own a narrow WorkRunner, joined registry, and one-second fallback scan',
+  );
+  assert(
+    /HEARTBEAT_CADENCE:\s*Duration\s*=\s*Duration::from_secs\(5\)/.test(runtimeController) &&
+      /ShutdownController/.test(runtimeController) && /classify_unresolved_shutdown_work/.test(runtimeController),
+    'Stage 10 heartbeat and conservative graceful-shutdown controller are incomplete',
+  );
+  assert(
+    !/start_scheduler\s*\(/.test(readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8')) &&
+      !/mark_ready\s*\(/.test(readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8')),
+    'production Stage 10 bootstrap must remain live_unready until a real Stage 17 WorkRunner exists',
+  );
+
+  const commandService = readFileSync(join(rustRoot, 'application', 'command_service.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  const failpoints = readFileSync(join(rustRoot, 'test_failpoints.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  for (const variant of [
+    'AfterMessageTransactionCommit',
+    'AfterWorkClaimCommit',
+    'AfterCancelRequestedCommit',
+    'DuringGracefulShutdown',
+  ]) {
+    assert(
+      new RegExp(`active_spec\\(\\s*FailpointName::${variant}`).test(failpoints),
+      `Stage 10 failpoint ${variant} is not active`,
+    );
+  }
+  assert(
+    (commandService.match(/PhysicalHook::AfterMessageTransactionCommit/g) ?? []).length === 1 &&
+      (commandService.match(/PhysicalHook::AfterCancelRequestedCommit/g) ?? []).length === 1 &&
+      (scheduler.match(/PhysicalHook::AfterWorkClaimCommit/g) ?? []).length === 1 &&
+      (runtimeController.match(/PhysicalHook::DuringGracefulShutdown/g) ?? []).length === 1,
+    'the four Stage 10 failpoints must each have exactly one production callsite',
+  );
+  assert(
+    /pub const ALL: \[Self; 14\]/.test(failpoints),
+    'Stage 10 must not add a new public failpoint name',
+  );
+
+  const productionRust = rustFiles
+    .filter((path) => !/_tests\.rs$/.test(path))
+    .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
+    .join('\n');
+  assert(
+    !/\b(?:axum|tower|WebSocket|Router::new|route\s*\()\b/.test(productionRust),
+    'Stage 11 HTTP/WebSocket implementation is forbidden in Stage 10',
+  );
+  assert(
+    !/tokio::process|std::process::Command|Command::new|(?:struct|trait)\s+(?:ToolRegistry|AgentLoop|ContextAssembler)\b/.test(productionRust),
+    'Stage 13/14/17 execution implementation is forbidden in Stage 10',
+  );
+
+  assert(
+    /^tokio\s*=\s*\{[^\n]*features\s*=\s*\[[^\]]*"signal"[^\]]*\][^\n]*\}$/m.test(cargoManifest),
+    'Tokio signal must be the only Stage 10 direct-dependency feature activation',
   );
 
   const trackedAdminResidue = trackedFiles().filter((path) =>
@@ -729,10 +833,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage9 = verifyStage9Boundaries();
+  const stage10 = verifyStage10Boundaries();
 
   console.log(
-    `Repository invariants passed through Stage 9: 1 workspace member/package, craxii-server lib/admin binaries, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies including getrandom 0.4.3, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage9.rustFileCount} Rust files, ${stage9.migrationFileCount} exact migrations, ${stage9.tableCount} product tables, ${stage9.indexCount} named indexes, 28 journal events, device authentication and insert-only idempotent commands, local content-addressed artifact storage, 0 triggers/views, 0 tracked SQLite artifacts`,
+    `Repository invariants passed through Stage 10: 1 workspace member/package, craxii-server lib/admin binaries, production live_unready without a real WorkRunner, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage10.rustFileCount} Rust files, ${stage10.migrationFileCount} exact migrations, ${stage10.tableCount} product tables, ${stage10.indexCount} named indexes, 28 journal events, durable FIFO scheduler/runtime/recovery/shutdown contracts, 4 active Stage 10 failpoints, 0 triggers/views, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

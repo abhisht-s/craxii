@@ -94,20 +94,26 @@ async fn fixture() -> Fixture {
     let runtime_id = RuntimeInstanceId::generate();
     let work_id = WorkId::generate();
     let correlation_id = CorrelationId::generate();
+    store
+        .create_runtime_and_started_event(CreateRuntimeRequest {
+            evidence: RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+                runtime_instance_id: runtime_id,
+                craxii_id: bootstrap.identity.craxii_id,
+                workstation_id: bootstrap.identity.workstation_id,
+                workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
+                linux_boot_id: Some(LinuxBootId::try_new("stage8-test-boot").unwrap()),
+                diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
+                package_version: PackageVersion::try_new("0.0.1").unwrap(),
+                git_revision: GitRevision::try_new("stage8-test").unwrap(),
+                schema_version: SchemaVersion::try_new(3).unwrap(),
+                started_at: T0.parse().unwrap(),
+            }),
+            event_id: JournalEventId::generate(),
+            correlation_id: CorrelationId::generate(),
+        })
+        .await
+        .unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    sqlx::query(
-        "INSERT INTO runtime_instances (runtime_instance_id, craxii_id, workstation_id, \
-         workstation_generation, linux_boot_id, process_id, binary_version, git_revision, \
-         schema_version, state, started_at, last_heartbeat_at, stopped_at, stop_reason) \
-         VALUES (?, ?, ?, 1, 'stage8-test-boot', 42, '0.0.1', 'stage8-test', 3, 'running', ?, NULL, NULL, NULL)",
-    )
-    .bind(runtime_id.to_string())
-    .bind(bootstrap.identity.craxii_id.to_string())
-    .bind(bootstrap.identity.workstation_id.to_string())
-    .bind(T0)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
     sqlx::query(
         "INSERT INTO work_items (work_id, craxii_id, conversation_id, \
          conversation_work_ordinal, kind, state, state_version, priority, workspace_id, \
@@ -512,6 +518,14 @@ struct BegunModel {
 }
 
 async fn begin_and_stream_model(fixture: &Fixture) -> BegunModel {
+    begin_model(fixture, true).await
+}
+
+async fn begin_requesting_model(fixture: &Fixture) -> BegunModel {
+    begin_model(fixture, false).await
+}
+
+async fn begin_model(fixture: &Fixture, stream: bool) -> BegunModel {
     let invocation_id = ModelInvocationId::generate();
     let logical_id = LogicalInvocationId::generate();
     let manifest_id = ContextManifestId::generate();
@@ -633,36 +647,41 @@ async fn begin_and_stream_model(fixture: &Fixture) -> BegunModel {
         .await
         .unwrap();
 
-    let streaming_event_id = JournalEventId::generate();
-    fixture
-        .store
-        .mark_model_streaming(MarkModelStreamingRequest {
-            expected_work: WorkExpectation {
-                work_id: fixture.work_id,
-                state: WorkState::WaitingOnModel,
-                version: ProjectionVersion::try_new(3).unwrap(),
-                runtime_owner: Some(fixture.runtime_id),
-                current_attempt: CurrentWorkAttempt::Model(invocation_id),
-            },
-            expected_model: ModelExpectation {
-                model_invocation_id: invocation_id,
-                state: ModelInvocationState::Requesting,
-            },
-            observation: ModelStreamingObservation {
-                first_byte_at: T2.parse().unwrap(),
-                first_output_at: Some(T2.parse().unwrap()),
-                provider_request_id: Some("request-1".to_owned()),
-                provider_response_id: None,
-                draft_exposed: false,
-            },
-            event: EventIntent {
-                event_id: streaming_event_id,
-                correlation_id: fixture.correlation_id,
-                causation_event_id: Some(started_event),
-            },
-        })
-        .await
-        .unwrap();
+    let streaming_event_id = if stream {
+        let streaming_event_id = JournalEventId::generate();
+        fixture
+            .store
+            .mark_model_streaming(MarkModelStreamingRequest {
+                expected_work: WorkExpectation {
+                    work_id: fixture.work_id,
+                    state: WorkState::WaitingOnModel,
+                    version: ProjectionVersion::try_new(3).unwrap(),
+                    runtime_owner: Some(fixture.runtime_id),
+                    current_attempt: CurrentWorkAttempt::Model(invocation_id),
+                },
+                expected_model: ModelExpectation {
+                    model_invocation_id: invocation_id,
+                    state: ModelInvocationState::Requesting,
+                },
+                observation: ModelStreamingObservation {
+                    first_byte_at: T2.parse().unwrap(),
+                    first_output_at: Some(T2.parse().unwrap()),
+                    provider_request_id: Some("request-1".to_owned()),
+                    provider_response_id: None,
+                    draft_exposed: false,
+                },
+                event: EventIntent {
+                    event_id: streaming_event_id,
+                    correlation_id: fixture.correlation_id,
+                    causation_event_id: Some(started_event),
+                },
+            })
+            .await
+            .unwrap();
+        streaming_event_id
+    } else {
+        started_event
+    };
     BegunModel {
         invocation_id,
         logical_id,
@@ -2864,4 +2883,411 @@ async fn natural_stage8_queries_use_the_frozen_named_indexes() {
     }
     drop(connection);
     guard.shutdown().await;
+}
+
+async fn create_stage10_recovery_runtime(fixture: &Fixture) -> RuntimeInstanceId {
+    create_stage10_recovery_runtime_with_evidence(fixture)
+        .await
+        .0
+}
+
+async fn create_stage10_recovery_runtime_with_evidence(
+    fixture: &Fixture,
+) -> (RuntimeInstanceId, JournalEventId, CorrelationId) {
+    let runtime_id = RuntimeInstanceId::generate();
+    let started_event_id = JournalEventId::generate();
+    let correlation_id = CorrelationId::generate();
+    fixture
+        .store
+        .create_runtime_and_started_event(CreateRuntimeRequest {
+            evidence: RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+                runtime_instance_id: runtime_id,
+                craxii_id: fixture.identity.craxii_id,
+                workstation_id: fixture.identity.workstation_id,
+                workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
+                linux_boot_id: Some(LinuxBootId::try_new("stage10-recovery-test-boot").unwrap()),
+                diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
+                package_version: PackageVersion::try_new("0.0.1").unwrap(),
+                git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
+                schema_version: SchemaVersion::try_new(3).unwrap(),
+                started_at: T5.parse().unwrap(),
+            }),
+            event_id: started_event_id,
+            correlation_id,
+        })
+        .await
+        .unwrap();
+    (runtime_id, started_event_id, correlation_id)
+}
+
+async fn append_stage10_recovery_summary(
+    fixture: &Fixture,
+    runtime_id: RuntimeInstanceId,
+    started_event_id: JournalEventId,
+    correlation_id: CorrelationId,
+    recovery: RecoveryReceipt,
+) {
+    fixture
+        .store
+        .append_recovery_summary(AppendRecoverySummaryRequest {
+            summary: RuntimeRecoveryPerformedV1 {
+                runtime_instance_id: runtime_id,
+                stale_runtimes_observed: 1,
+                stale_runtimes_closed: u64::from(recovery.stale_runtime_closed),
+                retained_queued_work: fixture.store.count_retained_queued_work().await.unwrap(),
+                interrupted_work: recovery.interrupted_work,
+                model_attempts_provider_outcome_unknown: recovery
+                    .model_attempts_provider_outcome_unknown,
+                model_attempts_terminal_preserved: recovery.model_attempts_terminal_preserved,
+                tool_attempts_interrupted_before_dispatch: recovery
+                    .tool_attempts_interrupted_before_dispatch,
+                tool_attempts_outcome_unknown: recovery.tool_attempts_outcome_unknown,
+                tool_attempts_terminal_preserved: recovery.tool_attempts_terminal_preserved,
+                drafts_abandoned: recovery.drafts_abandoned,
+                orphan_artifacts_observed: 0,
+                cleanup_checks_performed: recovery.cleanup_checks_performed,
+                cleanup_unconfirmed: recovery.cleanup_unconfirmed,
+                recovery_duration_ms: 0,
+                binary_version: PackageVersion::try_new("0.0.1").unwrap(),
+                schema_version: SchemaVersion::try_new(3).unwrap(),
+                recovered_at: T5.parse().unwrap(),
+            },
+            event_id: JournalEventId::generate(),
+            started_event_id,
+            correlation_id,
+        })
+        .await
+        .unwrap();
+}
+
+async fn corrupt_and_rehash_recovery_counter(fixture: &Fixture, field: &str) {
+    let mut connection = fixture.store.runtime.acquire().await.unwrap();
+    let payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM journal_events WHERE event_type = 'runtime.recovery_performed' \
+         ORDER BY journal_offset DESC LIMIT 1",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    value[field] = (value[field].as_u64().unwrap() + 1).into();
+    let reencoded = serde_json::to_string(&value).unwrap();
+    let digest = Sha256Digest::hash_bytes(reencoded.as_bytes());
+    sqlx::query(
+        "UPDATE journal_events SET payload_json = ?, payload_sha256 = ? \
+         WHERE event_type = 'runtime.recovery_performed' AND journal_offset = \
+         (SELECT MAX(journal_offset) FROM journal_events \
+          WHERE event_type = 'runtime.recovery_performed')",
+    )
+    .bind(reencoded)
+    .bind(digest.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+}
+
+async fn request_shutdown_cancellation(fixture: &Fixture) {
+    fixture
+        .store
+        .request_owned_work_cancellation(RequestOwnedCancellationRequest {
+            runtime_id: fixture.runtime_id,
+            requested_at: T4.parse().unwrap(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn recover_fixture(
+    fixture: &Fixture,
+    current_runtime_id: RuntimeInstanceId,
+) -> RecoveryReceipt {
+    fixture
+        .store
+        .recover_stale_runtime_ownership(RecoverStaleRuntimeRequest {
+            stale_runtime_id: fixture.runtime_id,
+            current_runtime_id,
+            recovered_at: T5.parse().unwrap(),
+        })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn stage10_model_requesting_streaming_and_cancel_requested_recovery_is_conservative() {
+    for (streaming, cancellation_requested, draft_exposed) in [
+        (false, false, false),
+        (true, false, true),
+        (true, true, false),
+    ] {
+        let fixture = fixture().await;
+        make_fixture_journal_consistent(&fixture).await;
+        let model = if streaming {
+            begin_and_stream_model(&fixture).await
+        } else {
+            begin_requesting_model(&fixture).await
+        };
+        if draft_exposed {
+            let mut connection = fixture.store.runtime.acquire().await.unwrap();
+            sqlx::query(
+                "UPDATE model_invocations SET draft_exposed = 1 WHERE model_invocation_id = ?",
+            )
+            .bind(model.invocation_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        }
+        if cancellation_requested {
+            request_shutdown_cancellation(&fixture).await;
+            fixture
+                .store
+                .verify_application_consistency()
+                .await
+                .unwrap();
+        }
+        let current_runtime = create_stage10_recovery_runtime(&fixture).await;
+        let recovery = recover_fixture(&fixture, current_runtime).await;
+        assert_eq!(recovery.interrupted_work, 1);
+        assert_eq!(recovery.model_attempts_provider_outcome_unknown, 1);
+        assert_eq!(recovery.drafts_abandoned, u64::from(draft_exposed));
+        assert_eq!(recovery.tool_attempts_outcome_unknown, 0);
+
+        let mut connection = fixture.store.runtime.acquire().await.unwrap();
+        let attempt: (String, String) = sqlx::query_as(
+            "SELECT state, completed_at FROM model_invocations WHERE model_invocation_id = ?",
+        )
+        .bind(model.invocation_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(attempt, ("provider_outcome_unknown".into(), T5.into()));
+        let work: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, runtime_instance_id, current_model_invocation_id \
+             FROM work_items WHERE work_id = ?",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(work, ("interrupted".into(), None, None));
+        let terminal_events: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM journal_events WHERE work_id = ? AND event_type IN \
+             ('model.invocation_interrupted','work.interrupted') ORDER BY journal_offset",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            terminal_events,
+            vec!["model.invocation_interrupted", "work.interrupted"]
+        );
+        drop(connection);
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .unwrap();
+        fixture.guard.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn stage10_tool_requested_dispatching_and_cancel_requested_recovery_is_conservative() {
+    for (dispatching, cancellation_requested) in [(false, false), (true, false), (true, true)] {
+        let fixture = fixture().await;
+        make_fixture_journal_consistent(&fixture).await;
+        let model = begin_and_stream_model(&fixture).await;
+        complete_model(&fixture, &model).await;
+        let (tool_id, requested_event, waiting) = request_tool(&fixture, &model, 1, 4).await;
+        if dispatching {
+            dispatch_tool(&fixture, tool_id, requested_event, waiting).await;
+        }
+        if cancellation_requested {
+            request_shutdown_cancellation(&fixture).await;
+            fixture
+                .store
+                .verify_application_consistency()
+                .await
+                .unwrap();
+        }
+        let current_runtime = create_stage10_recovery_runtime(&fixture).await;
+        let recovery = recover_fixture(&fixture, current_runtime).await;
+        assert_eq!(recovery.interrupted_work, 1);
+        assert_eq!(
+            recovery.tool_attempts_interrupted_before_dispatch,
+            u64::from(!dispatching)
+        );
+        assert_eq!(
+            recovery.tool_attempts_outcome_unknown,
+            u64::from(dispatching)
+        );
+        assert_eq!(recovery.cleanup_checks_performed, u64::from(dispatching));
+        assert_eq!(recovery.cleanup_unconfirmed, u64::from(dispatching));
+
+        let expected_state = if dispatching {
+            "outcome_unknown"
+        } else {
+            "interrupted_before_dispatch"
+        };
+        let expected_event = if dispatching {
+            "tool.execution_outcome_unknown"
+        } else {
+            "tool.execution_interrupted_before_dispatch"
+        };
+        let mut connection = fixture.store.runtime.acquire().await.unwrap();
+        let attempt: (String, Option<i64>) = sqlx::query_as(
+            "SELECT state, cleanup_confirmed FROM tool_executions WHERE tool_execution_id = ?",
+        )
+        .bind(tool_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(attempt.0, expected_state);
+        if dispatching {
+            assert_eq!(attempt.1, Some(0));
+        }
+        let terminal_events: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM journal_events WHERE work_id = ? AND event_type IN \
+             ('tool.execution_interrupted_before_dispatch','tool.execution_outcome_unknown',\
+              'work.interrupted') ORDER BY journal_offset",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(terminal_events, vec![expected_event, "work.interrupted"]);
+        drop(connection);
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .unwrap();
+        fixture.guard.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn stage10_completed_attempt_evidence_is_preserved_and_stale_work_is_not_resumed() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let current_runtime = create_stage10_recovery_runtime(&fixture).await;
+    let recovery = recover_fixture(&fixture, current_runtime).await;
+    assert_eq!(recovery.interrupted_work, 1);
+    assert_eq!(recovery.model_attempts_provider_outcome_unknown, 0);
+    let mut connection = fixture.store.runtime.acquire().await.unwrap();
+    let model_state: String =
+        sqlx::query_scalar("SELECT state FROM model_invocations WHERE model_invocation_id = ?")
+            .bind(model.invocation_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(model_state, "completed");
+    let work_state: String = sqlx::query_scalar("SELECT state FROM work_items WHERE work_id = ?")
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(work_state, "interrupted");
+    let resumed_after_recovery: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal_events WHERE work_id = ? AND event_type = 'work.resumed' \
+         AND recorded_at = ?",
+    )
+    .bind(fixture.work_id.to_string())
+    .bind(T5)
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(resumed_after_recovery, 0);
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_summary_interrupted_and_model_counter_corruption_fail_closed() {
+    for field in [
+        "interrupted_work",
+        "model_attempts_provider_outcome_unknown",
+    ] {
+        let fixture = fixture().await;
+        make_fixture_journal_consistent(&fixture).await;
+        begin_and_stream_model(&fixture).await;
+        let (current_runtime, started_event_id, correlation_id) =
+            create_stage10_recovery_runtime_with_evidence(&fixture).await;
+        let recovery = recover_fixture(&fixture, current_runtime).await;
+        append_stage10_recovery_summary(
+            &fixture,
+            current_runtime,
+            started_event_id,
+            correlation_id,
+            recovery,
+        )
+        .await;
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .unwrap();
+
+        corrupt_and_rehash_recovery_counter(&fixture, field).await;
+        assert!(
+            fixture
+                .store
+                .verify_application_consistency()
+                .await
+                .is_err(),
+            "corrupted exact recovery counter was accepted: {field}"
+        );
+        fixture.guard.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn recovery_summary_tool_counter_corruption_fails_closed() {
+    for (dispatching, field) in [
+        (false, "tool_attempts_interrupted_before_dispatch"),
+        (true, "tool_attempts_outcome_unknown"),
+    ] {
+        let fixture = fixture().await;
+        make_fixture_journal_consistent(&fixture).await;
+        let model = begin_and_stream_model(&fixture).await;
+        complete_model(&fixture, &model).await;
+        let (tool_id, requested_event, waiting) = request_tool(&fixture, &model, 1, 4).await;
+        if dispatching {
+            dispatch_tool(&fixture, tool_id, requested_event, waiting).await;
+        }
+        let (current_runtime, started_event_id, correlation_id) =
+            create_stage10_recovery_runtime_with_evidence(&fixture).await;
+        let recovery = recover_fixture(&fixture, current_runtime).await;
+        append_stage10_recovery_summary(
+            &fixture,
+            current_runtime,
+            started_event_id,
+            correlation_id,
+            recovery,
+        )
+        .await;
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .unwrap();
+
+        corrupt_and_rehash_recovery_counter(&fixture, field).await;
+        assert!(
+            fixture
+                .store
+                .verify_application_consistency()
+                .await
+                .is_err(),
+            "corrupted exact recovery counter was accepted: {field}"
+        );
+        fixture.guard.shutdown().await;
+    }
 }

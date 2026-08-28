@@ -573,12 +573,12 @@ const SHUTDOWN: [PhysicalBoundarySpec; 1] = [PhysicalBoundarySpec {
 }];
 
 pub static REGISTRY: [FailpointSpec; 14] = [
-    spec(
+    active_spec(
         FailpointName::AfterMessageTransactionCommit,
         &MESSAGE,
-        OwningStage::Stage9,
+        OwningStage::Stage10,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterWorkClaimCommit,
         &WORK_CLAIM,
         OwningStage::Stage10,
@@ -633,12 +633,12 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &FINAL_ANSWER,
         OwningStage::Stage17,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterCancelRequestedCommit,
         &CANCELLATION,
         OwningStage::Stage10,
     ),
-    spec(
+    active_spec(
         FailpointName::DuringGracefulShutdown,
         &SHUTDOWN,
         OwningStage::Stage10,
@@ -655,6 +655,19 @@ const fn spec(
         physical_boundaries,
         owning_stage,
         status: HookStatus::Reserved,
+    }
+}
+
+const fn active_spec(
+    architecture_name: FailpointName,
+    physical_boundaries: &'static [PhysicalBoundarySpec],
+    owning_stage: OwningStage,
+) -> FailpointSpec {
+    FailpointSpec {
+        architecture_name,
+        physical_boundaries,
+        owning_stage,
+        status: HookStatus::Active,
     }
 }
 
@@ -806,12 +819,25 @@ fn parse_activation_record(input: &[u8]) -> Result<ActivationRecord, ControlErro
             ResolutionError::AmbiguousAlias => ControlError::AmbiguousAlias,
             ResolutionError::IncompatiblePhysicalHook => ControlError::IncompatiblePhysicalHook,
         })?;
-    let _selection = ControlSelection {
+    let selection = ControlSelection {
         architecture_name: Some(architecture_name),
         physical_hook: resolved.physical_hook,
         boundary: resolved.boundary,
     };
-    Err(ControlError::ReservedArchitectureFailpoint)
+    let status = REGISTRY
+        .iter()
+        .find(|candidate| candidate.architecture_name == architecture_name)
+        .map(|candidate| candidate.status)
+        .ok_or(ControlError::UnknownArchitectureName)?;
+    if status == HookStatus::Reserved {
+        Err(ControlError::ReservedArchitectureFailpoint)
+    } else {
+        Ok(ActivationRecord {
+            run_id: run_id.to_owned(),
+            selection,
+            startup_ready: false,
+        })
+    }
 }
 
 fn exact_field<'a>(field: &'a str, prefix: &str) -> Result<&'a str, ControlError> {
@@ -950,6 +976,13 @@ pub fn reach(hook: PhysicalHook) {
     if let Some(activation) = PROCESS_ACTIVATION.0.get() {
         activation.reach(hook);
     }
+    if std::env::var("CRAXII_TEST_ABORT_AT_FAILPOINT")
+        .ok()
+        .as_deref()
+        == Some(hook.as_str())
+    {
+        std::process::abort();
+    }
 }
 
 fn write_marker(writer: &mut impl Write, record: &ActivationRecord) -> io::Result<()> {
@@ -998,7 +1031,12 @@ pub fn run_controlled_startup() -> Result<(), ControlError> {
     record.startup_ready = health.snapshot().is_ready();
     let marker = duplicate_marker_file(MARKER_FILE_DESCRIPTOR)?;
     PROCESS_ACTIVATION.initialize(record.clone(), marker)?;
-    run_foundation_probe(&record.run_id)
+    if record.selection.architecture_name.is_some() {
+        reach(record.selection.physical_hook);
+        Err(ControlError::ProbeIo)
+    } else {
+        run_foundation_probe(&record.run_id)
+    }
 }
 
 fn run_foundation_probe(run_id: &str) -> Result<(), ControlError> {
@@ -1096,9 +1134,23 @@ mod tests {
     }
 
     #[test]
-    fn registry_metadata_is_complete_typed_and_reserved() {
+    fn registry_metadata_is_complete_typed_and_has_exact_stage10_activation() {
         for spec in REGISTRY {
-            assert_eq!(spec.status, HookStatus::Reserved);
+            let active = matches!(
+                spec.architecture_name,
+                FailpointName::AfterMessageTransactionCommit
+                    | FailpointName::AfterWorkClaimCommit
+                    | FailpointName::AfterCancelRequestedCommit
+                    | FailpointName::DuringGracefulShutdown
+            );
+            assert_eq!(
+                spec.status,
+                if active {
+                    HookStatus::Active
+                } else {
+                    HookStatus::Reserved
+                }
+            );
             assert!(!spec.physical_boundaries.is_empty());
             for physical in spec.physical_boundaries {
                 assert!(!physical.physical_hook.as_str().is_empty());
@@ -1193,13 +1245,18 @@ mod tests {
     }
 
     #[test]
-    fn reserved_selection_is_distinct_from_unknown_and_ambiguous() {
+    fn active_and_reserved_selections_are_distinct_from_unknown_and_ambiguous() {
         let direct = format!(
             "{CONTROL_PROTOCOL}\trun_id=run-unit-3\tarchitecture_name={}\tphysical_hook=none\n",
             FailpointName::AfterWorkClaimCommit.as_str()
         );
+        assert!(parse_control(direct.as_bytes()).is_ok());
+        let reserved = format!(
+            "{CONTROL_PROTOCOL}\trun_id=run-unit-3\tarchitecture_name={}\tphysical_hook=none\n",
+            FailpointName::AfterFirstProviderDelta.as_str()
+        );
         assert_eq!(
-            parse_control(direct.as_bytes()),
+            parse_control(reserved.as_bytes()),
             Err(ControlError::ReservedArchitectureFailpoint)
         );
         let ambiguous = format!(

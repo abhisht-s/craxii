@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="f15e7a96fb5f9a1dc213372393495ed5c8cbe9e088bdb9e5c639fbf84aa38725">
+  <meta name="craxii-source-sha256" content="eeca79f989c295b0f31807c8d18a2abcc89cb5196e2ff5ff222c1cbb23e20ab4">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>f15e7a96fb5f9a1d…</code></p>
+        <p>Source SHA-256:<br><code>eeca79f989c295b0…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -1265,7 +1265,11 @@ AWS-managed snapshot plane
 <li>notification/broadcast tasks are owned by application state and shut down on service termination.</li>
 <li>No task may be intentionally detached with its result ignored.</li>
 </ul>
-<p>Task failure MUST propagate to its owning subsystem. A panic in an agent-loop task must mark the runtime attempt unhealthy and be observed; it must not silently remove active work from memory while leaving its database state running.</p>
+<p>Task failure MUST propagate to its owning subsystem. A panic in an agent-loop task must mark the runtime attempt unhealthy and be observed; it must not silently remove active work from memory while leaving its database state running.
+At a graceful-shutdown deadline, the scheduler parent MUST abort its remaining runner children and
+drain every resulting join record before removing registry ownership or acknowledging scheduler
+shutdown. Aborting or dropping the scheduler parent is not a graceful child-ownership mechanism;
+unrecoverable process termination is the only catastrophic fallback.</p>
 <h3>Runtime instance identity</h3>
 <aside class="explain-card level-3" data-source-heading="Runtime instance identity">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -1286,6 +1290,20 @@ AWS-managed snapshot plane
 <li>terminal time and reason when graceful.</li>
 </ul>
 <p>PIDs are never used for durable ownership because Linux reuses them. Active work and attempts carry <code>runtime_instance_id</code>; startup recovery can therefore identify state owned by a dead process.</p>
+<p><code>RuntimeInstanceId</code> is a fresh UUIDv7 for every process start, is never reused, and is durable
+ownership identity rather than PID identity. The exact lifecycle is
+<code>new -&gt; running -&gt; stopping -&gt; stopped(graceful_shutdown)</code>. With the lifetime-exclusive process
+lock held, every earlier <code>running</code> or <code>stopping</code> runtime is stale and becomes
+<code>stopped(startup_failure)</code> only after its ownership is reconciled. Staleness MUST NOT use heartbeat
+age, PID liveness/reuse, boot ID, or lease expiry. Linux reads diagnostic boot ID from
+<code>/proc/sys/kernel/random/boot_id</code>; non-Linux persists the honest sentinel
+<code>non_linux_not_applicable</code> and MUST NOT fabricate a Linux host identity.</p>
+<p>The owned heartbeat task runs every five seconds, updates only the current <code>running</code> runtime,
+never moves <code>last_heartbeat_at</code> backwards, emits no journal event, and is stopped and joined.
+Persistent heartbeat storage failure is fatal/unready and initiates controlled shutdown rather
+than silently spinning. Fatal health is terminal presentation evidence, but it does not disable
+the shutdown-controller latch: a fatal process keeps health <code>fatal</code> while it quiesces claims,
+persists stopping/closure when storage permits, and joins owned tasks.</p>
 <h3>Readiness</h3>
 <aside class="explain-card level-3" data-source-heading="Readiness">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -1298,6 +1316,11 @@ AWS-managed snapshot plane
 <li><strong>Ready:</strong> configuration and schema are valid, database integrity checks passed, startup recovery committed, scheduler started, and the default model/tool configuration is usable.</li>
 </ul>
 <p>The TLS proxy may expose liveness without authentication but MUST return no internal detail. Readiness SHOULD be restricted to loopback or authenticated callers.</p>
+<p>Application health has exactly <code>live_unready</code>, <code>ready</code>, <code>draining</code>, and <code>fatal</code>. Stage 10
+production remains <code>live_unready</code> after recovery because no production <code>WorkRunner</code> exists. A
+scripted test composition may become ready after proving recovery, scheduler, and notification
+operation. Stage 17 supplies the first real execution-readiness prerequisite; Stage 11 only
+exposes this read-only state.</p>
 <h2>Technology decisions</h2>
 <aside class="explain-card level-2" data-source-heading="Technology decisions">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -1836,6 +1859,11 @@ for each block in order:
 <p><code>ModelAttemptReference</code> contains <code>LogicalInvocationId</code>, <code>ModelInvocationId</code>, <code>WorkId</code>, <code>RuntimeInstanceId</code>, <code>ContextManifestId</code>, <code>AgentStepNo</code>, <code>AttemptNo</code>, <code>ProviderModelReference</code>, and optional <code>retry_of: ModelInvocationId</code>. It has no state, outcome, provider request/response ID, usage, or lifecycle timestamps.</p>
 <p><code>ToolAttemptReference</code> contains <code>ToolExecutionId</code>, <code>ExecutionId</code>, <code>WorkId</code>, <code>RuntimeInstanceId</code>, source <code>ModelInvocationId</code>, <code>AgentStepNo</code>, <code>ToolOrdinal</code>, <code>ToolName</code>, <code>ToolVersion</code>, <code>SchemaVersion</code>, <code>WorkstationId</code>, <code>WorkstationGeneration</code>, <code>WorkspaceId</code>, optional requested <code>LogicalPathReference</code>, and <code>AuthorityDecisionSnapshot</code>. Provider-native tool-call ID, PID, process state, and outcome are excluded.</p>
 <p><code>RuntimeStartEvidence</code> contains <code>RuntimeInstanceId</code>, <code>CraxiiId</code>, <code>WorkstationId</code>, <code>WorkstationGeneration</code>, optional bounded Linux boot ID and diagnostic PID, bounded package version and git revision, <code>SchemaVersion</code>, and <code>started_at</code>. <code>RuntimeInstanceId</code> is canonical identity; PID/boot ID are diagnostic only. Hostname, heartbeat/state/stopped fields, persistence behavior, PID lookup, and boot-ID reads are excluded. Domain code MUST NOT import bootstrap build metadata wholesale.</p>
+<p>The persisted Stage 10 runtime start requires both diagnostic fields: Linux supplies the actual
+kernel boot ID and non-Linux supplies <code>non_linux_not_applicable</code>; PID is the positive current
+process value. Test composition may inject either observation. The narrow runtime-observation port
+contains no hostname, path, liveness decision, operating-system handle, or process identity
+semantics.</p>
 <h3>Stage 3.2 application invariants</h3>
 <p>The pure V0 topology constructor/validator accepts one <code>CraxiiPrincipal</code>, requires exactly one <code>Conversation</code>, requires its ID to equal <code>primary_conversation_id</code>, requires matching Craxii ownership, and requires exactly one matching default <code>WorkspaceIdentity</code> with the same Craxii ownership. It uses no persistence, global singleton, or startup coupling.</p>
 <p>The pure V0 conversational input constructor/validator requires exactly one <code>WorkItemInput</code>, relationship <code>trigger</code>, ordinal one, and matching <code>WorkId</code>. It rejects every reserved relationship and does not yet verify journal-event semantic type.</p>
@@ -2149,7 +2177,9 @@ payloads.</p>
   <p><strong>Plain-English significance:</strong> Durable queue defines a durable work-control rule rather than an in-memory scheduling convenience. Explicit queue and transition rules preserve causal order and make restart reconstruction deterministic.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A deli takes numbered tickets. A new request is printed immediately, waits behind the active ticket, and moves only through allowed board columns such as queued, preparing, and complete.</p>
 </aside>
-<p>SQLite is the queue. Tokio notifications only wake the scheduler and may be lost without losing work.</p>
+<p>SQLite is the queue. Tokio notifications only wake the scheduler and may be lost without losing
+work. Stage 10 performs an initial scan and a one-second fallback scan; a notification implementation
+may be a no-op without affecting correctness.</p>
 <p>For each conversation, eligible work is ordered by:</p>
 <ol>
 <li><code>conversation_work_ordinal</code> ascending;</li>
@@ -2188,6 +2218,29 @@ payloads.</p>
 <li>Spawns the owned agent-loop task in the scheduler&#39;s task collection.</li>
 </ol>
 <p>If the guarded update affects zero rows, another claim or cancellation won; the scheduler reloads state. It never assumes an in-memory queue entry is still valid.</p>
+<p>The claim is one <code>WriteCoordinator</code> plus <code>BEGIN IMMEDIATE</code> transaction. It reloads and validates
+the candidate state, version, owner, and exclusive current-attempt link; increments the Work state
+version exactly once; and appends <code>work.started</code> caused by the immediately prior Work-stream event
+with the current runtime actor/envelope. Only after commit may the
+<code>after_work_claim_commit</code> failpoint run and the runner be registered/spawned. Claim and cancellation
+therefore have deterministic first-committer outcomes: cancellation-first leaves no claimable row;
+claim-first makes the subsequent active cancellation <code>cancel_requested</code>.</p>
+<p>The scheduler owns its loop and every runner in a joined task collection. A registry keyed by
+<code>WorkId</code> holds only runtime ownership, cancellation observation, and join association; it is never
+recovery truth. Every task completion, start failure, panic, cancellation, and shutdown exit is
+observed before removal. A committed claim whose runner cannot start, or whose runner exits
+abnormally while Work remains active, becomes <code>interrupted</code> and is never requeued. Persistent
+storage/invariant failure sets health <code>fatal</code>, stops claims, and requests controlled shutdown.</p>
+<p>Claim admission closes through an explicit asynchronous quiescence barrier. Closing the latch
+wakes the scheduler and prevents any later <code>claim_next_work</code> call; shutdown then waits for an
+already-entered claim section to finish. That section begins before the candidate claim attempt and
+ends only after no claim committed, or after a committed claim crossed
+<code>after_work_claim_commit</code> and obtained runner-registry ownership or durable start-failure
+classification. Only the barrier acknowledgment permits <code>runtime.stopping</code> to commit.</p>
+<p><code>WorkRunner</code> is a narrow application boundary. Stage 10 production has no implementation and MUST
+NOT pretend to run an agent loop; permanent tests may install scripted runners. Scheduler hints for
+new messages and active cancellation are lossy. A fallback database scan discovers both queued and
+current-runtime <code>cancel_requested</code> Work, and durable state always wins.</p>
 <h3>A second message during active work</h3>
 <aside class="explain-card level-3" data-source-heading="A second message during active work">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -2213,15 +2266,28 @@ payloads.</p>
 </aside>
 <p>On graceful service shutdown, the scheduler:</p>
 <ol>
-<li>Stops claiming new queued work.</li>
+<li>Closes claim admission and acknowledges that any in-flight claim section is quiescent.</li>
 <li>Marks readiness false.</li>
 <li>Requests cancellation of owned agent-loop tasks.</li>
 <li>Allows a bounded grace period for provider requests and tool children to stop.</li>
 <li>Commits <code>cancelled</code> only where cleanup is confirmed.</li>
 <li>Commits <code>interrupted</code> for active work that cannot finish or confirm cleanup before shutdown.</li>
-<li>Joins owned tasks before process exit when possible.</li>
+<li>At the deadline, freezes join reconciliation, waits for conservative durable classification,
+aborts remaining children itself, and drains every expected cancelled, panic, or normal join
+result before clearing the registry.</li>
 </ol>
 <p>On <code>SIGKILL</code>, startup recovery performs the classification instead.</p>
+<p>The application shutdown latch is idempotent. Its first request fixes both a monotonic waiting
+deadline and a persistable wall-clock deadline derived from the existing
+<code>shutdown.grace_period_ms</code>; later requests do not extend it or append another stopping event. The
+exact order is latch; mark nonfatal health <code>draining</code> while preserving already-fatal health;
+close claim admission and await quiescence; commit runtime <code>running -&gt; stopping</code> plus
+<code>runtime.stopping</code>; run <code>during_graceful_shutdown</code>; stop heartbeat; request/reconcile owned Work
+cancellation; notify runners; and join until the original deadline. At the deadline the scheduler
+acknowledges a frozen reconciliation boundary, unresolved attempts/Work are durably classified,
+and only then does the scheduler parent abort and drain its remaining child joins. Residual durable
+classification precedes <code>stopped(graceful_shutdown)</code>. No cleanup is claimed without proof.
+SIGINT/SIGTERM wiring remains at composition; no signal type crosses domain or ports.</p>
 <h2>Cancellation semantics</h2>
 <aside class="explain-card level-2" data-source-heading="Cancellation semantics">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -2317,14 +2383,23 @@ payloads.</p>
 <li>Acquire the single-instance startup lock.</li>
 <li>Validate schema compatibility and apply approved migrations.</li>
 <li>Run <code>PRAGMA quick_check</code> and required application invariants.</li>
-<li>Create the new runtime-instance row and append <code>runtime.started</code>.</li>
-<li>Inspect every nonterminal work item and every nonterminal model/tool attempt.</li>
-<li>Classify old-runtime attempts and update projections plus journal atomically.</li>
-<li>Append <code>runtime.recovery_performed</code> with counts and classifications.</li>
-<li>Start durable event delivery and the scheduler.</li>
-<li>Mark readiness true.</li>
+<li>In one <code>BEGIN IMMEDIATE</code> transaction, create the new running runtime-instance row with
+<code>last_heartbeat_at = started_at</code> and append <code>runtime.started</code>; commit before recovery.</li>
+<li>Enumerate every earlier running/stopping runtime while the lifetime-exclusive process lock is
+held, and inspect its nonterminal Work and model/tool attempts.</li>
+<li>Classify old-runtime attempts and projections in bounded idempotent transactions per stale Work,
+then close the reconciled stale runtime as <code>stopped(startup_failure)</code>.</li>
+<li>Append the current runtime&#39;s <code>runtime.recovery_performed</code> summary in one final transaction,
+including when all counts are zero.</li>
+<li>Start owned heartbeat/event-delivery/scheduler tasks only after recovery commits.</li>
+<li>Evaluate readiness; Stage 10 production remains <code>live_unready</code> until Stage 17 supplies the real
+<code>WorkRunner</code> and usable model/tool execution prerequisites.</li>
 </ol>
 <p>If integrity checks or recovery writes fail, the process MUST NOT become ready. It must emit a redacted fatal diagnostic and require operator intervention rather than guessing.</p>
+<p>If startup fails after the current runtime creation commit, the process preserves the original
+error and best-effort marks that runtime <code>stopped(startup_failure)</code>. Failure of that cleanup remains
+visible as a stale runtime to the next startup. Recovery never holds one write transaction across
+all stale state and performs no provider, tool, process, or cleanup side effect.</p>
 <h3>Recovery classification</h3>
 <aside class="explain-card level-3" data-source-heading="Recovery classification">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -2381,26 +2456,53 @@ payloads.</p>
 </tr>
 </tbody></table>
 <p>Queued work after an interrupted work item remains eligible because the interrupted item is terminal. Context for the next work MUST include an explicit synthetic status item describing unresolved <code>outcome_unknown</code> executions so the model does not assume success or failure.</p>
+<p>For <code>cancel_requested</code>, zero current attempts with no cleanup ambiguity becomes <code>cancelled</code>.
+Requesting/streaming model attempts first become <code>provider_outcome_unknown</code> and then interrupt
+Work; an already unknown model attempt is preserved and Work interrupts. Other terminal model
+attempts permit cancellation only when cleanup is confirmed or not required. Requested tools first
+become <code>interrupted_before_dispatch</code>; dispatching tools first become <code>outcome_unknown</code> with cleanup
+unconfirmed; existing pre-dispatch/unknown classifications are preserved; and the Work interrupts.
+A completed tool permits cancellation only with confirmed/no-required cleanup. Cleanup uncertainty
+always interrupts. Valid <code>cancel_requested</code> Work may retain zero or one exclusive current model or
+tool attempt, whose runtime MUST equal Work ownership.</p>
+<p>Recovery of stale waiting Work does not emit <code>work.resumed</code>: even an exactly completed attempt is
+terminal evidence, not authority for Stage 10 to invent Stage 14/17 continuation. Stale waiting
+Work is safely interrupted unless a later architecture explicitly supplies a continuation owner.
+No recovery transition returns stale Work or an ambiguous attempt to <code>queued</code>; automatic retry of
+<code>provider_outcome_unknown</code>, tool <code>outcome_unknown</code>, stale dispatch, interrupted non-idempotent side
+effects, stale running Work, and stale waiting states is permanently forbidden.</p>
 <h3>Recovery event</h3>
 <aside class="explain-card level-3" data-source-heading="Recovery event">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
   <p><strong>Plain-English significance:</strong> Recovery event defines what Craxii knows and does when execution continuity breaks. Recovery must derive from committed evidence; process disappearance never proves that an external action failed or succeeded.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> Imagine power failing while a mechanic presses a machine&#x27;s start button. On return, the job card and physical evidence decide whether to continue, retry, or mark the outcome unknown.</p>
 </aside>
-<p><code>runtime.recovery_performed</code> records counts, not sensitive payloads:</p>
+<p><code>runtime.recovery_performed</code> is a strict V1 payload containing only:</p>
 <ul>
-<li>old runtime instances observed;</li>
-<li>queued work retained;</li>
-<li>work marked interrupted;</li>
-<li>model attempts interrupted;</li>
-<li>tool attempts marked outcome unknown;</li>
-<li>drafts abandoned;</li>
-<li>orphan artifact files detected;</li>
-<li>cleanup checks performed;</li>
-<li>recovery duration;</li>
-<li>binary and schema version.</li>
+<li><code>runtime_instance_id</code>;</li>
+<li>stale runtime instances observed and closed;</li>
+<li>queued Work retained and Work interrupted;</li>
+<li>model attempts marked provider-outcome-unknown or preserved terminal;</li>
+<li>tool attempts marked interrupted-before-dispatch, outcome-unknown, or preserved terminal;</li>
+<li>drafts abandoned, orphan artifacts observed, cleanup checks, and cleanup-unconfirmed counts;</li>
+<li>recovery duration in milliseconds;</li>
+<li>binary version, schema version, and recovery timestamp.</li>
 </ul>
 <p>This event is product evidence. Detailed stack traces remain in tracing.</p>
+<p>Its recovery window is journal order strictly after the current runtime&#39;s <code>runtime.started</code> and
+strictly before its <code>runtime.recovery_performed</code>. Within that window, retained queued Work; Work
+interruptions; newly unknown model attempts; newly pre-dispatch-interrupted or unknown tool
+attempts; preserved terminal attempts; abandoned drafts; and cleanup checked/unconfirmed counts
+are exactly reconstructed from journal causation plus stable attempt rows and MUST equal the
+summary. Stale-runtime observed/closed counts, orphan-artifact observations, and recovery duration
+are observational evidence that V3 cannot independently reconstruct after mutation; they receive
+type/bound validation only, including <code>stale_runtimes_closed &lt;= stale_runtimes_observed</code>. This
+distinction MUST NOT be presented as historical proof that V3 does not contain.</p>
+<p>The event is emitted exactly once for the current startup, is caused by that runtime&#39;s
+<code>runtime.started</code>, and uses nonnegative signed-64-bit-safe counts. Recovery crash idempotency comes
+from bounded transactions and terminal-state guards: committed units are not emitted again,
+unfinished units converge on the next startup, and each new runtime receives its own start and
+recovery events.</p>
 <h2>Journal architecture</h2>
 <aside class="explain-card level-2" data-source-heading="Journal architecture">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -2723,6 +2825,18 @@ runtime:&lt;runtime_instance_id&gt;
 <td>Records graceful shutdown intent when possible.</td>
 </tr>
 </tbody></table>
+<p>The runtime kinds retain payload version 1 but do not share a generic DTO. <code>runtime.started</code>
+contains exactly <code>runtime_instance_id</code>, <code>craxii_id</code>, <code>workstation_id</code>,
+<code>workstation_generation</code>, diagnostic <code>linux_boot_id</code> and <code>process_id</code>, <code>binary_version</code>,
+<code>git_revision</code>, <code>schema_version</code>, and <code>started_at</code>. <code>runtime.recovery_performed</code> contains exactly
+the bounded recovery facts listed above. <code>runtime.stopping</code> contains exactly
+<code>runtime_instance_id</code>, <code>shutdown_requested_at</code>, reason <code>graceful_shutdown</code>, <code>grace_deadline</code>,
+<code>active_work_count</code>, and <code>active_task_count</code>. It is atomically appended with
+<code>running -&gt; stopping</code>; repeated shutdown requests append nothing and retain the first deadline.
+There is no runtime-stopped journal kind. Startup/projector validation requires start payload/row
+equality, coherent stopping history, exact recovery-window equality for journal/row-derivable
+counters, and bounded validation for explicitly observational counters; it never repairs one
+representation from the other.</p>
 <h3>What is not a journal event</h3>
 <aside class="explain-card level-3" data-source-heading="What is not a journal event">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -2841,7 +2955,11 @@ migration history above version 1 is newer schema.</p>
 workstation/workspace/conversation bootstrap. Stage 8 owns model/tool/context/artifact/authority/
 evidence tables. Consequently <code>current_model_invocation_id</code> and <code>current_tool_execution_id</code> have no
 Stage 6 foreign key. Stage 9 owns device authentication and command idempotency behavior; Stage 10
-owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution.</p>
+owns runtime rows, heartbeats, scheduling, shutdown transitions, and recovery execution. Runtime
+startup consistency additionally requires: queued Work has no owner; every active Work has an
+existing runtime owner; a current attempt has the same runtime as its Work; the exclusive attempt
+link agrees with <code>waiting_on_model</code>, <code>waiting_on_tool</code>, or valid <code>cancel_requested</code>; terminal Work
+has no owner/link; and a conversation has at most one active Work. Contradiction fails closed.</p>
 <h3>Stage 7 canonical journal and bootstrap contract</h3>
 <aside class="explain-card level-3" data-source-heading="Stage 7 canonical journal and bootstrap contract">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -3192,6 +3310,13 @@ an alternate connection reloads the winner and applies the same match/conflict r
 coordinator serializes duplicates so one same-request winner mutates once and different material
 conflicts. Post-commit scheduler/event notifications are lossy hints and never a condition of
 command durability.</p>
+<p>The Stage 10 postcommit notification boundary has an explicit no-op fallback. A truly new message
+commit reaches <code>after_message_transaction_commit</code> before its scheduler hint and caller delivery. A
+truly new active cancellation commit reaches <code>after_cancel_requested_commit</code> before its
+cancellation hint and caller delivery. <code>CommandOutcome::Committed|Replayed</code> distinguishes the
+cases without changing persisted rows, response DTOs, or canonical hashes. Replay, queued direct
+cancellation, and terminal no-op never re-trigger a new-commit crash window. The scheduler&#39;s
+one-second fallback scan makes a lost or no-op notifier correct.</p>
 <h4>Atomic message acceptance</h4>
 <p>A new message command pre-generates candidate <code>MessageId</code>, <code>WorkId</code>, <code>message.accepted</code> and
 <code>work.queued</code> <code>JournalEventId</code> values. Lost candidates after rollback are harmless. The distinct
@@ -3892,7 +4017,7 @@ PRAGMA temp_store = MEMORY;
   <p><strong>Plain-English significance:</strong> This freezes the safe foundation beneath later persistence: one local owner, one reviewed SQLite build, exact durability settings, and a version-zero boundary that cannot accidentally create product data.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> Before installing records in a vault, verify the room, lock, fireproofing, access policy, and inventory ledger. Stage 5 proves that shell while deliberately leaving the records shelves empty for Stage 6.</p>
 </aside>
-<p>The V0 implementation uses SQLx <code>0.9</code> with only <code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, and <code>macros</code>; Tokio <code>1.53</code> with only <code>macros</code>, <code>rt-multi-thread</code>, <code>sync</code>, and <code>time</code>; and nix <code>0.31</code> with only <code>fs</code>. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside <code>adapters/sqlite</code>; neither application nor the <code>StateStore</code> port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work.</p>
+<p>The V0 implementation uses SQLx <code>0.9</code> with only <code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, and <code>macros</code>; Tokio <code>1.53</code> with only <code>macros</code>, <code>rt-multi-thread</code>, <code>sync</code>, <code>time</code>, and <code>signal</code>; and nix <code>0.31</code> with only <code>fs</code>. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside <code>adapters/sqlite</code>; neither application nor the <code>StateStore</code> port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio signal support is owned only by binary composition; Stage 10 adds no <code>tokio-util</code>, <code>futures</code>, or other direct async dependency.</p>
 <p>The database path is exactly <code>&lt;state_root&gt;/db/craxii.sqlite3</code> and the process-lock path is exactly <code>&lt;state_root&gt;/locks/craxii.lock</code>. <code>state_root</code> MUST preexist; Stage 5 may create only its <code>db/</code> and <code>locks/</code> children. Those directories are mode <code>0700</code>, and new database and lock files are mode <code>0600</code>. Production provisioning owns <code>state_root</code>, user ownership, and any <code>chown</code>; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production <code>:memory:</code> mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.</p>
 <p>The mounted filesystem MUST be locally classified before use. Linux V0 allows ext2/3/4, XFS, Btrfs, tmpfs, and overlayfs. macOS V0 allows APFS and HFS/HFS+. Known remote classes including NFS, SMB/CIFS, 9p, Ceph, and identifiable network-style FUSE mounts are rejected, and unknown classes fail closed. This classification does not prove EBS backing.</p>
 <p>In addition to the required pragmas above, every connection MUST apply and verify:</p>
@@ -7020,6 +7145,14 @@ after_assistant_message_commit
 after_cancel_requested_commit
 during_graceful_shutdown
 </code></pre>
+<p>Stage 10 activates exactly <code>after_message_transaction_commit</code>, <code>after_work_claim_commit</code>,
+<code>after_cancel_requested_commit</code>, and <code>during_graceful_shutdown</code>. They are development/test-only and
+the release compile guard remains authoritative. Message and active-cancellation failpoints fire
+only for a newly committed transaction, before hint/caller delivery; replay, queued direct
+cancellation, and terminal no-op do not re-fire them. Claim fires after its commit and before runner
+registration. Shutdown fires after claim admission closes, the in-flight claim section quiesces,
+and <code>runtime.stopping</code> commits, but before drain or classification. No additional public failpoint
+name is authorized.</p>
 <h3>Required assertions</h3>
 <aside class="explain-card level-3" data-source-heading="Required assertions">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -8166,7 +8299,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-28T03:49:30.608Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>f15e7a96fb5f9a1dc213372393495ed5c8cbe9e088bdb9e5c639fbf84aa38725</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-28T12:56:20.842Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>eeca79f989c295b0f31807c8d18a2abcc89cb5196e2ff5ff222c1cbb23e20ab4</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

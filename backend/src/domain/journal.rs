@@ -8,11 +8,12 @@ use serde::{Deserialize, Serialize};
 use super::{
     ArtifactId, ArtifactRetention, ClientMessageId, ConversationId, ConversationKind,
     ConversationLifecycle, ConversationWorkOrdinal, CorrelationId, CraxiiId, DeviceId,
-    JournalEventId, JournalOffset, LogicalInvocationId, Message, MessageContent, MessageId,
-    MessageInput, MessageRole, ModelInvocationId, ModelInvocationState, ProjectionVersion,
-    RuntimeInstanceId, SchemaVersion, Sha256Digest, StreamSeq, ToolExecutionId, ToolExecutionState,
-    ToolResultClass, UtcTimestamp, WorkId, WorkInputActor, WorkInputOrdinal, WorkInputRelationship,
-    WorkKind, WorkspaceId, WorkstationGeneration, WorkstationId,
+    DiagnosticPid, GitRevision, JournalEventId, JournalOffset, LinuxBootId, LogicalInvocationId,
+    Message, MessageContent, MessageId, MessageInput, MessageRole, ModelInvocationId,
+    ModelInvocationState, PackageVersion, ProjectionVersion, RuntimeInstanceId,
+    RuntimeShutdownReason, SchemaVersion, Sha256Digest, StreamSeq, ToolExecutionId,
+    ToolExecutionState, ToolResultClass, UtcTimestamp, WorkId, WorkInputActor, WorkInputOrdinal,
+    WorkInputRelationship, WorkKind, WorkspaceId, WorkstationGeneration, WorkstationId,
 };
 
 /// The four aggregate families with durable journal streams in V0.
@@ -398,23 +399,70 @@ pub struct ArtifactRecordedV1 {
     pub recorded_at: UtcTimestamp,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JournalRuntimeState {
-    Running,
-    Stopping,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStartedV1 {
+    pub runtime_instance_id: RuntimeInstanceId,
+    pub craxii_id: CraxiiId,
+    pub workstation_id: WorkstationId,
+    pub workstation_generation: WorkstationGeneration,
+    pub linux_boot_id: LinuxBootId,
+    pub process_id: DiagnosticPid,
+    pub binary_version: PackageVersion,
+    pub git_revision: GitRevision,
+    pub schema_version: SchemaVersion,
+    pub started_at: UtcTimestamp,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RuntimeEventV1 {
+pub struct RuntimeRecoveryPerformedV1 {
     pub runtime_instance_id: RuntimeInstanceId,
-    pub workstation_id: WorkstationId,
-    pub workstation_generation: WorkstationGeneration,
-    pub state: JournalRuntimeState,
-    pub observed_at: UtcTimestamp,
-    pub retained_queued: u64,
+    pub stale_runtimes_observed: u64,
+    pub stale_runtimes_closed: u64,
+    pub retained_queued_work: u64,
     pub interrupted_work: u64,
-    pub outcome_unknown_attempts: u64,
+    pub model_attempts_provider_outcome_unknown: u64,
+    pub model_attempts_terminal_preserved: u64,
+    pub tool_attempts_interrupted_before_dispatch: u64,
+    pub tool_attempts_outcome_unknown: u64,
+    pub tool_attempts_terminal_preserved: u64,
+    pub drafts_abandoned: u64,
+    pub orphan_artifacts_observed: u64,
+    pub cleanup_checks_performed: u64,
+    pub cleanup_unconfirmed: u64,
+    pub recovery_duration_ms: u64,
+    pub binary_version: PackageVersion,
+    pub schema_version: SchemaVersion,
+    pub recovered_at: UtcTimestamp,
+}
+
+impl RuntimeRecoveryPerformedV1 {
+    #[must_use]
+    pub const fn counts_are_persistable(&self) -> bool {
+        self.stale_runtimes_observed <= i64::MAX as u64
+            && self.stale_runtimes_closed <= i64::MAX as u64
+            && self.retained_queued_work <= i64::MAX as u64
+            && self.interrupted_work <= i64::MAX as u64
+            && self.model_attempts_provider_outcome_unknown <= i64::MAX as u64
+            && self.model_attempts_terminal_preserved <= i64::MAX as u64
+            && self.tool_attempts_interrupted_before_dispatch <= i64::MAX as u64
+            && self.tool_attempts_outcome_unknown <= i64::MAX as u64
+            && self.tool_attempts_terminal_preserved <= i64::MAX as u64
+            && self.drafts_abandoned <= i64::MAX as u64
+            && self.orphan_artifacts_observed <= i64::MAX as u64
+            && self.cleanup_checks_performed <= i64::MAX as u64
+            && self.cleanup_unconfirmed <= i64::MAX as u64
+            && self.recovery_duration_ms <= i64::MAX as u64
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStoppingV1 {
+    pub runtime_instance_id: RuntimeInstanceId,
+    pub shutdown_requested_at: UtcTimestamp,
+    pub shutdown_reason: RuntimeShutdownReason,
+    pub grace_deadline: UtcTimestamp,
+    pub active_work_count: u64,
+    pub active_task_count: u64,
 }
 
 /// Trusted typed payloads. The envelope remains the sole kind/version discriminator.
@@ -445,9 +493,9 @@ pub enum JournalEventPayload {
     ToolExecutionOutcomeUnknown(ToolExecutionEventV1),
     AssistantMessageCommitted(MessageCommittedV1),
     ArtifactRecorded(ArtifactRecordedV1),
-    RuntimeStarted(RuntimeEventV1),
-    RuntimeRecoveryPerformed(RuntimeEventV1),
-    RuntimeStopping(RuntimeEventV1),
+    RuntimeStarted(RuntimeStartedV1),
+    RuntimeRecoveryPerformed(RuntimeRecoveryPerformedV1),
+    RuntimeStopping(RuntimeStoppingV1),
 }
 
 impl JournalEventPayload {

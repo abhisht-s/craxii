@@ -4,16 +4,17 @@ use sqlx::Row;
 use crate::domain::{
     ArtifactId, ArtifactRecordedV1, ArtifactRetention, ClientMessageId, ContentBlock,
     ConversationCreatedV1, ConversationId, ConversationKind, ConversationLifecycle,
-    ConversationWorkOrdinal, CorrelationId, CraxiiId, CraxiiInitializedV1, DeviceId, JournalActor,
-    JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventKind,
-    JournalEventPayload, JournalOffset, JournalRuntimeState, JournalStreamId, LogicalInvocationId,
-    MessageCommittedV1, MessageContent, MessageId, MessageRole, ModelInvocationEventV1,
-    ModelInvocationId, ModelInvocationState, ProjectionVersion, RuntimeEventV1, RuntimeInstanceId,
-    SchemaVersion, Sha256Digest, StreamSeq, ToolExecutionEventV1, ToolExecutionId,
-    ToolExecutionState, ToolResultClass, UtcTimestamp, WorkCancellationReason, WorkId,
-    WorkInputActor, WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkKind,
-    WorkQueuedV1, WorkState, WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId,
-    resolve_event_version,
+    ConversationWorkOrdinal, CorrelationId, CraxiiId, CraxiiInitializedV1, DeviceId, DiagnosticPid,
+    GitRevision, JournalActor, JournalContractError, JournalCurrentAttempt, JournalEvent,
+    JournalEventId, JournalEventKind, JournalEventPayload, JournalOffset, JournalStreamId,
+    LinuxBootId, LogicalInvocationId, MessageCommittedV1, MessageContent, MessageId, MessageRole,
+    ModelInvocationEventV1, ModelInvocationId, ModelInvocationState, PackageVersion,
+    ProjectionVersion, RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeShutdownReason,
+    RuntimeStartedV1, RuntimeStoppingV1, SchemaVersion, Sha256Digest, StreamSeq,
+    ToolExecutionEventV1, ToolExecutionId, ToolExecutionState, ToolResultClass, UtcTimestamp,
+    WorkCancellationReason, WorkId, WorkInputActor, WorkInputFactV1, WorkInputOrdinal,
+    WorkInputRelationship, WorkKind, WorkQueuedV1, WorkState, WorkTransitionV1, WorkspaceId,
+    WorkstationGeneration, WorkstationId, resolve_event_version,
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
@@ -553,44 +554,181 @@ impl From<StoredArtifactRecordedV1> for ArtifactRecordedV1 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StoredRuntimeEventV1 {
+struct StoredRuntimeStartedV1 {
     runtime_instance_id: RuntimeInstanceId,
+    craxii_id: CraxiiId,
     workstation_id: WorkstationId,
     workstation_generation: WorkstationGeneration,
-    state: JournalRuntimeState,
-    observed_at: UtcTimestamp,
-    retained_queued: u64,
-    interrupted_work: u64,
-    outcome_unknown_attempts: u64,
+    linux_boot_id: String,
+    process_id: DiagnosticPid,
+    binary_version: String,
+    git_revision: String,
+    schema_version: SchemaVersion,
+    started_at: UtcTimestamp,
 }
 
-impl From<&RuntimeEventV1> for StoredRuntimeEventV1 {
-    fn from(value: &RuntimeEventV1) -> Self {
+impl From<&RuntimeStartedV1> for StoredRuntimeStartedV1 {
+    fn from(value: &RuntimeStartedV1) -> Self {
         Self {
             runtime_instance_id: value.runtime_instance_id,
+            craxii_id: value.craxii_id,
             workstation_id: value.workstation_id,
             workstation_generation: value.workstation_generation,
-            state: value.state,
-            observed_at: value.observed_at,
-            retained_queued: value.retained_queued,
-            interrupted_work: value.interrupted_work,
-            outcome_unknown_attempts: value.outcome_unknown_attempts,
+            linux_boot_id: value.linux_boot_id.as_str().to_owned(),
+            process_id: value.process_id,
+            binary_version: value.binary_version.as_str().to_owned(),
+            git_revision: value.git_revision.as_str().to_owned(),
+            schema_version: value.schema_version,
+            started_at: value.started_at,
         }
     }
 }
 
-impl From<StoredRuntimeEventV1> for RuntimeEventV1 {
-    fn from(value: StoredRuntimeEventV1) -> Self {
-        Self {
+impl TryFrom<StoredRuntimeStartedV1> for RuntimeStartedV1 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredRuntimeStartedV1) -> Result<Self, Self::Error> {
+        Ok(Self {
             runtime_instance_id: value.runtime_instance_id,
+            craxii_id: value.craxii_id,
             workstation_id: value.workstation_id,
             workstation_generation: value.workstation_generation,
-            state: value.state,
-            observed_at: value.observed_at,
-            retained_queued: value.retained_queued,
+            linux_boot_id: LinuxBootId::try_new(value.linux_boot_id).map_err(|_| inconsistent())?,
+            process_id: value.process_id,
+            binary_version: PackageVersion::try_new(value.binary_version)
+                .map_err(|_| inconsistent())?,
+            git_revision: GitRevision::try_new(value.git_revision).map_err(|_| inconsistent())?,
+            schema_version: value.schema_version,
+            started_at: value.started_at,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRuntimeRecoveryPerformedV1 {
+    runtime_instance_id: RuntimeInstanceId,
+    stale_runtimes_observed: u64,
+    stale_runtimes_closed: u64,
+    retained_queued_work: u64,
+    interrupted_work: u64,
+    model_attempts_provider_outcome_unknown: u64,
+    model_attempts_terminal_preserved: u64,
+    tool_attempts_interrupted_before_dispatch: u64,
+    tool_attempts_outcome_unknown: u64,
+    tool_attempts_terminal_preserved: u64,
+    drafts_abandoned: u64,
+    orphan_artifacts_observed: u64,
+    cleanup_checks_performed: u64,
+    cleanup_unconfirmed: u64,
+    recovery_duration_ms: u64,
+    binary_version: String,
+    schema_version: SchemaVersion,
+    recovered_at: UtcTimestamp,
+}
+
+impl From<&RuntimeRecoveryPerformedV1> for StoredRuntimeRecoveryPerformedV1 {
+    fn from(value: &RuntimeRecoveryPerformedV1) -> Self {
+        Self {
+            runtime_instance_id: value.runtime_instance_id,
+            stale_runtimes_observed: value.stale_runtimes_observed,
+            stale_runtimes_closed: value.stale_runtimes_closed,
+            retained_queued_work: value.retained_queued_work,
             interrupted_work: value.interrupted_work,
-            outcome_unknown_attempts: value.outcome_unknown_attempts,
+            model_attempts_provider_outcome_unknown: value.model_attempts_provider_outcome_unknown,
+            model_attempts_terminal_preserved: value.model_attempts_terminal_preserved,
+            tool_attempts_interrupted_before_dispatch: value
+                .tool_attempts_interrupted_before_dispatch,
+            tool_attempts_outcome_unknown: value.tool_attempts_outcome_unknown,
+            tool_attempts_terminal_preserved: value.tool_attempts_terminal_preserved,
+            drafts_abandoned: value.drafts_abandoned,
+            orphan_artifacts_observed: value.orphan_artifacts_observed,
+            cleanup_checks_performed: value.cleanup_checks_performed,
+            cleanup_unconfirmed: value.cleanup_unconfirmed,
+            recovery_duration_ms: value.recovery_duration_ms,
+            binary_version: value.binary_version.as_str().to_owned(),
+            schema_version: value.schema_version,
+            recovered_at: value.recovered_at,
         }
+    }
+}
+
+impl TryFrom<StoredRuntimeRecoveryPerformedV1> for RuntimeRecoveryPerformedV1 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredRuntimeRecoveryPerformedV1) -> Result<Self, Self::Error> {
+        let decoded = Self {
+            runtime_instance_id: value.runtime_instance_id,
+            stale_runtimes_observed: value.stale_runtimes_observed,
+            stale_runtimes_closed: value.stale_runtimes_closed,
+            retained_queued_work: value.retained_queued_work,
+            interrupted_work: value.interrupted_work,
+            model_attempts_provider_outcome_unknown: value.model_attempts_provider_outcome_unknown,
+            model_attempts_terminal_preserved: value.model_attempts_terminal_preserved,
+            tool_attempts_interrupted_before_dispatch: value
+                .tool_attempts_interrupted_before_dispatch,
+            tool_attempts_outcome_unknown: value.tool_attempts_outcome_unknown,
+            tool_attempts_terminal_preserved: value.tool_attempts_terminal_preserved,
+            drafts_abandoned: value.drafts_abandoned,
+            orphan_artifacts_observed: value.orphan_artifacts_observed,
+            cleanup_checks_performed: value.cleanup_checks_performed,
+            cleanup_unconfirmed: value.cleanup_unconfirmed,
+            recovery_duration_ms: value.recovery_duration_ms,
+            binary_version: PackageVersion::try_new(value.binary_version)
+                .map_err(|_| inconsistent())?,
+            schema_version: value.schema_version,
+            recovered_at: value.recovered_at,
+        };
+        if !decoded.counts_are_persistable() {
+            return Err(inconsistent());
+        }
+        Ok(decoded)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRuntimeStoppingV1 {
+    runtime_instance_id: RuntimeInstanceId,
+    shutdown_requested_at: UtcTimestamp,
+    shutdown_reason: String,
+    grace_deadline: UtcTimestamp,
+    active_work_count: u64,
+    active_task_count: u64,
+}
+
+impl From<&RuntimeStoppingV1> for StoredRuntimeStoppingV1 {
+    fn from(value: &RuntimeStoppingV1) -> Self {
+        Self {
+            runtime_instance_id: value.runtime_instance_id,
+            shutdown_requested_at: value.shutdown_requested_at,
+            shutdown_reason: value.shutdown_reason.as_str().to_owned(),
+            grace_deadline: value.grace_deadline,
+            active_work_count: value.active_work_count,
+            active_task_count: value.active_task_count,
+        }
+    }
+}
+
+impl TryFrom<StoredRuntimeStoppingV1> for RuntimeStoppingV1 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredRuntimeStoppingV1) -> Result<Self, Self::Error> {
+        if value.shutdown_reason != RuntimeShutdownReason::GracefulShutdown.as_str()
+            || value.grace_deadline < value.shutdown_requested_at
+            || value.active_work_count > i64::MAX as u64
+            || value.active_task_count > i64::MAX as u64
+        {
+            return Err(inconsistent());
+        }
+        Ok(Self {
+            runtime_instance_id: value.runtime_instance_id,
+            shutdown_requested_at: value.shutdown_requested_at,
+            shutdown_reason: RuntimeShutdownReason::GracefulShutdown,
+            grace_deadline: value.grace_deadline,
+            active_work_count: value.active_work_count,
+            active_task_count: value.active_task_count,
+        })
     }
 }
 
@@ -603,7 +741,9 @@ enum StoredEventPayloadV1 {
     Model(StoredModelInvocationEventV1),
     Tool(StoredToolExecutionEventV1),
     Artifact(StoredArtifactRecordedV1),
-    Runtime(StoredRuntimeEventV1),
+    RuntimeStarted(StoredRuntimeStartedV1),
+    RuntimeRecovery(StoredRuntimeRecoveryPerformedV1),
+    RuntimeStopping(StoredRuntimeStoppingV1),
 }
 
 fn to_json<T: Serialize>(value: &T) -> Result<String, SqliteAdapterError> {
@@ -664,10 +804,14 @@ pub(super) fn encode_event_payload(
         JournalEventPayload::ArtifactRecorded(value) => {
             StoredEventPayloadV1::Artifact(value.into())
         }
-        JournalEventPayload::RuntimeStarted(value)
-        | JournalEventPayload::RuntimeRecoveryPerformed(value)
-        | JournalEventPayload::RuntimeStopping(value) => {
-            StoredEventPayloadV1::Runtime(value.into())
+        JournalEventPayload::RuntimeStarted(value) => {
+            StoredEventPayloadV1::RuntimeStarted(value.into())
+        }
+        JournalEventPayload::RuntimeRecoveryPerformed(value) => {
+            StoredEventPayloadV1::RuntimeRecovery(value.into())
+        }
+        JournalEventPayload::RuntimeStopping(value) => {
+            StoredEventPayloadV1::RuntimeStopping(value.into())
         }
     };
     let json = match &stored {
@@ -679,7 +823,9 @@ pub(super) fn encode_event_payload(
         StoredEventPayloadV1::Model(value) => to_json(value)?,
         StoredEventPayloadV1::Tool(value) => to_json(value)?,
         StoredEventPayloadV1::Artifact(value) => to_json(value)?,
-        StoredEventPayloadV1::Runtime(value) => to_json(value)?,
+        StoredEventPayloadV1::RuntimeStarted(value) => to_json(value)?,
+        StoredEventPayloadV1::RuntimeRecovery(value) => to_json(value)?,
+        StoredEventPayloadV1::RuntimeStopping(value) => to_json(value)?,
     };
     let digest = Sha256Digest::hash_bytes(json.as_bytes());
     Ok((json, digest))
@@ -792,15 +938,15 @@ pub(super) fn decode_event_payload(
             from_json::<StoredArtifactRecordedV1>(payload_json)?.into(),
         ),
         JournalEventKind::RuntimeStarted => JournalEventPayload::RuntimeStarted(
-            from_json::<StoredRuntimeEventV1>(payload_json)?.into(),
+            from_json::<StoredRuntimeStartedV1>(payload_json)?.try_into()?,
         ),
         JournalEventKind::RuntimeRecoveryPerformed => {
             JournalEventPayload::RuntimeRecoveryPerformed(
-                from_json::<StoredRuntimeEventV1>(payload_json)?.into(),
+                from_json::<StoredRuntimeRecoveryPerformedV1>(payload_json)?.try_into()?,
             )
         }
         JournalEventKind::RuntimeStopping => JournalEventPayload::RuntimeStopping(
-            from_json::<StoredRuntimeEventV1>(payload_json)?.into(),
+            from_json::<StoredRuntimeStoppingV1>(payload_json)?.try_into()?,
         ),
     };
     validate_payload_kind(&payload)?;
@@ -889,11 +1035,21 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
             value.state == ToolExecutionState::OutcomeUnknown
         }
         JournalEventPayload::ArtifactRecorded(value) => value.canonical_length <= i64::MAX as u64,
-        JournalEventPayload::RuntimeStarted(value) => value.state == JournalRuntimeState::Running,
-        JournalEventPayload::RuntimeRecoveryPerformed(value) => {
-            value.state == JournalRuntimeState::Running
+        JournalEventPayload::RuntimeStarted(value) => {
+            value.schema_version.get() == 3
+                && !value.linux_boot_id.as_str().is_empty()
+                && !value.binary_version.as_str().is_empty()
+                && !value.git_revision.as_str().is_empty()
         }
-        JournalEventPayload::RuntimeStopping(value) => value.state == JournalRuntimeState::Stopping,
+        JournalEventPayload::RuntimeRecoveryPerformed(value) => {
+            value.schema_version.get() == 3 && value.counts_are_persistable()
+        }
+        JournalEventPayload::RuntimeStopping(value) => {
+            value.shutdown_reason == RuntimeShutdownReason::GracefulShutdown
+                && value.grace_deadline >= value.shutdown_requested_at
+                && value.active_work_count <= i64::MAX as u64
+                && value.active_task_count <= i64::MAX as u64
+        }
     };
     if valid { Ok(()) } else { Err(inconsistent()) }
 }
@@ -1012,12 +1168,17 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
         (JournalEventPayload::ArtifactRecorded(value), JournalStreamId::Work(id)) => {
             id == value.work_id && intent.work_id == Some(value.work_id)
         }
-        (
-            JournalEventPayload::RuntimeStarted(value)
-            | JournalEventPayload::RuntimeRecoveryPerformed(value)
-            | JournalEventPayload::RuntimeStopping(value),
-            JournalStreamId::Runtime(id),
-        ) => {
+        (JournalEventPayload::RuntimeStarted(value), JournalStreamId::Runtime(id)) => {
+            id == value.runtime_instance_id
+                && intent.runtime_instance_id == Some(value.runtime_instance_id)
+                && intent.actor == JournalActor::Runtime(value.runtime_instance_id)
+        }
+        (JournalEventPayload::RuntimeRecoveryPerformed(value), JournalStreamId::Runtime(id)) => {
+            id == value.runtime_instance_id
+                && intent.runtime_instance_id == Some(value.runtime_instance_id)
+                && intent.actor == JournalActor::Runtime(value.runtime_instance_id)
+        }
+        (JournalEventPayload::RuntimeStopping(value), JournalStreamId::Runtime(id)) => {
             id == value.runtime_instance_id
                 && intent.runtime_instance_id == Some(value.runtime_instance_id)
                 && intent.actor == JournalActor::Runtime(value.runtime_instance_id)
@@ -1570,33 +1731,51 @@ mod tests {
                     recorded_at: at(),
                 })
             }
-            JournalEventKind::RuntimeStarted
-            | JournalEventKind::RuntimeRecoveryPerformed
-            | JournalEventKind::RuntimeStopping => {
-                let value = RuntimeEventV1 {
+            JournalEventKind::RuntimeStarted => {
+                JournalEventPayload::RuntimeStarted(RuntimeStartedV1 {
                     runtime_instance_id: id(),
+                    craxii_id: id(),
                     workstation_id: id(),
                     workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
-                    state: if kind == JournalEventKind::RuntimeStopping {
-                        JournalRuntimeState::Stopping
-                    } else {
-                        JournalRuntimeState::Running
-                    },
-                    observed_at: at(),
-                    retained_queued: 1,
+                    linux_boot_id: LinuxBootId::try_new("non_linux_not_applicable").unwrap(),
+                    process_id: DiagnosticPid::try_new(42).unwrap(),
+                    binary_version: PackageVersion::try_new("0.0.1").unwrap(),
+                    git_revision: GitRevision::try_new("test").unwrap(),
+                    schema_version: SchemaVersion::try_new(3).unwrap(),
+                    started_at: at(),
+                })
+            }
+            JournalEventKind::RuntimeRecoveryPerformed => {
+                JournalEventPayload::RuntimeRecoveryPerformed(RuntimeRecoveryPerformedV1 {
+                    runtime_instance_id: id(),
+                    stale_runtimes_observed: 1,
+                    stale_runtimes_closed: 1,
+                    retained_queued_work: 1,
                     interrupted_work: 2,
-                    outcome_unknown_attempts: 3,
-                };
-                match kind {
-                    JournalEventKind::RuntimeStarted => JournalEventPayload::RuntimeStarted(value),
-                    JournalEventKind::RuntimeRecoveryPerformed => {
-                        JournalEventPayload::RuntimeRecoveryPerformed(value)
-                    }
-                    JournalEventKind::RuntimeStopping => {
-                        JournalEventPayload::RuntimeStopping(value)
-                    }
-                    _ => unreachable!(),
-                }
+                    model_attempts_provider_outcome_unknown: 3,
+                    model_attempts_terminal_preserved: 4,
+                    tool_attempts_interrupted_before_dispatch: 5,
+                    tool_attempts_outcome_unknown: 6,
+                    tool_attempts_terminal_preserved: 7,
+                    drafts_abandoned: 8,
+                    orphan_artifacts_observed: 9,
+                    cleanup_checks_performed: 10,
+                    cleanup_unconfirmed: 11,
+                    recovery_duration_ms: 12,
+                    binary_version: PackageVersion::try_new("0.0.1").unwrap(),
+                    schema_version: SchemaVersion::try_new(3).unwrap(),
+                    recovered_at: at(),
+                })
+            }
+            JournalEventKind::RuntimeStopping => {
+                JournalEventPayload::RuntimeStopping(RuntimeStoppingV1 {
+                    runtime_instance_id: id(),
+                    shutdown_requested_at: at(),
+                    shutdown_reason: RuntimeShutdownReason::GracefulShutdown,
+                    grace_deadline: at(),
+                    active_work_count: 1,
+                    active_task_count: 2,
+                })
             }
         }
     }
@@ -1756,15 +1935,15 @@ mod tests {
             ),
             (
                 JournalEventKind::RuntimeStarted,
-                "57596b3d9b8fd97cd9e44591c2546456b0959b2621a17ae5862a44278db45405",
+                "124ce4a11d3df09669a2db9bd55fff9ce018a4101f3a8c26a2118c6b1105e6b7",
             ),
             (
                 JournalEventKind::RuntimeRecoveryPerformed,
-                "57596b3d9b8fd97cd9e44591c2546456b0959b2621a17ae5862a44278db45405",
+                "1f8c7167e46c5d82b33b1afdd183118becb3ffe636673aab1ec52ba926704454",
             ),
             (
                 JournalEventKind::RuntimeStopping,
-                "34a91ae9c21033d240522deeb2178668eb52232ea953b86a9ed5fa51bbd08c5a",
+                "34a6d68da2887d07530a8e5cd1ddda902d7f31872e989d316f36e2bf90ce8095",
             ),
         ];
         assert_eq!(expected.len(), JournalEventKind::ALL.len());

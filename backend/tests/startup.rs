@@ -1,8 +1,10 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use serde_json::Value;
 
@@ -184,10 +186,28 @@ fn no_valid_startup_format_reports_ready() {
 }
 
 fn run(arguments: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_craxii-server"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_craxii-server"))
         .args(arguments)
-        .output()
-        .expect("craxii-server binary should execute")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("craxii-server binary should execute");
+    for _ in 0..200 {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    // Successful Stage 10 startup is a long-lived process. Exercise the real
+    // composition-edge SIGTERM path so these startup assertions also wait for
+    // a graceful RuntimeInstance close instead of leaving stale test state.
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    // SAFETY: `child.id()` is the live child we own and signal 15 is SIGTERM on
+    // every Unix target supported by this repository.
+    assert_eq!(unsafe { kill(child.id() as i32, 15) }, 0);
+    child.wait_with_output().unwrap()
 }
 
 fn text(bytes: &[u8]) -> String {
