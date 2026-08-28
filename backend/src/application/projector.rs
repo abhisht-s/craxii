@@ -177,6 +177,7 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
         ) => id == payload.work_id && event.work_id == Some(payload.work_id),
         (
             JournalEventPayload::ModelInvocationStarted(payload)
+            | JournalEventPayload::ModelInvocationStreaming(payload)
             | JournalEventPayload::ModelInvocationCompleted(payload)
             | JournalEventPayload::ModelInvocationFailed(payload)
             | JournalEventPayload::ModelInvocationInterrupted(payload),
@@ -186,6 +187,7 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
             JournalEventPayload::ToolExecutionRequested(payload)
             | JournalEventPayload::ToolExecutionDispatching(payload)
             | JournalEventPayload::ToolExecutionCompleted(payload)
+            | JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(payload)
             | JournalEventPayload::ToolExecutionOutcomeUnknown(payload),
             JournalStreamId::Work(id),
         ) => id == payload.work_id && event.work_id == Some(payload.work_id),
@@ -378,6 +380,7 @@ fn apply_event(
             apply_work_transition(state, event.correlation_id, payload)?;
         }
         JournalEventPayload::ModelInvocationStarted(payload)
+        | JournalEventPayload::ModelInvocationStreaming(payload)
         | JournalEventPayload::ModelInvocationCompleted(payload)
         | JournalEventPayload::ModelInvocationFailed(payload)
         | JournalEventPayload::ModelInvocationInterrupted(payload) => {
@@ -414,6 +417,7 @@ fn apply_event(
         JournalEventPayload::ToolExecutionRequested(payload)
         | JournalEventPayload::ToolExecutionDispatching(payload)
         | JournalEventPayload::ToolExecutionCompleted(payload)
+        | JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(payload)
         | JournalEventPayload::ToolExecutionOutcomeUnknown(payload) => {
             require_work_context(state, event, payload.work_id)?;
             match event.kind() {

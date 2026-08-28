@@ -31,7 +31,7 @@ fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
         "architecture_version=\"V0.0.01\"",
         "protocol_version=1",
         "configuration_version=1",
-        "max_supported_schema_version=2",
+        "max_supported_schema_version=3",
         "configuration_fingerprint=\"sha256:",
         "health_state=\"live_unready\"",
         "live=true",
@@ -143,6 +143,13 @@ fn startup_does_not_read_declared_credential_files() {
 
     let input = LOCAL
         .replace(
+            "artifact_root = \"/tmp/craxii-dev/state/artifacts\"",
+            &format!(
+                "artifact_root = \"{}\"",
+                state_root.join("artifacts").to_str().unwrap()
+            ),
+        )
+        .replace(
             "state_root = \"/tmp/craxii-dev/state\"",
             &format!("state_root = \"{}\"", state_root.to_str().unwrap()),
         )
@@ -216,6 +223,19 @@ impl TempConfig {
                 &format!("state_root = \"{}\"", state_root.to_str().unwrap()),
             ),
             None => contents.to_owned(),
+        };
+        let contents = match contents
+            .lines()
+            .find(|line| line.starts_with("artifact_root = "))
+        {
+            Some(artifact_root_line) => contents.replace(
+                artifact_root_line,
+                &format!(
+                    "artifact_root = \"{}\"",
+                    state_root.join("artifacts").to_str().unwrap()
+                ),
+            ),
+            None => contents,
         };
         let path = root.join("config.toml");
         fs::write(&path, contents).unwrap();

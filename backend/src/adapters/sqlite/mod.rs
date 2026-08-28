@@ -9,6 +9,8 @@ mod journal;
 mod projection;
 mod runtime;
 mod schema;
+mod stage8;
+mod stage8_codec;
 mod state_store;
 #[allow(dead_code)] // Stage 5 establishes the private primitive; Stage 6 named writes consume it.
 mod transaction;
@@ -17,6 +19,8 @@ mod transaction;
 mod stage6_tests;
 #[cfg(test)]
 mod stage7_tests;
+#[cfg(test)]
+mod stage8_tests;
 
 pub use error::{SqliteAdapterError, SqliteFailureKind};
 pub use runtime::{CheckpointReport, SqliteRuntime, SqliteRuntimeGuard};

@@ -127,12 +127,50 @@ bounded_reference!(
     64,
     "A canonical authority reason code."
 );
-bounded_reference!(
-    OpaqueStorageKey,
-    bounded_opaque,
-    512,
-    "An opaque local artifact-storage key."
-);
+/// Canonical content-addressed artifact storage key with no absolute-path meaning.
+#[derive(Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ArtifactStorageKey(String);
+
+impl ArtifactStorageKey {
+    /// Derives `sha256/<two-hex>/<digest>` from captured-byte identity.
+    #[must_use]
+    pub fn from_digest(digest: Sha256Digest) -> Self {
+        let digest = digest.to_string();
+        Self(format!("sha256/{}/{}", &digest[..2], digest))
+    }
+
+    /// Parses only the exact canonical relative storage-key grammar.
+    pub fn parse_canonical(value: &str) -> Result<Self, DomainValidationError> {
+        if value.len() != 74
+            || !value.starts_with("sha256/")
+            || value.as_bytes().get(9) != Some(&b'/')
+        {
+            return Err(invalid_identifier());
+        }
+        let shard = &value[7..9];
+        let digest = &value[10..];
+        Sha256Digest::parse_canonical(digest)?;
+        if shard != &digest[..2] {
+            return Err(invalid_identifier());
+        }
+        Ok(Self(value.to_owned()))
+    }
+
+    /// Returns the canonical logical key; this is never an absolute filesystem path.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ArtifactStorageKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ArtifactStorageKey")
+            .field(&self.0)
+            .finish()
+    }
+}
 bounded_reference!(
     ArtifactMimeType,
     visible_ascii,
@@ -385,7 +423,7 @@ pub struct ArtifactReferenceInput {
     pub craxii_id: CraxiiId,
     pub producing_work_id: Option<WorkId>,
     pub producer: ArtifactProducer,
-    pub storage_key: OpaqueStorageKey,
+    pub storage_key: ArtifactStorageKey,
     pub sha256: Sha256Digest,
     pub canonical_length: CanonicalByteCount,
     pub observed_length: Option<CanonicalByteCount>,
@@ -406,7 +444,7 @@ pub struct ArtifactReference {
     producing_work_id: Option<WorkId>,
     producer: ArtifactProducer,
     storage_backend: ArtifactStorageBackend,
-    storage_key: OpaqueStorageKey,
+    storage_key: ArtifactStorageKey,
     sha256: Sha256Digest,
     canonical_length: CanonicalByteCount,
     observed_length: Option<CanonicalByteCount>,
@@ -458,7 +496,7 @@ impl ArtifactReference {
     pub const fn storage_backend(&self) -> ArtifactStorageBackend {
         self.storage_backend
     }
-    pub const fn storage_key(&self) -> &OpaqueStorageKey {
+    pub const fn storage_key(&self) -> &ArtifactStorageKey {
         &self.storage_key
     }
     pub const fn sha256(&self) -> Sha256Digest {
@@ -987,14 +1025,18 @@ mod tests {
 
     #[test]
     fn artifact_storage_key_and_closed_literals_are_exact() {
-        assert!(OpaqueStorageKey::try_new("k".repeat(512)).is_ok());
-        for invalid in [
-            String::new(),
-            "k".repeat(513),
-            "bad\0key".into(),
-            "bad\nkey".into(),
-        ] {
-            assert!(OpaqueStorageKey::try_new(invalid).is_err());
+        let digest = Sha256Digest::hash_bytes(b"artifact");
+        let storage_key = ArtifactStorageKey::from_digest(digest);
+        assert_eq!(
+            storage_key.as_str(),
+            "sha256/c7/c7c5c1d70c5dec4416ab6158afd0b223ef40c29b1dc1f97ed9428b94d4cadb1c"
+        );
+        assert_eq!(
+            ArtifactStorageKey::parse_canonical(storage_key.as_str()).unwrap(),
+            storage_key
+        );
+        for invalid in ["", "sha256/AB/00", "../sha256/00"] {
+            assert!(ArtifactStorageKey::parse_canonical(invalid).is_err());
         }
 
         let literals = [
@@ -1046,7 +1088,7 @@ mod tests {
             craxii_id: id(V7),
             producing_work_id: Some(id(V7)),
             producer,
-            storage_key: OpaqueStorageKey::try_new("opaque/key-not-client-path").unwrap(),
+            storage_key: ArtifactStorageKey::from_digest(Sha256Digest::hash_bytes(b"artifact")),
             sha256: Sha256Digest::hash_bytes(b"artifact"),
             canonical_length: CanonicalByteCount::try_new(8).unwrap(),
             observed_length: Some(CanonicalByteCount::try_new(9).unwrap()),

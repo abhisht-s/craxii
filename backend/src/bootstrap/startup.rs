@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use crate::adapters::artifacts::LocalArtifactStore;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
@@ -14,6 +16,7 @@ use crate::domain::{
     ConversationId, CorrelationId, CraxiiId, JournalEventId, UtcTimestamp, WorkspaceId,
     WorkstationGeneration, WorkstationId,
 };
+use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
 use crate::ports::clock::Clock;
 use crate::ports::state_store::{
     BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, StateStoreErrorKind,
@@ -56,6 +59,8 @@ pub async fn run(
     )
     .await
     .map_err(StartupError::from_sqlite)?;
+    let artifact_store = LocalArtifactStore::initialize(config.paths().artifact_root())
+        .map_err(StartupError::from_artifact_initialization)?;
     let observation = bootstrap_observation(&config)?;
     let created_at =
         UtcTimestamp::from_offset_datetime(clock.utc_now().map_err(|_| StartupError::Clock)?)
@@ -81,6 +86,20 @@ pub async fn run(
         .verify_application_consistency()
         .await
         .map_err(StartupError::from_state_store)?;
+    let referenced_artifacts = state_store
+        .load_referenced_artifacts()
+        .await
+        .map_err(StartupError::from_sqlite)?;
+    let mut referenced_keys = BTreeSet::new();
+    for artifact in &referenced_artifacts {
+        artifact_store
+            .verify(artifact)
+            .map_err(StartupError::from_artifact_integrity)?;
+        referenced_keys.insert(artifact.storage_key().clone());
+    }
+    let orphan_report = artifact_store
+        .scan_orphans(&referenced_keys, created_at)
+        .map_err(StartupError::from_artifact_integrity)?;
     let snapshot = state_store
         .load_bootstrap_snapshot()
         .await
@@ -95,6 +114,8 @@ pub async fn run(
     Ok(RunningBootstrap {
         application: ApplicationShell::new(process, health, snapshot),
         sqlite_runtime,
+        artifact_store,
+        orphan_report,
     })
 }
 
@@ -142,6 +163,8 @@ fn bootstrap_observation(
 pub struct RunningBootstrap {
     application: ApplicationShell,
     sqlite_runtime: SqliteRuntimeGuard,
+    artifact_store: LocalArtifactStore,
+    orphan_report: ArtifactOrphanReport,
 }
 
 impl RunningBootstrap {
@@ -153,6 +176,16 @@ impl RunningBootstrap {
     #[must_use]
     pub const fn sqlite_runtime(&self) -> &SqliteRuntimeGuard {
         &self.sqlite_runtime
+    }
+
+    #[must_use]
+    pub const fn artifact_store(&self) -> &LocalArtifactStore {
+        &self.artifact_store
+    }
+
+    #[must_use]
+    pub const fn artifact_orphan_report(&self) -> &ArtifactOrphanReport {
+        &self.orphan_report
     }
 
     pub async fn shutdown(self) {
@@ -202,6 +235,26 @@ pub enum StartupError {
 }
 
 impl StartupError {
+    const fn from_artifact_initialization(
+        _error: crate::ports::artifact_store::ArtifactStoreError,
+    ) -> Self {
+        Self::DatabaseLifecycle
+    }
+
+    const fn from_artifact_integrity(
+        error: crate::ports::artifact_store::ArtifactStoreError,
+    ) -> Self {
+        match error.kind() {
+            ArtifactStoreErrorKind::Integrity | ArtifactStoreErrorKind::Collision => {
+                Self::DatabaseIntegrity
+            }
+            ArtifactStoreErrorKind::InvalidRequest
+            | ArtifactStoreErrorKind::UnsafeRoot
+            | ArtifactStoreErrorKind::UnsupportedFilesystem
+            | ArtifactStoreErrorKind::Storage => Self::DatabaseLifecycle,
+        }
+    }
+
     const fn from_sqlite(error: crate::adapters::sqlite::SqliteAdapterError) -> Self {
         match error.kind() {
             SqliteFailureKind::AlreadyOwned => Self::StateRootAlreadyOwned,

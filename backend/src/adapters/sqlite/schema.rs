@@ -3,11 +3,13 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 2;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 3;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
 pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
 pub(super) const JOURNAL_MIGRATION_DESCRIPTION: &str = "journal and work inputs";
+pub(super) const EVIDENCE_MIGRATION_VERSION: i64 = 3;
+pub(super) const EVIDENCE_MIGRATION_DESCRIPTION: &str = "context model tool artifacts";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -42,7 +44,7 @@ pub(super) const V1_PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
-pub(super) const PRODUCT_TABLES: &[&str] = &[
+pub(super) const V2_PRODUCT_TABLES: &[&str] = &[
     "client_commands",
     "client_devices",
     "conversations",
@@ -57,7 +59,7 @@ pub(super) const PRODUCT_TABLES: &[&str] = &[
     "workstations",
 ];
 
-pub(super) const PRODUCT_INDEXES: &[&str] = &[
+pub(super) const V2_PRODUCT_INDEXES: &[&str] = &[
     "ix_journal_events_conversation_offset",
     "ix_journal_events_work_offset",
     "ix_messages_conversation",
@@ -80,12 +82,77 @@ pub(super) const PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
+pub(super) const PRODUCT_TABLES: &[&str] = &[
+    "artifacts",
+    "client_commands",
+    "client_devices",
+    "context_manifest_sources",
+    "context_manifests",
+    "conversations",
+    "craxii_principals",
+    "journal_events",
+    "messages",
+    "model_invocations",
+    "runtime_instances",
+    "stream_heads",
+    "tool_executions",
+    "work_item_inputs",
+    "work_items",
+    "workspaces",
+    "workstations",
+];
+
+pub(super) const PRODUCT_INDEXES: &[&str] = &[
+    "ix_artifacts_content",
+    "ix_artifacts_producer_kind_id",
+    "ix_artifacts_producing_work",
+    "ix_artifacts_storage_key",
+    "ix_context_manifest_sources_artifact",
+    "ix_context_manifest_sources_event",
+    "ix_context_manifests_work_created",
+    "ix_journal_events_conversation_offset",
+    "ix_journal_events_work_offset",
+    "ix_messages_conversation",
+    "ix_model_invocations_context_attempt",
+    "ix_model_invocations_runtime_nonterminal",
+    "ix_runtime_instances_craxii_state",
+    "ix_tool_executions_runtime_nonterminal",
+    "ix_work_items_nonterminal_by_runtime",
+    "ix_work_items_queued_fifo",
+    "ix_workspaces_craxii_id",
+    "ix_workstations_craxii_id",
+    "ux_client_devices_token_hash",
+    "ux_context_manifests_logical_invocation",
+    "ux_conversations_craxii_kind",
+    "ux_journal_events_event_id",
+    "ux_journal_events_stream_sequence",
+    "ux_messages_client_identity",
+    "ux_messages_produced_by_work",
+    "ux_model_invocations_logical_attempt",
+    "ux_model_invocations_one_nonterminal_per_work",
+    "ux_model_invocations_retry_of",
+    "ux_model_invocations_work_step_attempt",
+    "ux_tool_executions_execution_id",
+    "ux_tool_executions_one_nonterminal_per_work",
+    "ux_tool_executions_source_ordinal",
+    "ux_tool_executions_source_provider_call",
+    "ux_tool_executions_work_step_ordinal",
+    "ux_work_item_inputs_work_ordinal",
+    "ux_work_items_conversation_ordinal",
+    "ux_work_items_current_model_invocation",
+    "ux_work_items_current_tool_execution",
+    "ux_work_items_one_active_per_conversation",
+    "ux_workspaces_workstation_logical_name",
+];
+
 // Filled from deterministic structural manifests produced by the bundled SQLite engine. The
 // generation test fails closed if either frozen value ever becomes stale.
 const V1_SCHEMA_FINGERPRINT: &str =
     "f4636df22c635c90ac469f49f2ac3a9ccb38956f1670d26ab566140a137f5521";
-const CURRENT_SCHEMA_FINGERPRINT: &str =
+const V2_SCHEMA_FINGERPRINT: &str =
     "391d9bfb54cf771de1815a3bf54ee4d7d16f1b877acf629cf783ca12dbd37d4d";
+const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseDisposition {
@@ -173,6 +240,16 @@ pub(super) async fn classify_schema(
         }
         Some(JOURNAL_MIGRATION_VERSION) => {
             if migrations.len() != 2
+                || !has_exact_objects(&objects, V2_PRODUCT_TABLES, V2_PRODUCT_INDEXES)
+                || !schema_matches(connection, V2_PRODUCT_TABLES, V2_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::MigratedUninitialized)
+            }
+        }
+        Some(EVIDENCE_MIGRATION_VERSION) => {
+            if migrations.len() != 3
                 || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
                 || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
             {
@@ -233,6 +310,7 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
     let embedded_contracts = [
         (CORE_MIGRATION_VERSION, CORE_MIGRATION_DESCRIPTION),
         (JOURNAL_MIGRATION_VERSION, JOURNAL_MIGRATION_DESCRIPTION),
+        (EVIDENCE_MIGRATION_VERSION, EVIDENCE_MIGRATION_DESCRIPTION),
     ];
     if embedded_contracts.iter().any(|(version, description)| {
         !MIGRATOR.iter().any(|migration| {
@@ -538,6 +616,12 @@ pub(super) fn expected_schema_fingerprint() -> &'static str {
 #[allow(dead_code)]
 pub(super) fn v1_schema_fingerprint() -> &'static str {
     V1_SCHEMA_FINGERPRINT
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(super) fn v2_schema_fingerprint() -> &'static str {
+    V2_SCHEMA_FINGERPRINT
 }
 
 #[cfg(test)]

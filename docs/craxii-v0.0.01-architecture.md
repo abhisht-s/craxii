@@ -4,8 +4,8 @@
 
 **Status:** Authoritative implementation source of truth  
 **Architecture version:** V0.0.01  
-**Document revision:** 3\
-**Last updated:** 2026-08-27\
+**Document revision:** 4\
+**Last updated:** 2026-08-28\
 **Audience:** Craxii engineering, Codex, ChatGPT, reviewers, and future contributors  
 **Supersedes for V0.0.01:** `CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md` and the V0 recommendations in `docs/temp/craxii-v0.0.01-architecture-review.md`
 
@@ -953,7 +953,7 @@ These grammars are canonical domain references and MUST NOT be derived from boot
 
 `ArtifactReference` is immutable metadata only: `ArtifactId`, `CraxiiId`, optional producing `WorkId`, one `ArtifactProducer`, storage backend `local`, opaque storage key, `Sha256Digest`, canonical byte length, optional observed length, MIME type, optional encoding/logical name, retention, truncation flag, optional compression, and `created_at`.
 
-`ArtifactProducer` is exactly `none`, `model(ModelInvocationId)`, or `tool(ToolExecutionId)`, preventing simultaneous model/tool identity. Broader work provenance may coexist with a specific producer; there is no XOR with `producing_work_id`. Retention is `canonical_evidence`, `diagnostic`, or `regenerable`. The storage key is opaque preserved UTF-8 text of 1..=512 bytes with no NUL/control character and is not a client URI/path. Stage 3.2 performs no filesystem I/O.
+`ArtifactProducer` is exactly `none`, `model(ModelInvocationId)`, or `tool(ToolExecutionId)`, preventing simultaneous model/tool identity. Broader work provenance may coexist with a specific producer; there is no XOR with `producing_work_id`. Retention is `canonical_evidence`, `diagnostic`, or `regenerable`. V0 freezes `ArtifactStorageKey` to `sha256/<2 lowercase hex>/<64 lowercase hex>`; it is a logical content key, never an absolute path or client URI. Stage 3.2 performs no filesystem I/O.
 
 #### Authority and attempt references
 
@@ -1476,12 +1476,14 @@ Every stored payload is generated from a typed domain structure. `serde_json::Va
 | `work.failed` | Work | Yes | Records definite terminal failure. |
 | `work.interrupted` | Work | Yes | Records loss of runtime continuity/unknown attempt. |
 | `model.invocation_started` | Work | Yes | Persists outbound inference intent before network action. |
+| `model.invocation_streaming` | Work | Yes | Records the first durable requesting-to-streaming observation without provider wire data. |
 | `model.invocation_completed` | Work | Yes | References normalized ordered output and usage. |
 | `model.invocation_failed` | Work | Yes | Records a classified observed provider failure. |
 | `model.invocation_interrupted` | Work | Yes | Records ambiguous or abandoned provider attempt. |
 | `tool.execution_requested` | Work | Yes | Persists model call and validated execution record before policy/dispatch. |
 | `tool.execution_dispatching` | Work | Yes | Persists side-effect intent immediately before Workstation invocation. |
 | `tool.execution_completed` | Work | Yes | References an observed terminal structured outcome. |
+| `tool.execution_interrupted_before_dispatch` | Work | Yes | Terminalizes a requested execution after proving that no dispatch side effect occurred. |
 | `tool.execution_outcome_unknown` | Work | Yes | Records ambiguous side effect after interruption/cleanup failure. |
 | `assistant.message_committed` | Conversation | Yes | Commits user-visible assistant content. |
 | `artifact.recorded` | Work | No for work state | Records canonical evidence artifact metadata. |
@@ -1644,7 +1646,7 @@ runtime owner/current attempt/cancellation and terminal classifications, and tra
 Replay compares every expected fact with the reconstructed current projection before applying the
 shared Stage 4 legal-transition rule; stream sequence is independent of projection version.
 
-The exact 26-kind registry is the Required domain events table above. Its typed registry also
+The exact 28-kind registry is the Required domain events table above. Its typed registry also
 freezes current version, state-bearing classification, primary stream family, first-emitting stage,
 and internal public-candidate metadata without defining Stage 11 wire payloads. Stage 7 production
 code emits only `craxii.initialized` and `conversation.created`. Model, tool, context, artifact,
@@ -1715,6 +1717,154 @@ startup gathers the observation, constructs that facade, loads or creates identi
 consistency replay, loads the immutable bootstrap snapshot into `ApplicationShell`, and remains
 `live_unready`. It creates no runtime, scheduler, provider/tool work, recovery action, or readiness
 transition.
+
+### Stage 8 canonical evidence-attempt and artifact contract
+
+Stage 8 is SQLx migration `0003`, version `3`, description `context model tool artifacts`. The
+maximum supported schema version is `3`. A valid version-1 or version-2 database retains its frozen
+structural fingerprint and migrates forward through the remaining immutable migrations; a fresh
+database applies `0001`, `0002`, and `0003` in order. Migration `0003` creates exactly five product
+tables: `context_manifests`, `context_manifest_sources`, `model_invocations`, `tool_executions`, and
+`artifacts`. All five use `STRICT, WITHOUT ROWID`. It creates no rows, artifact bytes or directories,
+trigger, view, custom version table, down migration, chunk/output/retention table, provider
+conversation table, or Stage 9-or-later table. `PRAGMA user_version` remains zero.
+
+Every context manifest is an immutable, successfully assembled request fact. A context-limit
+failure creates no manifest. Provider/model identity is stored as the exact neutral tuple
+`model_target_id`, `provider_id`, `provider_model_id`, positive `target_configuration_version`, and
+the versioned `model_capabilities_json` snapshot defined by `ProviderModelReference`; credentials,
+account secrets, authorization headers, pricing data, provider SDK values, and provider wire
+requests are forbidden. Utilization is the deterministic ceiling basis-point value of
+`(estimated_input_tokens + reserved_output_tokens) / context_window_tokens`, bounded from zero
+through 10,000; SQLite `REAL` is not canonical evidence. Capability decode reconstructs the
+provider-neutral domain snapshot and rejects a nonpositive context window or an output limit above
+that window.
+
+Context sources are immutable and ordered only by stored positive `position`. `source_kind` uses
+exactly `system_instruction`, `developer_instruction`, `workstation_capability_summary`,
+`workspace_identity`, `tool_definition`, `user_message`, `active_trigger`, `assistant_message`,
+`completed_model_output`, `observed_tool_result`, `artifact_content`, `synthetic_failure`,
+`synthetic_interruption`, `synthetic_outcome_unknown`, `synthetic_draft_status`, or
+`provider_native_continuation`. Exactly one identity family is present: a journal event, an
+artifact, or a typed source record. Typed record kinds are exactly `instruction_version`,
+`workstation`, `workspace`, `tool_definition`, `message`, `model_invocation`, `tool_execution`, or
+`work`; the adapter validates the corresponding UUID or bounded version/definition identifier.
+This taxonomy preserves future Stage 16 inputs without introducing summary memory, semantic
+retrieval, selection, rendering, or token-budget behavior.
+
+One model row is one provider attempt. Attempt and agent-step numbers are positive. Attempt one has
+no predecessor; every later attempt names exactly the immediately preceding terminal attempt with
+the same logical invocation, Work, context manifest, and agent step. Retry branching and gaps are
+forbidden. Database uniqueness enforces the local shape and application/startup verification
+enforces the cross-row chain. Model states remain exactly `requesting`, `streaming`, `completed`,
+`failed`, `cancelled_locally`, and `provider_outcome_unknown`. Terminal rows are immutable through
+port shape. `model.invocation_streaming` version 1 is a Work-stream state-bearing event containing
+only stable provider-neutral model facts; no provider body is journaled.
+
+One tool row is one explicit call and has no infrastructure retry. States remain exactly
+`requested`, `dispatching`, `completed`, `interrupted_before_dispatch`, and `outcome_unknown`, with
+the Stage 4 transition matrix unchanged. `tool.execution_interrupted_before_dispatch` version 1 is
+a Work-stream state-bearing event and is never represented as outcome unknown. `requested` requires
+one concrete effective requested logical current working directory. A caller that omits an
+explicit directory resolves the Work/workspace default through `LogicalPathReference` before Stage
+8 persistence; Stage 8 never persists or later reinterprets a null requested directory.
+`resolved_cwd` remains null until dispatch intent. `requested` requires no authority decision.
+`dispatching` requires a complete allow snapshot, effective privilege,
+resolved working-directory evidence, timeout/output policy, and committed dispatch intent before
+Stage 14 may perform any workstation, process, or filesystem side effect. Authority JSON is the
+versioned adapter-private encoding of decision `allow|deny`, the existing privilege literal,
+policy `v0-development-workstation`, and exactly one reason code from `registered_tool`,
+`policy_denied`, `malformed_request`, `limit_exceeded`, `work_cancelled`, or `scope_denied`.
+A denial cannot claim effective `admin` privilege.
+A definite `completed` result before dispatch may retain an optional `deny` snapshot; it has no
+dispatch timestamp, effective dispatch privilege, resolved path, process result, or output bytes.
+`interrupted_before_dispatch` retains no authority snapshot because evaluation did not authorize or
+cross the dispatch boundary.
+
+For stdout and stderr independently, observed bytes are all drained bytes, captured bytes are the
+stored prefix under the hard capture limit, returned-inline bytes are the bounded portion exposed
+to later model/result semantics, and omitted bytes equal observed minus returned-inline. Therefore
+`observed >= captured >= returned_inline`, and these quantities are never collapsed. Artifact
+SHA-256 identifies captured bytes only. The tool row records the per-stream counts; no raw process
+bytes enter SQLite or journal JSON.
+
+`ArtifactId` is a semantic provenance identity. Physical storage is content addressed by
+`sha256/<first-two-lowercase-hex>/<64-lowercase-hex>` and may be shared by multiple Artifact IDs.
+Consequently neither storage key nor `(sha256, captured_byte_count, backend)` is unique. To avoid a
+circular foreign-key graph, `artifacts` physically references the Craxii principal and optional
+producing Work, then stores a typed `producer_kind` plus canonical producer UUID without a reverse
+model/tool foreign key. Model/tool/context artifact references retain physical foreign keys to
+`artifacts`; startup validates that each typed producer exists and agrees with the producing Work.
+
+The dependency-neutral `ArtifactStore` exposes bounded capture, finalization, verified read,
+verification, and orphan classification without SQLx, absolute paths, or local filesystem types.
+The local adapter owns `<artifact_root>/tmp` and `<artifact_root>/sha256`, uses modes 0700 for
+directories and 0600 for files, rejects symlinks/non-regular files/permissive modes/unsafe
+hardlinks/cross-filesystem publication/path traversal, and uses exclusive no-follow creation.
+Finalization order is exact: generate Artifact ID; exclusively create `tmp/<artifact-id>.partial`;
+stream, bound, hash, and count; flush; `sync_all` the temporary file; create and verify the digest
+shard; publish without replacement using `renameat2(RENAME_NOREPLACE)` on Linux or
+`renamex_np(RENAME_EXCL)` on macOS; sync required containing directories; reopen and fully verify
+regular-file type, 0600 mode, link count one, size, and digest; then return a finalized descriptor.
+Only after that return may an owning SQLite transaction insert metadata or a reference. An existing
+canonical target is reused only after the same full verification; it is never overwritten.
+`FinalizedArtifact` is a sealed durable-publication capability: its fields are private and only the
+local artifact adapter may construct it after this sequence. SQLite may reconstruct a distinct
+read-verification reference from committed metadata, but cannot mint a finalized descriptor.
+
+Every semantic artifact metadata row committed for context/model/tool evidence appends exactly one
+`artifact.recorded` event on the owning Work stream. When a transaction introduces artifacts, each
+artifact event precedes the terminal attempt event that references it. Model begin ordering is
+`artifact.recorded` when applicable, `model.invocation_started`, then caused
+`work.waiting_on_model`; streaming appends `model.invocation_streaming`; model terminal ordering is
+artifact events, terminal model event, then a caused legal Work event when supplied. Tool request
+ordering is `tool.execution_requested` then caused `work.waiting_on_tool`; dispatch appends
+`tool.execution_dispatching`; terminal ordering is artifact events, the exact tool terminal event,
+then a caused legal Work event. There is no context-manifest event.
+
+`work_items` is not rebuilt and its current model/tool columns gain no physical reverse foreign
+key. Named Stage 8 transactions maintain application-enforced reverse links atomically. Startup
+requires waiting-on-model to name exactly one matching nonterminal model attempt, waiting-on-tool
+to name exactly one matching nonterminal tool execution, all other Work states to have neither,
+matching Work/runtime ownership where required, model/tool XOR, terminal attempts absent from
+current links, valid retry chains, and journal/detail/projector agreement.
+
+Named Stage 8 persistence operations receive complete prebuilt identities, facts, event IDs,
+timestamps, and already finalized artifact descriptors. They implement begin/stream/terminal model
+transactions and request/dispatch-intent/terminal tool transactions only; they perform no provider,
+workstation, process, filesystem-workspace, registry, policy-evaluation, context-assembly, or agent
+loop behavior. A transaction may apply a caller-supplied legal Stage 4 Work transition, but after
+commit a current model/tool link never points to a terminal attempt. `CompletionStateStore` and the
+assistant-message/final-work transaction belong to Stage 17, not Stage 8.
+
+Every named transaction validates the complete artifact set before inserting any artifact row or
+event. The distinct supplied Artifact IDs must equal the distinct IDs referenced by that owning
+model, tool, manifest, and context-source request: missing, extra, or duplicate descriptors are
+rejected. Reuse is rejected across incompatible semantic roles; the sole model-begin reuse allowed
+is an explicitly identical attempt-one invocation request and manifest rendered request with equal
+ID, digest, count, producer, and Work facts. Each descriptor is cross-checked against its referenced
+digest, captured/observed counts, truncation, producer identity, and producing Work. Existing
+context-source artifacts are accepted only as already-valid durable same-Work metadata with the
+same digest. Only after the whole set passes may the SQLite transaction insert artifact metadata
+and events, owning rows, Work/journal mutations, and commit once; the artifact helper never commits.
+
+Artifact directories are initialized only after V3 SQLite migration/integrity succeeds. Stage 8
+startup order is configuration validation; SQLite lock/runtime/migration/integrity; artifact-root
+initialization and hardening; Stage 7 identity load/bootstrap; journal/application consistency;
+Stage 8 relational attempt consistency; full verification of every distinct referenced artifact;
+orphan scan/report; bootstrap snapshot; remain `live_unready`. Missing, corrupt, unsafe, or
+metadata-inconsistent referenced bytes are fatal and never repaired. Temp partials and valid final
+objects with no metadata reference are nonfatal orphans. Ordinary startup never deletes them.
+Explicit maintenance may consider only an unreferenced canonical final object at least 24 hours old
+and must recheck SQLite immediately before deletion; Stage 8 provides classification and pure
+eligibility only, with no scheduled or automatic deletion.
+
+Stage ownership remains narrow: Stage 9 owns authentication, device-token verification, message and
+cancel commands, and command idempotency; Stage 10 owns runtime lifecycle, scheduling, recovery
+execution, and readiness; Stage 14 owns registry resolution, authority evaluation, and actual tool
+side effects; Stage 15 owns provider ports/adapters and canonical provider semantics; Stage 16 owns
+context eligibility, selection, rendering, and token budgeting; Stage 17 owns provider calls, the
+agent loop, and terminal assistant completion.
 
 ### `craxii_principals`
 
@@ -1960,24 +2110,26 @@ context_manifests (
   context_manifest_id       TEXT PRIMARY KEY,
   work_id                   TEXT NOT NULL REFERENCES work_items,
   logical_invocation_id     TEXT NOT NULL,
-  selected_provider         TEXT NOT NULL,
-  selected_model            TEXT NOT NULL,
-  model_config_version      TEXT NOT NULL,
+  model_target_id           TEXT NOT NULL,
+  provider_id               TEXT NOT NULL,
+  provider_model_id         TEXT NOT NULL,
+  target_configuration_version INTEGER NOT NULL,
+  model_capabilities_json   TEXT NOT NULL,
   assembler_version         TEXT NOT NULL,
   context_policy_version    TEXT NOT NULL,
-  system_prompt_version     TEXT NOT NULL,
+  system_prompt_fingerprint TEXT NOT NULL,
   toolset_fingerprint       TEXT NOT NULL,
   eligibility_cutoff_json   TEXT NOT NULL,
   source_count              INTEGER NOT NULL,
-  canonical_bytes           INTEGER NOT NULL,
-  rendered_request_bytes    INTEGER,
+  canonical_byte_count      INTEGER NOT NULL,
+  rendered_request_byte_count INTEGER NOT NULL,
   estimated_input_tokens    INTEGER NOT NULL,
-  token_estimator           TEXT NOT NULL,
+  token_estimator_id        TEXT NOT NULL,
   context_window_tokens     INTEGER NOT NULL,
   reserved_output_tokens    INTEGER NOT NULL,
-  usage_ratio               REAL NOT NULL,
+  utilization_basis_points  INTEGER NOT NULL,
   manifest_sha256           TEXT NOT NULL,
-  rendered_request_sha256   TEXT,
+  rendered_request_sha256   TEXT NOT NULL,
   rendered_request_artifact_id TEXT REFERENCES artifacts,
   omissions_json            TEXT NOT NULL,
   created_at                TEXT NOT NULL
@@ -1991,18 +2143,22 @@ context_manifest_sources (
   context_manifest_id  TEXT NOT NULL REFERENCES context_manifests,
   position             INTEGER NOT NULL,
   source_kind          TEXT NOT NULL,
-  source_event_id      TEXT REFERENCES journal_events(event_id),
-  source_artifact_id   TEXT REFERENCES artifacts,
+  event_id             TEXT REFERENCES journal_events(event_id),
+  artifact_id          TEXT REFERENCES artifacts,
+  source_record_kind   TEXT,
   source_record_id     TEXT,
-  model_role           TEXT NOT NULL,
-  source_sha256        TEXT NOT NULL,
-  rendered_bytes       INTEGER NOT NULL,
+  model_role           TEXT,
+  item_class           TEXT,
+  source_content_sha256 TEXT NOT NULL,
+  rendered_byte_contribution INTEGER NOT NULL,
   transform_json       TEXT NOT NULL,
   PRIMARY KEY (context_manifest_id, position)
 )
 ```
 
-Exactly one source identity form must be present. `transform_json` records normalization, inline projection, or synthetic status rendering.
+Exactly one source identity family must be present. `transform_json` records normalization, inline
+projection, or synthetic status rendering. Source positions start at one, are contiguous at load,
+and reconcile exactly with the immutable parent `source_count`.
 
 ### `model_invocations`
 
@@ -2016,10 +2172,12 @@ model_invocations (
   agent_step_no             INTEGER NOT NULL,
   attempt_no                INTEGER NOT NULL,
   retry_of_invocation_id    TEXT REFERENCES model_invocations,
-  provider                  TEXT NOT NULL,
-  model                     TEXT NOT NULL,
-  model_config_version      TEXT NOT NULL,
-  selection_reason_json     TEXT NOT NULL,
+  model_target_id           TEXT NOT NULL,
+  provider_id               TEXT NOT NULL,
+  provider_model_id         TEXT NOT NULL,
+  target_configuration_version INTEGER NOT NULL,
+  model_capabilities_json   TEXT NOT NULL,
+  selection_reason          TEXT NOT NULL,
   required_capabilities_json TEXT NOT NULL,
   provider_options_json     TEXT NOT NULL,
   state                     TEXT NOT NULL,
@@ -2050,6 +2208,16 @@ model_invocations (
 
 Each provider attempt is a new row. `logical_invocation_id` groups retries of the same agent step and context manifest.
 
+The schema also has a partial unique predecessor index, a partial unique one-nonterminal-model-row
+per Work index, and indexes for runtime/nonterminal and context/attempt lookup. Request, capability,
+requirement, options, normalized output, and normalized error JSON use bounded versioned
+adapter-private DTOs that deny unknown fields. The normalized output envelope preserves ordered
+provider-neutral items without making Stage 15 wire types canonical. Decode is symmetric with
+encode: it reconstructs canonical IDs and existing domain types, applies the same key grammar,
+bounded text/JSON and numeric relations, validates every nested item and closed literal, and rejects
+duplicates or impossible cross-field shapes. Deserializing storage strings is never sufficient to
+trust persisted identity or provider-neutral evidence.
+
 Model invocation states are:
 
 - `requesting`: intent is durable and the request may or may not have reached the provider;
@@ -2066,49 +2234,50 @@ Model invocation states are:
 ```sql
 tool_executions (
   tool_execution_id          TEXT PRIMARY KEY,
+  execution_id               TEXT NOT NULL UNIQUE,
   work_id                    TEXT NOT NULL REFERENCES work_items,
-  runtime_instance_id        TEXT NOT NULL REFERENCES runtime_instances,
   source_model_invocation_id TEXT NOT NULL REFERENCES model_invocations,
-  provider_tool_call_id      TEXT NOT NULL,
+  runtime_instance_id        TEXT NOT NULL REFERENCES runtime_instances,
   agent_step_no              INTEGER NOT NULL,
   tool_ordinal               INTEGER NOT NULL,
+  provider_tool_call_id      TEXT,
   tool_name                  TEXT NOT NULL,
   tool_version               TEXT NOT NULL,
-  schema_version             TEXT NOT NULL,
+  tool_schema_version        TEXT NOT NULL,
   arguments_json             TEXT NOT NULL,
   arguments_sha256           TEXT NOT NULL,
   workstation_id             TEXT NOT NULL REFERENCES workstations,
   workstation_generation     INTEGER NOT NULL,
   workspace_id               TEXT NOT NULL REFERENCES workspaces,
-  requested_cwd_json         TEXT,
+  requested_cwd              TEXT NOT NULL,
   resolved_cwd               TEXT,
   requested_privilege        TEXT NOT NULL,
   effective_privilege        TEXT,
   authority_decision_json    TEXT,
   timeout_ms                 INTEGER NOT NULL,
   output_policy_json         TEXT NOT NULL,
-  execution_id               TEXT NOT NULL UNIQUE,
   state                      TEXT NOT NULL,
   requested_at               TEXT NOT NULL,
   dispatch_intent_at         TEXT,
-  start_observed_at          TEXT,
+  started_at                 TEXT,
   completed_at               TEXT,
-  result_kind                TEXT,
   exit_code                  INTEGER,
-  terminating_signal         INTEGER,
+  signal                     INTEGER,
   timed_out                  INTEGER,
   cancelled                  INTEGER,
-  duration_ms                INTEGER,
+  cleanup_confirmed          INTEGER,
+  result_json                TEXT,
   stdout_artifact_id         TEXT REFERENCES artifacts,
   stderr_artifact_id         TEXT REFERENCES artifacts,
-  inline_result_json         TEXT,
-  observed_stdout_bytes      INTEGER,
-  observed_stderr_bytes      INTEGER,
-  captured_stdout_bytes      INTEGER,
-  captured_stderr_bytes      INTEGER,
-  stdout_truncated           INTEGER,
-  stderr_truncated           INTEGER,
-  cleanup_status             TEXT,
+  stdout_observed_bytes      INTEGER,
+  stdout_captured_bytes      INTEGER,
+  stdout_returned_inline_bytes INTEGER,
+  stdout_omitted_bytes       INTEGER,
+  stderr_observed_bytes      INTEGER,
+  stderr_captured_bytes      INTEGER,
+  stderr_returned_inline_bytes INTEGER,
+  stderr_omitted_bytes       INTEGER,
+  truncated                  INTEGER NOT NULL DEFAULT 0,
   normalized_error_json      TEXT,
   UNIQUE (work_id, agent_step_no, tool_ordinal)
 )
@@ -2122,34 +2291,44 @@ Tool states are:
 - `interrupted_before_dispatch`;
 - `outcome_unknown`.
 
-`completed` includes observed nonzero exit, timeout, cancellation, not-found, permission denial, and validation rejection. `result_kind` preserves the distinction.
+`completed` includes observed nonzero exit, timeout, cancellation, not-found, permission denial, and
+validation rejection. The closed result kind inside `result_json` preserves the distinction.
+
+The versioned `result_json` preserves the result classification. Database uniqueness additionally
+enforces source-invocation/tool ordinal, optional provider-call ID within its source invocation,
+and one nonterminal Tool row per Work. Adapter decode cross-checks each stream's four counts, the
+global truncation fact, authority/state shape, cleanup certainty, artifact references, and safe
+normalized error. Result kinds are closed and each kind rejects missing required or forbidden
+exit, signal, timeout, cancellation, cleanup, and result fields.
 
 ### `artifacts`
 
 ```sql
 artifacts (
-  artifact_id             TEXT PRIMARY KEY,
-  craxii_id               TEXT NOT NULL REFERENCES craxii_principals,
-  producing_work_id       TEXT REFERENCES work_items,
-  producing_invocation_id TEXT REFERENCES model_invocations,
-  producing_tool_id       TEXT REFERENCES tool_executions,
-  storage_backend         TEXT NOT NULL CHECK (storage_backend = 'local'),
-  storage_key             TEXT NOT NULL UNIQUE,
-  sha256                  TEXT NOT NULL,
-  byte_length             INTEGER NOT NULL,
-  observed_byte_length    INTEGER,
-  mime_type               TEXT NOT NULL,
-  encoding                TEXT,
-  logical_name            TEXT,
-  retention_class         TEXT NOT NULL,
-  truncated               INTEGER NOT NULL,
-  compression             TEXT,
-  created_at              TEXT NOT NULL,
-  UNIQUE (sha256, byte_length, storage_backend)
+  artifact_id          TEXT PRIMARY KEY,
+  craxii_id            TEXT NOT NULL REFERENCES craxii_principals,
+  producing_work_id    TEXT REFERENCES work_items,
+  producer_kind        TEXT,
+  producer_id          TEXT,
+  backend              TEXT NOT NULL CHECK (backend = 'local'),
+  storage_key          TEXT NOT NULL,
+  sha256               TEXT NOT NULL,
+  captured_byte_count  INTEGER NOT NULL,
+  observed_byte_count  INTEGER,
+  mime_type            TEXT NOT NULL,
+  encoding             TEXT,
+  logical_name         TEXT,
+  retention_class      TEXT NOT NULL,
+  truncated            INTEGER NOT NULL,
+  compression          TEXT,
+  created_at           TEXT NOT NULL
 )
 ```
 
-Content deduplication is optional. Provenance remains per producing record even if bytes share a storage object.
+`producer_kind` is null with `producer_id`, or exactly `model_invocation` or `tool_execution` with a
+canonical UUIDv7. Provenance remains per semantic Artifact ID even when several rows share the same
+physical storage object. Named indexes support storage key, content, producing Work, and typed
+producer lookup; no uniqueness collapses semantic occurrences.
 
 ## Transaction boundaries
 
@@ -2185,14 +2364,24 @@ Before outbound provider I/O:
 1. Model target has already been selected.
 2. Context source eligibility and manifest are finalized.
 3. Persist any canonical context/request artifact bytes before the database references them.
-4. Insert the context manifest and ordered source rows.
-5. Insert `model_invocations(state='requesting')`.
-6. Update work to `waiting_on_model` with invocation ID.
-7. Append `model.invocation_started` and `work.waiting_on_model`.
-8. Commit.
-9. Begin provider I/O.
+4. Validate exact artifact-set equality and all reference/digest/count/producer/Work facts before
+   inserting any artifact row or event.
+5. Insert each finalized artifact's semantic metadata and append its `artifact.recorded` event.
+6. Insert the context manifest and ordered source rows.
+7. Insert `model_invocations(state='requesting')`.
+8. Update work to `waiting_on_model` with invocation ID.
+9. Append `model.invocation_started` and caused `work.waiting_on_model` in that order.
+10. Commit.
+11. Begin provider I/O.
 
-After provider completion, one transaction updates the invocation with ordered normalized output, usage, stop reason, request IDs, and terminal state; appends the terminal invocation event; and returns work to `running` unless cancellation or terminal failure wins.
+The first durable valid stream observation uses one transaction to guard `requesting`, transition to
+`streaming`, and append `model.invocation_streaming` while Work remains waiting on the same attempt.
+
+After provider completion, one transaction first validates exact response artifact-set equality and
+the response ID/digest/count/producer/Work facts, then inserts finalized response artifact
+metadata/events, updates the invocation with caller-supplied ordered normalized output, usage, stop
+reason, request IDs, and terminal state; appends the terminal invocation event; and applies only a
+caller-supplied legal Work decision. Stage 8 performs no provider semantics or agent-loop decision.
 
 When work returns to `running`, the same transaction appends `work.resumed` caused by the terminal invocation event. An exhausted provider failure transitions directly to `work.failed` instead.
 
@@ -2200,14 +2389,21 @@ When work returns to `running`, the same transaction appends `work.resumed` caus
 
 Tool execution uses two pre-side-effect transitions:
 
-1. **Requested transaction:** persist the complete model tool call, decoded/validated arguments or structured validation result, tool identity, workspace, requested privilege, and `tool.execution_requested`. Set work `waiting_on_tool`.
+1. **Requested transaction:** persist the complete model tool call, decoded/validated arguments or structured validation result, tool identity, workspace, concrete effective requested logical cwd, requested privilege, and `tool.execution_requested`. Set work `waiting_on_tool` and append the caused Work event.
 2. **Dispatch-intent transaction:** after authority evaluation and immediately before Workstation invocation, set state `dispatching`, record effective privilege/deadline/output policy, and append `tool.execution_dispatching`. Commit.
 3. **External execution:** invoke Workstation without a database transaction.
-4. **Outcome transaction:** after canonical artifact bytes are finalized, set the terminal tool outcome, append `tool.execution_completed`, append `work.resumed`, and return work to `running`; or append outcome-unknown/interruption transitions.
+4. **Outcome transaction:** after canonical artifact bytes are finalized, validate exact stdout and
+   stderr artifact-set equality and each stream's ID/digest/count/truncation/producer/Work facts;
+   then insert their metadata and `artifact.recorded` events, set the caller-supplied terminal tool outcome, append
+   `tool.execution_completed`, `tool.execution_interrupted_before_dispatch`, or
+   `tool.execution_outcome_unknown` as exact, then apply a caller-supplied legal Work transition.
 
 A crash after step 2 is intentionally conservative: recovery cannot know whether step 3 started, so the execution becomes `outcome_unknown` even if the process never actually spawned.
 
 ### Final-answer transaction
+
+Stage 17 owns this transaction and `CompletionStateStore`; Stage 8 deliberately does not implement
+assistant-message or final-answer persistence.
 
 One transaction:
 
@@ -2388,17 +2584,25 @@ The storage key is logical and never exposed as a permanent client path.
 
 ### Commit protocol
 
-For artifact bytes referenced by a terminal database record:
+For any artifact bytes that a database record may reference:
 
-1. Stream bytes into a same-filesystem temporary file with a hard capture limit.
-2. Compute SHA-256 and byte count while streaming.
-3. Flush and `fsync` the file when retention class is canonical evidence.
-4. Atomically rename to the content-addressed path.
-5. Ensure directory durability when required by the filesystem policy.
-6. Insert artifact metadata and the referencing terminal record in one SQLite transaction.
-7. Commit.
+1. Generate the semantic `ArtifactId`.
+2. Exclusively create same-filesystem `tmp/<artifact-id>.partial` with no-follow semantics.
+3. Stream, drain, bound, hash, and count captured and observed bytes.
+4. Flush and `sync_all` the temporary file.
+5. Create or verify the digest shard and sync a newly created directory.
+6. Publish without replacement to the content-addressed path.
+7. Sync the containing shard after first publication.
+8. Reopen the final object no-follow and fully verify type, mode, link count, size, and digest.
+9. Return the finalized descriptor.
+10. Insert semantic artifact metadata/event and the referencing record in one later SQLite
+    transaction, then commit.
 
-This ordering permits an orphan file after a crash but never a committed database reference to a not-yet-renamed file. Orphan cleanup waits a grace period and never removes a path referenced by SQLite.
+This ordering permits an orphan file after a crash but never a committed database reference to a
+not-yet-published or unverified file. Startup reports temp partials and unreferenced canonical
+objects without deleting either. An explicit maintenance operation may delete only an unreferenced
+canonical final object at least 24 hours old after an immediate database recheck; Stage 8 schedules
+no automatic deletion.
 
 ### Retention classes
 

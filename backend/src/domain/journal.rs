@@ -162,7 +162,7 @@ macro_rules! event_kinds {
         pub enum JournalEventKind { $( $variant ),+ }
 
         impl JournalEventKind {
-            pub const ALL: [Self; 26] = [$(Self::$variant),+];
+            pub const ALL: [Self; 28] = [$(Self::$variant),+];
             #[must_use]
             pub const fn as_str(self) -> &'static str { match self { $(Self::$variant => $literal),+ } }
             #[must_use]
@@ -203,12 +203,14 @@ event_kinds! {
     WorkFailed => ("work.failed", Work, true, Stage8, true),
     WorkInterrupted => ("work.interrupted", Work, true, Stage10, true),
     ModelInvocationStarted => ("model.invocation_started", Work, true, Stage8, false),
+    ModelInvocationStreaming => ("model.invocation_streaming", Work, true, Stage8, false),
     ModelInvocationCompleted => ("model.invocation_completed", Work, true, Stage8, false),
     ModelInvocationFailed => ("model.invocation_failed", Work, true, Stage8, false),
     ModelInvocationInterrupted => ("model.invocation_interrupted", Work, true, Stage8, false),
     ToolExecutionRequested => ("tool.execution_requested", Work, true, Stage8, false),
     ToolExecutionDispatching => ("tool.execution_dispatching", Work, true, Stage8, false),
     ToolExecutionCompleted => ("tool.execution_completed", Work, true, Stage8, false),
+    ToolExecutionInterruptedBeforeDispatch => ("tool.execution_interrupted_before_dispatch", Work, true, Stage8, false),
     ToolExecutionOutcomeUnknown => ("tool.execution_outcome_unknown", Work, true, Stage8, false),
     AssistantMessageCommitted => ("assistant.message_committed", Conversation, true, Stage8, true),
     ArtifactRecorded => ("artifact.recorded", Work, false, Stage8, false),
@@ -432,12 +434,14 @@ pub enum JournalEventPayload {
     WorkFailed(WorkTransitionV1),
     WorkInterrupted(WorkTransitionV1),
     ModelInvocationStarted(ModelInvocationEventV1),
+    ModelInvocationStreaming(ModelInvocationEventV1),
     ModelInvocationCompleted(ModelInvocationEventV1),
     ModelInvocationFailed(ModelInvocationEventV1),
     ModelInvocationInterrupted(ModelInvocationEventV1),
     ToolExecutionRequested(ToolExecutionEventV1),
     ToolExecutionDispatching(ToolExecutionEventV1),
     ToolExecutionCompleted(ToolExecutionEventV1),
+    ToolExecutionInterruptedBeforeDispatch(ToolExecutionEventV1),
     ToolExecutionOutcomeUnknown(ToolExecutionEventV1),
     AssistantMessageCommitted(MessageCommittedV1),
     ArtifactRecorded(ArtifactRecordedV1),
@@ -464,12 +468,16 @@ impl JournalEventPayload {
             Self::WorkFailed(_) => JournalEventKind::WorkFailed,
             Self::WorkInterrupted(_) => JournalEventKind::WorkInterrupted,
             Self::ModelInvocationStarted(_) => JournalEventKind::ModelInvocationStarted,
+            Self::ModelInvocationStreaming(_) => JournalEventKind::ModelInvocationStreaming,
             Self::ModelInvocationCompleted(_) => JournalEventKind::ModelInvocationCompleted,
             Self::ModelInvocationFailed(_) => JournalEventKind::ModelInvocationFailed,
             Self::ModelInvocationInterrupted(_) => JournalEventKind::ModelInvocationInterrupted,
             Self::ToolExecutionRequested(_) => JournalEventKind::ToolExecutionRequested,
             Self::ToolExecutionDispatching(_) => JournalEventKind::ToolExecutionDispatching,
             Self::ToolExecutionCompleted(_) => JournalEventKind::ToolExecutionCompleted,
+            Self::ToolExecutionInterruptedBeforeDispatch(_) => {
+                JournalEventKind::ToolExecutionInterruptedBeforeDispatch
+            }
             Self::ToolExecutionOutcomeUnknown(_) => JournalEventKind::ToolExecutionOutcomeUnknown,
             Self::AssistantMessageCommitted(_) => JournalEventKind::AssistantMessageCommitted,
             Self::ArtifactRecorded(_) => JournalEventKind::ArtifactRecorded,
@@ -570,12 +578,12 @@ mod tests {
 
     #[test]
     fn registry_is_exact_complete_and_versioned() {
-        assert_eq!(JournalEventKind::ALL.len(), 26);
+        assert_eq!(JournalEventKind::ALL.len(), 28);
         let unique = JournalEventKind::ALL
             .iter()
             .map(|kind| kind.as_str())
             .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(unique.len(), 26);
+        assert_eq!(unique.len(), 28);
         assert!(
             JournalEventKind::ALL
                 .iter()

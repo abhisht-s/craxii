@@ -15,6 +15,12 @@ use super::error::{DomainValidationError, DomainValidationKind};
 pub struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
+    /// Constructs a digest from the exact 32 digest bytes produced by a trusted hasher.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Hashes the provided bytes with SHA-256.
     #[must_use]
     pub fn hash_bytes(bytes: &[u8]) -> Self {

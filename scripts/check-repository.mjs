@@ -238,7 +238,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage7Boundaries() {
+function verifyStage8Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -272,12 +272,25 @@ function verifyStage7Boundaries() {
     equalStringArrays(migrationFiles, [
       '0001_core_durable_schema.sql',
       '0002_journal_and_work_inputs.sql',
+      '0003_context_model_tool_artifacts.sql',
     ]),
-    `Stage 7 must contain exactly migrations 0001 and 0002; found ${migrationFiles.join(', ') || 'nothing'}`,
+    `Stage 8 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
   );
   const migration1 = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
   const migration2 = readFileSync(join(migrationRoot, migrationFiles[1]), 'utf8');
-  const migrations = `${migration1}\n${migration2}`;
+  const migration3 = readFileSync(join(migrationRoot, migrationFiles[2]), 'utf8');
+  const migrations = `${migration1}\n${migration2}\n${migration3}`;
+  const migrationChecksums = [migration1, migration2, migration3].map((migration) =>
+    createHash('sha384').update(migration).digest('hex'),
+  );
+  assert(
+    equalStringArrays(migrationChecksums, [
+      '717c44a33c94ccaadbdb6fd7a2cc3b4d99eb269216de241f379af7cce2c3557eb78e5a0ba98b1fe280d2b8449675dd8d',
+      '677379cfb19c61d45c6a61bdeb978539490adcee97f57e51cab8794e63038b70950d715a90e7e524397007a97f875ebf',
+      'e2f5cab2ac0921ce54e6ae8a741eb23c11766e847a5d17f21f7381ae4aa1d729287542c1ebaa12d25431f3b277cd5c39',
+    ]),
+    `migration checksum inventory differs: ${migrationChecksums.join(', ')}`,
+  );
 
   const expectedStage6Tables = [
     'client_commands',
@@ -311,49 +324,100 @@ function verifyStage7Boundaries() {
       `Stage 7 table is premature in migration 0001: ${table}`,
     );
   }
-  for (const table of [
-    'context_manifests',
+  const expectedStage8Tables = [
+    'artifacts',
     'context_manifest_sources',
+    'context_manifests',
     'model_invocations',
     'tool_executions',
-    'artifacts',
+  ];
+  const actualStage8Tables = [...migration3.matchAll(/\bCREATE\s+TABLE\s+([a-z][a-z0-9_]*)/gi)]
+    .map((match) => match[1])
+    .sort();
+  assert(
+    equalStringArrays(actualStage8Tables, expectedStage8Tables),
+    `migration 0003 table inventory differs: ${actualStage8Tables.join(', ')}`,
+  );
+  for (const table of expectedStage8Tables) {
+    assert(
+      !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(`${migration1}\n${migration2}`),
+      `Stage 8 table is premature before migration 0003: ${table}`,
+    );
+  }
+  assert(
+    (migration3.match(/\)\s+STRICT,\s+WITHOUT\s+ROWID\s*;/gi) ?? []).length === 5,
+    'every Stage 8 table must be STRICT and WITHOUT ROWID',
+  );
+  for (const table of [
+    'artifact_blobs',
+    'evidence_refs',
     'authority_evidence',
+    'model_outputs',
+    'model_output_items',
+    'tool_results',
+    'stdout_chunks',
+    'stderr_chunks',
+    'retention_policies',
+    'artifact_deletions',
+    'provider_conversations',
+    'authentication_tokens',
+    'command_idempotency',
     'schema_versions',
   ]) {
     assert(
       !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migrations),
-      `Stage 8+ or custom-version table is premature: ${table}`,
+      `Stage 9+ or forbidden custom table is premature: ${table}`,
     );
   }
 
   const expectedIndexes = [
     'ix_journal_events_conversation_offset',
     'ix_journal_events_work_offset',
+    'ix_artifacts_content',
+    'ix_artifacts_producer_kind_id',
+    'ix_artifacts_producing_work',
+    'ix_artifacts_storage_key',
+    'ix_context_manifest_sources_artifact',
+    'ix_context_manifest_sources_event',
+    'ix_context_manifests_work_created',
     'ix_messages_conversation',
+    'ix_model_invocations_context_attempt',
+    'ix_model_invocations_runtime_nonterminal',
     'ix_runtime_instances_craxii_state',
+    'ix_tool_executions_runtime_nonterminal',
     'ix_work_items_nonterminal_by_runtime',
     'ix_work_items_queued_fifo',
     'ix_workspaces_craxii_id',
     'ix_workstations_craxii_id',
     'ux_client_devices_token_hash',
     'ux_conversations_craxii_kind',
+    'ux_context_manifests_logical_invocation',
     'ux_journal_events_event_id',
     'ux_journal_events_stream_sequence',
     'ux_messages_client_identity',
     'ux_messages_produced_by_work',
+    'ux_model_invocations_logical_attempt',
+    'ux_model_invocations_one_nonterminal_per_work',
+    'ux_model_invocations_retry_of',
+    'ux_model_invocations_work_step_attempt',
+    'ux_tool_executions_execution_id',
+    'ux_tool_executions_one_nonterminal_per_work',
+    'ux_tool_executions_source_ordinal',
+    'ux_tool_executions_source_provider_call',
+    'ux_tool_executions_work_step_ordinal',
     'ux_work_item_inputs_work_ordinal',
     'ux_work_items_conversation_ordinal',
     'ux_work_items_current_model_invocation',
     'ux_work_items_current_tool_execution',
     'ux_work_items_one_active_per_conversation',
     'ux_workspaces_workstation_logical_name',
-  ];
+  ].sort();
   const actualIndexes = [...migrations.matchAll(/\bCREATE\s+(?:UNIQUE\s+)?INDEX\s+([a-z][a-z0-9_]*)/gi)]
     .map((match) => match[1])
     .sort();
   assert(
     equalStringArrays(actualIndexes, expectedIndexes),
-    `Stage 7 named index inventory differs: ${actualIndexes.join(', ')}`,
+    `Stage 8 named index inventory differs: ${actualIndexes.join(', ')}`,
   );
   assert(
     !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migrations),
@@ -372,8 +436,13 @@ function verifyStage7Boundaries() {
     'message indexes must not create timestamp/UUID ordering authority',
   );
   assert(
-    !/\b(?:provider_response_id|provider_request_json|provider_response_json|openai_|responses_api)\b/i.test(migrations),
+    !/\b(?:provider_request_json|provider_response_json|authorization_header|api_key|openai_|responses_api)\b/i.test(migrations),
     'provider wire types must not enter migrations',
+  );
+  assert(
+    /requested_cwd\s+TEXT\s+NOT\s+NULL/i.test(migration3) &&
+      !/requested_cwd\s+TEXT\s+NULL/i.test(migration3),
+    'Stage 8 requested_cwd must persist one concrete non-null effective logical path',
   );
   assert(!/\bCREATE\s+TRIGGER\b/i.test(migrations), 'production trigger inventory must remain zero');
   assert(!/\bCREATE\s+VIEW\b/i.test(migrations), 'production view inventory must remain zero');
@@ -386,7 +455,7 @@ function verifyStage7Boundaries() {
   const sqliteSource = sqliteFiles.map((path) => readFileSync(path, 'utf8')).join('\n');
   assert(!/\bquery(?:_as)?!\s*\(/.test(sqliteSource), 'SQLx query macros are forbidden in persistence codecs');
   assert(!/derive\([^)]*FromRow/.test(sqliteSource), 'SQLx FromRow derives are forbidden on persistence rows');
-  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 7');
+  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 8');
   const productionSqliteSource = sqliteFiles
     .filter((path) => !/_tests\.rs$/.test(path))
     .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
@@ -403,6 +472,51 @@ function verifyStage7Boundaries() {
     !/impl\s+ReplayStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
     'Stage 11 public replay capability must remain unimplemented',
   );
+  assert(
+    !/pub(?:\([^)]*\))?\s+async\s+fn\s+insert_artifact_metadata/.test(productionSqliteSource),
+    'artifact metadata insertion must remain adapter-private and transaction-composed',
+  );
+
+  const artifactAdapterRoot = join(rustRoot, 'adapters', 'artifacts');
+  assert(
+    existsSync(join(artifactAdapterRoot, 'local.rs')) && existsSync(join(artifactAdapterRoot, 'mod.rs')),
+    'the local artifact filesystem adapter must live outside the SQLite adapter',
+  );
+  const artifactPort = readFileSync(join(rustRoot, 'ports', 'artifact_store.rs'), 'utf8');
+  assert(
+    !/std::path|PathBuf|\bPath\b/.test(artifactPort),
+    'ArtifactStore public types must not expose physical filesystem paths',
+  );
+  assert(
+    !/impl\s+FinalizedArtifact\s*\{[\s\S]*?pub\s+(?:const\s+)?fn\s+new\s*\(/.test(artifactPort) &&
+      /pub\(crate\)\s+const\s+fn\s+from_durable_publication\s*\(/.test(artifactPort),
+    'FinalizedArtifact construction must remain sealed from public callers',
+  );
+  const finalizedArtifactFields = artifactPort.match(
+    /pub struct FinalizedArtifact\s*\{([\s\S]*?)\n\}/,
+  );
+  assert(
+    finalizedArtifactFields !== null &&
+      !/\bpub(?:\([^)]*\))?\s+\w+\s*:/.test(finalizedArtifactFields[1]),
+    'FinalizedArtifact fields must remain private',
+  );
+  const durablePublicationCallSites = rustFiles
+    .filter((path) => readFileSync(path, 'utf8').includes('FinalizedArtifact::from_durable_publication('))
+    .map((path) => relative(rustRoot, path));
+  assert(
+    equalStringArrays(durablePublicationCallSites, ['adapters/artifacts/local.rs']),
+    `only the local artifact adapter may mint FinalizedArtifact: ${durablePublicationCallSites.join(', ')}`,
+  );
+  const stage8Transactions = readFileSync(join(sqliteRoot, 'stage8.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  assert(
+    !/FinalizedArtifact::from_durable_publication/.test(stage8Transactions),
+    'SQLite must reconstruct verification references, not finalized-publication capabilities',
+  );
+  assert(
+    !/tokio::process|std::process|Command::new|reqwest|anthropic|openai/i.test(stage8Transactions),
+    'Stage 8 transactions must not perform tool or provider side effects',
+  );
 
   const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
   assert(
@@ -413,12 +527,20 @@ function verifyStage7Boundaries() {
   const compatibility = readFileSync(join(rustRoot, 'bootstrap', 'compatibility.rs'), 'utf8');
   const schema = readFileSync(join(sqliteRoot, 'schema.rs'), 'utf8');
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*2;/.test(compatibility),
-    'bootstrap schema compatibility ceiling must be 2',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*3;/.test(compatibility),
+    'bootstrap schema compatibility ceiling must be 3',
   );
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*2;/.test(schema),
-    'SQLite schema compatibility ceiling must be 2',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*3;/.test(schema),
+    'SQLite schema compatibility ceiling must be 3',
+  );
+
+  const journalDomain = readFileSync(join(rustRoot, 'domain', 'journal.rs'), 'utf8');
+  assert(/pub const ALL: \[Self; 28\]/.test(journalDomain), 'journal registry must contain 28 events');
+  assert(/"model\.invocation_streaming"/.test(journalDomain), 'model streaming event is absent');
+  assert(
+    /"tool\.execution_interrupted_before_dispatch"/.test(journalDomain),
+    'tool pre-dispatch interruption event is absent',
   );
 
   const sqliteArtifacts = trackedFiles().filter((path) =>
@@ -428,6 +550,15 @@ function verifyStage7Boundaries() {
     sqliteArtifacts.length === 0,
     `tracked SQLite database artifacts are forbidden: ${sqliteArtifacts.join(', ')}`,
   );
+  const trackedArtifactObjects = trackedFiles().filter(
+    (path) =>
+      /(?:^|\/)artifacts\/(?:tmp|sha256)\//.test(path) ||
+      /\.partial$/i.test(path),
+  );
+  assert(
+    trackedArtifactObjects.length === 0,
+    `tracked runtime artifact files are forbidden: ${trackedArtifactObjects.join(', ')}`,
+  );
   const stateStore = readFileSync(join(rustRoot, 'ports', 'state_store.rs'), 'utf8');
   assert(!/\bsqlx\s*::/.test(stateStore), 'StateStore must remain free of SQLx crate types');
   assert(
@@ -435,8 +566,25 @@ function verifyStage7Boundaries() {
     'StateStore must not expose a generic transaction operation',
   );
   assert(!/payload_json/.test(stateStore), 'StateStore must not expose raw journal payload JSON');
-  const journalDomain = readFileSync(join(rustRoot, 'domain', 'journal.rs'), 'utf8');
   assert(!/payload_json/.test(journalDomain), 'trusted journal domain types must not expose raw JSON');
+  assert(
+    /pub\s+requested_cwd:\s+LogicalPathReference/.test(stateStore) &&
+      !/pub\s+requested_cwd:\s+Option\s*</.test(stateStore),
+    'Stage 8 persistence port requested_cwd must be concrete and nonoptional',
+  );
+  assert(
+    !/impl\s+(?:CommandStateStore|SchedulerStateStore|RecoveryStateStore|CompletionStateStore)\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 9, 10, and 17 StateStore behavior must remain unimplemented',
+  );
+  const canonicalPersistence = [stateStore, artifactPort, journalDomain].join('\n');
+  assert(
+    !/\b(?:authorization_header|api_key|bearer_token|access_token)\b/i.test(canonicalPersistence),
+    'canonical domain and ports must not persist raw authorization or credential fields',
+  );
+  assert(
+    !/\b(?:stdout_bytes|stderr_bytes|raw_output|process_output)\b/i.test(journalDomain),
+    'journal payloads must not contain raw process or filesystem output',
+  );
   const projector = readFileSync(join(rustRoot, 'application', 'projector.rs'), 'utf8')
     .split('\n#[cfg(test)]')[0];
   assert(!/\bsqlx\s*::/.test(projector), 'pure projector must remain SQLx-free');
@@ -445,7 +593,7 @@ function verifyStage7Boundaries() {
   return {
     rustFileCount: rustFiles.length,
     migrationFileCount: migrationFiles.length,
-    tableCount: actualStage6Tables.length + actualStage7Tables.length,
+    tableCount: actualStage6Tables.length + actualStage7Tables.length + actualStage8Tables.length,
     indexCount: actualIndexes.length,
   };
 }
@@ -505,10 +653,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage7 = verifyStage7Boundaries();
+  const stage8 = verifyStage8Boundaries();
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage7.rustFileCount} Rust files, ${stage7.migrationFileCount} exact migrations, ${stage7.tableCount} product tables, ${stage7.indexCount} named indexes, 0 triggers/views, 0 tracked SQLite artifacts`,
+    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage8.rustFileCount} Rust files, ${stage8.migrationFileCount} exact migrations, ${stage8.tableCount} product tables, ${stage8.indexCount} named indexes, 28 journal events, local content-addressed artifact storage, 0 triggers/views, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

@@ -650,7 +650,23 @@ pub(super) struct PersistedSourceStatus {
 pub(super) fn encode_normalized_error_detail(
     error: &NormalizedError,
 ) -> Result<String, SqliteAdapterError> {
-    if error.certainty().as_str() != "definite" {
+    encode_persisted_normalized_error(error, false)
+}
+
+pub(super) fn encode_attempt_normalized_error(
+    error: &NormalizedError,
+    allow_outcome_unknown: bool,
+) -> Result<String, SqliteAdapterError> {
+    encode_persisted_normalized_error(error, allow_outcome_unknown)
+}
+
+fn encode_persisted_normalized_error(
+    error: &NormalizedError,
+    allow_outcome_unknown: bool,
+) -> Result<String, SqliteAdapterError> {
+    if error.certainty().as_str() != "definite"
+        && (!allow_outcome_unknown || error.certainty().as_str() != "outcome_unknown")
+    {
         return Err(corrupt_row());
     }
     let stored = PersistedNormalizedError {
@@ -670,15 +686,34 @@ pub(super) fn encode_normalized_error_detail(
 pub(super) fn decode_normalized_error_detail(
     json: &str,
 ) -> Result<PersistedNormalizedError, SqliteAdapterError> {
+    decode_persisted_normalized_error(json, false)
+}
+
+pub(super) fn decode_attempt_normalized_error(
+    json: &str,
+    allow_outcome_unknown: bool,
+) -> Result<PersistedNormalizedError, SqliteAdapterError> {
+    decode_persisted_normalized_error(json, allow_outcome_unknown)
+}
+
+fn decode_persisted_normalized_error(
+    json: &str,
+    allow_outcome_unknown: bool,
+) -> Result<PersistedNormalizedError, SqliteAdapterError> {
     let stored: PersistedNormalizedError = serde_json::from_str(json).map_err(|_| corrupt_row())?;
-    if !valid_persisted_normalized_error(&stored) {
+    if !valid_persisted_normalized_error(&stored, allow_outcome_unknown) {
         return Err(corrupt_row());
     }
     Ok(stored)
 }
 
-fn valid_persisted_normalized_error(stored: &PersistedNormalizedError) -> bool {
-    if stored.certainty != "definite" {
+fn valid_persisted_normalized_error(
+    stored: &PersistedNormalizedError,
+    allow_outcome_unknown: bool,
+) -> bool {
+    if stored.certainty != "definite"
+        && (!allow_outcome_unknown || stored.certainty != "outcome_unknown")
+    {
         return false;
     }
     let (code, message, retryabilities, source_allowed) = match stored.category.as_str() {

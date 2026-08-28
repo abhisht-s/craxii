@@ -648,6 +648,7 @@ pub(super) fn encode_event_payload(
             StoredEventPayloadV1::WorkTransition(value.into())
         }
         JournalEventPayload::ModelInvocationStarted(value)
+        | JournalEventPayload::ModelInvocationStreaming(value)
         | JournalEventPayload::ModelInvocationCompleted(value)
         | JournalEventPayload::ModelInvocationFailed(value)
         | JournalEventPayload::ModelInvocationInterrupted(value) => {
@@ -656,6 +657,7 @@ pub(super) fn encode_event_payload(
         JournalEventPayload::ToolExecutionRequested(value)
         | JournalEventPayload::ToolExecutionDispatching(value)
         | JournalEventPayload::ToolExecutionCompleted(value)
+        | JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(value)
         | JournalEventPayload::ToolExecutionOutcomeUnknown(value) => {
             StoredEventPayloadV1::Tool(value.into())
         }
@@ -742,6 +744,11 @@ pub(super) fn decode_event_payload(
         JournalEventKind::ModelInvocationStarted => JournalEventPayload::ModelInvocationStarted(
             from_json::<StoredModelInvocationEventV1>(payload_json)?.into(),
         ),
+        JournalEventKind::ModelInvocationStreaming => {
+            JournalEventPayload::ModelInvocationStreaming(
+                from_json::<StoredModelInvocationEventV1>(payload_json)?.into(),
+            )
+        }
         JournalEventKind::ModelInvocationCompleted => {
             JournalEventPayload::ModelInvocationCompleted(
                 from_json::<StoredModelInvocationEventV1>(payload_json)?.into(),
@@ -766,6 +773,11 @@ pub(super) fn decode_event_payload(
         JournalEventKind::ToolExecutionCompleted => JournalEventPayload::ToolExecutionCompleted(
             from_json::<StoredToolExecutionEventV1>(payload_json)?.into(),
         ),
+        JournalEventKind::ToolExecutionInterruptedBeforeDispatch => {
+            JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(
+                from_json::<StoredToolExecutionEventV1>(payload_json)?.into(),
+            )
+        }
         JournalEventKind::ToolExecutionOutcomeUnknown => {
             JournalEventPayload::ToolExecutionOutcomeUnknown(
                 from_json::<StoredToolExecutionEventV1>(payload_json)?.into(),
@@ -801,7 +813,7 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
             value.display_name == "Craxii"
                 && value.owner_label == "local-owner"
                 && value.architecture_revision == "V0.0.01"
-                && value.schema_revision.get() == 2
+                && matches!(value.schema_revision.get(), 2 | 3)
                 && crate::domain::LogicalPathReference::absolute(
                     value.workspace_logical_root.clone(),
                 )
@@ -844,6 +856,9 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         JournalEventPayload::ModelInvocationStarted(value) => {
             value.state == ModelInvocationState::Requesting
         }
+        JournalEventPayload::ModelInvocationStreaming(value) => {
+            value.state == ModelInvocationState::Streaming
+        }
         JournalEventPayload::ModelInvocationCompleted(value) => {
             value.state == ModelInvocationState::Completed
         }
@@ -866,11 +881,12 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         JournalEventPayload::ToolExecutionCompleted(value) => {
             value.state == ToolExecutionState::Completed
         }
+        JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(value) => {
+            value.state == ToolExecutionState::InterruptedBeforeDispatch
+                && value.outcome_classification.is_none()
+        }
         JournalEventPayload::ToolExecutionOutcomeUnknown(value) => {
-            matches!(
-                value.state,
-                ToolExecutionState::InterruptedBeforeDispatch | ToolExecutionState::OutcomeUnknown
-            )
+            value.state == ToolExecutionState::OutcomeUnknown
         }
         JournalEventPayload::ArtifactRecorded(value) => value.canonical_length <= i64::MAX as u64,
         JournalEventPayload::RuntimeStarted(value) => value.state == JournalRuntimeState::Running,
@@ -979,6 +995,7 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
         ) => id == value.work_id && intent.work_id == Some(value.work_id),
         (
             JournalEventPayload::ModelInvocationStarted(value)
+            | JournalEventPayload::ModelInvocationStreaming(value)
             | JournalEventPayload::ModelInvocationCompleted(value)
             | JournalEventPayload::ModelInvocationFailed(value)
             | JournalEventPayload::ModelInvocationInterrupted(value),
@@ -988,6 +1005,7 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
             JournalEventPayload::ToolExecutionRequested(value)
             | JournalEventPayload::ToolExecutionDispatching(value)
             | JournalEventPayload::ToolExecutionCompleted(value)
+            | JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(value)
             | JournalEventPayload::ToolExecutionOutcomeUnknown(value),
             JournalStreamId::Work(id),
         ) => id == value.work_id && intent.work_id == Some(value.work_id),
@@ -1458,11 +1476,13 @@ mod tests {
                 JournalEventPayload::WorkInterrupted(transition(kind))
             }
             JournalEventKind::ModelInvocationStarted
+            | JournalEventKind::ModelInvocationStreaming
             | JournalEventKind::ModelInvocationCompleted
             | JournalEventKind::ModelInvocationFailed
             | JournalEventKind::ModelInvocationInterrupted => {
                 let state = match kind {
                     JournalEventKind::ModelInvocationStarted => ModelInvocationState::Requesting,
+                    JournalEventKind::ModelInvocationStreaming => ModelInvocationState::Streaming,
                     JournalEventKind::ModelInvocationCompleted => ModelInvocationState::Completed,
                     JournalEventKind::ModelInvocationFailed => ModelInvocationState::Failed,
                     JournalEventKind::ModelInvocationInterrupted => {
@@ -1481,6 +1501,9 @@ mod tests {
                     JournalEventKind::ModelInvocationStarted => {
                         JournalEventPayload::ModelInvocationStarted(value)
                     }
+                    JournalEventKind::ModelInvocationStreaming => {
+                        JournalEventPayload::ModelInvocationStreaming(value)
+                    }
                     JournalEventKind::ModelInvocationCompleted => {
                         JournalEventPayload::ModelInvocationCompleted(value)
                     }
@@ -1496,11 +1519,15 @@ mod tests {
             JournalEventKind::ToolExecutionRequested
             | JournalEventKind::ToolExecutionDispatching
             | JournalEventKind::ToolExecutionCompleted
+            | JournalEventKind::ToolExecutionInterruptedBeforeDispatch
             | JournalEventKind::ToolExecutionOutcomeUnknown => {
                 let state = match kind {
                     JournalEventKind::ToolExecutionRequested => ToolExecutionState::Requested,
                     JournalEventKind::ToolExecutionDispatching => ToolExecutionState::Dispatching,
                     JournalEventKind::ToolExecutionCompleted => ToolExecutionState::Completed,
+                    JournalEventKind::ToolExecutionInterruptedBeforeDispatch => {
+                        ToolExecutionState::InterruptedBeforeDispatch
+                    }
                     JournalEventKind::ToolExecutionOutcomeUnknown => {
                         ToolExecutionState::OutcomeUnknown
                     }
@@ -1523,6 +1550,9 @@ mod tests {
                     }
                     JournalEventKind::ToolExecutionCompleted => {
                         JournalEventPayload::ToolExecutionCompleted(value)
+                    }
+                    JournalEventKind::ToolExecutionInterruptedBeforeDispatch => {
+                        JournalEventPayload::ToolExecutionInterruptedBeforeDispatch(value)
                     }
                     JournalEventKind::ToolExecutionOutcomeUnknown => {
                         JournalEventPayload::ToolExecutionOutcomeUnknown(value)
@@ -1622,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn all_twenty_six_v1_payloads_have_golden_exact_bytes_hashes_and_roundtrip() {
+    fn all_twenty_eight_v1_payloads_have_golden_exact_bytes_hashes_and_roundtrip() {
         let expected = [
             (
                 JournalEventKind::CraxiiInitialized,
@@ -1681,6 +1711,10 @@ mod tests {
                 "d4ea825576ee37e5df76f4af038a05a64a13991e365a91fd186a477400927645",
             ),
             (
+                JournalEventKind::ModelInvocationStreaming,
+                "e62bac3a4c181e84503d47b177ebeba1ca96bd0c76664500274c20b590d988d5",
+            ),
+            (
                 JournalEventKind::ModelInvocationCompleted,
                 "dc44f2d26bf94223e8d546866a12d53068207247ca3fc2845ed734a7c54f8fed",
             ),
@@ -1703,6 +1737,10 @@ mod tests {
             (
                 JournalEventKind::ToolExecutionCompleted,
                 "21b48ea7ee0ee995f7d4406c0fd3e78bb44b3b812091aca6486f639af6d33a6a",
+            ),
+            (
+                JournalEventKind::ToolExecutionInterruptedBeforeDispatch,
+                "b285c7e4019b95de3b4088f28d14d2c0c9289355ba8a6ca171a3c0d65e6d5f49",
             ),
             (
                 JournalEventKind::ToolExecutionOutcomeUnknown,

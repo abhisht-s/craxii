@@ -24,7 +24,7 @@ use super::journal::{
 use super::runtime::SqliteRuntimeGuard;
 use super::schema::{
     JOURNAL_MIGRATION_DESCRIPTION, MIGRATOR, PRODUCT_INDEXES, PRODUCT_TABLES,
-    expected_schema_fingerprint, v1_schema_fingerprint,
+    expected_schema_fingerprint, v1_schema_fingerprint, v2_schema_fingerprint,
 };
 use super::state_store::{BootstrapTestHook, SqliteStateStore};
 use super::transaction::WriteTransaction;
@@ -204,12 +204,12 @@ fn conversation_event_intent(
 }
 
 #[tokio::test]
-async fn migration_two_manifest_schema_and_zero_product_rows_are_exact() {
+async fn migration_three_manifest_schema_and_zero_product_rows_are_exact() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    assert_eq!(PRODUCT_TABLES.len(), 12);
-    assert_eq!(PRODUCT_INDEXES.len(), 20);
+    assert_eq!(PRODUCT_TABLES.len(), 17);
+    assert_eq!(PRODUCT_INDEXES.len(), 40);
     for table in PRODUCT_TABLES {
         assert_eq!(count(guard.runtime(), table).await, 0, "{table}");
     }
@@ -260,11 +260,15 @@ async fn migration_two_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "391d9bfb54cf771de1815a3bf54ee4d7d16f1b877acf629cf783ca12dbd37d4d"
+        "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3"
     );
     assert_eq!(
         v1_schema_fingerprint(),
         "f4636df22c635c90ac469f49f2ac3a9ccb38956f1670d26ab566140a137f5521"
+    );
+    assert_eq!(
+        v2_schema_fingerprint(),
+        "391d9bfb54cf771de1815a3bf54ee4d7d16f1b877acf629cf783ca12dbd37d4d"
     );
     let partial_indexes = sqlx::query(
         "SELECT name, sql FROM sqlite_schema WHERE name IN \
@@ -589,7 +593,7 @@ async fn work_input_constraints_and_private_causal_validation_fail_closed() {
 }
 
 #[tokio::test]
-async fn valid_version_one_database_migrates_to_version_two_and_reopens() {
+async fn valid_version_one_database_migrates_to_version_three_and_reopens() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -626,7 +630,7 @@ async fn valid_version_one_database_migrates_to_version_two_and_reopens() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        2
+        3
     );
     drop(connection);
     guard.shutdown().await;
@@ -1551,10 +1555,10 @@ async fn partial_bootstrap_matrix_fails_closed_and_never_repairs() {
 }
 
 #[test]
-fn exact_registry_has_only_two_stage_seven_emitters() {
+fn exact_registry_has_two_stage_seven_emitters_and_twenty_eight_total_events() {
     fn requires_bootstrap_capability<T: BootstrapStateStore>() {}
     requires_bootstrap_capability::<SqliteStateStore>();
-    assert_eq!(JournalEventKind::ALL.len(), 26);
+    assert_eq!(JournalEventKind::ALL.len(), 28);
     assert_eq!(
         JournalEventKind::ALL
             .iter()

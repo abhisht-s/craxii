@@ -10,13 +10,18 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::domain::{
-    ClientCommandId, ClientMessageId, Conversation, ConversationId, CorrelationId, CraxiiId,
-    CraxiiPrincipal, CurrentWorkAttempt, DeviceId, JournalEventId, JournalOffset, Message,
-    MessageId, ModelAttemptReference, ModelInvocationId, ModelInvocationState, ProjectionVersion,
-    RuntimeInstanceId, ToolExecutionId, ToolExecutionState, ToolLifecycleReference, UtcTimestamp,
-    WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId, WorkspaceIdentity,
-    WorkstationCapabilities, WorkstationGeneration, WorkstationId, WorkstationIdentity,
+    ArtifactId, ArtifactReference, AuthorityDecisionSnapshot, CanonicalByteCount, ClientCommandId,
+    ClientMessageId, Conversation, ConversationId, CorrelationId, CraxiiId, CraxiiPrincipal,
+    CurrentWorkAttempt, DeviceId, JournalEventId, JournalOffset, LogicalInvocationId,
+    LogicalPathReference, Message, MessageId, ModelAttemptReference, ModelInvocationId,
+    ModelInvocationState, NormalizedError, PrivilegeMode, ProjectionVersion,
+    ProviderModelReference, ResolvedPathEvidence, RuntimeInstanceId, Sha256Digest, ToolExecutionId,
+    ToolExecutionState, ToolLifecycleReference, ToolName, ToolResultClass, ToolVersion,
+    UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId,
+    WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
+    WorkstationIdentity,
 };
+use crate::ports::artifact_store::FinalizedArtifact;
 
 /// Boxed future used by the port without an async-trait or adapter dependency.
 pub type StateStoreFuture<'a, T> =
@@ -125,6 +130,310 @@ pub struct EventIntent {
     pub causation_event_id: Option<JournalEventId>,
 }
 
+/// A finalized physical object plus one immutable semantic metadata occurrence and event identity.
+#[derive(Clone)]
+pub struct PreparedArtifact {
+    pub finalized: FinalizedArtifact,
+    pub metadata: ArtifactReference,
+    pub event: EventIntent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextSourceKind {
+    SystemInstruction,
+    DeveloperInstruction,
+    WorkstationCapabilitySummary,
+    WorkspaceIdentity,
+    ToolDefinition,
+    UserMessage,
+    ActiveTrigger,
+    AssistantMessage,
+    CompletedModelOutput,
+    ObservedToolResult,
+    ArtifactContent,
+    SyntheticFailure,
+    SyntheticInterruption,
+    SyntheticOutcomeUnknown,
+    SyntheticDraftStatus,
+    ProviderNativeContinuation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextSourceRecordKind {
+    InstructionVersion,
+    Workstation,
+    Workspace,
+    ToolDefinition,
+    Message,
+    ModelInvocation,
+    ToolExecution,
+    Work,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContextSourceIdentity {
+    Event(JournalEventId),
+    Artifact(ArtifactId),
+    Record {
+        kind: ContextSourceRecordKind,
+        id: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextModelRole {
+    System,
+    Developer,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextTransformKind {
+    Identity,
+    InlineProjection,
+    SyntheticStatus,
+    ProviderContinuation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedContextSource {
+    pub position: i64,
+    pub kind: ContextSourceKind,
+    pub identity: ContextSourceIdentity,
+    pub model_role: Option<ContextModelRole>,
+    pub item_class: Option<String>,
+    pub source_content_sha256: Sha256Digest,
+    pub rendered_byte_contribution: CanonicalByteCount,
+    pub transform: ContextTransformKind,
+    pub transformed: bool,
+}
+
+/// Exact immutable manifest facts produced later by Stage 16 and persisted by Stage 8.
+pub struct PreparedContextManifest {
+    pub context_manifest_id: crate::domain::ContextManifestId,
+    pub work_id: WorkId,
+    pub logical_invocation_id: LogicalInvocationId,
+    pub provider_model: ProviderModelReference,
+    pub assembler_version: String,
+    pub context_policy_version: String,
+    pub system_prompt_fingerprint: Sha256Digest,
+    pub toolset_fingerprint: Sha256Digest,
+    pub eligibility_conversation_id: ConversationId,
+    pub active_work_ordinal: i64,
+    pub highest_prior_terminal_work_ordinal: Option<i64>,
+    pub input_event_ids: Vec<JournalEventId>,
+    pub active_output_record_ids: Vec<String>,
+    pub maximum_journal_offset: JournalOffset,
+    pub canonical_byte_count: CanonicalByteCount,
+    pub rendered_request_byte_count: CanonicalByteCount,
+    pub estimated_input_tokens: u64,
+    pub token_estimator_id: String,
+    pub context_window_tokens: u64,
+    pub reserved_output_tokens: u64,
+    pub utilization_basis_points: u16,
+    pub manifest_sha256: Sha256Digest,
+    pub rendered_request_sha256: Sha256Digest,
+    pub rendered_request_artifact_id: Option<ArtifactId>,
+    pub omitted_source_count: u64,
+    pub transformed_source_count: u64,
+    pub sources: Vec<PreparedContextSource>,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelSelectionReason {
+    Explicit,
+    ConfiguredDefault,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RequiredModelCapabilities {
+    pub text_input: bool,
+    pub text_output: bool,
+    pub custom_tool_calling: bool,
+    pub streaming: bool,
+    pub ordered_output_items: bool,
+    pub structured_output: bool,
+    pub reasoning_continuation: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderOptionValue {
+    Boolean(bool),
+    Integer(i64),
+    Text(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderOption {
+    pub key: String,
+    pub value: ProviderOptionValue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NormalizedModelOutputItem {
+    Text {
+        text: String,
+    },
+    ToolCall {
+        call_id: String,
+        tool_name: ToolName,
+        arguments_json: String,
+    },
+    StructuredData {
+        canonical_json: String,
+    },
+    Refusal {
+        text: String,
+    },
+    ReasoningSummary {
+        text: String,
+    },
+    ProviderOpaque {
+        provider_id: crate::domain::ProviderId,
+        item_type: String,
+        sha256: Sha256Digest,
+        artifact_id: ArtifactId,
+    },
+    UnknownProviderItem {
+        item_type: String,
+        sha256: Sha256Digest,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedModelOutput {
+    pub items: Vec<NormalizedModelOutputItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ModelUsage {
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub total_tokens: u64,
+}
+
+pub struct PreparedModelInvocation {
+    pub attempt: ModelAttemptReference,
+    pub selection_reason: ModelSelectionReason,
+    pub required_capabilities: RequiredModelCapabilities,
+    pub provider_options: Vec<ProviderOption>,
+    pub request_sha256: Sha256Digest,
+    pub request_artifact_id: Option<ArtifactId>,
+    pub started_at: UtcTimestamp,
+}
+
+pub struct ModelStreamingObservation {
+    pub first_byte_at: UtcTimestamp,
+    pub first_output_at: Option<UtcTimestamp>,
+    pub provider_request_id: Option<String>,
+    pub provider_response_id: Option<String>,
+    pub draft_exposed: bool,
+}
+
+pub struct ModelTerminalOutcome {
+    pub state: ModelInvocationState,
+    pub response_sha256: Option<Sha256Digest>,
+    pub response_artifact_id: Option<ArtifactId>,
+    pub normalized_output: Option<NormalizedModelOutput>,
+    pub provider_request_id: Option<String>,
+    pub provider_response_id: Option<String>,
+    pub first_byte_at: Option<UtcTimestamp>,
+    pub first_output_at: Option<UtcTimestamp>,
+    pub completed_at: UtcTimestamp,
+    pub usage: Option<ModelUsage>,
+    pub stop_reason: Option<String>,
+    pub tool_call_count: Option<u64>,
+    pub draft_exposed: bool,
+    pub normalized_error: Option<NormalizedError>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolOutputPolicy {
+    pub stdout_capture_limit: CanonicalByteCount,
+    pub stderr_capture_limit: CanonicalByteCount,
+    pub combined_inline_limit: CanonicalByteCount,
+    pub per_stream_inline_limit: CanonicalByteCount,
+}
+
+pub struct PreparedToolExecution {
+    pub lifecycle: ToolLifecycleReference,
+    pub provider_tool_call_id: Option<String>,
+    pub tool_name: ToolName,
+    pub tool_version: ToolVersion,
+    pub tool_schema_version: i64,
+    pub arguments_json: String,
+    pub arguments_sha256: Sha256Digest,
+    pub workstation_id: WorkstationId,
+    pub workstation_generation: WorkstationGeneration,
+    pub workspace_id: WorkspaceId,
+    /// Concrete effective logical CWD; omission is resolved to the workspace default by the caller.
+    pub requested_cwd: LogicalPathReference,
+    pub requested_privilege: PrivilegeMode,
+    pub timeout_ms: u64,
+    pub output_policy: ToolOutputPolicy,
+    pub requested_at: UtcTimestamp,
+}
+
+impl PreparedToolExecution {
+    /// Resolves an omitted user/tool CWD before constructing the persistence request.
+    #[must_use]
+    pub fn effective_requested_cwd(
+        requested: Option<LogicalPathReference>,
+        workspace_default: &LogicalPathReference,
+    ) -> LogicalPathReference {
+        requested.unwrap_or_else(|| workspace_default.clone())
+    }
+}
+
+pub struct ToolDispatchIntent {
+    pub authority: AuthorityDecisionSnapshot,
+    pub effective_privilege: PrivilegeMode,
+    pub resolved_cwd: ResolvedPathEvidence,
+    pub timeout_ms: u64,
+    pub output_policy: ToolOutputPolicy,
+    pub dispatch_intent_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ToolStreamCounts {
+    pub observed: CanonicalByteCount,
+    pub captured: CanonicalByteCount,
+    pub returned_inline: CanonicalByteCount,
+    pub omitted: CanonicalByteCount,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolResultEvidence {
+    pub result_kind: ToolResultClass,
+    pub summary: String,
+    pub fields: Vec<(String, String)>,
+}
+
+pub struct ToolTerminalOutcome {
+    pub state: ToolExecutionState,
+    /// Optional deny evidence for a definite completed-before-dispatch result.
+    pub predispatch_authority: Option<AuthorityDecisionSnapshot>,
+    pub started_at: Option<UtcTimestamp>,
+    pub completed_at: UtcTimestamp,
+    pub exit_code: Option<i64>,
+    pub signal: Option<i64>,
+    pub timed_out: Option<bool>,
+    pub cancelled: Option<bool>,
+    pub cleanup_confirmed: Option<bool>,
+    pub result: Option<ToolResultEvidence>,
+    pub stdout_artifact_id: Option<ArtifactId>,
+    pub stderr_artifact_id: Option<ArtifactId>,
+    pub stdout_counts: Option<ToolStreamCounts>,
+    pub stderr_counts: Option<ToolStreamCounts>,
+    pub truncated: bool,
+    pub normalized_error: Option<NormalizedError>,
+}
+
 /// Stable identity references created or loaded by the Stage 7 bootstrap transaction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V0IdentityReference {
@@ -219,38 +528,54 @@ pub struct FinishCancellationRequest {
 
 pub struct BeginModelInvocationRequest {
     pub expected_work: WorkExpectation,
-    pub attempt: ModelAttemptReference,
+    pub manifest: PreparedContextManifest,
+    pub invocation: PreparedModelInvocation,
+    pub artifacts: Vec<PreparedArtifact>,
     pub work_next: WorkLifecycleSnapshot,
+    pub invocation_event: EventIntent,
+    pub work_event: EventIntent,
+}
+
+pub struct MarkModelStreamingRequest {
+    pub expected_work: WorkExpectation,
+    pub expected_model: ModelExpectation,
+    pub observation: ModelStreamingObservation,
     pub event: EventIntent,
 }
 
 pub struct FinishModelInvocationRequest {
     pub expected_work: WorkExpectation,
     pub expected_model: ModelExpectation,
-    pub model_next: ModelInvocationState,
+    pub outcome: ModelTerminalOutcome,
+    pub artifacts: Vec<PreparedArtifact>,
     pub work_next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
+    pub model_event: EventIntent,
+    pub work_event: EventIntent,
 }
 
 pub struct RequestToolExecutionRequest {
     pub expected_work: WorkExpectation,
-    pub tool: ToolLifecycleReference,
+    pub tool: PreparedToolExecution,
     pub work_next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
+    pub tool_event: EventIntent,
+    pub work_event: EventIntent,
 }
 
 pub struct CommitToolDispatchIntentRequest {
     pub expected_work: WorkExpectation,
     pub expected_tool: ToolExpectation,
+    pub dispatch: ToolDispatchIntent,
     pub event: EventIntent,
 }
 
 pub struct FinishToolExecutionRequest {
     pub expected_work: WorkExpectation,
     pub expected_tool: ToolExpectation,
-    pub tool_next: ToolExecutionState,
+    pub outcome: ToolTerminalOutcome,
+    pub artifacts: Vec<PreparedArtifact>,
     pub work_next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
+    pub tool_event: EventIntent,
+    pub work_event: EventIntent,
 }
 
 pub struct CommitAssistantCompletionRequest {
@@ -356,6 +681,10 @@ pub trait ModelStateStore: Send + Sync {
         &self,
         request: BeginModelInvocationRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn mark_model_streaming(
+        &self,
+        request: MarkModelStreamingRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
     fn finish_model_invocation(
         &self,
         request: FinishModelInvocationRequest,
@@ -378,7 +707,7 @@ pub trait ToolStateStore: Send + Sync {
     ) -> StateStoreFuture<'_, CommitReceipt>;
 }
 
-/// Stage 8 terminal assistant completion capability.
+/// Stage 17 terminal assistant completion capability.
 pub trait CompletionStateStore: Send + Sync {
     fn commit_assistant_completion(
         &self,
@@ -442,6 +771,7 @@ mod tests {
         RequestCancellation,
         FinishCancellation,
         BeginModel,
+        MarkModelStreaming,
         FinishModel,
         RequestTool,
         CommitToolDispatch,
@@ -454,7 +784,7 @@ mod tests {
     }
 
     impl Intent {
-        const ALL: [Self; 16] = [
+        const ALL: [Self; 17] = [
             Self::LoadOrBootstrapIdentity,
             Self::AcceptMessage,
             Self::ClaimWork,
@@ -462,6 +792,7 @@ mod tests {
             Self::RequestCancellation,
             Self::FinishCancellation,
             Self::BeginModel,
+            Self::MarkModelStreaming,
             Self::FinishModel,
             Self::RequestTool,
             Self::CommitToolDispatch,
@@ -552,6 +883,12 @@ mod tests {
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::BeginModel)
         }
+        fn mark_model_streaming(
+            &self,
+            _: MarkModelStreamingRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::MarkModelStreaming)
+        }
         fn finish_model_invocation(
             &self,
             _: FinishModelInvocationRequest,
@@ -615,7 +952,7 @@ mod tests {
         require_state_store::<FakeStateStore>();
         let fake = FakeStateStore::new();
         assert!(fake.calls.lock().unwrap().is_empty());
-        assert_eq!(Intent::ALL.len(), 16);
+        assert_eq!(Intent::ALL.len(), 17);
     }
 
     #[test]
@@ -654,6 +991,7 @@ mod tests {
             "request_cancellation",
             "finish_cancellation",
             "begin_model_invocation",
+            "mark_model_streaming",
             "finish_model_invocation",
             "request_tool_execution",
             "commit_tool_dispatch_intent",
@@ -666,5 +1004,19 @@ mod tests {
         ];
         let unique = names.into_iter().collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), Intent::ALL.len());
+    }
+
+    #[test]
+    fn omitted_tool_cwd_is_resolved_to_a_concrete_workspace_default_before_persistence() {
+        let default = LogicalPathReference::absolute("/workspace").unwrap();
+        assert_eq!(
+            PreparedToolExecution::effective_requested_cwd(None, &default).canonical(),
+            "/workspace"
+        );
+        let explicit = LogicalPathReference::workspace_relative("src").unwrap();
+        assert_eq!(
+            PreparedToolExecution::effective_requested_cwd(Some(explicit), &default).canonical(),
+            "src"
+        );
     }
 }

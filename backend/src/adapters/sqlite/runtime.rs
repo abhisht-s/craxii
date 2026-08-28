@@ -951,7 +951,7 @@ pub(super) mod tests {
         assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(5));
         let root = TestRoot::new();
         let guard =
-            SqliteRuntimeGuard::start_with_timeout(root.path(), 1, Duration::from_millis(25))
+            SqliteRuntimeGuard::start_with_timeout(root.path(), 1, Duration::from_millis(250))
                 .await
                 .unwrap();
         let held = guard.runtime().acquire().await.unwrap();
@@ -1102,7 +1102,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_two_inventory_is_exact_and_reopen_is_idempotent() {
+    async fn migration_version_three_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
         assert_eq!(guard.disposition(), DatabaseDisposition::Current);
@@ -1121,14 +1121,6 @@ pub(super) mod tests {
             )
             .collect::<Vec<_>>();
         assert_eq!(tables, expected_tables);
-        for forbidden in [
-            "context_manifests",
-            "model_invocations",
-            "tool_executions",
-            "artifacts",
-        ] {
-            assert!(!tables.iter().any(|object| object == forbidden));
-        }
         for table in crate::adapters::sqlite::schema::PRODUCT_TABLES {
             let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM {table}"
@@ -1148,7 +1140,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 2);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 3);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1175,7 +1167,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (3, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (4, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

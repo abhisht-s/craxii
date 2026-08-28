@@ -385,7 +385,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 2);
+    assert_eq!(migrations.len(), 3);
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -465,10 +465,15 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
 }
 
 #[tokio::test]
-async fn stage5_metadata_only_database_migrates_forward_to_current_version_two() {
+async fn stage5_metadata_only_database_migrates_forward_to_current_version_three() {
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
+        "context_manifest_sources",
+        "context_manifests",
+        "tool_executions",
+        "model_invocations",
+        "artifacts",
         "work_item_inputs",
         "stream_heads",
         "journal_events",
@@ -505,7 +510,7 @@ async fn stage5_metadata_only_database_migrates_forward_to_current_version_two()
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        2
+        3
     );
     drop(connection);
     migrated.shutdown().await;
@@ -1783,7 +1788,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (3, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (4, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

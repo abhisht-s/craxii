@@ -51,6 +51,8 @@ xcuserdata/
 # Logs, test output, and local artifacts
 *.log
 artifacts/
+!backend/src/adapters/artifacts/
+!backend/src/adapters/artifacts/*.rs
 test-results/
 playwright-report/
 

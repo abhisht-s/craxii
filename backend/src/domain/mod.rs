@@ -191,11 +191,11 @@ pub use error::{
 pub use evidence::{
     ArtifactCompression, ArtifactEncoding, ArtifactLogicalName, ArtifactMimeType, ArtifactProducer,
     ArtifactReference, ArtifactReferenceInput, ArtifactRetention, ArtifactStorageBackend,
-    AuthorityDecision, AuthorityDecisionSnapshot, AuthorityPolicyVersion, AuthorityReasonCode,
-    DiagnosticPid, GitRevision, LinuxBootId, ModelAttemptReference, ModelAttemptReferenceInput,
-    ModelCapabilitySnapshot, ModelCapabilitySnapshotInput, ModelTargetId, OpaqueStorageKey,
-    PackageVersion, PrivilegeMode, ProviderId, ProviderModelId, ProviderModelReference,
-    ResolvedPathEvidence, RuntimeStartEvidence, RuntimeStartEvidenceInput,
+    ArtifactStorageKey, AuthorityDecision, AuthorityDecisionSnapshot, AuthorityPolicyVersion,
+    AuthorityReasonCode, DiagnosticPid, GitRevision, LinuxBootId, ModelAttemptReference,
+    ModelAttemptReferenceInput, ModelCapabilitySnapshot, ModelCapabilitySnapshotInput,
+    ModelTargetId, PackageVersion, PrivilegeMode, ProviderId, ProviderModelId,
+    ProviderModelReference, ResolvedPathEvidence, RuntimeStartEvidence, RuntimeStartEvidenceInput,
     TargetConfigurationVersion, TokenCount, ToolAttemptReference, ToolAttemptReferenceInput,
     ToolName, ToolVersion,
 };

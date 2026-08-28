@@ -30,11 +30,11 @@ use super::transaction::WriteTransaction;
 const DISPLAY_NAME: &str = "Craxii";
 const OWNER_LABEL: &str = "local-owner";
 const ARCHITECTURE_REVISION: &str = "V0.0.01";
-const SCHEMA_REVISION: i64 = 2;
+const SCHEMA_REVISION: i64 = 3;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
-    runtime: SqliteRuntime,
+    pub(super) runtime: SqliteRuntime,
     #[cfg(test)]
     bootstrap_hook: std::sync::Arc<std::sync::Mutex<Option<BootstrapTestHook>>>,
 }
@@ -177,6 +177,8 @@ impl SqliteStateStore {
         compare_message_projection(&mut transaction, &projected).await?;
         compare_work_projection(&mut transaction, &projected).await?;
         compare_work_inputs(&mut transaction, &projected).await?;
+        let stage8_invariants =
+            super::stage8::verify_stage8_consistency(&mut transaction, &projected, &events).await?;
 
         let journal_head = events.last().map(|event| event.journal_offset);
         transaction
@@ -184,7 +186,7 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 18,
+            checked_invariants: 18 + stage8_invariants,
             journal_head,
         })
     }
@@ -274,7 +276,7 @@ impl BootstrapStateStore for SqliteStateStore {
     }
 }
 
-fn map_port_error(error: SqliteAdapterError) -> StateStoreError {
+pub(super) fn map_port_error(error: SqliteAdapterError) -> StateStoreError {
     let kind = match error.kind() {
         SqliteFailureKind::StateConflict => StateStoreErrorKind::StateConflict,
         SqliteFailureKind::InternalInvariant | SqliteFailureKind::InconsistentSchema => {
@@ -665,7 +667,7 @@ async fn load_root_snapshot(
         || principal.primary_conversation_id() != primary_conversation.conversation_id()
         || principal.default_workspace_id() != workspace.workspace_id()
         || workstation.workstation_id() != workspace.workstation_id()
-        || principal.schema_revision().get() != SCHEMA_REVISION
+        || !matches!(principal.schema_revision().get(), 2 | SCHEMA_REVISION)
     {
         return Err(inconsistent());
     }
