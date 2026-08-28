@@ -238,7 +238,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage8Boundaries() {
+function verifyStage9Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -274,7 +274,7 @@ function verifyStage8Boundaries() {
       '0002_journal_and_work_inputs.sql',
       '0003_context_model_tool_artifacts.sql',
     ]),
-    `Stage 8 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
+    `Stage 9 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
   );
   const migration1 = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
   const migration2 = readFileSync(join(migrationRoot, migrationFiles[1]), 'utf8');
@@ -366,7 +366,7 @@ function verifyStage8Boundaries() {
   ]) {
     assert(
       !new RegExp(`\\bCREATE\\s+TABLE\\s+${table}\\b`, 'i').test(migrations),
-      `Stage 9+ or forbidden custom table is premature: ${table}`,
+      `forbidden custom table is present in the frozen V3 schema: ${table}`,
     );
   }
 
@@ -417,7 +417,7 @@ function verifyStage8Boundaries() {
     .sort();
   assert(
     equalStringArrays(actualIndexes, expectedIndexes),
-    `Stage 8 named index inventory differs: ${actualIndexes.join(', ')}`,
+    `Stage 9 named index inventory differs: ${actualIndexes.join(', ')}`,
   );
   assert(
     !/\b(?:raw_token|bearer_token|access_token|token)\s+TEXT\b/i.test(migrations),
@@ -455,7 +455,7 @@ function verifyStage8Boundaries() {
   const sqliteSource = sqliteFiles.map((path) => readFileSync(path, 'utf8')).join('\n');
   assert(!/\bquery(?:_as)?!\s*\(/.test(sqliteSource), 'SQLx query macros are forbidden in persistence codecs');
   assert(!/derive\([^)]*FromRow/.test(sqliteSource), 'SQLx FromRow derives are forbidden on persistence rows');
-  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 8');
+  assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 9');
   const productionSqliteSource = sqliteFiles
     .filter((path) => !/_tests\.rs$/.test(path))
     .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
@@ -467,6 +467,14 @@ function verifyStage8Boundaries() {
   assert(
     !/\b(?:UPDATE\s+work_item_inputs|DELETE\s+FROM\s+work_item_inputs)\b/i.test(productionSqliteSource),
     'production adapters must not mutate Work input rows',
+  );
+  assert(
+    !/\b(?:UPDATE\s+client_commands|DELETE\s+FROM\s+client_commands)\b/i.test(productionSqliteSource),
+    'client_commands rows are insert-only durable receipts',
+  );
+  assert(
+    !/UPDATE\s+client_devices\s+SET\s+(?:token_hash|display_name)\b/i.test(productionSqliteSource),
+    'V0 device credentials and display names are immutable; rotation provisions a replacement',
   );
   assert(
     !/impl\s+ReplayStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
@@ -518,11 +526,39 @@ function verifyStage8Boundaries() {
     'Stage 8 transactions must not perform tool or provider side effects',
   );
 
+  const stage9Transactions = readFileSync(join(sqliteRoot, 'stage9.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
+  assert(
+    /impl\s+CommandStateStore\s+for\s+SqliteStateStore/.test(stage9Transactions),
+    'Stage 9 CommandStateStore implementation is absent',
+  );
+  assert(
+    /impl\s+DeviceCredentialStore\s+for\s+SqliteStateStore/.test(stage9Transactions),
+    'Stage 9 device credential persistence implementation is absent',
+  );
+  assert(
+    !/tokio::process|std::process::Command|Command::new|reqwest|anthropic|openai/i.test(stage9Transactions),
+    'Stage 9 transactions must not perform scheduler, tool, or provider side effects',
+  );
+
   const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
   assert(
     /^serde_json\s*=\s*"1\.0"$/m.test(cargoManifest) &&
       !/\[dev-dependencies\][\s\S]*^serde_json\s*=/m.test(cargoManifest),
     'serde_json must be one normal direct production dependency, not dev-only',
+  );
+  assert(
+    /^getrandom\s*=\s*\{\s*version\s*=\s*"0\.4",\s*default-features\s*=\s*false\s*\}$/m.test(cargoManifest),
+    'getrandom 0.4 must be a direct default-feature-free dependency',
+  );
+  assert(
+    !/^\s*(?:rand|jsonwebtoken|base64|hmac|subtle|zeroize)\s*=/mi.test(cargoManifest),
+    'Stage 9 must not add alternate RNG, JWT, base64, HMAC, subtle, or zeroization dependencies',
+  );
+  const cargoLock = readFileSync(join(repositoryRoot, 'Cargo.lock'), 'utf8');
+  assert(
+    /\[\[package\]\]\s+name = "getrandom"\s+version = "0\.4\.3"/m.test(cargoLock),
+    'the direct getrandom dependency must retain locked resolution 0.4.3',
   );
   const compatibility = readFileSync(join(rustRoot, 'bootstrap', 'compatibility.rs'), 'utf8');
   const schema = readFileSync(join(sqliteRoot, 'schema.rs'), 'utf8');
@@ -541,6 +577,10 @@ function verifyStage8Boundaries() {
   assert(
     /"tool\.execution_interrupted_before_dispatch"/.test(journalDomain),
     'tool pre-dispatch interruption event is absent',
+  );
+  assert(
+    /WorkCancelled\s*=>\s*\("work\.cancelled",\s*Work,\s*true,\s*Stage9,\s*true\)/.test(journalDomain),
+    'work.cancelled first-emitter ownership must be Stage 9',
   );
 
   const sqliteArtifacts = trackedFiles().filter((path) =>
@@ -573,8 +613,8 @@ function verifyStage8Boundaries() {
     'Stage 8 persistence port requested_cwd must be concrete and nonoptional',
   );
   assert(
-    !/impl\s+(?:CommandStateStore|SchedulerStateStore|RecoveryStateStore|CompletionStateStore)\s+for\s+SqliteStateStore/.test(productionSqliteSource),
-    'Stage 9, 10, and 17 StateStore behavior must remain unimplemented',
+    !/impl\s+(?:SchedulerStateStore|RecoveryStateStore|CompletionStateStore)\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 10 and 17 StateStore behavior must remain unimplemented',
   );
   const canonicalPersistence = [stateStore, artifactPort, journalDomain].join('\n');
   assert(
@@ -589,6 +629,42 @@ function verifyStage8Boundaries() {
     .split('\n#[cfg(test)]')[0];
   assert(!/\bsqlx\s*::/.test(projector), 'pure projector must remain SQLx-free');
   assert(/stream_seq/.test(projector), 'projector must retain journal-derived stream ordering');
+
+  const stage9CanonicalFiles = [
+    join(rustRoot, 'domain', 'authentication.rs'),
+    join(rustRoot, 'domain', 'command.rs'),
+    join(rustRoot, 'application', 'authentication.rs'),
+    join(rustRoot, 'application', 'command_service.rs'),
+    join(rustRoot, 'ports', 'device_credentials.rs'),
+    join(rustRoot, 'ports', 'state_store.rs'),
+  ];
+  const stage9Canonical = stage9CanonicalFiles
+    .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
+    .join('\n');
+  assert(
+    !/\b(?:axum|tower|Authorization|HeaderMap|WebSocket)\b/.test(stage9Canonical),
+    'Stage 9 canonical layers must remain transport-free',
+  );
+  assert(
+    !/\b(?:jwt|jsonwebtoken)\b/i.test(stage9Canonical),
+    'Stage 9 authentication must remain opaque bearer-token authentication, not JWT',
+  );
+  assert(
+    !/pub\s+(?:raw_)?(?:bearer|token)(?:_text|_bytes)?\s*:/.test(stage9Canonical),
+    'raw bearer material must not be a public persistence or command field',
+  );
+  assert(
+    !/after_message_transaction_commit|after_cancel_requested_commit/.test(stage9Transactions),
+    'Stage 10-owned named post-commit failpoints must have no Stage 9 callsite',
+  );
+
+  const trackedAdminResidue = trackedFiles().filter((path) =>
+    /(?:^|\/)(?:craxii-admin-output|device-token|admin-result)(?:\.|\/|$)/i.test(path),
+  );
+  assert(
+    trackedAdminResidue.length === 0,
+    `tracked admin output residue is forbidden: ${trackedAdminResidue.join(', ')}`,
+  );
 
   return {
     rustFileCount: rustFiles.length,
@@ -653,10 +729,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage8 = verifyStage8Boundaries();
+  const stage9 = verifyStage9Boundaries();
 
   console.log(
-    `Repository invariants passed: 1 workspace member/package, craxii-server lib/bin, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage8.rustFileCount} Rust files, ${stage8.migrationFileCount} exact migrations, ${stage8.tableCount} product tables, ${stage8.indexCount} named indexes, 28 journal events, local content-addressed artifact storage, 0 triggers/views, 0 tracked SQLite artifacts`,
+    `Repository invariants passed through Stage 9: 1 workspace member/package, craxii-server lib/admin binaries, empty defaults, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies including getrandom 0.4.3, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage9.rustFileCount} Rust files, ${stage9.migrationFileCount} exact migrations, ${stage9.tableCount} product tables, ${stage9.indexCount} named indexes, 28 journal events, device authentication and insert-only idempotent commands, local content-addressed artifact storage, 0 triggers/views, 0 tracked SQLite artifacts`,
   );
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

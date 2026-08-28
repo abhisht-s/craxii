@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="14b29154b183ec13374380a6e51d4347339685842de13faed95e2a23fd6c5cfd">
+  <meta name="craxii-source-sha256" content="f15e7a96fb5f9a1dc213372393495ed5c8cbe9e088bdb9e5c639fbf84aa38725">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>14b29154b183ec13…</code></p>
+        <p>Source SHA-256:<br><code>f15e7a96fb5f9a1d…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 284 detailed subsections, and 337 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 291 detailed subsections, and 337 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -2612,7 +2612,7 @@ runtime:&lt;runtime_instance_id&gt;
 <td><code>work.cancelled</code></td>
 <td>Work</td>
 <td align="right">Yes</td>
-<td>Confirms terminal cancellation and cleanup.</td>
+<td>Confirms terminal cancellation: Stage 9 first emits it for never-started queued Work; Stage 10 may emit it after confirmed active cleanup.</td>
 </tr>
 <tr>
 <td><code>work.completed</code></td>
@@ -3086,11 +3086,177 @@ Explicit maintenance may consider only an unreferenced canonical final object at
 and must recheck SQLite immediately before deletion; Stage 8 provides classification and pure
 eligibility only, with no scheduled or automatic deletion.</p>
 <p>Stage ownership remains narrow: Stage 9 owns authentication, device-token verification, message and
-cancel commands, and command idempotency; Stage 10 owns runtime lifecycle, scheduling, recovery
-execution, and readiness; Stage 14 owns registry resolution, authority evaluation, and actual tool
-side effects; Stage 15 owns provider ports/adapters and canonical provider semantics; Stage 16 owns
-context eligibility, selection, rendering, and token budgeting; Stage 17 owns provider calls, the
-agent loop, and terminal assistant completion.</p>
+cancel commands, command idempotency, and direct terminal cancellation of queued Work; Stage 10
+owns runtime lifecycle, scheduling, recovery execution, readiness, and completion of only active
+cancel-requested cleanup paths; Stage 14 owns registry resolution, authority evaluation, and actual
+tool side effects; Stage 15 owns provider ports/adapters and canonical provider semantics; Stage 16
+owns context eligibility, selection, rendering, and token budgeting; Stage 17 owns provider calls,
+the agent loop, and terminal assistant completion.</p>
+<h3>Stage 9 canonical authentication and command contract</h3>
+<p>Stage 9 adds no migration. SQLx migrations remain exactly <code>0001</code> through <code>0003</code>, the supported
+schema ceiling remains <code>3</code>, and the existing 17 tables, 40 named indexes, zero triggers/views, and
+28 journal event kinds are unchanged. Stage 9 implements behavior over the V3 <code>client_devices</code>,
+<code>client_commands</code>, message, Work, input, conversation, journal, and stream-head schema. It changes
+neither an existing event payload meaning nor an event payload version.</p>
+<h4>Device bearer credentials and offline administration</h4>
+<p>A V0 bearer token is exactly 32 bytes of operating-system CSPRNG output encoded locally as 64
+lowercase hexadecimal ASCII characters. Accepted input is exactly <code>[0-9a-f]{64}</code>: uppercase,
+prefixes, whitespace, and every other length or character are invalid. The token is opaque and
+contains neither a <code>DeviceId</code> nor a version. <code>getrandom</code> <code>0.4</code> is the direct dependency used only to
+fill the exact 32-byte production token buffer; V0 adds no fallback RNG, <code>rand</code>, JWT, base64, HMAC,
+password hashing, <code>zeroize</code>, or <code>subtle</code> dependency.</p>
+<p>The stored token hash is <code>SHA-256</code> of the exact accepted 64 ASCII bearer bytes, encoded as lowercase
+hexadecimal in <code>client_devices.token_hash</code>. Authentication hashes those accepted textual bytes; it
+does not hex-decode and hash the original 32 random bytes. The production <code>BearerToken</code> keeps its
+text private, has redacted <code>Debug</code>, has no revealing <code>Display</code>, is not serializable, and exposes
+only narrow hashing and one-time issuance operations. V0 makes no memory-zeroization claim. A raw
+token MUST NOT enter SQLite, journal data, artifacts, command hashes, logs/tracing, errors/panics,
+child environments, or diagnostics.</p>
+<p>A device display name preserves the exact validated Unicode text without case or Unicode
+normalization. It is 1 through 128 UTF-8 bytes, contains no control character, and has no leading or
+trailing whitespace; validation never silently trims it. Provisioning generates a new <code>DeviceId</code>,
+hash, creation timestamp, null <code>last_seen_at</code>, and null <code>revoked_at</code>. Active means
+<code>revoked_at IS NULL</code>. Revocation is one-way: it sets <code>revoked_at</code> only when null, and a repeated
+revoke returns the existing timestamp without rewriting it. Credential rotation is replacement
+based: provision a replacement device/token and then revoke the old device; V0 never overwrites
+<code>token_hash</code> or mutates a display name.</p>
+<p>Provisioning, safe listing, and revocation are offline <code>craxii-admin device</code> operations, not client
+commands or public enrollment. The admin path validates configuration/state root, acquires the
+same exclusive lifetime process lock as Craxii, opens/migrates/checks V3, validates the canonical
+bootstrap topology and application consistency, and performs no runtime creation, readiness,
+scheduler, recovery, provider, or tool work. Listing reveals only <code>DeviceId</code>, display name,
+active/revoked status, and creation/last-seen/revocation timestamps. Provision commits before it
+writes the raw token exactly once to a dedicated stdout result line; metadata may use stderr but
+never includes the token or hash. If stdout fails after commit, the unrecoverable raw token is not
+reissued because it was never stored; the operator provisions a replacement and may revoke the
+unreachable credential. Device administration emits no journal event. Zero devices remains a
+valid bootstrapped state, and ordinary startup never creates a device.</p>
+<h4>Application authentication order</h4>
+<p><code>DeviceAuthenticator</code> receives a bearer secret at the application edge. It validates exact token
+grammar, hashes the exact ASCII bytes, looks up an active device by digest, performs a reviewed
+full-length XOR-accumulating comparison of the expected and returned 32-byte digests as defense in
+depth, rejects a non-null <code>revoked_at</code>, and returns only an <code>AuthenticatedDevice</code> containing the
+<code>DeviceId</code>. Malformed, missing, unknown, and revoked credentials collapse to one safe
+<code>authentication_failed</code> result with no existence or revocation oracle. Authentication always
+precedes idempotency lookup or command execution.</p>
+<p>After successful authentication, a best-effort evidence-only <code>last_seen_at</code> touch may run outside
+the command transaction. It updates only when the new canonical timestamp is later than the stored
+value. Touch failure never changes authentication success or command correctness and emits no
+journal event. Startup validates canonical device IDs, display names, digest/timestamps,
+<code>last_seen_at &gt;= created_at</code>, and <code>revoked_at &gt;= created_at</code> without requiring a device row.</p>
+<h4>Command identity and canonical request hashes</h4>
+<p>The exact Stage 9 command kinds stored in <code>client_commands.command_type</code> are <code>message</code> and
+<code>cancel</code>. An <code>IdempotencyKey</code> is a canonical lowercase UUIDv7 string, scoped by
+<code>(DeviceId, IdempotencyKey)</code> across both kinds. Different devices may reuse one UUID. A message key
+MUST equal its <code>ClientMessageId</code>; a cancellation key MUST equal its <code>ClientCommandId</code>. A public
+message key/body mismatch is validation failure before persistence. Reusing one scoped key for a
+different kind or canonical request is <code>idempotency_conflict</code>.</p>
+<p>Command request hash encoding version 1 is independent of the database schema. Its exact byte
+sequence begins with ASCII <code>craxii.command</code>, followed by the single byte <code>0x01</code>. Every following
+fixed-position field is encoded as an unsigned 64-bit big-endian byte length followed by the exact
+field bytes. Protocol version is the existing V0 protocol version represented by exactly eight
+unsigned 64-bit big-endian bytes. Message fields, in order, are protocol version, ASCII <code>message</code>,
+canonical lowercase <code>ConversationId</code> text, canonical lowercase <code>ClientMessageId</code> text, and the
+exact existing <code>MessageContent::canonical_bytes()</code>. Cancellation fields, in order, are protocol
+version, ASCII <code>cancel</code>, canonical lowercase <code>ClientCommandId</code> text, and canonical lowercase
+<code>WorkId</code> text. <code>CommandRequestHash</code> is SHA-256 of the complete sequence.</p>
+<p>The hash excludes <code>DeviceId</code>, a separately repeated idempotency key, bearer secret/digest,
+server-generated timestamps and IDs, message <code>WorkId</code>, event IDs, transport request IDs, raw JSON,
+and HTTP bytes. Consequently JSON member order/whitespace is irrelevant while exact typed Unicode
+message bytes remain significant. Version 1 known vectors are permanent; a later format must retain
+V1 decoding and recomputation for already committed rows.</p>
+<h4>Committed command-row and replay semantics</h4>
+<p><code>client_commands</code> is insert-only in production. There is no pending row and no production update
+or delete API. Row presence means a final logical result and all of its effects or accepted no-op
+are durable in the same transaction. The adapter owns a strict versioned response codec rather
+than persisting an HTTP framework object or arbitrary response body. On lookup, it validates the
+canonical scoped key, known kind, canonical request hash, allowed status, unknown-field-denying
+response DTO, positive cursor, and canonical creation time. Corrupt or contradictory stored data is
+<code>storage_inconsistent</code>, never a replay.</p>
+<p>A stored message receipt is exact V1 JSON with only <code>version</code>, <code>conversation_id</code>, <code>message_id</code>,
+<code>work_id</code>, <code>work_ordinal</code>, <code>work_state</code> equal to <code>queued</code>, and <code>committed_cursor</code>; its stored status
+is <code>202</code>. A stored cancellation receipt contains only <code>version</code>, <code>work_id</code>,
+<code>resulting_work_state</code>, <code>cleanup_pending</code>, and <code>committed_cursor</code>. Status is <code>200</code> for direct queued
+cancellation or a terminal no-op and <code>202</code> for a new/already <code>cancel_requested</code> result. A transport
+may later add a duplicate convenience flag, but duplicate state is not stored in the logical DTO.</p>
+<p>Authentication/validation failure, malformed key/body, invalid content, idempotency conflict,
+unknown or unauthorized cancellation target, transient storage error, and detected inconsistency
+create no command row. A new valid cancellation key targeting <code>cancel_requested</code>, <code>completed</code>,
+<code>failed</code>, <code>cancelled</code>, or <code>interrupted</code> does persist its accepted stable no-op receipt. Exact replay
+returns the stored logical IDs, state, status, and cursor; it never regenerates persisted IDs.</p>
+<p>Inside the production <code>WriteCoordinator</code> and <code>BEGIN IMMEDIATE</code>, a command first loads the scoped
+row. Exact kind/hash match strictly decodes and replays it; mismatch conflicts. If absent, the
+transaction authorizes the V0 target, applies any semantic mutation and journal append, constructs
+the stable receipt/cursor, inserts <code>client_commands</code> last, and commits once. A uniqueness loser on
+an alternate connection reloads the winner and applies the same match/conflict rule. The normal
+coordinator serializes duplicates so one same-request winner mutates once and different material
+conflicts. Post-commit scheduler/event notifications are lossy hints and never a condition of
+command durability.</p>
+<h4>Atomic message acceptance</h4>
+<p>A new message command pre-generates candidate <code>MessageId</code>, <code>WorkId</code>, <code>message.accepted</code> and
+<code>work.queued</code> <code>JournalEventId</code> values. Lost candidates after rollback are harmless. The distinct
+<code>CorrelationId</code> is derived explicitly from the exact UUID bytes of <code>WorkId</code>; this is a narrowly
+named conversion, not general ID interchangeability.</p>
+<p>In one immediate transaction, after the idempotency check, the adapter loads the sole principal,
+primary active conversation, and default workspace; reads conversation ordinal <code>N</code> and state
+version <code>V</code>; constructs and inserts the immutable user message with authenticated
+<code>DeviceId</code>/<code>ClientMessageId</code>, exact canonical content/hash, and server command timestamp; appends
+<code>message.accepted</code> in the conversation stream caused by <code>conversation.created</code>; inserts one
+conversational queued Work at ordinal <code>N</code>, state version <code>1</code>, priority <code>0</code>, no runtime/current
+attempt/cancellation/terminal fields, and <code>created_at == queued_at</code>; inserts exactly one trigger
+input at ordinal <code>1</code> attached by <code>user</code> to the acceptance event; appends <code>work.queued</code> in the Work
+stream caused by <code>message.accepted</code>; guardedly advances conversation ordinal to <code>N+1</code> and version
+to <code>V+1</code>; builds the receipt using the <code>work.queued</code> offset; inserts the command row last; and
+commits.</p>
+<p>The acceptance actor is <code>user</code> with actor ID the authenticated <code>DeviceId</code>; the queue actor is
+<code>craxii</code> with the sole <code>CraxiiId</code>. Both events use the Work-derived correlation and retain their
+existing V1 payload meaning. Work ordinal follows serialized commit order, never timestamps or
+UUID order. Each Work input closes over only its own acceptance event; later accepted messages do
+not become its inputs. Any failure before commit rolls back message, Work, input, events, stream
+heads, conversation ordinal/version, and command row. The existing message client-identity unique
+index is defense in depth: a bypassed duplicate fails closed and cannot create an orphan success
+receipt.</p>
+<h4>Idempotent cancellation matrix</h4>
+<p>Cancellation reloads the authoritative Work in the immediate transaction and uses the existing
+Stage 4 cancellation decision; it never decides from a stale caller snapshot. Any active V0 device
+may cancel Work belonging to the sole principal/primary-conversation/default-workspace topology;
+the creating device is not an authorization boundary. Unknown or foreign targets return
+<code>target_not_found</code> with no row, mutation, or event.</p>
+<p>For <code>queued</code>, Stage 9 is the first emitter of <code>work.cancelled</code>: it directly transitions to
+<code>cancelled</code>, increments state version once, sets the exact existing <code>user_request</code> terminal reason
+and command timestamp, leaves <code>started_at</code> null and all runtime/attempt facts absent, appends the
+event as user/authenticated-Device actor with existing Work correlation and latest Work-stream event
+causation, persists a <code>200</code>/<code>cleanup_pending=false</code> receipt whose cursor is that event offset, and
+commits atomically. No external cleanup is claimed because no activity ever began.</p>
+<p>For <code>running</code>, <code>waiting_on_model</code>, and <code>waiting_on_tool</code>, Stage 9 transitions to
+<code>cancel_requested</code>, increments the version, preserves runtime and current-attempt facts, sets the
+existing <code>user_request</code> request timestamp/reason, appends <code>work.cancel_requested</code> caused by the
+latest Work-stream event, and persists a <code>202</code>/<code>cleanup_pending=true</code> receipt at that offset. Stage
+9 does not signal a runner, cancel a provider, kill a process, mutate an attempt, clear ownership,
+classify an outcome, or terminalize active Work.</p>
+<p>For existing <code>cancel_requested</code>, no Work update or event occurs; a new valid command key persists a
+<code>202</code>/<code>cleanup_pending=true</code> receipt at the positive journal high-water observed inside the same
+transaction. For <code>completed</code>, <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code>, no update/event occurs and a
+new key persists a <code>200</code>/<code>cleanup_pending=false</code> receipt at that in-transaction high-water. A valid
+Work implies at least one journal row; an absent/nonpositive head is inconsistency. Event causation
+is loaded from the latest authoritative Work-stream event, never guessed from state.</p>
+<p>No-op receipt consistency is necessarily the strongest sound V3 invariant rather than a claim of
+an event that does not exist: the cursor must name an existing offset no later than current head,
+the Work must exist, and the receipt state must be compatible with its current immutable terminal
+state or reconstructable cancel-requested history. Event-bearing cancellation receipts must match
+the exact <code>work.cancel_requested</code> or <code>work.cancelled</code> event and cursor. This limitation is the
+accepted no-migration tradeoff.</p>
+<p>Stage 10 may later emit <code>work.cancelled</code> only after confirmed cleanup of active
+<code>cancel_requested</code> Work. It never re-terminalizes queued Work already cancelled by Stage 9. Stage
+10 owns runner signaling and active cleanup; Stage 11 owns bearer extraction, uniform HTTP <code>401</code>,
+HTTP request/response mapping, duplicate convenience fields, and WebSocket transport; Stage 17
+owns provider calls, agent-loop progression, assistant-message completion, and
+<code>CompletionStateStore</code>.</p>
+<p>The Stage 2 production failpoint names <code>after_message_transaction_commit</code> and
+<code>after_cancel_requested_commit</code> remain registered but have no Stage 9 callsite; Stage 10.4 owns
+their activation. Stage 9 transaction tests use adapter-private test-only precommit rollback hooks.
+Postcommit lost-response tests discard the returned receipt at the application/test boundary,
+close/reopen the file-backed store, and prove exact replay without adding a production failpoint.</p>
 <h3><code>craxii_principals</code></h3>
 <aside class="explain-card level-3" data-source-heading="craxii_principals">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -3680,7 +3846,10 @@ assistant-message or final-answer persistence.</p>
   <p><strong>Plain-English significance:</strong> Cancellation transaction separates asking an operation to stop from proving that it stopped. External systems and child processes may race with cancellation, so the durable record needs intermediate and terminal facts.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> A train controller sends an emergency stop and records &#x27;stop requested&#x27;; only a sensor confirmation justifies &#x27;stopped.&#x27; If contact is lost, uncertainty remains visible.</p>
 </aside>
-<p>Cancellation command state and its journal event commit with the client-command idempotency response. Cleanup completion is a later transaction for active work. Queued cancellation may become terminal in the command transaction because no external action exists.</p>
+<p>Cancellation command state and its journal event, when one is required by the Stage 9 matrix,
+commit with the insert-only client-command idempotency response. Stage 9 terminalizes queued Work
+directly because no external action exists. Cleanup completion is a later Stage 10 transaction only
+for active Work that Stage 9 placed in <code>cancel_requested</code>.</p>
 <h2>SQLite configuration and operations</h2>
 <aside class="explain-card level-2" data-source-heading="SQLite configuration and operations">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -7997,7 +8166,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-28T02:33:58.918Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>14b29154b183ec13374380a6e51d4347339685842de13faed95e2a23fd6c5cfd</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-28T03:49:30.608Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>f15e7a96fb5f9a1dc213372393495ed5c8cbe9e088bdb9e5c639fbf84aa38725</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

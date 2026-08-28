@@ -10,16 +10,17 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::domain::{
-    ArtifactId, ArtifactReference, AuthorityDecisionSnapshot, CanonicalByteCount, ClientCommandId,
-    ClientMessageId, Conversation, ConversationId, CorrelationId, CraxiiId, CraxiiPrincipal,
-    CurrentWorkAttempt, DeviceId, JournalEventId, JournalOffset, LogicalInvocationId,
-    LogicalPathReference, Message, MessageId, ModelAttemptReference, ModelInvocationId,
-    ModelInvocationState, NormalizedError, PrivilegeMode, ProjectionVersion,
-    ProviderModelReference, ResolvedPathEvidence, RuntimeInstanceId, Sha256Digest, ToolExecutionId,
-    ToolExecutionState, ToolLifecycleReference, ToolName, ToolResultClass, ToolVersion,
-    UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId,
-    WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
-    WorkstationIdentity,
+    ArtifactId, ArtifactReference, AuthorityDecisionSnapshot, CancellationCommandReceipt,
+    CanonicalByteCount, ClientCommandId, ClientMessageId, CommandHashEncodingVersion,
+    CommandOutcome, CommandRequestHash, Conversation, ConversationId, CorrelationId, CraxiiId,
+    CraxiiPrincipal, CurrentWorkAttempt, DeviceId, IdempotencyKey, JournalEventId, JournalOffset,
+    LogicalInvocationId, LogicalPathReference, Message, MessageCommandReceipt, MessageContent,
+    MessageId, ModelAttemptReference, ModelInvocationId, ModelInvocationState, NormalizedError,
+    PrivilegeMode, ProjectionVersion, ProviderModelReference, ResolvedPathEvidence,
+    RuntimeInstanceId, Sha256Digest, ToolExecutionId, ToolExecutionState, ToolLifecycleReference,
+    ToolName, ToolResultClass, ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot,
+    WorkState, WorkspaceId, WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration,
+    WorkstationId, WorkstationIdentity,
 };
 use crate::ports::artifact_store::FinalizedArtifact;
 
@@ -33,6 +34,8 @@ pub enum StateStoreErrorKind {
     Storage,
     StateConflict,
     InternalInvariant,
+    IdempotencyConflict,
+    TargetNotFound,
 }
 
 /// A safe port error that retains no adapter failure or raw storage detail.
@@ -59,6 +62,8 @@ impl Display for StateStoreError {
             StateStoreErrorKind::Storage => "state store storage failure",
             StateStoreErrorKind::StateConflict => "state store state conflict",
             StateStoreErrorKind::InternalInvariant => "state store internal invariant failure",
+            StateStoreErrorKind::IdempotencyConflict => "state store idempotency conflict",
+            StateStoreErrorKind::TargetNotFound => "state store target not found",
         })
     }
 }
@@ -474,22 +479,25 @@ pub struct LoadOrBootstrapIdentityReceipt {
     pub commit: CommitReceipt,
 }
 
-/// Atomic user-message acceptance and conversational Work creation.
-pub struct AcceptUserMessageRequest {
-    pub command_id: ClientCommandId,
-    pub client_message_id: ClientMessageId,
-    pub device_id: DeviceId,
-    pub expected_conversation_version: ProjectionVersion,
-    pub message: Message,
-    pub work: WorkItem,
-    pub acceptance_event: EventIntent,
-    pub queued_event: EventIntent,
-}
-
-pub struct AcceptUserMessageReceipt {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MessageCommandCandidates {
     pub message_id: MessageId,
     pub work_id: WorkId,
-    pub commit: CommitReceipt,
+    pub acceptance_event_id: JournalEventId,
+    pub queued_event_id: JournalEventId,
+}
+
+/// Atomic user-message acceptance and conversational Work creation intent.
+pub struct AcceptUserMessageRequest {
+    pub client_message_id: ClientMessageId,
+    pub device_id: DeviceId,
+    pub idempotency_key: IdempotencyKey,
+    pub request_hash: CommandRequestHash,
+    pub hash_version: CommandHashEncodingVersion,
+    pub conversation_id: ConversationId,
+    pub content: MessageContent,
+    pub accepted_at: UtcTimestamp,
+    pub candidates: MessageCommandCandidates,
 }
 
 /// FIFO claim request; the adapter guards the selected row as queued at its current version.
@@ -514,10 +522,14 @@ pub struct TransitionWorkRequest {
 }
 
 pub struct RequestCancellationRequest {
-    pub command_id: ClientCommandId,
-    pub expected: WorkExpectation,
-    pub next: WorkLifecycleSnapshot,
-    pub event: EventIntent,
+    pub client_command_id: ClientCommandId,
+    pub device_id: DeviceId,
+    pub idempotency_key: IdempotencyKey,
+    pub request_hash: CommandRequestHash,
+    pub hash_version: CommandHashEncodingVersion,
+    pub work_id: WorkId,
+    pub requested_at: UtcTimestamp,
+    pub event_id: JournalEventId,
 }
 
 pub struct FinishCancellationRequest {
@@ -652,11 +664,11 @@ pub trait CommandStateStore: Send + Sync {
     fn accept_user_message_and_create_work(
         &self,
         request: AcceptUserMessageRequest,
-    ) -> StateStoreFuture<'_, AcceptUserMessageReceipt>;
+    ) -> StateStoreFuture<'_, CommandOutcome<MessageCommandReceipt>>;
     fn request_cancellation(
         &self,
         request: RequestCancellationRequest,
-    ) -> StateStoreFuture<'_, CommitReceipt>;
+    ) -> StateStoreFuture<'_, CommandOutcome<CancellationCommandReceipt>>;
 }
 
 /// Stage 10 scheduler/work-transition capability.
@@ -844,13 +856,13 @@ mod tests {
         fn accept_user_message_and_create_work(
             &self,
             _: AcceptUserMessageRequest,
-        ) -> StateStoreFuture<'_, AcceptUserMessageReceipt> {
+        ) -> StateStoreFuture<'_, CommandOutcome<MessageCommandReceipt>> {
             self.fail(Intent::AcceptMessage)
         }
         fn request_cancellation(
             &self,
             _: RequestCancellationRequest,
-        ) -> StateStoreFuture<'_, CommitReceipt> {
+        ) -> StateStoreFuture<'_, CommandOutcome<CancellationCommandReceipt>> {
             self.fail(Intent::RequestCancellation)
         }
     }

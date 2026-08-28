@@ -184,6 +184,14 @@ server_generated_id!(ExecutionId);
 server_generated_id!(DraftId);
 server_generated_id!(CorrelationId);
 
+impl CorrelationId {
+    /// Derives the conversational responsibility correlation without blurring ID semantics.
+    #[must_use]
+    pub const fn for_work(work_id: WorkId) -> Self {
+        Self(work_id.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, hash::Hash};
@@ -316,5 +324,12 @@ mod tests {
     fn bounded_generated_work_id_uniqueness_sanity() {
         let generated: HashSet<_> = (0..1_024).map(|_| WorkId::generate().to_string()).collect();
         assert_eq!(generated.len(), 1_024);
+    }
+
+    #[test]
+    fn work_correlation_copies_uuid_bytes_but_retains_a_distinct_type() {
+        let work: WorkId = V7.parse().unwrap();
+        let correlation = CorrelationId::for_work(work);
+        assert_eq!(correlation.to_string(), work.to_string());
     }
 }

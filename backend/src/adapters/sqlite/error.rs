@@ -14,6 +14,8 @@ pub enum SqliteFailureKind {
     NewerSchema,
     InconsistentSchema,
     StateConflict,
+    IdempotencyConflict,
+    TargetNotFound,
     InternalInvariant,
 }
 
@@ -46,6 +48,8 @@ impl SqliteAdapterError {
     pub fn normalized(self) -> NormalizedError {
         match self.kind {
             SqliteFailureKind::StateConflict => NormalizedError::state_conflict(),
+            SqliteFailureKind::IdempotencyConflict => NormalizedError::idempotency(),
+            SqliteFailureKind::TargetNotFound => NormalizedError::client_protocol(),
             SqliteFailureKind::InternalInvariant => NormalizedError::internal_invariant(),
             _ => NormalizedError::storage(None),
         }
@@ -93,6 +97,8 @@ impl Display for SqliteAdapterError {
             SqliteFailureKind::NewerSchema => "SQLite schema is newer than this binary",
             SqliteFailureKind::InconsistentSchema => "SQLite schema is inconsistent",
             SqliteFailureKind::StateConflict => "SQLite state conflict",
+            SqliteFailureKind::IdempotencyConflict => "SQLite idempotency conflict",
+            SqliteFailureKind::TargetNotFound => "SQLite target not found",
             SqliteFailureKind::InternalInvariant => "SQLite internal invariant failure",
         })
     }

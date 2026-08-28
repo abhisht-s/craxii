@@ -2,6 +2,20 @@
   "schema_version": 1,
   "approved_direct_cargo_dependencies": [
     {
+      "package": "getrandom",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.4",
+      "enabled_features": [],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/getrandom.md"
+    },
+    {
       "package": "nix",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",

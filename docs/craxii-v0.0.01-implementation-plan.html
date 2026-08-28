@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Readable HTML rendering of the Craxii V0.0.01 implementation plan.">
-  <meta name="craxii-source-sha256" content="55fceda05f53fe46effc4093733822f0f196c3bfd9c53e1a7f1bb74783f11132">
+  <meta name="craxii-source-sha256" content="27b88665e9686df1d2856d552c859ba5379359ea479fbe13ad8b14a5c22af0f6">
   <title>Craxii V0.0.01 implementation plan</title>
   <style>
 :root {
@@ -180,8 +180,8 @@ tbody tr:nth-child(even) { background: color-mix(in srgb, var(--bg) 65%, transpa
       <input id="toc-search" class="toc-search" type="search" placeholder="Filter sections…" aria-label="Filter table of contents">
       <nav id="toc"></nav>
       <div class="sidebar-meta">
-        <p>Generated 2026-08-27T19:56:11.128Z</p>
-        <p>Source SHA-256:<br><code>55fceda05f53fe46…</code></p>
+        <p>Generated 2026-08-28T03:49:30.635Z</p>
+        <p>Source SHA-256:<br><code>27b88665e9686df1…</code></p>
         <p><a href="craxii-v0.0.01-implementation-plan.md">Open source Markdown</a></p>
       </div>
     </aside>
@@ -1769,7 +1769,7 @@ tables.</p>
 <ul>
 <li>Maintain ephemeral work cancellation tokens keyed by stable work ID and linked to scheduler-owned tasks; always reload durable state at critical checkpoints.</li>
 <li>On cancel wakeup/poll, signal the owned runner; expose sub-cancellation handles to provider/workstation ports later.</li>
-<li>Complete queued/active cancellation through State Store only after the runner reports no activity or confirmed cleanup; append <code>work.cancelled</code> and clear ownership.</li>
+<li>Complete only active <code>cancel_requested</code> cancellation through State Store after the runner reports confirmed cleanup; append <code>work.cancelled</code> and clear ownership. Stage 9 has already terminalized queued cancellation directly.</li>
 <li>On SIGTERM: mark unready/draining, stop claims, append <code>runtime.stopping</code>, cancel owned tasks, wait bounded configured grace, persist cancelled where confirmed and interrupted otherwise, join tasks, close server/pool cleanly.</li>
 <li>Ensure a late normal result cannot overwrite durable <code>cancel_requested</code>.</li>
 </ul>
@@ -6014,8 +6014,8 @@ tables.</p>
 </tr>
 <tr>
 <td>Cancellation</td>
-<td>Stage 10 command plus Stages 13/17 checkpoints</td>
-<td>Intent is durable/idempotent; safe terminal or honest unknown wins by legal precedence; no later loop step.</td>
+<td>Stage 9 command, Stage 10 active cleanup, plus Stages 13/17 checkpoints</td>
+<td>Intent is durable/idempotent; queued cancellation is already terminal, while active cleanup reaches a safe terminal or honest unknown by legal precedence; no later loop step.</td>
 <td>Stages 18, 31.1/31.3, and 38</td>
 </tr>
 <tr>
@@ -6159,7 +6159,7 @@ tables.</p>
 </ul>
 
       <footer class="source-footer">
-        <p><strong>Generated view:</strong> 2026-08-27T19:56:11.128Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>55fceda05f53fe46effc4093733822f0f196c3bfd9c53e1a7f1bb74783f11132</code>.</p>
+        <p><strong>Generated view:</strong> 2026-08-28T03:49:30.635Z · Source: <a href="craxii-v0.0.01-implementation-plan.md"><code>craxii-v0.0.01-implementation-plan.md</code></a> · SHA-256 <code>27b88665e9686df1d2856d552c859ba5379359ea479fbe13ad8b14a5c22af0f6</code>.</p>
         <p>The Markdown source remains authoritative. This standalone HTML has no external stylesheet, font, script, or network dependency.</p>
       </footer>
     </main>

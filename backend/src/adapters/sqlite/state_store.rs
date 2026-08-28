@@ -37,6 +37,8 @@ pub struct SqliteStateStore {
     pub(super) runtime: SqliteRuntime,
     #[cfg(test)]
     bootstrap_hook: std::sync::Arc<std::sync::Mutex<Option<BootstrapTestHook>>>,
+    #[cfg(test)]
+    pub(super) stage9_hook: std::sync::Arc<std::sync::Mutex<Option<super::stage9::Stage9TestHook>>>,
 }
 
 impl SqliteStateStore {
@@ -46,6 +48,8 @@ impl SqliteStateStore {
             runtime,
             #[cfg(test)]
             bootstrap_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            stage9_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -179,6 +183,8 @@ impl SqliteStateStore {
         compare_work_inputs(&mut transaction, &projected).await?;
         let stage8_invariants =
             super::stage8::verify_stage8_consistency(&mut transaction, &projected, &events).await?;
+        let stage9_invariants =
+            super::stage9::verify_stage9_consistency(&mut transaction, &events).await?;
 
         let journal_head = events.last().map(|event| event.journal_offset);
         transaction
@@ -186,7 +192,7 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 18 + stage8_invariants,
+            checked_invariants: 18 + stage8_invariants + stage9_invariants,
             journal_head,
         })
     }
@@ -279,6 +285,8 @@ impl BootstrapStateStore for SqliteStateStore {
 pub(super) fn map_port_error(error: SqliteAdapterError) -> StateStoreError {
     let kind = match error.kind() {
         SqliteFailureKind::StateConflict => StateStoreErrorKind::StateConflict,
+        SqliteFailureKind::IdempotencyConflict => StateStoreErrorKind::IdempotencyConflict,
+        SqliteFailureKind::TargetNotFound => StateStoreErrorKind::TargetNotFound,
         SqliteFailureKind::InternalInvariant | SqliteFailureKind::InconsistentSchema => {
             StateStoreErrorKind::InternalInvariant
         }

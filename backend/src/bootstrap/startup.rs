@@ -268,9 +268,10 @@ impl StartupError {
 
     const fn from_state_store(error: crate::ports::state_store::StateStoreError) -> Self {
         match error.kind() {
-            StateStoreErrorKind::InternalInvariant | StateStoreErrorKind::StateConflict => {
-                Self::DatabaseIntegrity
-            }
+            StateStoreErrorKind::InternalInvariant
+            | StateStoreErrorKind::StateConflict
+            | StateStoreErrorKind::IdempotencyConflict
+            | StateStoreErrorKind::TargetNotFound => Self::DatabaseIntegrity,
             StateStoreErrorKind::Storage => Self::DatabaseLifecycle,
         }
     }

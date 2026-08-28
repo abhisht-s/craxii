@@ -135,6 +135,7 @@ dependencies = [
 name = "craxii-server"
 version = "0.0.1"
 dependencies = [
+ "getrandom",
  "nix",
  "serde",
  "serde_json",

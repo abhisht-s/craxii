@@ -1471,7 +1471,7 @@ Every stored payload is generated from a typed domain structure. `serde_json::Va
 | `work.waiting_on_tool` | Work | Yes | Associates active work with a tool execution. |
 | `work.resumed` | Work | Yes | Records that an observed model/tool outcome returned control to the agent loop. |
 | `work.cancel_requested` | Work | Yes | Persists a cancellation request. |
-| `work.cancelled` | Work | Yes | Confirms terminal cancellation and cleanup. |
+| `work.cancelled` | Work | Yes | Confirms terminal cancellation: Stage 9 first emits it for never-started queued Work; Stage 10 may emit it after confirmed active cleanup. |
 | `work.completed` | Work | Yes | Commits terminal successful/refused outcome. |
 | `work.failed` | Work | Yes | Records definite terminal failure. |
 | `work.interrupted` | Work | Yes | Records loss of runtime continuity/unknown attempt. |
@@ -1860,11 +1860,208 @@ and must recheck SQLite immediately before deletion; Stage 8 provides classifica
 eligibility only, with no scheduled or automatic deletion.
 
 Stage ownership remains narrow: Stage 9 owns authentication, device-token verification, message and
-cancel commands, and command idempotency; Stage 10 owns runtime lifecycle, scheduling, recovery
-execution, and readiness; Stage 14 owns registry resolution, authority evaluation, and actual tool
-side effects; Stage 15 owns provider ports/adapters and canonical provider semantics; Stage 16 owns
-context eligibility, selection, rendering, and token budgeting; Stage 17 owns provider calls, the
-agent loop, and terminal assistant completion.
+cancel commands, command idempotency, and direct terminal cancellation of queued Work; Stage 10
+owns runtime lifecycle, scheduling, recovery execution, readiness, and completion of only active
+cancel-requested cleanup paths; Stage 14 owns registry resolution, authority evaluation, and actual
+tool side effects; Stage 15 owns provider ports/adapters and canonical provider semantics; Stage 16
+owns context eligibility, selection, rendering, and token budgeting; Stage 17 owns provider calls,
+the agent loop, and terminal assistant completion.
+
+### Stage 9 canonical authentication and command contract
+
+Stage 9 adds no migration. SQLx migrations remain exactly `0001` through `0003`, the supported
+schema ceiling remains `3`, and the existing 17 tables, 40 named indexes, zero triggers/views, and
+28 journal event kinds are unchanged. Stage 9 implements behavior over the V3 `client_devices`,
+`client_commands`, message, Work, input, conversation, journal, and stream-head schema. It changes
+neither an existing event payload meaning nor an event payload version.
+
+#### Device bearer credentials and offline administration
+
+A V0 bearer token is exactly 32 bytes of operating-system CSPRNG output encoded locally as 64
+lowercase hexadecimal ASCII characters. Accepted input is exactly `[0-9a-f]{64}`: uppercase,
+prefixes, whitespace, and every other length or character are invalid. The token is opaque and
+contains neither a `DeviceId` nor a version. `getrandom` `0.4` is the direct dependency used only to
+fill the exact 32-byte production token buffer; V0 adds no fallback RNG, `rand`, JWT, base64, HMAC,
+password hashing, `zeroize`, or `subtle` dependency.
+
+The stored token hash is `SHA-256` of the exact accepted 64 ASCII bearer bytes, encoded as lowercase
+hexadecimal in `client_devices.token_hash`. Authentication hashes those accepted textual bytes; it
+does not hex-decode and hash the original 32 random bytes. The production `BearerToken` keeps its
+text private, has redacted `Debug`, has no revealing `Display`, is not serializable, and exposes
+only narrow hashing and one-time issuance operations. V0 makes no memory-zeroization claim. A raw
+token MUST NOT enter SQLite, journal data, artifacts, command hashes, logs/tracing, errors/panics,
+child environments, or diagnostics.
+
+A device display name preserves the exact validated Unicode text without case or Unicode
+normalization. It is 1 through 128 UTF-8 bytes, contains no control character, and has no leading or
+trailing whitespace; validation never silently trims it. Provisioning generates a new `DeviceId`,
+hash, creation timestamp, null `last_seen_at`, and null `revoked_at`. Active means
+`revoked_at IS NULL`. Revocation is one-way: it sets `revoked_at` only when null, and a repeated
+revoke returns the existing timestamp without rewriting it. Credential rotation is replacement
+based: provision a replacement device/token and then revoke the old device; V0 never overwrites
+`token_hash` or mutates a display name.
+
+Provisioning, safe listing, and revocation are offline `craxii-admin device` operations, not client
+commands or public enrollment. The admin path validates configuration/state root, acquires the
+same exclusive lifetime process lock as Craxii, opens/migrates/checks V3, validates the canonical
+bootstrap topology and application consistency, and performs no runtime creation, readiness,
+scheduler, recovery, provider, or tool work. Listing reveals only `DeviceId`, display name,
+active/revoked status, and creation/last-seen/revocation timestamps. Provision commits before it
+writes the raw token exactly once to a dedicated stdout result line; metadata may use stderr but
+never includes the token or hash. If stdout fails after commit, the unrecoverable raw token is not
+reissued because it was never stored; the operator provisions a replacement and may revoke the
+unreachable credential. Device administration emits no journal event. Zero devices remains a
+valid bootstrapped state, and ordinary startup never creates a device.
+
+#### Application authentication order
+
+`DeviceAuthenticator` receives a bearer secret at the application edge. It validates exact token
+grammar, hashes the exact ASCII bytes, looks up an active device by digest, performs a reviewed
+full-length XOR-accumulating comparison of the expected and returned 32-byte digests as defense in
+depth, rejects a non-null `revoked_at`, and returns only an `AuthenticatedDevice` containing the
+`DeviceId`. Malformed, missing, unknown, and revoked credentials collapse to one safe
+`authentication_failed` result with no existence or revocation oracle. Authentication always
+precedes idempotency lookup or command execution.
+
+After successful authentication, a best-effort evidence-only `last_seen_at` touch may run outside
+the command transaction. It updates only when the new canonical timestamp is later than the stored
+value. Touch failure never changes authentication success or command correctness and emits no
+journal event. Startup validates canonical device IDs, display names, digest/timestamps,
+`last_seen_at >= created_at`, and `revoked_at >= created_at` without requiring a device row.
+
+#### Command identity and canonical request hashes
+
+The exact Stage 9 command kinds stored in `client_commands.command_type` are `message` and
+`cancel`. An `IdempotencyKey` is a canonical lowercase UUIDv7 string, scoped by
+`(DeviceId, IdempotencyKey)` across both kinds. Different devices may reuse one UUID. A message key
+MUST equal its `ClientMessageId`; a cancellation key MUST equal its `ClientCommandId`. A public
+message key/body mismatch is validation failure before persistence. Reusing one scoped key for a
+different kind or canonical request is `idempotency_conflict`.
+
+Command request hash encoding version 1 is independent of the database schema. Its exact byte
+sequence begins with ASCII `craxii.command`, followed by the single byte `0x01`. Every following
+fixed-position field is encoded as an unsigned 64-bit big-endian byte length followed by the exact
+field bytes. Protocol version is the existing V0 protocol version represented by exactly eight
+unsigned 64-bit big-endian bytes. Message fields, in order, are protocol version, ASCII `message`,
+canonical lowercase `ConversationId` text, canonical lowercase `ClientMessageId` text, and the
+exact existing `MessageContent::canonical_bytes()`. Cancellation fields, in order, are protocol
+version, ASCII `cancel`, canonical lowercase `ClientCommandId` text, and canonical lowercase
+`WorkId` text. `CommandRequestHash` is SHA-256 of the complete sequence.
+
+The hash excludes `DeviceId`, a separately repeated idempotency key, bearer secret/digest,
+server-generated timestamps and IDs, message `WorkId`, event IDs, transport request IDs, raw JSON,
+and HTTP bytes. Consequently JSON member order/whitespace is irrelevant while exact typed Unicode
+message bytes remain significant. Version 1 known vectors are permanent; a later format must retain
+V1 decoding and recomputation for already committed rows.
+
+#### Committed command-row and replay semantics
+
+`client_commands` is insert-only in production. There is no pending row and no production update
+or delete API. Row presence means a final logical result and all of its effects or accepted no-op
+are durable in the same transaction. The adapter owns a strict versioned response codec rather
+than persisting an HTTP framework object or arbitrary response body. On lookup, it validates the
+canonical scoped key, known kind, canonical request hash, allowed status, unknown-field-denying
+response DTO, positive cursor, and canonical creation time. Corrupt or contradictory stored data is
+`storage_inconsistent`, never a replay.
+
+A stored message receipt is exact V1 JSON with only `version`, `conversation_id`, `message_id`,
+`work_id`, `work_ordinal`, `work_state` equal to `queued`, and `committed_cursor`; its stored status
+is `202`. A stored cancellation receipt contains only `version`, `work_id`,
+`resulting_work_state`, `cleanup_pending`, and `committed_cursor`. Status is `200` for direct queued
+cancellation or a terminal no-op and `202` for a new/already `cancel_requested` result. A transport
+may later add a duplicate convenience flag, but duplicate state is not stored in the logical DTO.
+
+Authentication/validation failure, malformed key/body, invalid content, idempotency conflict,
+unknown or unauthorized cancellation target, transient storage error, and detected inconsistency
+create no command row. A new valid cancellation key targeting `cancel_requested`, `completed`,
+`failed`, `cancelled`, or `interrupted` does persist its accepted stable no-op receipt. Exact replay
+returns the stored logical IDs, state, status, and cursor; it never regenerates persisted IDs.
+
+Inside the production `WriteCoordinator` and `BEGIN IMMEDIATE`, a command first loads the scoped
+row. Exact kind/hash match strictly decodes and replays it; mismatch conflicts. If absent, the
+transaction authorizes the V0 target, applies any semantic mutation and journal append, constructs
+the stable receipt/cursor, inserts `client_commands` last, and commits once. A uniqueness loser on
+an alternate connection reloads the winner and applies the same match/conflict rule. The normal
+coordinator serializes duplicates so one same-request winner mutates once and different material
+conflicts. Post-commit scheduler/event notifications are lossy hints and never a condition of
+command durability.
+
+#### Atomic message acceptance
+
+A new message command pre-generates candidate `MessageId`, `WorkId`, `message.accepted` and
+`work.queued` `JournalEventId` values. Lost candidates after rollback are harmless. The distinct
+`CorrelationId` is derived explicitly from the exact UUID bytes of `WorkId`; this is a narrowly
+named conversion, not general ID interchangeability.
+
+In one immediate transaction, after the idempotency check, the adapter loads the sole principal,
+primary active conversation, and default workspace; reads conversation ordinal `N` and state
+version `V`; constructs and inserts the immutable user message with authenticated
+`DeviceId`/`ClientMessageId`, exact canonical content/hash, and server command timestamp; appends
+`message.accepted` in the conversation stream caused by `conversation.created`; inserts one
+conversational queued Work at ordinal `N`, state version `1`, priority `0`, no runtime/current
+attempt/cancellation/terminal fields, and `created_at == queued_at`; inserts exactly one trigger
+input at ordinal `1` attached by `user` to the acceptance event; appends `work.queued` in the Work
+stream caused by `message.accepted`; guardedly advances conversation ordinal to `N+1` and version
+to `V+1`; builds the receipt using the `work.queued` offset; inserts the command row last; and
+commits.
+
+The acceptance actor is `user` with actor ID the authenticated `DeviceId`; the queue actor is
+`craxii` with the sole `CraxiiId`. Both events use the Work-derived correlation and retain their
+existing V1 payload meaning. Work ordinal follows serialized commit order, never timestamps or
+UUID order. Each Work input closes over only its own acceptance event; later accepted messages do
+not become its inputs. Any failure before commit rolls back message, Work, input, events, stream
+heads, conversation ordinal/version, and command row. The existing message client-identity unique
+index is defense in depth: a bypassed duplicate fails closed and cannot create an orphan success
+receipt.
+
+#### Idempotent cancellation matrix
+
+Cancellation reloads the authoritative Work in the immediate transaction and uses the existing
+Stage 4 cancellation decision; it never decides from a stale caller snapshot. Any active V0 device
+may cancel Work belonging to the sole principal/primary-conversation/default-workspace topology;
+the creating device is not an authorization boundary. Unknown or foreign targets return
+`target_not_found` with no row, mutation, or event.
+
+For `queued`, Stage 9 is the first emitter of `work.cancelled`: it directly transitions to
+`cancelled`, increments state version once, sets the exact existing `user_request` terminal reason
+and command timestamp, leaves `started_at` null and all runtime/attempt facts absent, appends the
+event as user/authenticated-Device actor with existing Work correlation and latest Work-stream event
+causation, persists a `200`/`cleanup_pending=false` receipt whose cursor is that event offset, and
+commits atomically. No external cleanup is claimed because no activity ever began.
+
+For `running`, `waiting_on_model`, and `waiting_on_tool`, Stage 9 transitions to
+`cancel_requested`, increments the version, preserves runtime and current-attempt facts, sets the
+existing `user_request` request timestamp/reason, appends `work.cancel_requested` caused by the
+latest Work-stream event, and persists a `202`/`cleanup_pending=true` receipt at that offset. Stage
+9 does not signal a runner, cancel a provider, kill a process, mutate an attempt, clear ownership,
+classify an outcome, or terminalize active Work.
+
+For existing `cancel_requested`, no Work update or event occurs; a new valid command key persists a
+`202`/`cleanup_pending=true` receipt at the positive journal high-water observed inside the same
+transaction. For `completed`, `failed`, `cancelled`, and `interrupted`, no update/event occurs and a
+new key persists a `200`/`cleanup_pending=false` receipt at that in-transaction high-water. A valid
+Work implies at least one journal row; an absent/nonpositive head is inconsistency. Event causation
+is loaded from the latest authoritative Work-stream event, never guessed from state.
+
+No-op receipt consistency is necessarily the strongest sound V3 invariant rather than a claim of
+an event that does not exist: the cursor must name an existing offset no later than current head,
+the Work must exist, and the receipt state must be compatible with its current immutable terminal
+state or reconstructable cancel-requested history. Event-bearing cancellation receipts must match
+the exact `work.cancel_requested` or `work.cancelled` event and cursor. This limitation is the
+accepted no-migration tradeoff.
+
+Stage 10 may later emit `work.cancelled` only after confirmed cleanup of active
+`cancel_requested` Work. It never re-terminalizes queued Work already cancelled by Stage 9. Stage
+10 owns runner signaling and active cleanup; Stage 11 owns bearer extraction, uniform HTTP `401`,
+HTTP request/response mapping, duplicate convenience fields, and WebSocket transport; Stage 17
+owns provider calls, agent-loop progression, assistant-message completion, and
+`CompletionStateStore`.
+
+The Stage 2 production failpoint names `after_message_transaction_commit` and
+`after_cancel_requested_commit` remain registered but have no Stage 9 callsite; Stage 10.4 owns
+their activation. Stage 9 transaction tests use adapter-private test-only precommit rollback hooks.
+Postcommit lost-response tests discard the returned receipt at the application/test boundary,
+close/reopen the file-backed store, and prove exact replay without adding a production failpoint.
 
 ### `craxii_principals`
 
@@ -2419,7 +2616,10 @@ The client sees the committed assistant message only after this commit. A proces
 
 ### Cancellation transaction
 
-Cancellation command state and its journal event commit with the client-command idempotency response. Cleanup completion is a later transaction for active work. Queued cancellation may become terminal in the command transaction because no external action exists.
+Cancellation command state and its journal event, when one is required by the Stage 9 matrix,
+commit with the insert-only client-command idempotency response. Stage 9 terminalizes queued Work
+directly because no external action exists. Cleanup completion is a later Stage 10 transaction only
+for active Work that Stage 9 placed in `cancel_requested`.
 
 ## SQLite configuration and operations
 

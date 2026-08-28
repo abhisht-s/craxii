@@ -2105,7 +2105,7 @@ Substage 10.1 and cancellation command semantics exist.
 
 - Maintain ephemeral work cancellation tokens keyed by stable work ID and linked to scheduler-owned tasks; always reload durable state at critical checkpoints.
 - On cancel wakeup/poll, signal the owned runner; expose sub-cancellation handles to provider/workstation ports later.
-- Complete queued/active cancellation through State Store only after the runner reports no activity or confirmed cleanup; append `work.cancelled` and clear ownership.
+- Complete only active `cancel_requested` cancellation through State Store after the runner reports confirmed cleanup; append `work.cancelled` and clear ownership. Stage 9 has already terminalized queued cancellation directly.
 - On SIGTERM: mark unready/draining, stop claims, append `runtime.stopping`, cancel owned tasks, wait bounded configured grace, persist cancelled where confirmed and interrupted otherwise, join tasks, close server/pool cleanly.
 - Ensure a late normal result cannot overwrite durable `cancel_requested`.
 
@@ -8481,7 +8481,7 @@ The failpoint controller introduced in Stage 2 names every hook precisely, is co
 | Process exit before durable outcome | Stages 13–14 result finalization | Use a durably finalized observation only if provable; otherwise unknown/interrupted, never inferred from absent PID. | Stages 18 and 31.3 |
 | Artifact rename before database commit | Stage 8 artifact protocol | Content-addressed orphan is safe to reconcile; no committed metadata points to missing bytes. | Stages 8, 18, and 31.4 |
 | Assistant-message commit | Stage 17 terminal transaction | Message/work terminal/events are all absent or all present; postcommit notification/replay delivers once. | Planning Challenge, Stages 18 and 31.1 |
-| Cancellation | Stage 10 command plus Stages 13/17 checkpoints | Intent is durable/idempotent; safe terminal or honest unknown wins by legal precedence; no later loop step. | Stages 18, 31.1/31.3, and 38 |
+| Cancellation | Stage 9 command, Stage 10 active cleanup, plus Stages 13/17 checkpoints | Intent is durable/idempotent; queued cancellation is already terminal, while active cleanup reaches a safe terminal or honest unknown by legal precedence; no later loop step. | Stages 18, 31.1/31.3, and 38 |
 | Graceful shutdown | Stage 10 runtime drain | Stop accepting/claiming, checkpoint/terminate bounded external work, persist honest state, and let next runtime recover before readiness. | Stages 18 and 31.1/31.4 |
 
 Every crash case records: build/config/schema versions; seed; failpoint and physical boundary; pre/post global journal head; runtime/work/tool/execution/artifact IDs; expected and actual rows/events; process/cgroup status; client cursor/projection; systemd restart/recovery timing; and forbidden-repeat checks.

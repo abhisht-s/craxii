@@ -160,6 +160,8 @@
 //! persist_work_state(ModelInvocationState::Requesting);
 //! ```
 
+mod authentication;
+mod command;
 mod content;
 mod digest;
 mod entities;
@@ -172,6 +174,15 @@ mod path;
 mod sequence;
 mod time;
 
+pub use authentication::{
+    AuthenticatedDevice, BearerToken, CredentialValidationError, CredentialValidationKind,
+    DeviceDisplayName, DeviceTokenHash, MAX_DEVICE_DISPLAY_NAME_BYTES, device_token_hashes_equal,
+};
+pub use command::{
+    CancellationCleanupDisposition, CancellationCommandReceipt, CommandHashEncodingVersion,
+    CommandKind, CommandOutcome, CommandRequestHash, CommandValidationError, CommandValidationKind,
+    IdempotencyKey, MessageCommandReceipt,
+};
 pub use content::{ContentBlock, ContentVersion, MAX_CONTENT_TEXT_BYTES, MessageContent};
 pub use digest::{CanonicalByteCount, Sha256Digest};
 pub use entities::{

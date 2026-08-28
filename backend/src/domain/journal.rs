@@ -198,7 +198,7 @@ event_kinds! {
     WorkWaitingOnTool => ("work.waiting_on_tool", Work, true, Stage8, true),
     WorkResumed => ("work.resumed", Work, true, Stage8, true),
     WorkCancelRequested => ("work.cancel_requested", Work, true, Stage9, true),
-    WorkCancelled => ("work.cancelled", Work, true, Stage10, true),
+    WorkCancelled => ("work.cancelled", Work, true, Stage9, true),
     WorkCompleted => ("work.completed", Work, true, Stage8, true),
     WorkFailed => ("work.failed", Work, true, Stage8, true),
     WorkInterrupted => ("work.interrupted", Work, true, Stage10, true),

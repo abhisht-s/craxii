@@ -64,10 +64,10 @@ where applicable.
   upstream-change, advisory, and license review appropriate to the dependency.
 
 The machine-readable approved Rust direct-dependency registry is
-[`dependency-registry.json`](dependency-registry.json). It contains the owner-approved
-`serde`, `sha2`, `toml`, and `url` requirements and declaration metadata. The approved
-Swift dependency registry remains empty. No record may claim approval for a dependency
-that has not been added and human-reviewed.
+[`dependency-registry.json`](dependency-registry.json). It contains every owner-approved direct
+Cargo requirement and its declaration metadata, including the Stage 9 OS-CSPRNG boundary supplied
+by `getrandom`. The approved Swift dependency registry remains empty. No record may claim approval
+for a dependency that has not been added and human-reviewed.
 
 The first external Rust dependency has activated supply-chain enforcement with
 `cargo-deny` exactly versioned by its decision record and `scripts/verify`, plus the
