@@ -384,10 +384,6 @@ fn bootstrap_request() -> LoadOrBootstrapIdentityRequest {
             workspace_logical_name: "primary".into(),
             workspace_logical_root: "/secret/workspace".into(),
             workspace_resolved_root: "/secret/resolved/workspace".into(),
-            max_execution_timeout_ms: 10_000,
-            max_stdout_bytes: 1_024,
-            max_stderr_bytes: 2_048,
-            administrative_enabled: false,
         },
     }
 }

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="b36c0666de05c3b5b7cd2327be58b4aa8a2fbc7685caab923150b6162ffbb046">
+  <meta name="craxii-source-sha256" content="606bcc5f37c8a8e7ba0e8b55ae43a9e3c331d109d6a79205967f5b510f90dd70">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>b36c0666de05c3b5…</code></p>
+        <p>Source SHA-256:<br><code>606bcc5f37c8a8e7…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -3065,6 +3065,13 @@ create a runtime. Stage 7 leaves <code>last_seen_at</code> unchanged on reopen. 
 persisted IDs, appends nothing, changes no generation/version/ordinal/root link, and requires the
 current observation/configuration to agree. Empty state bootstraps; any nonempty partial,
 contradictory, duplicated, or mismatched root/event/head state fails closed without repair.</p>
+<p>The <code>capabilities_sha256</code> value in <code>craxii.initialized</code> is the immutable digest of the capability
+snapshot observed when that initialization event was created. A later controlled refresh of the
+current <code>workstations.capabilities_json</code>, <code>workstations.last_seen_at</code>, or
+<code>workspaces.local_resolved_root</code> MUST NOT rewrite or reinterpret that historical event. Durable
+workstation OS evidence remains the normalized platform-family fact supplied by portable runtime
+constants; exact Ubuntu 24.04 verification is a target-environment assertion and is not fabricated
+on a non-Ubuntu development host.</p>
 <p>The persistence port is split into intent-specific capability traits. Stage 7&#39;s SQLite facade
 implements only bootstrap identity, snapshot loading, and consistency verification; command,
 scheduler, model, tool, completion, replay, and recovery capabilities remain independently
@@ -5201,6 +5208,8 @@ default workspace IDs and logical roots
 <li><code>permission_denied</code>;</li>
 <li><code>binary_content</code>;</li>
 <li><code>file_too_large</code>;</li>
+<li><code>changed_during_read</code>;</li>
+<li><code>unsupported_capability</code>;</li>
 <li><code>spawn_failed</code>;</li>
 <li><code>timeout</code>;</li>
 <li><code>cancelled</code>;</li>
@@ -8380,7 +8389,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-28T18:27:54.101Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>b36c0666de05c3b5b7cd2327be58b4aa8a2fbc7685caab923150b6162ffbb046</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-29T07:43:16.530Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>606bcc5f37c8a8e7ba0e8b55ae43a9e3c331d109d6a79205967f5b510f90dd70</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

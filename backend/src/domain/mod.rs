@@ -83,6 +83,15 @@
 //! dispatch(tool_attempt);
 //! ```
 //!
+//! Workstation operation identity remains distinct from dispatch identity:
+//!
+//! ```compile_fail
+//! use craxii_server::domain::{ExecutionId, OperationId};
+//!
+//! fn operation(_: OperationId) {}
+//! operation(ExecutionId::generate());
+//! ```
+//!
 //! Stable normalized codes and safe messages cannot be created from arbitrary text:
 //!
 //! ```compile_fail
@@ -214,7 +223,8 @@ pub use evidence::{
 pub use ids::{
     ArtifactId, ClientCommandId, ClientMessageId, ContextManifestId, ConversationId, CorrelationId,
     CraxiiId, DeviceId, DraftId, ExecutionId, JournalEventId, LogicalInvocationId, MessageId,
-    ModelInvocationId, RuntimeInstanceId, ToolExecutionId, WorkId, WorkspaceId, WorkstationId,
+    ModelInvocationId, OperationId, RuntimeInstanceId, ToolExecutionId, WorkId, WorkspaceId,
+    WorkstationId,
 };
 pub use journal::{
     ArtifactRecordedV1, ConversationCreatedV1, CraxiiInitializedV1, JournalActor,

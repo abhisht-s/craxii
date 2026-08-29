@@ -65,10 +65,6 @@ fn observation() -> BootstrapObservation {
         workspace_logical_name: "primary".into(),
         workspace_logical_root: "/workspace".into(),
         workspace_resolved_root: "/tmp/craxii-workspace".into(),
-        max_execution_timeout_ms: 10_000,
-        max_stdout_bytes: 1_024,
-        max_stderr_bytes: 2_048,
-        administrative_enabled: false,
     }
 }
 
@@ -888,6 +884,113 @@ async fn first_bootstrap_and_reopen_are_exact_atomic_and_idempotent() {
     assert!(second.commit.events.is_none());
     assert_eq!(count(guard.runtime(), "journal_events").await, 2);
     assert_eq!(count(guard.runtime(), "stream_heads").await, 2);
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn stage12_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event()
+{
+    let root = TestRoot::new();
+    let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
+    let store = SqliteStateStore::new(guard.runtime().clone());
+    store
+        .load_or_bootstrap_v0_identity(request())
+        .await
+        .unwrap();
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    let legacy_capabilities: String = sqlx::query_scalar(
+        "SELECT json_set(capabilities_json, \
+         '$.flags.filesystem_read', json('false'), \
+         '$.limits.max_execution_timeout_ms', 900000, \
+         '$.limits.max_stdout_bytes', 8388608, \
+         '$.limits.max_stderr_bytes', 8388608) FROM workstations",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let initial_payload: String = sqlx::query_scalar(
+        "SELECT json_set(payload_json, '$.capabilities_sha256', ?) \
+         FROM journal_events WHERE event_type = 'craxii.initialized'",
+    )
+    .bind(Sha256Digest::hash_bytes(legacy_capabilities.as_bytes()).to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let initial_payload_sha256 = Sha256Digest::hash_bytes(initial_payload.as_bytes()).to_string();
+    sqlx::query("UPDATE workstations SET capabilities_json = ?")
+        .bind(&legacy_capabilities)
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE journal_events SET payload_json = ?, payload_sha256 = ? \
+         WHERE event_type = 'craxii.initialized'",
+    )
+    .bind(&initial_payload)
+    .bind(&initial_payload_sha256)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+
+    let mut refresh = request();
+    refresh.created_at = "2026-08-29T02:03:04.567890Z".parse().unwrap();
+    refresh.observation.workspace_resolved_root = "/tmp/craxii-workspace-relocated".into();
+    let receipt = store.load_or_bootstrap_v0_identity(refresh).await.unwrap();
+    assert!(!receipt.created);
+    assert!(receipt.commit.events.is_none());
+    assert_eq!(count(guard.runtime(), "journal_events").await, 2);
+
+    let snapshot = store.load_bootstrap_snapshot().await.unwrap();
+    let flags = snapshot.workstation_capabilities.flags();
+    assert!(flags.filesystem_read());
+    assert!(flags.privilege_user());
+    assert!(!flags.foreground_execute());
+    assert!(!flags.cancel_execution());
+    assert!(!flags.inspect_execution());
+    assert!(!flags.privilege_administrative());
+    assert_eq!(
+        snapshot
+            .workstation_capabilities
+            .limits()
+            .max_execution_timeout_ms(),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .workstation_capabilities
+            .limits()
+            .max_stdout_bytes(),
+        0
+    );
+    assert_eq!(
+        snapshot
+            .workstation_capabilities
+            .limits()
+            .max_stderr_bytes(),
+        0
+    );
+
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    let persisted_payload: (String, String) = sqlx::query_as(
+        "SELECT payload_json, payload_sha256 FROM journal_events \
+         WHERE event_type = 'craxii.initialized'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(persisted_payload.0, initial_payload);
+    assert_eq!(persisted_payload.1, initial_payload_sha256);
+    let (last_seen_at, resolved_root): (String, String) = sqlx::query_as(
+        "SELECT w.last_seen_at, s.local_resolved_root FROM workstations w CROSS JOIN workspaces s",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(last_seen_at, "2026-08-29T02:03:04.567890Z");
+    assert_eq!(resolved_root, "/tmp/craxii-workspace-relocated");
+    drop(connection);
+    assert!(store.verify_application_consistency().await.is_ok());
     guard.shutdown().await;
 }
 

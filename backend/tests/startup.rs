@@ -154,6 +154,8 @@ fn startup_does_not_read_declared_credential_files() {
     let credential_file = credential_directory.join("openai_primary");
     fs::write(&credential_file, SECRET_SENTINEL).unwrap();
     fs::set_permissions(&credential_file, fs::Permissions::from_mode(0o000)).unwrap();
+    let workspace_root = root.join("workspace");
+    fs::create_dir(&workspace_root).unwrap();
 
     let input = LOCAL
         .replace(
@@ -174,6 +176,13 @@ fn startup_does_not_read_declared_credential_files() {
         .replace(
             "/tmp/craxii-dev/credentials",
             credential_directory.to_str().unwrap(),
+        )
+        .replace(
+            "primary_workspace_root = \"/tmp/craxii-dev/workspaces/primary\"",
+            &format!(
+                "primary_workspace_root = \"{}\"",
+                workspace_root.to_str().unwrap()
+            ),
         );
     let config_path = root.join("config.toml");
     fs::write(&config_path, input).unwrap();
@@ -254,6 +263,8 @@ impl TempConfig {
         let state_root = root.join("state");
         fs::create_dir(&state_root).unwrap();
         fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let workspace_root = root.join("workspace");
+        fs::create_dir(&workspace_root).unwrap();
         let contents = contents
             .replace(
                 "bind_address = \"127.0.0.1:8080\"",
@@ -282,6 +293,19 @@ impl TempConfig {
                 &format!(
                     "artifact_root = \"{}\"",
                     state_root.join("artifacts").to_str().unwrap()
+                ),
+            ),
+            None => contents,
+        };
+        let contents = match contents
+            .lines()
+            .find(|line| line.starts_with("primary_workspace_root = "))
+        {
+            Some(workspace_root_line) => contents.replace(
+                workspace_root_line,
+                &format!(
+                    "primary_workspace_root = \"{}\"",
+                    workspace_root.to_str().unwrap()
                 ),
             ),
             None => contents,

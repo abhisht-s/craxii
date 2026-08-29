@@ -160,6 +160,10 @@ canonical_id!(
     ExecutionId,
     "The stable identity of a workstation dispatch."
 );
+canonical_id!(
+    OperationId,
+    "The caller-generated identity of one Workstation operation."
+);
 canonical_id!(DraftId, "The ephemeral identity of streamed draft output.");
 canonical_id!(
     CorrelationId,
@@ -181,6 +185,7 @@ server_generated_id!(ToolExecutionId);
 server_generated_id!(ArtifactId);
 server_generated_id!(DeviceId);
 server_generated_id!(ExecutionId);
+server_generated_id!(OperationId);
 server_generated_id!(DraftId);
 server_generated_id!(CorrelationId);
 
@@ -246,6 +251,7 @@ mod tests {
         assert_id_contract!(ClientCommandId);
         assert_id_contract!(ClientMessageId);
         assert_id_contract!(ExecutionId);
+        assert_id_contract!(OperationId);
         assert_id_contract!(DraftId);
         assert_id_contract!(CorrelationId);
     }
@@ -316,6 +322,7 @@ mod tests {
         assert_generated(ArtifactId::generate());
         assert_generated(DeviceId::generate());
         assert_generated(ExecutionId::generate());
+        assert_generated(OperationId::generate());
         assert_generated(DraftId::generate());
         assert_generated(CorrelationId::generate());
     }

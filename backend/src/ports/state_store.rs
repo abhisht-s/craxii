@@ -468,10 +468,6 @@ pub struct BootstrapObservation {
     pub workspace_logical_name: String,
     pub workspace_logical_root: String,
     pub workspace_resolved_root: String,
-    pub max_execution_timeout_ms: u64,
-    pub max_stdout_bytes: u64,
-    pub max_stderr_bytes: u64,
-    pub administrative_enabled: bool,
 }
 
 pub struct LoadOrBootstrapIdentityReceipt {

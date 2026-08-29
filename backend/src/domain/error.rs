@@ -854,6 +854,24 @@ impl NormalizedError {
         )
     }
 
+    /// Constructs an explicitly classified workstation failure.
+    ///
+    /// Retryability remains advisory and never authorizes an automatic replay.
+    #[must_use]
+    pub const fn workstation_classified(
+        retryability: Retryability,
+        certainty: Certainty,
+        source_status: Option<SourceStatus>,
+    ) -> Self {
+        Self::generic(
+            ErrorCategory::WorkstationError,
+            retryability,
+            certainty,
+            SafeMessage::WORKSTATION,
+            source_status,
+        )
+    }
+
     /// Constructs a generic artifact failure with caller-selected certainty.
     #[must_use]
     pub const fn artifact(certainty: Certainty, source_status: Option<SourceStatus>) -> Self {

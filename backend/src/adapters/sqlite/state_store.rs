@@ -321,12 +321,7 @@ impl PreparedBootstrap {
         let default_shell =
             LogicalPathReference::absolute(request.observation.default_shell.clone())
                 .map_err(|_| inconsistent())?;
-        let limits = WorkstationCapabilityLimits::try_new(
-            request.observation.max_execution_timeout_ms,
-            request.observation.max_stdout_bytes,
-            request.observation.max_stderr_bytes,
-        )
-        .map_err(|_| inconsistent())?;
+        let limits = WorkstationCapabilityLimits::try_new(0, 0, 0).map_err(|_| inconsistent())?;
         let capabilities = WorkstationCapabilities::try_new(WorkstationCapabilitiesInput {
             workstation_id: request.proposed.workstation_id,
             generation: request.observation.initial_generation,
@@ -334,12 +329,12 @@ impl PreparedBootstrap {
             os_release: request.observation.os_release.clone(),
             default_shell,
             flags: WorkstationCapabilityFlags::new(WorkstationCapabilityFlagsInput {
-                filesystem_read: false,
+                filesystem_read: true,
                 foreground_execute: false,
                 cancel_execution: false,
                 inspect_execution: false,
                 privilege_user: true,
-                privilege_administrative: request.observation.administrative_enabled,
+                privilege_administrative: false,
                 process_group_cleanup: false,
                 cgroup_cleanup: false,
             }),
@@ -514,10 +509,6 @@ async fn validate_existing_bootstrap_in_write(
             workspace_logical_name: request.observation.workspace_logical_name.clone(),
             workspace_logical_root: request.observation.workspace_logical_root.clone(),
             workspace_resolved_root: request.observation.workspace_resolved_root.clone(),
-            max_execution_timeout_ms: request.observation.max_execution_timeout_ms,
-            max_stdout_bytes: request.observation.max_stdout_bytes,
-            max_stderr_bytes: request.observation.max_stderr_bytes,
-            administrative_enabled: request.observation.administrative_enabled,
         },
     })?;
     if root.workstation.generation() != request.observation.initial_generation
@@ -525,17 +516,29 @@ async fn validate_existing_bootstrap_in_write(
         || root.workstation.os_release() != request.observation.os_release
         || root.workspace.logical_name() != request.observation.workspace_logical_name
         || root.workspace.logical_root().canonical() != request.observation.workspace_logical_root
-        || root.capabilities != decode_capabilities_json(&expected.capabilities_json)?
     {
         return Err(inconsistent());
     }
-    let resolved_root: String =
-        sqlx::query_scalar("SELECT local_resolved_root FROM workspaces WHERE workspace_id = ?")
+    let _current_capabilities = decode_capabilities_json(&root.capabilities_json)?;
+    let workstation_update = sqlx::query(
+        "UPDATE workstations SET capabilities_json = ?, last_seen_at = ? \
+         WHERE workstation_id = ? AND generation = ?",
+    )
+    .bind(&expected.capabilities_json)
+    .bind(request.created_at.to_string())
+    .bind(root.workstation.workstation_id().to_string())
+    .bind(root.workstation.generation().get())
+    .execute(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    let workspace_update =
+        sqlx::query("UPDATE workspaces SET local_resolved_root = ? WHERE workspace_id = ?")
+            .bind(&request.observation.workspace_resolved_root)
             .bind(root.workspace.workspace_id().to_string())
-            .fetch_one(transaction.connection())
+            .execute(transaction.connection())
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
-    if resolved_root != request.observation.workspace_resolved_root {
+    if workstation_update.rows_affected() != 1 || workspace_update.rows_affected() != 1 {
         return Err(inconsistent());
     }
     Ok(V0IdentityReference {
@@ -719,8 +722,6 @@ fn compare_root_projection(
         || initialized.workstation_generation != root.workstation.generation()
         || initialized.workstation_architecture != root.workstation.cpu_architecture()
         || initialized.workstation_os_release != root.workstation.os_release()
-        || initialized.capabilities_sha256
-            != Sha256Digest::hash_bytes(root.capabilities_json.as_bytes())
         || initialized.workspace_id != root.workspace.workspace_id()
         || initialized.workspace_logical_name != root.workspace.logical_name()
         || initialized.workspace_logical_root != root.workspace.logical_root().canonical()

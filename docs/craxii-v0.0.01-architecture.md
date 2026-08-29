@@ -1844,6 +1844,14 @@ persisted IDs, appends nothing, changes no generation/version/ordinal/root link,
 current observation/configuration to agree. Empty state bootstraps; any nonempty partial,
 contradictory, duplicated, or mismatched root/event/head state fails closed without repair.
 
+The `capabilities_sha256` value in `craxii.initialized` is the immutable digest of the capability
+snapshot observed when that initialization event was created. A later controlled refresh of the
+current `workstations.capabilities_json`, `workstations.last_seen_at`, or
+`workspaces.local_resolved_root` MUST NOT rewrite or reinterpret that historical event. Durable
+workstation OS evidence remains the normalized platform-family fact supplied by portable runtime
+constants; exact Ubuntu 24.04 verification is a target-environment assertion and is not fabricated
+on a non-Ubuntu development host.
+
 The persistence port is split into intent-specific capability traits. Stage 7's SQLite facade
 implements only bootstrap identity, snapshot loading, and consistency verification; command,
 scheduler, model, tool, completion, replay, and recovery capabilities remain independently
@@ -3778,6 +3786,8 @@ The port returns normalized machine errors:
 - `permission_denied`;
 - `binary_content`;
 - `file_too_large`;
+- `changed_during_read`;
+- `unsupported_capability`;
 - `spawn_failed`;
 - `timeout`;
 - `cancelled`;

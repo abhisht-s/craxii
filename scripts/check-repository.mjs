@@ -361,38 +361,282 @@ function verifyBootstrapSnapshotStructure(source) {
   return snapshotSource;
 }
 
-function stage12ImplementationLeaks(productionFiles) {
+function stage13ImplementationLeaks(productionFiles) {
   const leaks = [];
   const generalImplementation = /tokio::process|std::process::Command|Command::new|struct\s+ToolRegistry\b|(?:async\s+)?fn\s+execute_tool\s*\(|reqwest|hyper::client|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(/;
   for (const file of productionFiles) {
     const source = stripRustComments(withoutRustTestModules(file.source));
-    const workstationTrait = /\b(?:pub(?:\s*\([^)]*\))?\s+)?trait\s+[A-Za-z_][A-Za-z0-9_]*Workstation(?:Port|Adapter)?\b/.test(
-      source,
-    );
-    const workstationAdapter = /\bimpl\b[^\{]*\b[A-Za-z_][A-Za-z0-9_]*Workstation(?:Port|Adapter)?\b[^\{]*\bfor\b/.test(
-      source,
-    );
-    const readFileSurface = /\b(?:async\s+)?fn\s+read_file\s*\(/.test(source);
-    let workstationCapabilitiesSurface = false;
-    for (const block of source.matchAll(/\b(?:impl|trait)\b[^\{]*\bWorkstation[A-Za-z0-9_]*[^\{]*\{/g)) {
-      const opening = block.index + block[0].lastIndexOf('{');
-      const closing = findMatchingDelimiter(source, opening, '{', '}');
-      assert(closing !== -1, `workstation block in ${file.path} has unbalanced braces`);
-      if (/\b(?:async\s+)?fn\s+capabilities\s*\(/.test(source.slice(opening, closing + 1))) {
-        workstationCapabilitiesSurface = true;
-      }
+    if (generalImplementation.test(source)) {
+      leaks.push(file.path);
     }
-    const workstationFilesystem =
-      (workstationTrait || workstationAdapter || readFileSurface || workstationCapabilitiesSurface) &&
-      /(?:std|tokio)::fs::(?:read|read_to_string)|File::open\s*\(/.test(source);
+  }
+  return sortedStrings(new Set(leaks));
+}
+
+function extractRustNamedBlock(source, pattern, label) {
+  const match = pattern.exec(source);
+  assert(match, `${label} is absent`);
+  const opening = source.indexOf('{', match.index);
+  assert(opening !== -1, `${label} has no body`);
+  const closing = findMatchingDelimiter(source, opening, '{', '}');
+  assert(closing !== -1, `${label} has an unbalanced body`);
+  return source.slice(match.index, closing + 1);
+}
+
+function rustMethodNames(source) {
+  return [...source.matchAll(/\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)].map((match) => match[1]);
+}
+
+function stage12ModelFilesystemLeaks(productionFiles) {
+  const leaks = [];
+  for (const file of productionFiles) {
+    if (!/^(?:application|domain|ports)\//.test(file.path)) continue;
+    const source = stripRustComments(withoutRustTestModules(file.source));
     if (
-      workstationTrait || workstationAdapter || readFileSurface || workstationCapabilitiesSurface ||
-      workstationFilesystem || generalImplementation.test(source)
+      /\b(?:std|tokio)::fs\b|\b(?:File|OpenOptions)::open\s*\(|\.read_to_(?:end|string)\s*\(/.test(
+        source,
+      )
     ) {
       leaks.push(file.path);
     }
   }
   return sortedStrings(new Set(leaks));
+}
+
+function localWorkstationViolations(source) {
+  const production = stripRustComments(withoutRustTestModules(source));
+  const violations = [];
+  if (/tokio::process|std::process|Command::new|\.spawn\s*\(/.test(production)) {
+    violations.push('process execution');
+  }
+  if (
+    /foreground_execute\s*:\s*true|cancel_execution\s*:\s*true|inspect_execution\s*:\s*true|privilege_administrative\s*:\s*true|process_group_cleanup\s*:\s*true|cgroup_cleanup\s*:\s*true/.test(
+      production,
+    )
+  ) {
+    violations.push('future capability advertised true');
+  }
+  if (
+    /\bstd::fs::(?:read|read_to_string)\s*\(|\.read_to_(?:end|string)\s*\(/.test(production)
+  ) {
+    violations.push('unbounded file read');
+  }
+  if (
+    /\.starts_with\s*\([^)]*(?:workspace|root)|(?:workspace|root)[^;\n]*\.starts_with\s*\(/.test(
+      production,
+    )
+  ) {
+    violations.push('prefix-based path confinement');
+  }
+  return violations;
+}
+
+function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
+  const portPath = join(rustRoot, 'ports', 'workstation.rs');
+  const adapterPath = join(rustRoot, 'adapters', 'local_workstation.rs');
+  assert(existsSync(portPath), 'Stage 12 Workstation port is absent');
+  assert(existsSync(adapterPath), 'Stage 12 LocalWorkstation adapter is absent');
+
+  const port = readFileSync(portPath, 'utf8');
+  const adapter = readFileSync(adapterPath, 'utf8');
+  const portProduction = stripRustComments(withoutRustTestModules(port));
+  const adapterProduction = stripRustComments(withoutRustTestModules(adapter));
+  const workstationTraits = productionFiles.reduce(
+    (count, file) => count + (stripRustComments(withoutRustTestModules(file.source)).match(/\btrait\s+Workstation\b/g) ?? []).length,
+    0,
+  );
+  const localWorkstationStructs = productionFiles.reduce(
+    (count, file) => count + (stripRustComments(withoutRustTestModules(file.source)).match(/\bstruct\s+LocalWorkstation\b/g) ?? []).length,
+    0,
+  );
+  assert(workstationTraits === 1, `expected one Workstation port, found ${workstationTraits}`);
+  assert(
+    localWorkstationStructs === 1,
+    `expected one production LocalWorkstation, found ${localWorkstationStructs}`,
+  );
+
+  const trait = extractRustNamedBlock(
+    portProduction,
+    /\bpub\s+trait\s+Workstation\s*:[^{]+\{/,
+    'Stage 12 Workstation trait',
+  );
+  assert(
+    equalStringArrays(rustMethodNames(trait), [
+      'capabilities',
+      'read_file',
+      'execute',
+      'inspect_execution',
+      'cancel_execution',
+    ]),
+    `Workstation methods differ: ${rustMethodNames(trait).join(', ')}`,
+  );
+  assert(
+    !/\b(?:PathBuf|RawFd|OwnedFd|BorrowedFd|DiagnosticPid|Pid)\b|\b(?:std::path|std::fs|std::process|tokio|sqlx|axum)::/.test(
+      portProduction,
+    ),
+    'Workstation port exposes a local filesystem, process, runtime, SQLx, or Axum type',
+  );
+  for (const required of [
+    'OperationId',
+    'WorkstationId',
+    'WorkstationGeneration',
+    'WorkspaceId',
+    'LogicalPathReference',
+    'WorkstationFuture',
+  ]) {
+    assert(portProduction.includes(required), `Workstation port is missing ${required}`);
+  }
+  for (const code of [
+    'workstation_unavailable',
+    'generation_mismatch',
+    'workspace_not_found',
+    'invalid_path',
+    'not_found',
+    'permission_denied',
+    'binary_content',
+    'file_too_large',
+    'changed_during_read',
+    'unsupported_capability',
+    'timeout',
+    'cancelled',
+    'io_error',
+    'internal_workstation_error',
+  ]) {
+    assert(portProduction.includes(`"${code}"`), `Workstation error code is missing: ${code}`);
+  }
+  assert(
+    /DEFAULT_FILE_READ_MAX_BYTES:\s*u64\s*=\s*1_048_576/.test(portProduction) &&
+      /HARD_FILE_READ_MAX_BYTES:\s*u64\s*=\s*8_388_608/.test(portProduction),
+    'Stage 12 file-read default/hard limits differ',
+  );
+
+  const workstationImpl = extractRustNamedBlock(
+    adapterProduction,
+    /\bimpl\s+Workstation\s+for\s+LocalWorkstation\s*\{/,
+    'Stage 12 LocalWorkstation implementation',
+  );
+  assert(
+    equalStringArrays(rustMethodNames(workstationImpl), [
+      'capabilities',
+      'read_file',
+      'execute',
+      'inspect_execution',
+      'cancel_execution',
+    ]),
+    `LocalWorkstation methods differ: ${rustMethodNames(workstationImpl).join(', ')}`,
+  );
+  for (const method of ['execute', 'inspect_execution', 'cancel_execution']) {
+    const body = extractRustFunction(workstationImpl, method);
+    assert(
+      /UnsupportedCapability/.test(body) &&
+        !/tokio::process|std::process|Command::new|\.spawn\s*\(|HashMap|Pid/.test(body),
+      `Stage 12 ${method} must remain unsupported-only without process state`,
+    );
+  }
+
+  const capabilities = extractRustFunction(adapterProduction, 'stage12_capabilities');
+  assert(
+    /cpu_architecture:\s*std::env::consts::ARCH/.test(capabilities) &&
+      /os_release:\s*std::env::consts::OS/.test(capabilities) &&
+      /filesystem_read:\s*true/.test(capabilities) &&
+      /privilege_user:\s*true/.test(capabilities) &&
+      /foreground_execute:\s*false/.test(capabilities) &&
+      /cancel_execution:\s*false/.test(capabilities) &&
+      /inspect_execution:\s*false/.test(capabilities) &&
+      /privilege_administrative:\s*false/.test(capabilities) &&
+      /process_group_cleanup:\s*false/.test(capabilities) &&
+      /cgroup_cleanup:\s*false/.test(capabilities) &&
+      /WorkstationCapabilityLimits::try_new\(0, 0, 0\)/.test(capabilities),
+    'LocalWorkstation Stage 12 capability truth differs',
+  );
+
+  const resolver = extractRustFunction(adapterProduction, 'resolve_existing_path');
+  const blockingRead = extractRustFunction(adapterProduction, 'read_blocking');
+  const asyncRead = extractRustFunction(workstationImpl, 'read_file');
+  assert(
+    /LogicalPathKind::WorkspaceRelative/.test(resolver) &&
+      /LogicalPathKind::Absolute/.test(resolver) &&
+      /std::fs::canonicalize/.test(resolver) &&
+      /ResolvedPathEvidence::try_new/.test(resolver) &&
+      !/\.starts_with\s*\(/.test(resolver),
+    'Stage 12 shared path resolver is incomplete or claims prefix confinement',
+  );
+  assert(
+    /tokio::task::spawn_blocking/.test(asyncRead) &&
+      /OpenOptions::new/.test(blockingRead) &&
+      /O_CLOEXEC/.test(blockingRead) &&
+      /O_NONBLOCK/.test(blockingRead) &&
+      (blockingRead.match(/file\.metadata\s*\(/g) ?? []).length === 2 &&
+      /ensure_regular_file/.test(blockingRead) &&
+      /file\.read\s*\(/.test(blockingRead) &&
+      /next_length as u64 > request\.max_bytes/.test(blockingRead) &&
+      /Sha256Digest::hash_bytes/.test(blockingRead) &&
+      /String::from_utf8/.test(blockingRead) &&
+      /truncated:\s*false/.test(blockingRead),
+    'Stage 12 descriptor-based bounded strict-UTF-8 read structure is incomplete',
+  );
+  assert(
+    localWorkstationViolations(adapter).length === 0,
+    `LocalWorkstation structural violations: ${localWorkstationViolations(adapter).join(', ')}`,
+  );
+  const filesystemLeaks = stage12ModelFilesystemLeaks(productionFiles);
+  assert(
+    filesystemLeaks.length === 0,
+    `model/application/domain/port filesystem access escaped LocalWorkstation: ${filesystemLeaks.join(', ')}`,
+  );
+
+  const startup = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
+  assert(
+    /LocalWorkstation::new\([\s\S]*config\.paths\(\)\.primary_workspace_root\(\)[\s\S]*config\.limits\(\)\.tools\(\)\.read_file_max_bytes\(\)/.test(
+      startup,
+    ) &&
+      /let workstation:\s*Arc<dyn Workstation>\s*=\s*Arc::new\(local_workstation\)/.test(startup) &&
+      /workstation:\s*Arc<dyn Workstation>/.test(startup) &&
+      !/mark_ready\s*\(/.test(startup),
+    'Stage 12 bootstrap must retain configured LocalWorkstation while remaining live_unready',
+  );
+
+  const stateStore = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'state_store.rs'), 'utf8');
+  const refresh = extractRustFunction(stateStore, 'validate_existing_bootstrap_in_write');
+  assert(
+    /UPDATE workstations SET capabilities_json = \?, last_seen_at = \?/.test(refresh) &&
+      /UPDATE workspaces SET local_resolved_root = \?/.test(refresh) &&
+      !/UPDATE journal_events/.test(refresh),
+    'Stage 12 current capability/root refresh is incomplete or rewrites journal history',
+  );
+
+  const pathTests = readFileSync(join(rustRoot, 'domain', 'path.rs'), 'utf8');
+  const stage7Tests = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'stage7_tests.rs'), 'utf8');
+  for (const [source, testName] of [
+    [port, 'fake_proves_the_port_has_no_local_descriptor_or_path_handle_requirement'],
+    [port, 'operation_and_execution_ids_are_distinct_uuidv7_domain_types'],
+    [adapter, 'capabilities_are_exact_truthful_stage12_runtime_facts'],
+    [adapter, 'identity_generation_and_workspace_guards_precede_path_io'],
+    [adapter, 'normal_utf8_empty_multibyte_bom_newlines_nul_and_hashes_are_exact'],
+    [adapter, 'absolute_nested_unicode_and_control_character_paths_are_supported_and_redacted'],
+    [adapter, 'invalid_utf8_returns_only_safe_binary_length_and_digest_evidence'],
+    [adapter, 'exact_request_and_hard_limits_succeed_while_oversize_and_sparse_fail'],
+    [adapter, 'missing_regular_target_is_not_found'],
+    [adapter, 'directory_fifo_socket_and_character_device_reject_without_blocking'],
+    [adapter, 'symlinks_inside_outside_and_chains_succeed_broken_and_loops_fail'],
+    [adapter, 'replacement_after_open_returns_one_complete_original_file_object'],
+    [adapter, 'deterministic_mutation_growth_and_shrink_are_changed_during_read'],
+    [adapter, 'expired_and_inflight_deadlines_are_honest_without_cancellation_claims'],
+    [adapter, 'read_has_no_target_or_directory_side_effects'],
+    [adapter, 'stage13_methods_are_guarded_and_unsupported_with_zero_process_mutation'],
+    [pathTests, 'workspace_relative_paths_normalize_lexically'],
+    [pathTests, 'workspace_relative_escape_and_empty_results_are_rejected'],
+    [pathTests, 'absolute_paths_normalize_and_clamp_at_root'],
+    [pathTests, 'backslash_and_nul_are_rejected_for_both_kinds'],
+    [pathTests, 'canonical_utf8_boundary_is_exact'],
+    [pathTests, 'debug_redacts_path_text'],
+    [stage7Tests, 'stage12_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event'],
+  ]) {
+    assert(
+      new RegExp(`(?:async\\s+)?fn\\s+${testName}\\s*\\(`).test(source),
+      `Stage 12 permanent test inventory is missing ${testName}`,
+    );
+  }
 }
 
 function expectStructuralRejection(label, operation) {
@@ -405,7 +649,7 @@ function expectStructuralRejection(label, operation) {
   assert(rejected, `checker negative probe was not rejected: ${label}`);
 }
 
-function verifyStage11CheckerNegativeProbes() {
+function verifyStage12CheckerNegativeProbes() {
   const allowedRouter = `
     Router::new()
       .route("/health/live", get(liveness))
@@ -433,20 +677,61 @@ function verifyStage11CheckerNegativeProbes() {
     verifyBootstrapSnapshotStructure(poolBackedSnapshot),
   );
 
-  const stage12Fixture = [{
+  const directFilesystemFixture = [{
+    path: 'application/tool_service.rs',
+    source: 'fn read(path: &str) { let _ = std::fs::read_to_string(path); }',
+  }];
+  assert(
+    stage12ModelFilesystemLeaks(directFilesystemFixture).length === 1,
+    'checker negative probe was not rejected: direct application filesystem read',
+  );
+
+  const stage13Fixture = [{
     path: 'adapters/local_workstation.rs',
     source: `
       pub struct LocalWorkstation;
       impl LocalWorkstation {
-        pub fn capabilities(&self) -> WorkstationCapabilities { todo!() }
-        pub fn read_file(&self, path: &Path) -> Vec<u8> { std::fs::read(path).unwrap() }
+        pub fn execute(&self) { std::process::Command::new("sh").spawn().unwrap(); }
       }`,
   }];
   assert(
-    stage12ImplementationLeaks(stage12Fixture).length === 1,
-    'checker negative probe was not rejected: concrete Stage 12 workstation implementation',
+    stage13ImplementationLeaks(stage13Fixture).length === 1,
+    'checker negative probe was not rejected: concrete Stage 13 process implementation',
   );
-  return 3;
+  assert(
+    localWorkstationViolations(stage13Fixture[0].source).includes('process execution'),
+    'checker negative probe was not rejected: LocalWorkstation process spawning',
+  );
+  assert(
+    localWorkstationViolations('fn capabilities() { foreground_execute: true }').includes(
+      'future capability advertised true',
+    ),
+    'checker negative probe was not rejected: execute capability advertised true',
+  );
+
+  const filesystemRouter = `
+    Router::new()
+      .route("/health/live", get(liveness))
+      .route("/health/ready", get(readiness))
+      .route("/bootstrap", get(bootstrap))
+      .route("/conversations/{conversation_id}/messages", post(message))
+      .route("/work-items/{work_id}/cancel", post(cancel))
+      .route("/events", get(events))
+      .route("/files/{path}", get(file));`;
+  expectStructuralRejection('filesystem HTTP route', () => verifyStage11RouteInventory(filesystemRouter));
+  assert(
+    localWorkstationViolations('fn read_file(path: &Path) { File::open(path).unwrap().read_to_end(&mut Vec::new()); }').includes(
+      'unbounded file read',
+    ),
+    'checker negative probe was not rejected: unbounded LocalWorkstation read',
+  );
+  assert(
+    localWorkstationViolations('fn resolve(path: &Path) { path.starts_with(workspace_root); }').includes(
+      'prefix-based path confinement',
+    ),
+    'checker negative probe was not rejected: prefix-based fake confinement',
+  );
+  return 9;
 }
 
 function verifyDirectDependencies(metadata, workspacePackages) {
@@ -613,7 +898,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage11Boundaries() {
+function verifyStage12Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -1290,21 +1575,22 @@ function verifyStage11Boundaries() {
   const laterStageModuleLeaks = rustFiles
     .filter((path) => !/_tests\.rs$/.test(path))
     .map((path) => relative(rustRoot, path))
-    .filter((path) => /(?:^|\/)(?:workstation|read-file|read_file|process-executor|process_executor|tool-registry|tool_registry|provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
+    .filter((path) => /(?:^|\/)(?:process-executor|process_executor|tool-registry|tool_registry|provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
   const productionImplementationFiles = rustFiles
     .filter((path) => !/_tests\.rs$/.test(path))
     .map((path) => ({
       path: relative(rustRoot, path),
       source: readFileSync(path, 'utf8'),
     }));
-  const laterStageImplementationLeaks = stage12ImplementationLeaks(productionImplementationFiles);
+  const laterStageImplementationLeaks = stage13ImplementationLeaks(productionImplementationFiles);
   assert(
     laterStageModuleLeaks.length === 0 &&
       laterStageImplementationLeaks.length === 0,
-    `Stage 12+ workstation/process/tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 11: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
+    `Stage 13+ process/tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 12: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
   );
 
-  const checkerNegativeProbeCount = verifyStage11CheckerNegativeProbes();
+  verifyStage12WorkstationStructure(rustRoot, productionImplementationFiles);
+  const checkerNegativeProbeCount = verifyStage12CheckerNegativeProbes();
 
   assert(
     /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest),
@@ -1383,10 +1669,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage11 = verifyStage11Boundaries();
+  const stage12 = verifyStage12Boundaries();
 
-  assert(directDependencyCount > 0 && stage11.checkerNegativeProbeCount === 3, 'checker summary evidence is incomplete');
-  console.log('Stage 11 structural invariants passed.');
+  assert(directDependencyCount > 0 && stage12.checkerNegativeProbeCount === 9, 'checker summary evidence is incomplete');
+  console.log('Stage 12 structural invariants passed.');
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
   process.exitCode = 1;

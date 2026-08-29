@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::adapters::artifacts::LocalArtifactStore;
 use crate::adapters::http::{ConnectionRegistry, HttpState, ServerHandle};
+use crate::adapters::local_workstation::LocalWorkstation;
 use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
@@ -31,6 +32,7 @@ use crate::ports::state_store::{
     BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, RuntimeStateStore,
     StateStoreErrorKind, V0IdentityReference,
 };
+use crate::ports::workstation::Workstation;
 
 pub async fn run_from_env() -> Result<RunningBootstrap, StartupError> {
     let arguments: Vec<_> = std::env::args_os().collect();
@@ -121,6 +123,28 @@ pub async fn run(
     if snapshot.identity != bootstrap.identity {
         return Err(StartupError::DatabaseIntegrity);
     }
+    let default_shell = crate::domain::LogicalPathReference::absolute(
+        config
+            .shell()
+            .executable()
+            .to_str()
+            .ok_or(StartupError::Configuration)?,
+    )
+    .map_err(|_| StartupError::Configuration)?;
+    let workstation_clock: Arc<dyn Clock> = clock.clone();
+    let local_workstation = LocalWorkstation::new(
+        &snapshot.workstation,
+        &snapshot.workspace,
+        default_shell,
+        config.paths().primary_workspace_root(),
+        config.limits().tools().read_file_max_bytes(),
+        workstation_clock,
+    )
+    .map_err(|_| StartupError::WorkstationLifecycle)?;
+    if local_workstation.capabilities_snapshot() != &snapshot.workstation_capabilities {
+        return Err(StartupError::DatabaseIntegrity);
+    }
+    let workstation: Arc<dyn Workstation> = Arc::new(local_workstation);
     let observation = SystemRuntimeProcessObserver
         .observe()
         .map_err(|_| StartupError::RuntimeLifecycle)?;
@@ -218,6 +242,7 @@ pub async fn run(
         artifact_store,
         orphan_report,
         runtime_instance_id: runtime.runtime_instance_id,
+        workstation,
         shutdown,
         mutation_admission,
         server,
@@ -243,9 +268,14 @@ fn allowed_hosts(config: &config::ValidatedConfig) -> Result<Vec<String>, Startu
 fn bootstrap_observation(
     config: &config::ValidatedConfig,
 ) -> Result<BootstrapObservation, StartupError> {
-    let workspace_root = config
+    let configured_workspace_root = config
         .paths()
         .primary_workspace_root()
+        .to_str()
+        .ok_or(StartupError::Configuration)?
+        .to_owned();
+    let workspace_root = std::fs::canonicalize(config.paths().primary_workspace_root())
+        .map_err(|_| StartupError::WorkstationLifecycle)?
         .to_str()
         .ok_or(StartupError::Configuration)?
         .to_owned();
@@ -267,12 +297,8 @@ fn bootstrap_observation(
             .workstation()
             .primary_workspace_logical_name()
             .to_owned(),
-        workspace_logical_root: workspace_root.clone(),
+        workspace_logical_root: configured_workspace_root,
         workspace_resolved_root: workspace_root,
-        max_execution_timeout_ms: config.limits().tools().run_shell_max_timeout_ms(),
-        max_stdout_bytes: config.limits().tools().stdout_capture_bytes(),
-        max_stderr_bytes: config.limits().tools().stderr_capture_bytes(),
-        administrative_enabled: config.shell().administrative_enabled(),
     })
 }
 
@@ -286,6 +312,7 @@ pub struct RunningBootstrap {
     artifact_store: LocalArtifactStore,
     orphan_report: ArtifactOrphanReport,
     runtime_instance_id: RuntimeInstanceId,
+    workstation: Arc<dyn Workstation>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
     server: ServerHandle,
@@ -316,6 +343,11 @@ impl RunningBootstrap {
     #[must_use]
     pub const fn runtime_instance_id(&self) -> RuntimeInstanceId {
         self.runtime_instance_id
+    }
+
+    #[must_use]
+    pub fn workstation(&self) -> &Arc<dyn Workstation> {
+        &self.workstation
     }
 
     pub async fn wait_for_shutdown_request(&mut self) -> Result<(), StartupError> {
@@ -417,6 +449,7 @@ pub enum StartupError {
     StateRootAlreadyOwned,
     DatabaseIntegrity,
     RuntimeLifecycle,
+    WorkstationLifecycle,
     Telemetry(TelemetryError),
     ServerBind,
     ServerLifecycle(crate::adapters::http::ServerError),
@@ -481,6 +514,7 @@ impl StartupError {
             Self::StateRootAlreadyOwned => "state_root_already_owned",
             Self::DatabaseIntegrity => "database_integrity_failure",
             Self::RuntimeLifecycle => "runtime_lifecycle_failure",
+            Self::WorkstationLifecycle => "workstation_lifecycle_failure",
             Self::Telemetry(TelemetryError::GlobalSubscriberConflict) => {
                 "telemetry_subscriber_conflict"
             }
