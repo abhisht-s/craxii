@@ -4,15 +4,15 @@
 - Dependency kind and owner: Direct normal dependency owned by bootstrap/runtime coordination.
 - Purpose: Main async runtime, SQLx runtime, the in-process write mutex, timeouts, owned tasks,
   and composition-edge graceful-shutdown signals.
-- Declaration: `version = "1.53"`, default features disabled, exactly `macros`,
+- Declaration: `version = "1.53"`, default features disabled, exactly `io-util`, `macros`, `net`,
   `rt-multi-thread`, `signal`, `sync`, and `time` enabled.
 - Resolved version and MSRV: `tokio 1.53.1`, MSRV `1.71`; verified with Rust `1.98.0`.
 - License and source: MIT, crates.io registry; accepted by cargo-deny.
 - Feature rationale: macros supports the binary/test runtime; multi-thread runtime supports SQLx and
   owned tasks; signal supplies only composition-edge Ctrl-C/SIGTERM handling; sync supplies
-  `Mutex`, `Notify`, `watch`, `mpsc`, and `oneshot`; time supplies heartbeat, fallback scans, and
-  bounded waits.
-  Direct `full`, fs, process, and explicit networking features are not enabled for convenience.
+  `Mutex`, `Notify`, `watch`, `mpsc`, `broadcast`, and `oneshot`; time supplies heartbeat, fallback
+  scans, and bounded waits; net and io-util supply the Stage 11 listener/socket and owned I/O
+  primitives. Direct `full`, fs, and process features are not enabled for convenience.
 - Proc-macro/runtime graph: resolves `tokio-macros 2.7.2`, `pin-project-lite`, and the platform
   runtime dependencies activated transitively by SQLx. The signal feature additionally activates
   the already governed platform signal registry/libc path. The proc macro uses the standard
@@ -26,4 +26,5 @@
   later network/process ownership.
 - Removal/replacement path: A runtime replacement must first replace SQLx runtime integration and
   every owned-task/timer/synchronization seam without changing StateStore semantics.
-- Review date and approval: 2026-08-28, approved by the repository/project owner for Stage 10.
+- Review date and approval: 2026-08-28, expanded and approved by the repository/project owner for
+  Stage 11.

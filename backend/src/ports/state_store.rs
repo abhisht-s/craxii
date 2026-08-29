@@ -635,13 +635,61 @@ pub struct ListPublicJournalRequest {
     pub limit: u32,
 }
 
-/// Payload decoding remains a later journal-owned contract; this preserves replay identity/order.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PublicJournalCandidate {
-    pub event_id: JournalEventId,
-    pub offset: JournalOffset,
-    pub correlation_id: CorrelationId,
-    pub causation_event_id: Option<JournalEventId>,
+/// One bounded underlying journal page. Public filtering belongs to the application layer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublicJournalPage {
+    pub candidates: Vec<crate::domain::JournalEvent>,
+    pub scanned_through: JournalOffset,
+    pub has_more: bool,
+}
+
+/// Dependency-neutral source facts read atomically for the public bootstrap projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientBootstrapCandidate {
+    pub snapshot_cursor: JournalOffset,
+    pub principal: CraxiiPrincipal,
+    pub primary_conversation: Conversation,
+    pub messages: Vec<ClientMessageCandidate>,
+    pub work_items: Vec<ClientWorkCandidate>,
+    pub tool_summaries: Vec<ClientToolCandidate>,
+    pub source_message_json_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientMessageCandidate {
+    pub message: Message,
+    pub conversation_sequence: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientWorkCandidate {
+    pub work_id: WorkId,
+    pub conversation_id: ConversationId,
+    pub conversation_work_ordinal: crate::domain::ConversationWorkOrdinal,
+    pub state: WorkState,
+    pub trigger_message_id: MessageId,
+    pub created_at: UtcTimestamp,
+    pub queued_at: UtcTimestamp,
+    pub started_at: Option<UtcTimestamp>,
+    pub cancel_requested_at: Option<UtcTimestamp>,
+    pub terminal_at: Option<UtcTimestamp>,
+    pub terminal_reason: Option<crate::domain::JournalWorkTerminalReason>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientToolCandidate {
+    pub work_id: WorkId,
+    pub work_ordinal: crate::domain::ConversationWorkOrdinal,
+    pub agent_step_no: crate::domain::AgentStepNo,
+    pub tool_ordinal: crate::domain::ToolOrdinal,
+    pub tool_execution_id: ToolExecutionId,
+    pub tool_name: ToolName,
+    pub state: ToolExecutionState,
+    pub result_class: Option<ToolResultClass>,
+    pub requested_at: UtcTimestamp,
+    pub started_at: Option<UtcTimestamp>,
+    pub completed_at: Option<UtcTimestamp>,
+    pub cleanup_confirmed: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -854,10 +902,12 @@ pub trait CompletionStateStore: Send + Sync {
 
 /// Stage 11 internal-to-public replay candidate capability.
 pub trait ReplayStateStore: Send + Sync {
+    fn current_journal_high_water(&self) -> StateStoreFuture<'_, JournalOffset>;
+    fn load_client_bootstrap_snapshot(&self) -> StateStoreFuture<'_, ClientBootstrapCandidate>;
     fn list_public_journal_replay_candidates(
         &self,
         request: ListPublicJournalRequest,
-    ) -> StateStoreFuture<'_, Vec<PublicJournalCandidate>>;
+    ) -> StateStoreFuture<'_, PublicJournalPage>;
 }
 
 /// Stage 10 stale-runtime recovery capability.
@@ -1151,10 +1201,18 @@ mod tests {
     }
 
     impl ReplayStateStore for FakeStateStore {
+        fn current_journal_high_water(&self) -> StateStoreFuture<'_, JournalOffset> {
+            self.fail(Intent::ListJournal)
+        }
+
+        fn load_client_bootstrap_snapshot(&self) -> StateStoreFuture<'_, ClientBootstrapCandidate> {
+            self.fail(Intent::LoadBootstrap)
+        }
+
         fn list_public_journal_replay_candidates(
             &self,
             _: ListPublicJournalRequest,
-        ) -> StateStoreFuture<'_, Vec<PublicJournalCandidate>> {
+        ) -> StateStoreFuture<'_, PublicJournalPage> {
             self.fail(Intent::ListJournal)
         }
     }

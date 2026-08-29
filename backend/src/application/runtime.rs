@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -235,10 +237,25 @@ pub struct ShutdownController<S, C> {
     runtime_instance_id: RuntimeInstanceId,
     correlation_id: CorrelationId,
     grace_period_ms: u64,
+    requested: std::sync::atomic::AtomicBool,
     state: tokio::sync::Mutex<Option<ShutdownState>>,
     failure: tokio::sync::Mutex<Option<RuntimeControlError>>,
     heartbeat: tokio::sync::Mutex<Option<HeartbeatTask>>,
     scheduler: tokio::sync::Mutex<Option<SchedulerHandle>>,
+}
+
+pub type ControlledShutdownFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ShutdownReceipt, RuntimeControlError>> + Send + 'a>>;
+
+/// Object-safe access to the one Stage 10 controlled-shutdown latch.
+///
+/// Transport supervisors use this narrow view so an unexpected shared-server failure requests
+/// the existing runtime shutdown instead of creating a second lifecycle authority.
+pub trait ControlledShutdown: Send + Sync {
+    fn request_controlled_shutdown(&self) -> ControlledShutdownFuture<'_>;
+
+    /// Reports the actual Stage 10 shutdown latch, not transport-local drain state.
+    fn shutdown_is_requested(&self) -> bool;
 }
 
 #[derive(Clone, Copy)]
@@ -269,6 +286,7 @@ where
             runtime_instance_id,
             correlation_id,
             grace_period_ms,
+            requested: std::sync::atomic::AtomicBool::new(false),
             state: tokio::sync::Mutex::new(None),
             failure: tokio::sync::Mutex::new(None),
             heartbeat: tokio::sync::Mutex::new(Some(heartbeat)),
@@ -291,7 +309,18 @@ where
         Ok(())
     }
 
+    /// Latches the one Stage 10 shutdown request before outward transports are told to exit.
+    ///
+    /// The later async `request` work still owns claim quiescence, the durable stopping event,
+    /// heartbeat join, and Work cancellation. Splitting this nonblocking latch lets bootstrap stop
+    /// listener acceptance without creating a transport-local expected-exit authority.
+    pub fn latch_shutdown_request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     pub async fn request(&self) -> Result<ShutdownReceipt, RuntimeControlError> {
+        self.latch_shutdown_request();
         let mut state = self.state.lock().await;
         if let Some(existing) = *state {
             return Ok(ShutdownReceipt {
@@ -310,10 +339,13 @@ where
             .ok_or(RuntimeControlError::Clock)?;
         let grace_deadline = UtcTimestamp::from_offset_datetime(wall_deadline)
             .map_err(|_| RuntimeControlError::Clock)?;
-        if self.health.snapshot().state() != HealthState::Fatal
-            && self.health.mark_draining().is_err()
-        {
-            self.record_failure(RuntimeControlError::Health).await;
+        match self.health.snapshot().state() {
+            HealthState::LiveUnready | HealthState::Ready => {
+                if self.health.mark_draining().is_err() {
+                    self.record_failure(RuntimeControlError::Health).await;
+                }
+            }
+            HealthState::Draining | HealthState::Fatal => {}
         }
         if let Some(scheduler) = self.scheduler.lock().await.as_ref() {
             scheduler.stop_claiming_and_wait().await;
@@ -381,6 +413,14 @@ where
             Err(_) => self.record_failure(RuntimeControlError::StateStore).await,
         }
         Ok(receipt)
+    }
+
+    pub async fn monotonic_deadline(&self) -> Result<tokio::time::Instant, RuntimeControlError> {
+        self.state
+            .lock()
+            .await
+            .map(|state| state.monotonic_deadline)
+            .ok_or(RuntimeControlError::InvalidShutdown)
     }
 
     pub async fn finish(&self) -> Result<(), RuntimeControlError> {
@@ -451,6 +491,20 @@ where
     async fn record_failure(&self, error: RuntimeControlError) {
         let mut failure = self.failure.lock().await;
         failure.get_or_insert(error);
+    }
+}
+
+impl<S, C> ControlledShutdown for ShutdownController<S, C>
+where
+    S: RuntimeStateStore + SchedulerStateStore + RecoveryStateStore + 'static,
+    C: Clock + 'static,
+{
+    fn request_controlled_shutdown(&self) -> ControlledShutdownFuture<'_> {
+        Box::pin(self.request())
+    }
+
+    fn shutdown_is_requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 

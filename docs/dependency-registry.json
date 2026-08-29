@@ -2,6 +2,34 @@
   "schema_version": 1,
   "approved_direct_cargo_dependencies": [
     {
+      "package": "axum",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.8.9",
+      "enabled_features": ["http1", "json", "matched-path", "query", "tokio", "tracing", "ws"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/axum.md"
+    },
+    {
+      "package": "futures-util",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "dev",
+      "approved_compatible_requirement": "^0.3.34",
+      "enabled_features": ["sink", "std"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/futures-util.md"
+    },
+    {
       "package": "getrandom",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -98,7 +126,9 @@
       "dependency_kind": "normal",
       "approved_compatible_requirement": "^1.53",
       "enabled_features": [
+        "io-util",
         "macros",
+        "net",
         "rt-multi-thread",
         "signal",
         "sync",
@@ -113,6 +143,20 @@
       "decision_record_path": "docs/dependencies/tokio.md"
     },
     {
+      "package": "tokio-tungstenite",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "dev",
+      "approved_compatible_requirement": "^0.29.0",
+      "enabled_features": ["connect"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/tokio-tungstenite.md"
+    },
+    {
       "package": "toml",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",
@@ -125,6 +169,34 @@
       "approver_role": "repository/project owner",
       "approval_date": "2026-08-27",
       "decision_record_path": "docs/dependencies/toml.md"
+    },
+    {
+      "package": "tower",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.5.3",
+      "enabled_features": ["limit", "util"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/tower.md"
+    },
+    {
+      "package": "tower-http",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.7.0",
+      "enabled_features": ["limit", "sensitive-headers", "set-header", "timeout", "trace"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-08-28",
+      "decision_record_path": "docs/dependencies/tower-http.md"
     },
     {
       "package": "tracing",

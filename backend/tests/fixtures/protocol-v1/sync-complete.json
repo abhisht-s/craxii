@@ -1,0 +1,6 @@
+{
+  "protocol_version": 1,
+  "delivery_kind": "ephemeral",
+  "event_type": "sync.complete",
+  "through_cursor": 8
+}

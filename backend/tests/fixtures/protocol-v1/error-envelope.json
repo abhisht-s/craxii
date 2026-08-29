@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "error": {
+    "code": "invalid_request",
+    "message": "The request is invalid.",
+    "retryable": false,
+    "request_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa005"
+  }
+}

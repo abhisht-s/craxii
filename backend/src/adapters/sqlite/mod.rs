@@ -10,6 +10,7 @@ mod projection;
 mod runtime;
 mod schema;
 mod stage10;
+mod stage11;
 mod stage8;
 mod stage8_codec;
 mod stage9;
@@ -20,6 +21,8 @@ mod transaction;
 
 #[cfg(test)]
 mod stage10_tests;
+#[cfg(test)]
+mod stage11_tests;
 #[cfg(test)]
 mod stage6_tests;
 #[cfg(test)]

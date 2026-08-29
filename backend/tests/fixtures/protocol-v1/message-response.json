@@ -1,0 +1,9 @@
+{
+  "protocol_version": 1,
+  "message_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa002",
+  "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+  "work_state": "queued",
+  "conversation_work_ordinal": 1,
+  "committed_cursor": 4,
+  "duplicate": false
+}

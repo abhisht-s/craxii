@@ -131,6 +131,18 @@ fn invalid_config_is_redacted_and_exits_nonzero() {
 }
 
 #[test]
+fn bind_failure_precedes_database_and_runtime_creation() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority = occupied.local_addr().unwrap().to_string();
+    let config = TempConfig::new_with_authority(LOCAL, &authority);
+    let output = run(&["--config", config.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(text(&output.stderr), "craxii fatal: server_bind_failure\n");
+    assert!(!config.root.join("state/db/craxii.sqlite3").exists());
+}
+
+#[test]
 fn startup_does_not_read_declared_credential_files() {
     let root = temporary_root();
     fs::create_dir_all(&root).unwrap();
@@ -144,6 +156,10 @@ fn startup_does_not_read_declared_credential_files() {
     fs::set_permissions(&credential_file, fs::Permissions::from_mode(0o000)).unwrap();
 
     let input = LOCAL
+        .replace(
+            "bind_address = \"127.0.0.1:8080\"",
+            &format!("bind_address = \"{}\"", available_loopback_authority()),
+        )
         .replace(
             "artifact_root = \"/tmp/craxii-dev/state/artifacts\"",
             &format!(
@@ -229,11 +245,24 @@ struct TempConfig {
 
 impl TempConfig {
     fn new(contents: &str) -> Self {
+        Self::new_with_authority(contents, &available_loopback_authority())
+    }
+
+    fn new_with_authority(contents: &str, authority: &str) -> Self {
         let root = temporary_root();
         fs::create_dir(&root).unwrap();
         let state_root = root.join("state");
         fs::create_dir(&state_root).unwrap();
         fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
+        let contents = contents
+            .replace(
+                "bind_address = \"127.0.0.1:8080\"",
+                &format!("bind_address = \"{authority}\""),
+            )
+            .replace(
+                "public_base_url = \"http://127.0.0.1:8080\"",
+                &format!("public_base_url = \"http://{authority}\""),
+            );
         let contents = match contents
             .lines()
             .find(|line| line.starts_with("state_root = "))
@@ -265,6 +294,13 @@ impl TempConfig {
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn available_loopback_authority() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    authority
 }
 
 impl Drop for TempConfig {

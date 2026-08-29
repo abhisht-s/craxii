@@ -529,7 +529,10 @@ Tool commands are child executions, not durable backend services. An explicitly 
 
 Every spawned Tokio task MUST have an owner and shutdown path.
 
-- Connection tasks are owned by the Axum server lifecycle.
+- Accepted WebSocket upgrades and connection tasks are owned by Craxii transport lifecycle
+  accounting. Ownership is reserved before returning Axum's upgrade response; the Axum callback
+  transfers that reservation to the active connection supervisor and reports callback failure,
+  cancellation, panic, and completion for observation before registry removal.
 - Per-work agent tasks are owned by a scheduler `JoinSet` or equivalent task collection.
 - Provider stream readers are owned by one model invocation and cancelled with it.
 - stdout/stderr drain tasks are owned by one tool execution and joined before terminal persistence.
@@ -4103,6 +4106,29 @@ GET  /v1/events?after=<journal_offset>     WebSocket upgrade
 
 Optional diagnostic/admin endpoints are out of scope and must not be exposed publicly without separate design.
 
+### Protocol v1 closure and transport bounds
+
+V0 request JSON rejects unknown fields and unsupported `protocol_version`; UUIDs are canonical
+lowercase-hyphenated UUIDv7 values and replay cursors are canonical unsigned decimal. Response
+envelopes are stable and may add optional fields that clients ignore. Every protected request has
+exactly one bearer header: the scheme is ASCII case-insensitive, followed by exactly one ASCII
+space and 64 lowercase hexadecimal characters, with no comma, tab, extra segment, or trailing
+data. A fresh server UUIDv7 request ID is generated for every HTTP request and WebSocket upgrade;
+inbound request-ID headers are never trusted or persisted.
+
+Message JSON is limited to 512 KiB before decode and retains the 64 KiB decoded UTF-8 content
+limit. Cancellation JSON is limited to 8 KiB. Active HTTP requests are bounded to 64, active
+mutation requests to 16, and WebSocket connections to 32. Health, mutation, and bootstrap
+timeouts are respectively two, ten, and thirty seconds; each replay page query is bounded to five
+seconds, while WebSocket lifetime has no generic HTTP timeout. Responses are `no-store` and
+`nosniff`; authorization is sensitive before tracing. Rust performs neither TLS, HSTS, permissive
+CORS, nor forwarded-header trust.
+
+After startup recovery, bootstrap/replay are admitted in `live_unready` or `ready`. Messages
+require `ready`; cancellation is responsibility-reducing and remains admitted in `live_unready`
+or `ready`. Mutations are rejected in `draining` or `fatal`. Production remains `live_unready`
+until Stage 17 installs a real WorkRunner.
+
 ### Message command
 
 Request:
@@ -4180,6 +4206,24 @@ Because all reads share one SQLite snapshot, returned state never includes a pro
 
 Bootstrap does not include provider request bodies, raw tool output artifacts, secrets, or internal-only journal events.
 
+The public bootstrap DTO contains exactly `protocol_version`, `snapshot_cursor`, `craxii`,
+`primary_conversation`, `messages`, `work_items`, and `unresolved_outcomes`; it is not the internal
+bootstrap type. Craxii exposes only ID, display name, and owner label. Conversation exposes ID,
+kind, lifecycle, and creation time. Messages expose stable IDs, conversation sequence, role,
+content, optional client-message/work IDs, and commit time. Work exposes stable IDs and ordinal,
+all nine public Work states, trigger message, lifecycle times, optional safe terminal reason,
+cleanup pending, and redacted tool summaries. Tool summaries expose only execution ID, tool name,
+safe status/result class, timestamps, and outcome-unknown status. Closed unresolved warnings are
+`provider_outcome_unknown`, `tool_outcome_unknown`, and `cleanup_unconfirmed` with only the IDs
+needed for client presentation.
+
+The transaction first reads journal head `H`, then every projection, and closes before JSON
+serialization or network send. It returns messages in conversation sequence order, Work in work
+ordinal order, tools in agent-step/tool-ordinal order, and warnings in work/tool order. It fails
+non-partially with `bootstrap_limit_exceeded` above 2,048 messages, all active plus 512 recent
+terminal Work, 2,048 tool summaries, 12 MiB source message JSON, or 16 MiB encoded JSON; it never
+silently truncates.
+
 ### Durable WebSocket event envelope
 
 ```json
@@ -4213,6 +4257,21 @@ Client-visible durable events include:
 - `work.interrupted`;
 - `assistant.message_committed`;
 - relevant `runtime.recovery_performed` summary.
+
+`work.waiting_on_tool` is public. An internal `work.resumed`, if a later stage emits it, maps to
+public `work.started` with `transition_kind="resumed"`. The exact allowlist also includes
+`tool.execution_interrupted_before_dispatch`; tool dispatch maps to
+`tool.execution_started`, while completed and outcome-unknown terminal facts map to the safe
+finished projection. Initialization, runtime start/stop, model invocation, tool request/internal
+arguments, artifacts/evidence, provider bodies, context manifests, filesystem/output data, and
+internal runtime/attempt facts are never public. An unknown kind/version whose visibility cannot
+be proven fails closed rather than being skipped.
+
+Replay wire cursor `0` is the from-start sentinel; positive cursors wrap global journal offsets.
+Negative, signed, padded, floating, junk, overflow, noncanonical, missing-required, and future
+values are invalid. SQLite scans at most 128 underlying journal rows per page through a fixed
+high-water, returning typed candidates, `scanned_through`, and `has_more`; scan progress crosses
+filtered/internal rows and therefore can advance on an empty public page.
 
 Internal event names and public event names may differ where redaction/aggregation requires it.
 
@@ -4293,6 +4352,41 @@ V0 never prunes journal events, so a valid old cursor remains replayable. Later 
 - Ephemeral drafts may be coalesced or dropped under pressure.
 - Maximum durable event payload is 256 KiB; larger evidence uses artifacts and summaries.
 - One slow client cannot block journal commits or the agent loop.
+
+The committed-cursor broadcaster has capacity 256 and is only a wakeup hint. Each connection
+subscribes before reading high-water, rechecks durable storage every second, and repairs hint loss
+or lag by scanning after its last scanned cursor. Each connection has an outbound queue of 16
+frames, a 262,144-byte durable payload limit, a 270,336-byte encoded-frame limit, and a five-second
+queue/send-stall limit. Sustained pressure closes `1013`; client application frames close `1008`,
+controlled shutdown closes `1001`, and replay/storage invariant failure closes `1011`.
+
+The 32-connection limit and transport shutdown drain count accepted pending upgrades as well as
+active sockets. A connection subscribes to shutdown before its initial high-water read, and every
+high-water read, replay-page fetch, frame send, `sync.complete` send, and live wait is
+shutdown-aware. Registry ownership is removed only after the upgrade callback and any transferred
+connection work have produced an observed completion outcome.
+
+### Transport shutdown ordering
+
+Transport mutation admission is separate from scheduler claim admission. Graceful shutdown
+latches, marks nonfatal health draining, stops listener acceptance and new upgrades, closes
+mutation admission and awaits explicit asynchronous quiescence, then closes claim admission and
+awaits quiescence before committing `runtime.stopping`. The mutation section covers command
+commit/no-commit and postcommit effect ownership, so no command event can commit after
+`runtime.stopping`. Existing WebSockets then close `1001`; server and connection tasks are joined
+before SQLite closes. Bootstrap binds the configured loopback listener before creating a runtime,
+but does not serve application traffic until startup/recovery is coherent; bind failure creates no
+RuntimeInstance. The Stage 10 shutdown controller remains the sole signal/shutdown authority.
+The server execution task is observed by an explicit transport supervisor. Unexpected early
+return, precise serve failure, or task panic marks fatal, requests that existing Stage 10
+controller, and preserves the originating typed cause while transport ownership drains within the
+controller's original deadline.
+
+Repository checks for this surface are structural guards over method/path construction,
+authentication placement, snapshot/replay source relationships, permanent test inventory, and
+stage exclusions. They do not prove runtime behavior; deterministic Rust unit and integration
+tests are the behavioral authority for atomic snapshots, replay progress, connection ownership,
+and shutdown supervision.
 
 ## Native macOS client
 

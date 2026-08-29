@@ -6,7 +6,8 @@ use crate::bootstrap::compatibility::PROTOCOL_VERSION;
 use crate::domain::{
     AuthenticatedDevice, CancellationCommandReceipt, ClientCommandId, ClientMessageId,
     CommandHashEncodingVersion, CommandOutcome, CommandRequestHash, ConversationId, IdempotencyKey,
-    JournalEventId, MessageCommandReceipt, MessageContent, MessageId, UtcTimestamp, WorkId,
+    JournalEventId, JournalOffset, MessageCommandReceipt, MessageContent, MessageId, UtcTimestamp,
+    WorkId,
 };
 use crate::ports::state_store::{
     AcceptUserMessageRequest, CommandStateStore, MessageCommandCandidates,
@@ -79,16 +80,18 @@ pub struct CancelWorkCommand {
 }
 
 pub trait CommandPostCommit: Send + Sync {
-    fn message_committed(&self, work_id: WorkId);
-    fn active_cancellation_committed(&self, work_id: WorkId);
+    fn message_committed(&self, work_id: WorkId, cursor: JournalOffset);
+    fn active_cancellation_committed(&self, work_id: WorkId, cursor: JournalOffset);
+    fn direct_cancellation_committed(&self, work_id: WorkId, cursor: JournalOffset);
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopCommandPostCommit;
 
 impl CommandPostCommit for NoopCommandPostCommit {
-    fn message_committed(&self, _: WorkId) {}
-    fn active_cancellation_committed(&self, _: WorkId) {}
+    fn message_committed(&self, _: WorkId, _: JournalOffset) {}
+    fn active_cancellation_committed(&self, _: WorkId, _: JournalOffset) {}
+    fn direct_cancellation_committed(&self, _: WorkId, _: JournalOffset) {}
 }
 
 pub struct CommandService<'a, S, H = NoopCommandPostCommit> {
@@ -161,7 +164,8 @@ where
             crate::test_failpoints::reach(
                 crate::test_failpoints::PhysicalHook::AfterMessageTransactionCommit,
             );
-            self.post_commit.message_committed(receipt.work_id);
+            self.post_commit
+                .message_committed(receipt.work_id, receipt.committed_cursor);
         }
         Ok(outcome)
     }
@@ -196,15 +200,29 @@ where
             })
             .await
             .map_err(map_store_error)?;
-        if let CommandOutcome::Committed(receipt) = &outcome
-            && receipt.resulting_work_state == crate::domain::WorkState::CancelRequested
-        {
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::reach(
-                crate::test_failpoints::PhysicalHook::AfterCancelRequestedCommit,
-            );
-            self.post_commit
-                .active_cancellation_committed(receipt.work_id);
+        if let CommandOutcome::Committed(receipt) = &outcome {
+            match receipt.resulting_work_state {
+                crate::domain::WorkState::CancelRequested => {
+                    #[cfg(feature = "test-failpoints")]
+                    crate::test_failpoints::reach(
+                        crate::test_failpoints::PhysicalHook::AfterCancelRequestedCommit,
+                    );
+                    self.post_commit
+                        .active_cancellation_committed(receipt.work_id, receipt.committed_cursor);
+                }
+                crate::domain::WorkState::Cancelled => {
+                    self.post_commit
+                        .direct_cancellation_committed(receipt.work_id, receipt.committed_cursor);
+                }
+                crate::domain::WorkState::Completed
+                | crate::domain::WorkState::Failed
+                | crate::domain::WorkState::Interrupted => {}
+                _ => {
+                    return Err(CommandServiceError::new(
+                        CommandServiceErrorKind::StorageInconsistent,
+                    ));
+                }
+            }
         }
         Ok(outcome)
     }

@@ -6,6 +6,7 @@ pub mod application;
 pub mod bootstrap;
 pub mod domain;
 pub mod ports;
+pub mod protocol;
 
 #[cfg(feature = "test-failpoints")]
 pub mod test_failpoints;

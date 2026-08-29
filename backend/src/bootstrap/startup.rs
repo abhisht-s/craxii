@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::adapters::artifacts::LocalArtifactStore;
+use crate::adapters::http::{ConnectionRegistry, HttpState, ServerHandle};
 use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
@@ -14,6 +15,7 @@ use crate::application::ApplicationShell;
 use crate::application::runtime::{
     HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
 };
+use crate::application::transport::{CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::config;
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
@@ -60,6 +62,11 @@ pub async fn run(
     let health = Health::new();
     let telemetry =
         Telemetry::initialize_global(config.tracing()).map_err(StartupError::Telemetry)?;
+    // Binding precedes every RuntimeInstance write. The socket is not served until recovery is
+    // coherent, so a bind failure cannot create runtime.started or accept application traffic.
+    let listener = tokio::net::TcpListener::bind(config.server().bind_address())
+        .await
+        .map_err(|_| StartupError::ServerBind)?;
     let sqlite_runtime = SqliteRuntimeGuard::start(
         config.paths().state_root(),
         config.sqlite().pool_connections(),
@@ -175,7 +182,7 @@ pub async fn run(
         Arc::clone(&clock),
         health.clone(),
         runtime.runtime_instance_id,
-        fatal,
+        fatal.clone(),
     );
     let shutdown = Arc::new(ShutdownController::new(
         Arc::clone(&state_store),
@@ -186,6 +193,25 @@ pub async fn run(
         config.shutdown().grace_period_ms(),
         heartbeat,
     ));
+    let mutation_admission = MutationAdmission::new();
+    let cursors = CursorBroadcaster::new();
+    let connections = ConnectionRegistry::default();
+    let (ws_shutdown, _) = tokio::sync::watch::channel(false);
+    let controlled_shutdown: Arc<dyn crate::application::runtime::ControlledShutdown> =
+        shutdown.clone();
+    let http_state = HttpState::new(
+        Arc::clone(&state_store),
+        Arc::clone(&clock),
+        health.clone(),
+        mutation_admission.clone(),
+        cursors,
+        fatal,
+        ws_shutdown,
+        connections,
+        allowed_hosts(&config)?,
+        Some(controlled_shutdown),
+    );
+    let server = ServerHandle::start(listener, http_state);
     Ok(RunningBootstrap {
         application: ApplicationShell::new(process, health, snapshot),
         sqlite_runtime,
@@ -193,8 +219,25 @@ pub async fn run(
         orphan_report,
         runtime_instance_id: runtime.runtime_instance_id,
         shutdown,
+        mutation_admission,
+        server,
         fatal_receiver,
     })
+}
+
+fn allowed_hosts(config: &config::ValidatedConfig) -> Result<Vec<String>, StartupError> {
+    let mut hosts = vec![config.server().bind_address().to_string()];
+    let public = url::Url::parse(config.server().public_base_url().as_str())
+        .map_err(|_| StartupError::Configuration)?;
+    let host = public.host_str().ok_or(StartupError::Configuration)?;
+    let authority = match public.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_owned(),
+    };
+    if !hosts.contains(&authority) {
+        hosts.push(authority);
+    }
+    Ok(hosts)
 }
 
 fn bootstrap_observation(
@@ -244,6 +287,8 @@ pub struct RunningBootstrap {
     orphan_report: ArtifactOrphanReport,
     runtime_instance_id: RuntimeInstanceId,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
+    mutation_admission: MutationAdmission,
+    server: ServerHandle,
     fatal_receiver: tokio::sync::watch::Receiver<bool>,
 }
 
@@ -299,16 +344,40 @@ impl RunningBootstrap {
     }
 
     pub async fn shutdown(self) -> Result<(), StartupError> {
-        self.shutdown
-            .request()
-            .await
-            .map_err(StartupError::from_runtime)?;
-        self.shutdown
-            .finish()
-            .await
-            .map_err(StartupError::from_runtime)?;
+        let mut runtime_cleanup_failed = false;
+        self.shutdown.latch_shutdown_request();
+        match self.application.health().snapshot().state() {
+            crate::bootstrap::health::HealthState::LiveUnready
+            | crate::bootstrap::health::HealthState::Ready => self
+                .application
+                .health()
+                .mark_draining()
+                .unwrap_or_else(|_| runtime_cleanup_failed = true),
+            crate::bootstrap::health::HealthState::Draining
+            | crate::bootstrap::health::HealthState::Fatal => {}
+        }
+        self.server.stop_accepting();
+        self.mutation_admission.close_and_wait().await;
+        if self.shutdown.request().await.is_err() {
+            runtime_cleanup_failed = true;
+        }
+        let deadline = self.shutdown.monotonic_deadline().await.ok();
+        self.server.close_websockets();
+        if self.shutdown.finish().await.is_err() {
+            runtime_cleanup_failed = true;
+        }
+        let server_result = match deadline {
+            Some(deadline) => self.server.join_before(deadline).await,
+            None => self.server.join().await,
+        };
         self.sqlite_runtime.shutdown().await;
-        Ok(())
+        if let Err(error) = server_result {
+            Err(StartupError::ServerLifecycle(error))
+        } else if runtime_cleanup_failed {
+            Err(StartupError::RuntimeLifecycle)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -338,7 +407,6 @@ impl Cli {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum StartupError {
     Cli,
     Configuration,
@@ -350,6 +418,8 @@ pub enum StartupError {
     DatabaseIntegrity,
     RuntimeLifecycle,
     Telemetry(TelemetryError),
+    ServerBind,
+    ServerLifecycle(crate::adapters::http::ServerError),
     #[cfg(all(feature = "test-failpoints", unix))]
     TestControl,
 }
@@ -400,7 +470,7 @@ impl StartupError {
         Self::RuntimeLifecycle
     }
 
-    pub const fn code(self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         match self {
             Self::Cli => "invalid_cli",
             Self::Configuration => "invalid_configuration",
@@ -415,6 +485,8 @@ impl StartupError {
                 "telemetry_subscriber_conflict"
             }
             Self::Telemetry(TelemetryError::SinkFailure) => "telemetry_sink_failure",
+            Self::ServerBind => "server_bind_failure",
+            Self::ServerLifecycle(_) => "server_lifecycle_failure",
             #[cfg(all(feature = "test-failpoints", unix))]
             Self::TestControl => "invalid_test_control",
         }
@@ -433,7 +505,27 @@ impl Debug for StartupError {
     }
 }
 
-impl std::error::Error for StartupError {}
+impl PartialEq for StartupError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ServerLifecycle(left), Self::ServerLifecycle(right)) => {
+                left.kind() == right.kind()
+            }
+            _ => self.code() == other.code(),
+        }
+    }
+}
+
+impl Eq for StartupError {}
+
+impl std::error::Error for StartupError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ServerLifecycle(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -463,6 +555,22 @@ mod tests {
         let mut output = Vec::new();
         write_fatal_diagnostic(&mut output, &StartupError::Configuration).unwrap();
         assert_eq!(output, b"craxii fatal: invalid_configuration\n");
+    }
+
+    #[test]
+    fn server_lifecycle_wrapper_preserves_the_original_typed_cause() {
+        let error = StartupError::ServerLifecycle(
+            crate::adapters::http::ServerError::InjectedSharedFailure,
+        );
+        assert_eq!(error.code(), "server_lifecycle_failure");
+        let source = std::error::Error::source(&error)
+            .unwrap()
+            .downcast_ref::<crate::adapters::http::ServerError>()
+            .unwrap();
+        assert_eq!(
+            source.kind(),
+            crate::adapters::http::ServerErrorKind::InjectedSharedFailure
+        );
     }
 
     #[test]

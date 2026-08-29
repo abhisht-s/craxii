@@ -7,11 +7,14 @@ use crate::domain::{
 use crate::ports::state_store::BootstrapSnapshot;
 
 pub mod authentication;
+pub mod command_gateway;
 pub mod command_service;
 pub mod device_provisioning;
 pub mod projector;
+pub mod publication;
 pub mod runtime;
 pub mod scheduler;
+pub mod transport;
 
 /// Validates the complete in-memory V0 principal/conversation/default-workspace topology.
 ///

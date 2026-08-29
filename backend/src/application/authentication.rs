@@ -42,7 +42,7 @@ impl std::error::Error for AuthenticationError {}
 pub struct DeviceAuthenticator<'a, S> {
     store: &'a S,
     #[cfg(test)]
-    digest_comparison_observer: Option<&'a dyn Fn()>,
+    digest_comparison_observer: Option<&'a (dyn Fn() + Send + Sync)>,
 }
 
 impl<'a, S> DeviceAuthenticator<'a, S>
@@ -59,7 +59,10 @@ where
     }
 
     #[cfg(test)]
-    fn with_digest_comparison_observer(store: &'a S, observer: &'a dyn Fn()) -> Self {
+    fn with_digest_comparison_observer(
+        store: &'a S,
+        observer: &'a (dyn Fn() + Send + Sync),
+    ) -> Self {
         Self {
             store,
             digest_comparison_observer: Some(observer),
@@ -117,8 +120,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::domain::{DeviceId, DeviceTokenHash};
@@ -282,13 +285,15 @@ mod tests {
         let token = BearerToken::parse("01".repeat(32)).unwrap();
         let other_hash = BearerToken::parse("02".repeat(32)).unwrap().token_hash();
         let active_store = store_for(&token);
-        let active_comparisons = Cell::new(0);
-        let observe_active = || active_comparisons.set(active_comparisons.get() + 1);
+        let active_comparisons = AtomicUsize::new(0);
+        let observe_active = || {
+            active_comparisons.fetch_add(1, Ordering::Relaxed);
+        };
         DeviceAuthenticator::with_digest_comparison_observer(&active_store, &observe_active)
             .authenticate(BearerToken::parse("01".repeat(32)).unwrap(), now())
             .await
             .unwrap();
-        assert_eq!(active_comparisons.get(), 1);
+        assert_eq!(active_comparisons.load(Ordering::Relaxed), 1);
         assert_eq!(active_store.touches.lock().unwrap().len(), 1);
 
         for matched_hash in [token.token_hash(), other_hash] {
@@ -303,13 +308,15 @@ mod tests {
                 lookups: Mutex::new(0),
                 touches: Mutex::new(Vec::new()),
             };
-            let comparisons = Cell::new(0);
-            let observe = || comparisons.set(comparisons.get() + 1);
+            let comparisons = AtomicUsize::new(0);
+            let observe = || {
+                comparisons.fetch_add(1, Ordering::Relaxed);
+            };
             let error = DeviceAuthenticator::with_digest_comparison_observer(&store, &observe)
                 .authenticate(BearerToken::parse("01".repeat(32)).unwrap(), now())
                 .await
                 .unwrap_err();
-            assert_eq!(comparisons.get(), 1);
+            assert_eq!(comparisons.load(Ordering::Relaxed), 1);
             assert_eq!(error.kind(), AuthenticationErrorKind::AuthenticationFailed);
             assert_eq!(error.to_string(), "authentication_failed");
             assert!(store.touches.lock().unwrap().is_empty());

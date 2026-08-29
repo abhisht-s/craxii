@@ -1,0 +1,8 @@
+{
+  "protocol_version": 1,
+  "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+  "work_state": "cancelled",
+  "committed_cursor": 5,
+  "duplicate": false,
+  "cleanup_pending": false
+}

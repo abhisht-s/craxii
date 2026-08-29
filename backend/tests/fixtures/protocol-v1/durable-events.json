@@ -1,0 +1,38 @@
+[
+  {
+    "protocol_version": 1,
+    "delivery_kind": "durable",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa008",
+    "cursor": 3,
+    "event_type": "message.accepted",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "recorded_at": "2026-08-28T00:00:01.000000Z",
+    "payload": {
+      "message_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa002",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello, Craxii."
+        }
+      ],
+      "client_message_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa001",
+      "committed_at": "2026-08-28T00:00:01.000000Z"
+    }
+  },
+  {
+    "protocol_version": 1,
+    "delivery_kind": "durable",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa009",
+    "cursor": 8,
+    "event_type": "work.started",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "recorded_at": "2026-08-28T00:00:02.000000Z",
+    "payload": {
+      "state": "running",
+      "transition_kind": "resumed",
+      "transitioned_at": "2026-08-28T00:00:02.000000Z"
+    }
+  }
+]

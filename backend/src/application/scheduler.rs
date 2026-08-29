@@ -8,7 +8,8 @@ use std::time::Duration;
 use crate::application::command_service::CommandPostCommit;
 use crate::bootstrap::health::{FatalReasonCode, Health};
 use crate::domain::{
-    ConversationId, CurrentWorkAttempt, JournalEventId, RuntimeInstanceId, UtcTimestamp, WorkId,
+    ConversationId, CurrentWorkAttempt, JournalEventId, JournalOffset, RuntimeInstanceId,
+    UtcTimestamp, WorkId,
 };
 use crate::ports::clock::Clock;
 use crate::ports::state_store::{
@@ -68,13 +69,15 @@ impl SchedulerNotifier {
 }
 
 impl CommandPostCommit for SchedulerNotifier {
-    fn message_committed(&self, _: WorkId) {
+    fn message_committed(&self, _: WorkId, _: JournalOffset) {
         self.wake();
     }
 
-    fn active_cancellation_committed(&self, _: WorkId) {
+    fn active_cancellation_committed(&self, _: WorkId, _: JournalOffset) {
         self.wake();
     }
+
+    fn direct_cancellation_committed(&self, _: WorkId, _: JournalOffset) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

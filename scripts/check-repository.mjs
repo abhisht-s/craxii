@@ -74,6 +74,381 @@ function equalStringArrays(left, right) {
   return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
+function findMatchingDelimiter(source, openingIndex, opening, closing) {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockCommentDepth = 0;
+
+  for (let index = openingIndex; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === '\n') lineComment = false;
+      continue;
+    }
+    if (blockCommentDepth > 0) {
+      if (character === '/' && next === '*') {
+        blockCommentDepth += 1;
+        index += 1;
+      } else if (character === '*' && next === '/') {
+        blockCommentDepth -= 1;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote !== null) {
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (character === '/' && next === '*') {
+      blockCommentDepth = 1;
+      index += 1;
+      continue;
+    }
+    if (
+      character === '"' ||
+      (character === "'" && (source[index + 2] === "'" || (next === '\\' && source[index + 3] === "'")))
+    ) {
+      quote = character;
+      continue;
+    }
+    if (character === opening) depth += 1;
+    if (character === closing) {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function stripRustComments(source) {
+  let result = '';
+  let quote = null;
+  let escaped = false;
+  let lineComment = false;
+  let blockCommentDepth = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (lineComment) {
+      if (character === '\n') {
+        lineComment = false;
+        result += '\n';
+      } else {
+        result += ' ';
+      }
+      continue;
+    }
+    if (blockCommentDepth > 0) {
+      if (character === '/' && next === '*') {
+        blockCommentDepth += 1;
+        result += '  ';
+        index += 1;
+      } else if (character === '*' && next === '/') {
+        blockCommentDepth -= 1;
+        result += '  ';
+        index += 1;
+      } else {
+        result += character === '\n' ? '\n' : ' ';
+      }
+      continue;
+    }
+    if (quote !== null) {
+      result += character;
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === quote) {
+        quote = null;
+      }
+      continue;
+    }
+    if (character === '/' && next === '/') {
+      lineComment = true;
+      result += '  ';
+      index += 1;
+    } else if (character === '/' && next === '*') {
+      blockCommentDepth = 1;
+      result += '  ';
+      index += 1;
+    } else {
+      if (
+        character === '"' ||
+        (character === "'" && (source[index + 2] === "'" || (next === '\\' && source[index + 3] === "'")))
+      ) {
+        quote = character;
+      }
+      result += character;
+    }
+  }
+  return result;
+}
+
+function withoutRustTestModules(source) {
+  let result = source;
+  const pattern = /#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+[A-Za-z_][A-Za-z0-9_]*\s*\{/g;
+  while (true) {
+    pattern.lastIndex = 0;
+    const match = pattern.exec(result);
+    if (!match) return result;
+    const opening = match.index + match[0].lastIndexOf('{');
+    const closing = findMatchingDelimiter(result, opening, '{', '}');
+    assert(closing !== -1, 'a #[cfg(test)] Rust module has unbalanced braces');
+    result = `${result.slice(0, match.index)}${' '.repeat(closing + 1 - match.index)}${result.slice(closing + 1)}`;
+  }
+}
+
+function extractRustFunction(source, name) {
+  const signature = new RegExp(`\\b(?:async\\s+)?fn\\s+${name}\\b`).exec(source);
+  assert(signature, `Rust function ${name} is absent`);
+  const opening = source.indexOf('{', signature.index);
+  assert(opening !== -1, `Rust function ${name} has no body`);
+  const closing = findMatchingDelimiter(source, opening, '{', '}');
+  assert(closing !== -1, `Rust function ${name} has an unbalanced body`);
+  return source.slice(signature.index, closing + 1);
+}
+
+function splitFirstTopLevelComma(source) {
+  let parentheses = 0;
+  let brackets = 0;
+  let braces = 0;
+  let quote = null;
+  let escaped = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (character === '"') {
+      quote = character;
+    } else if (character === '(') parentheses += 1;
+    else if (character === ')') parentheses -= 1;
+    else if (character === '[') brackets += 1;
+    else if (character === ']') brackets -= 1;
+    else if (character === '{') braces += 1;
+    else if (character === '}') braces -= 1;
+    else if (character === ',' && parentheses === 0 && brackets === 0 && braces === 0) {
+      return [source.slice(0, index), source.slice(index + 1)];
+    }
+  }
+  return null;
+}
+
+const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options'];
+const ALLOWED_STAGE11_ROUTES = [
+  'GET /health/live',
+  'GET /health/ready',
+  'GET /v1/bootstrap',
+  'POST /v1/conversations/{conversation_id}/messages',
+  'GET /v1/events',
+  'POST /v1/work-items/{work_id}/cancel',
+].sort();
+
+function stage11RouteInventory(routerSource) {
+  const routes = [];
+  const routePattern = /\.route\s*\(/g;
+  for (const match of routerSource.matchAll(routePattern)) {
+    const opening = match.index + match[0].lastIndexOf('(');
+    const closing = findMatchingDelimiter(routerSource, opening, '(', ')');
+    assert(closing !== -1, 'Stage 11 route call has unbalanced parentheses');
+    const argumentsSource = routerSource.slice(opening + 1, closing);
+    const argumentsPair = splitFirstTopLevelComma(argumentsSource);
+    assert(argumentsPair, 'Stage 11 route call must contain path and MethodRouter arguments');
+    const pathMatch = argumentsPair[0].trim().match(/^"([^"]+)"$/);
+    assert(pathMatch, `Stage 11 route path must be a static string: ${argumentsPair[0].trim()}`);
+    const methodRouter = argumentsPair[1];
+    const methods = new Set();
+    for (const method of HTTP_METHODS) {
+      if (new RegExp(`(?:^|[^A-Za-z0-9_])${method}\\s*\\(`).test(methodRouter)) {
+        methods.add(method.toUpperCase());
+      }
+    }
+    for (const filter of methodRouter.matchAll(
+      /MethodFilter\s*::\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\b/g,
+    )) {
+      methods.add(filter[1]);
+    }
+    if (/\b(?:any|any_service)\s*\(/.test(methodRouter)) {
+      HTTP_METHODS.forEach((method) => methods.add(method.toUpperCase()));
+    }
+    assert(
+      methods.size > 0,
+      `Stage 11 route uses an opaque or unsupported MethodRouter expression for ${pathMatch[1]}`,
+    );
+    if (/\bon\s*\(/.test(methodRouter)) {
+      assert(
+        /MethodFilter\s*::/.test(methodRouter),
+        `Stage 11 on(...) route must expose literal MethodFilter values for ${pathMatch[1]}`,
+      );
+    }
+    const path = pathMatch[1].startsWith('/health/') ? pathMatch[1] : `/v1${pathMatch[1]}`;
+    for (const method of methods) routes.push(`${method} ${path}`);
+  }
+  assert(
+    !/\.route_service\s*\(/.test(routerSource),
+    'Stage 11 route_service surfaces are forbidden because their method inventory is opaque',
+  );
+  return routes.sort();
+}
+
+function verifyStage11RouteInventory(routerSource) {
+  const routes = stage11RouteInventory(routerSource);
+  assert(
+    equalStringArrays(routes, ALLOWED_STAGE11_ROUTES),
+    `Stage 11 route inventory differs: ${routes.join(', ')}`,
+  );
+  return routes;
+}
+
+function verifyBootstrapSnapshotStructure(source) {
+  const snapshotSource = stripRustComments(extractRustFunction(source, 'load_client_bootstrap_inner'));
+  const beginMatch = /(?:self\s*\.\s*)?(?:runtime\s*\.\s*inner\s*\.\s*)?pool\s*\.\s*begin\s*\(\s*\)/.exec(
+    snapshotSource,
+  );
+  assert(beginMatch, 'Stage 11 snapshot must begin one transaction from the SQLite pool');
+  const headRead = snapshotSource.indexOf('SELECT max(journal_offset) FROM journal_events');
+  const firstFetch = snapshotSource.search(/\.fetch_(?:one|all|optional)\s*\(/);
+  const transactionCommit = snapshotSource.indexOf('.commit()');
+  const publicReturn = snapshotSource.indexOf('Ok(ClientBootstrapCandidate');
+  assert(
+    headRead !== -1 && firstFetch !== -1 && headRead < firstFetch,
+    'Stage 11 snapshot first read must establish the journal head',
+  );
+  assert(
+    transactionCommit > firstFetch && publicReturn > transactionCommit,
+    'Stage 11 snapshot must commit/release its transaction before returning public data',
+  );
+  const transactionRegion = snapshotSource.slice(beginMatch.index + beginMatch[0].length, transactionCommit);
+  assert(
+    !/(?:self\s*\.\s*)?(?:runtime\s*\.\s*inner\s*\.\s*)?pool\b/.test(transactionRegion) &&
+      !/\b(?:global_)?(?:connection|conn)\b/.test(transactionRegion),
+    'Stage 11 snapshot projection region must not access a pool-backed or global connection',
+  );
+  const fetches = [...transactionRegion.matchAll(/\.fetch_(?:one|all|optional)\s*\(([^)]*)\)/g)];
+  assert(fetches.length === 5, `Stage 11 snapshot must retain exactly five reads; found ${fetches.length}`);
+  assert(
+    fetches.every((fetch) => /^\s*&mut\s+\*transaction\s*$/.test(fetch[1])),
+    'every Stage 11 snapshot read must use the snapshot transaction handle',
+  );
+  for (const helper of transactionRegion.matchAll(/\bself\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+    if (helper[1] === 'fire_stage11_snapshot_hook') continue;
+    const opening = helper.index + helper[0].lastIndexOf('(');
+    const closing = findMatchingDelimiter(transactionRegion, opening, '(', ')');
+    assert(closing !== -1, `snapshot helper ${helper[1]} has unbalanced arguments`);
+    const argumentsSource = transactionRegion.slice(opening + 1, closing);
+    assert(
+      /&mut\s+\*?transaction\b/.test(argumentsSource),
+      `snapshot helper ${helper[1]} must receive the snapshot transaction handle`,
+    );
+  }
+  return snapshotSource;
+}
+
+function stage12ImplementationLeaks(productionFiles) {
+  const leaks = [];
+  const generalImplementation = /tokio::process|std::process::Command|Command::new|struct\s+ToolRegistry\b|(?:async\s+)?fn\s+execute_tool\s*\(|reqwest|hyper::client|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(/;
+  for (const file of productionFiles) {
+    const source = stripRustComments(withoutRustTestModules(file.source));
+    const workstationTrait = /\b(?:pub(?:\s*\([^)]*\))?\s+)?trait\s+[A-Za-z_][A-Za-z0-9_]*Workstation(?:Port|Adapter)?\b/.test(
+      source,
+    );
+    const workstationAdapter = /\bimpl\b[^\{]*\b[A-Za-z_][A-Za-z0-9_]*Workstation(?:Port|Adapter)?\b[^\{]*\bfor\b/.test(
+      source,
+    );
+    const readFileSurface = /\b(?:async\s+)?fn\s+read_file\s*\(/.test(source);
+    let workstationCapabilitiesSurface = false;
+    for (const block of source.matchAll(/\b(?:impl|trait)\b[^\{]*\bWorkstation[A-Za-z0-9_]*[^\{]*\{/g)) {
+      const opening = block.index + block[0].lastIndexOf('{');
+      const closing = findMatchingDelimiter(source, opening, '{', '}');
+      assert(closing !== -1, `workstation block in ${file.path} has unbalanced braces`);
+      if (/\b(?:async\s+)?fn\s+capabilities\s*\(/.test(source.slice(opening, closing + 1))) {
+        workstationCapabilitiesSurface = true;
+      }
+    }
+    const workstationFilesystem =
+      (workstationTrait || workstationAdapter || readFileSurface || workstationCapabilitiesSurface) &&
+      /(?:std|tokio)::fs::(?:read|read_to_string)|File::open\s*\(/.test(source);
+    if (
+      workstationTrait || workstationAdapter || readFileSurface || workstationCapabilitiesSurface ||
+      workstationFilesystem || generalImplementation.test(source)
+    ) {
+      leaks.push(file.path);
+    }
+  }
+  return sortedStrings(new Set(leaks));
+}
+
+function expectStructuralRejection(label, operation) {
+  let rejected = false;
+  try {
+    operation();
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, `checker negative probe was not rejected: ${label}`);
+}
+
+function verifyStage11CheckerNegativeProbes() {
+  const allowedRouter = `
+    Router::new()
+      .route("/health/live", get(liveness))
+      .route("/health/ready", get(readiness))
+      .route("/bootstrap", get(bootstrap).delete(remove_bootstrap))
+      .route("/conversations/{conversation_id}/messages", post(message))
+      .route("/work-items/{work_id}/cancel", post(cancel))
+      .route("/events", get(events));`;
+  expectStructuralRejection('DELETE /v1/bootstrap', () => verifyStage11RouteInventory(allowedRouter));
+
+  const poolBackedSnapshot = `
+    async fn load_client_bootstrap_inner(&self) -> Result<ClientBootstrapCandidate, Error> {
+      let mut transaction = self.pool.begin().await?;
+      let head = query("SELECT max(journal_offset) FROM journal_events")
+        .fetch_one(&mut *transaction).await?;
+      let roots = query("roots").fetch_all(&mut *transaction).await?;
+      let messages = query("messages").fetch_all(&mut *transaction).await?;
+      let work = query("work").fetch_all(&mut *transaction).await?;
+      let tools = query("tools").fetch_all(&mut *transaction).await?;
+      let leaked = query("leaked").fetch_all(&self.pool).await?;
+      transaction.commit().await?;
+      Ok(ClientBootstrapCandidate { head, roots, messages, work, tools, leaked })
+    }`;
+  expectStructuralRejection('pool-backed bootstrap projection', () =>
+    verifyBootstrapSnapshotStructure(poolBackedSnapshot),
+  );
+
+  const stage12Fixture = [{
+    path: 'adapters/local_workstation.rs',
+    source: `
+      pub struct LocalWorkstation;
+      impl LocalWorkstation {
+        pub fn capabilities(&self) -> WorkstationCapabilities { todo!() }
+        pub fn read_file(&self, path: &Path) -> Vec<u8> { std::fs::read(path).unwrap() }
+      }`,
+  }];
+  assert(
+    stage12ImplementationLeaks(stage12Fixture).length === 1,
+    'checker negative probe was not rejected: concrete Stage 12 workstation implementation',
+  );
+  return 3;
+}
+
 function verifyDirectDependencies(metadata, workspacePackages) {
   const registryEntries = dependencyRegistry();
   const registryByKey = new Map();
@@ -238,7 +613,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage10Boundaries() {
+function verifyStage11Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -458,7 +833,7 @@ function verifyStage10Boundaries() {
   assert(!existsSync(join(repositoryRoot, '.sqlx')), 'SQLx offline metadata is not part of Stage 9');
   const productionSqliteSource = sqliteFiles
     .filter((path) => !/_tests\.rs$/.test(path))
-    .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
+    .map((path) => readFileSync(path, 'utf8'))
     .join('\n');
   assert(
     !/\b(?:UPDATE\s+journal_events|DELETE\s+FROM\s+journal_events)\b/i.test(productionSqliteSource),
@@ -477,8 +852,8 @@ function verifyStage10Boundaries() {
     'V0 device credentials and display names are immutable; rotation provisions a replacement',
   );
   assert(
-    !/impl\s+ReplayStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
-    'Stage 11 public replay capability must remain unimplemented',
+    /impl\s+ReplayStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 11 public replay capability is absent',
   );
   assert(
     !/pub(?:\([^)]*\))?\s+async\s+fn\s+insert_artifact_metadata/.test(productionSqliteSource),
@@ -744,22 +1119,196 @@ function verifyStage10Boundaries() {
     'Stage 10 must not add a new public failpoint name',
   );
 
-  const productionRust = rustFiles
-    .filter((path) => !/_tests\.rs$/.test(path))
-    .map((path) => readFileSync(path, 'utf8').split('\n#[cfg(test)]')[0])
-    .join('\n');
+  const httpAdapter = readFileSync(join(rustRoot, 'adapters', 'http.rs'), 'utf8');
+  const routerSource = extractRustFunction(httpAdapter, 'router');
+  verifyStage11RouteInventory(routerSource);
   assert(
-    !/\b(?:axum|tower|WebSocket|Router::new|route\s*\()\b/.test(productionRust),
-    'Stage 11 HTTP/WebSocket implementation is forbidden in Stage 10',
+    /let health = Router::new\(\)[\s\S]*\/health\/live[\s\S]*\/health\/ready[\s\S]*let protected = Router::new\(\)/.test(routerSource) &&
+      /let protected = Router::new\(\)[\s\S]*\.route\("\/bootstrap", get\(bootstrap\)\)[\s\S]*\.route\("\/events", get\(events\)\)[\s\S]*\.fallback\(not_found\)[\s\S]*\.method_not_allowed_fallback\(method_not_allowed\)[\s\S]*\.layer\(middleware::from_fn\([\s\S]*authenticate\(authentication_state\.clone\(\), request, next\)[\s\S]*\.merge\(health\)[\s\S]*\.nest\("\/v1", protected\)/.test(routerSource),
+    'the /v1 subrouter, including its WebSocket route and fallbacks, must be authenticated while health remains outside that layer',
   );
   assert(
-    !/tokio::process|std::process::Command|Command::new|(?:struct|trait)\s+(?:ToolRegistry|AgentLoop|ContextAssembler)\b/.test(productionRust),
-    'Stage 13/14/17 execution implementation is forbidden in Stage 10',
+    /server delivery only/.test(httpAdapter) &&
+      !/route\([^\n]*events[^\n]*post\(/.test(httpAdapter),
+    'the WebSocket route must remain server-delivery-only with no mutation route',
+  );
+  assert(
+    /SetSensitiveRequestHeadersLayer[\s\S]*AUTHORIZATION/.test(httpAdapter) &&
+      /CACHE_CONTROL[\s\S]*no-store/.test(httpAdapter) &&
+      /x-content-type-options[\s\S]*nosniff/.test(httpAdapter),
+    'Stage 11 Authorization sensitivity and security response headers are incomplete',
   );
 
+  const protocol = readFileSync(join(rustRoot, 'protocol.rs'), 'utf8');
+  for (const constant of [
+    ['MESSAGE_BODY_LIMIT', '512 \\* 1024'],
+    ['CANCELLATION_BODY_LIMIT', '8 \\* 1024'],
+    ['HTTP_CONCURRENCY_LIMIT', '64'],
+    ['MUTATION_CONCURRENCY_LIMIT', '16'],
+    ['WEBSOCKET_CONNECTION_LIMIT', '32'],
+    ['REPLAY_PAGE_ROWS', '128'],
+    ['CURSOR_BROADCAST_CAPACITY', '256'],
+    ['WEBSOCKET_OUTBOUND_FRAMES', '16'],
+    ['MAX_DURABLE_PAYLOAD_BYTES', '262_144'],
+    ['MAX_WEBSOCKET_FRAME_BYTES', '270_336'],
+  ]) {
+    assert(
+      new RegExp(`pub const ${constant[0]}:[^=]+= ${constant[1]};`).test(protocol),
+      `Stage 11 protocol constant ${constant[0]} differs`,
+    );
+  }
+
+  const publication = readFileSync(join(rustRoot, 'application', 'publication.rs'), 'utf8')
+    .split('\n#[cfg(test)]')[0];
   assert(
-    /^tokio\s*=\s*\{[^\n]*features\s*=\s*\[[^\]]*"signal"[^\]]*\][^\n]*\}$/m.test(cargoManifest),
-    'Tokio signal must be the only Stage 10 direct-dependency feature activation',
+    /JournalEventPayload::WorkWaitingOnTool/.test(publication) &&
+      /JournalEventPayload::WorkResumed[\s\S]*"transition_kind": "resumed"/.test(publication) &&
+      /JournalEventPayload::RuntimeStopping\(_\) => return Ok\(None\)/.test(publication),
+    'Stage 11 explicit public event allowlist/omission mapping is incomplete',
+  );
+  assert(
+    !/stream_id|correlation_id|causation_id|state_version|runtime_instance_id|provider_call_id|request_hash/.test(
+      publication.replace(/JournalEventPayload/g, ''),
+    ),
+    'Stage 11 publication serializer contains an internal envelope field',
+  );
+
+  const stage11Storage = readFileSync(join(sqliteRoot, 'stage11.rs'), 'utf8');
+  const snapshotSource = verifyBootstrapSnapshotStructure(stage11Storage);
+  const snapshotStart = stage11Storage.indexOf('pub(super) async fn load_client_bootstrap_inner');
+  const snapshotEnd = stage11Storage.indexOf('pub(super) async fn list_replay_page_inner', snapshotStart);
+  assert(snapshotStart !== -1 && snapshotEnd > snapshotStart, 'Stage 11 snapshot function is absent');
+  const replayStart = snapshotEnd;
+  const replayEnd = stage11Storage.indexOf('\n    #[cfg(test)]\n    pub(super) fn set_stage11_snapshot_hook', replayStart);
+  assert(replayEnd > replayStart, 'Stage 11 replay function boundary is absent');
+  const replaySource = stage11Storage.slice(replayStart, replayEnd);
+  assert(
+    /request\.limit == 0 \|\| request\.limit > crate::protocol::REPLAY_PAGE_ROWS/.test(replaySource) &&
+      /journal_offset > \? AND journal_offset <= \?[\s\S]*ORDER BY journal_offset ASC LIMIT \?/.test(replaySource) &&
+      /\.bind\(request\.through\.get\(\)\)/.test(replaySource) &&
+      /let has_more =/.test(replaySource) && /let scanned_through =/.test(replaySource) &&
+      /REPLAY_PAGE_ROWS:\s*u32\s*=\s*128/.test(protocol),
+    'Stage 11 replay structure must retain its fixed through bound, ascending offset order, 128-row limit, scanned progress, and has-more check',
+  );
+
+  const stage11Tests = readFileSync(join(sqliteRoot, 'stage11_tests.rs'), 'utf8');
+  for (const testName of [
+    'real_http_health_auth_message_replay_conflict_limits_and_redaction',
+    'route_methods_and_authenticated_v1_fallback_boundary_are_real',
+    'real_http_lost_postcommit_response_retries_exactly_once_over_new_connection',
+    'websocket_slow_consumer_closes_1013_without_durable_change_and_reconnect_recovers',
+    'websocket_connection_limit_rejects_thirty_third_upgrade_retryably',
+    'shutdown_waits_for_pending_upgrade_then_initial_replay_observes_latched_shutdown',
+    'stage11_second_repair_deadline_keeps_pending_connection_owned_until_callback_terminal_record_is_consumed',
+    'upgrade_callback_panic_is_observed_and_isolated',
+    'binary_websocket_application_frame_closes_1008_without_mutation',
+    'shared_server_failure_supervisor_triggers_existing_shutdown_and_preserves_cause',
+    'stage11_second_repair_server_return_after_accept_stop_but_before_stage10_latch_is_unexpected_and_fatal',
+    'stage11_second_repair_server_return_after_stage10_latch_is_expected_and_not_fatal',
+    'stage11_second_repair_primary_server_failure_precedes_connection_cleanup_failure',
+    'stage11_second_repair_connection_cleanup_failure_surfaces_when_server_completion_is_graceful',
+    'shared_server_child_panic_is_observed_with_join_cause',
+    'bootstrap_first_head_barrier_defines_both_sides_of_concurrent_commit',
+    'replay_over_three_pages_crosses_mixed_and_all_filtered_underlying_rows',
+  ]) {
+    assert(
+      new RegExp(`async fn ${testName}\\(`).test(stage11Tests),
+      `Stage 11 behavioral test inventory is missing ${testName}`,
+    );
+  }
+  for (const canary of [
+    'PROVIDER_CANARY',
+    'MODEL_CANARY',
+    'TOOL_ARGUMENTS_CANARY',
+    'TOOL_RESULT_CANARY',
+    'ARTIFACT_METADATA_CANARY',
+  ]) {
+    assert(stage11Tests.includes(canary), `Stage 11 redaction inventory is missing ${canary}`);
+  }
+  assert(
+    /fn public_event_frame_size_boundary_encodes_without_truncation_and_rejects_oversize\(/.test(
+      readFileSync(join(rustRoot, 'application', 'publication.rs'), 'utf8'),
+    ),
+    'Stage 11 behavioral test inventory is missing the public-event frame boundary test',
+  );
+  assert(
+    /fn stage11_second_repair_duplicate_or_late_terminal_record_is_rejected_without_double_accounting\(/.test(
+      httpAdapter,
+    ),
+    'Stage 11 behavioral test inventory is missing duplicate/late completion accounting coverage',
+  );
+
+  const fixtureRoot = join(repositoryRoot, 'backend', 'tests', 'fixtures', 'protocol-v1');
+  const fixtureNames = walkFiles(fixtureRoot)
+    .map((path) => relative(fixtureRoot, path))
+    .filter((name) => name.endsWith('.json'))
+    .sort();
+  assert(
+    equalStringArrays(fixtureNames, [
+      'bootstrap-snapshot.json',
+      'cancellation-request.json',
+      'cancellation-response.json',
+      'durable-events.json',
+      'error-envelope.json',
+      'health.json',
+      'message-request.json',
+      'message-response.json',
+      'sync-complete.json',
+    ]),
+    `Stage 11 protocol golden inventory differs: ${fixtureNames.join(', ')}`,
+  );
+  const manifestLines = readFileSync(join(fixtureRoot, 'manifest.sha256'), 'utf8')
+    .trim().split('\n');
+  assert(manifestLines.length === fixtureNames.length, 'Stage 11 golden manifest length differs');
+  const manifestNames = [];
+  for (const line of manifestLines) {
+    const match = line.match(/^([a-f0-9]{64})  ([a-z0-9-]+\.json)$/);
+    assert(match, `invalid Stage 11 golden manifest line: ${line}`);
+    const actual = createHash('sha256').update(readFileSync(join(fixtureRoot, match[2]))).digest('hex');
+    assert(actual === match[1], `Stage 11 golden hash differs for ${match[2]}`);
+    manifestNames.push(match[2]);
+  }
+  assert(equalStringArrays(manifestNames.sort(), fixtureNames), 'Stage 11 golden manifest names differ');
+
+  assert(
+    /^axum\s*=\s*\{[^\n]*version\s*=\s*"0\.8\.9"[^\n]*features\s*=\s*\["http1", "json", "matched-path", "query", "tokio", "tracing", "ws"\][^\n]*\}$/m.test(cargoManifest) &&
+      /^tower\s*=\s*\{[^\n]*version\s*=\s*"0\.5\.3"[^\n]*features\s*=\s*\["limit", "util"\][^\n]*\}$/m.test(cargoManifest) &&
+      /^tower-http\s*=\s*\{[^\n]*version\s*=\s*"0\.7\.0"[^\n]*features\s*=\s*\["limit", "sensitive-headers", "set-header", "timeout", "trace"\][^\n]*\}$/m.test(cargoManifest),
+    'Stage 11 production dependency versions/features differ',
+  );
+  assert(
+    /\[dev-dependencies\][\s\S]*^futures-util\s*=\s*\{[^\n]*version\s*=\s*"0\.3\.34"[^\n]*features\s*=\s*\["sink", "std"\]/m.test(cargoManifest) &&
+      /\[dev-dependencies\][\s\S]*^tokio-tungstenite\s*=\s*\{[^\n]*version\s*=\s*"0\.29\.0"[^\n]*features\s*=\s*\["connect"\]/m.test(cargoManifest),
+    'Stage 11 development dependency versions/features differ',
+  );
+  assert(
+    !/^\s*(?:hyper|http)\s*=/m.test(cargoManifest) &&
+      !/^tokio-tungstenite\s*=/m.test(cargoManifest.split('[dev-dependencies]')[0]) &&
+      !/^\s*(?:rustls|native-tls|openssl|tower-http-cors|cors)\s*=/mi.test(cargoManifest),
+    'forbidden direct Hyper/HTTP/production WebSocket/TLS/CORS dependency is present',
+  );
+  const laterStageModuleLeaks = rustFiles
+    .filter((path) => !/_tests\.rs$/.test(path))
+    .map((path) => relative(rustRoot, path))
+    .filter((path) => /(?:^|\/)(?:workstation|read-file|read_file|process-executor|process_executor|tool-registry|tool_registry|provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
+  const productionImplementationFiles = rustFiles
+    .filter((path) => !/_tests\.rs$/.test(path))
+    .map((path) => ({
+      path: relative(rustRoot, path),
+      source: readFileSync(path, 'utf8'),
+    }));
+  const laterStageImplementationLeaks = stage12ImplementationLeaks(productionImplementationFiles);
+  assert(
+    laterStageModuleLeaks.length === 0 &&
+      laterStageImplementationLeaks.length === 0,
+    `Stage 12+ workstation/process/tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 11: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
+  );
+
+  const checkerNegativeProbeCount = verifyStage11CheckerNegativeProbes();
+
+  assert(
+    /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest),
+    'Tokio features must equal the Stage 10 set plus only Stage 11 net/io-util',
   );
 
   const trackedAdminResidue = trackedFiles().filter((path) =>
@@ -775,6 +1324,7 @@ function verifyStage10Boundaries() {
     migrationFileCount: migrationFiles.length,
     tableCount: actualStage6Tables.length + actualStage7Tables.length + actualStage8Tables.length,
     indexCount: actualIndexes.length,
+    checkerNegativeProbeCount,
   };
 }
 
@@ -833,11 +1383,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage10 = verifyStage10Boundaries();
+  const stage11 = verifyStage11Boundaries();
 
-  console.log(
-    `Repository invariants passed through Stage 10: 1 workspace member/package, craxii-server lib/admin binaries, production live_unready without a real WorkRunner, dependency-free test-failpoints feature, ${directDependencyCount} approved direct Cargo dependencies, 2 visible/machine-readable generated HTML source hashes, SQLx contained across ${stage10.rustFileCount} Rust files, ${stage10.migrationFileCount} exact migrations, ${stage10.tableCount} product tables, ${stage10.indexCount} named indexes, 28 journal events, durable FIFO scheduler/runtime/recovery/shutdown contracts, 4 active Stage 10 failpoints, 0 triggers/views, 0 tracked SQLite artifacts`,
-  );
+  assert(directDependencyCount > 0 && stage11.checkerNegativeProbeCount === 3, 'checker summary evidence is incomplete');
+  console.log('Stage 11 structural invariants passed.');
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
   process.exitCode = 1;

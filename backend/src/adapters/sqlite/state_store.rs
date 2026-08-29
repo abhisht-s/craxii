@@ -39,6 +39,9 @@ pub struct SqliteStateStore {
     bootstrap_hook: std::sync::Arc<std::sync::Mutex<Option<BootstrapTestHook>>>,
     #[cfg(test)]
     pub(super) stage9_hook: std::sync::Arc<std::sync::Mutex<Option<super::stage9::Stage9TestHook>>>,
+    #[cfg(test)]
+    pub(super) stage11_snapshot_hook:
+        std::sync::Arc<std::sync::Mutex<Option<super::stage11::Stage11SnapshotTestHook>>>,
 }
 
 impl SqliteStateStore {
@@ -50,6 +53,8 @@ impl SqliteStateStore {
             bootstrap_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             stage9_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            stage11_snapshot_hook: std::sync::Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
