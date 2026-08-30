@@ -3560,7 +3560,25 @@ Each registered tool definition includes:
 
 The registry is immutable after startup. Its ordered definitions are fingerprinted for each context manifest.
 
-The JSON Schema supplied to a provider and the typed decoder MUST be generated from one source or proven equivalent by tests. Provider schema acceptance is not runtime validation. Input structs deny unknown fields unless a field is intentionally forward-compatible.
+The JSON Schema supplied to a provider and the typed decoder MUST be generated from one source or
+proven equivalent by executable boundary tables. The equivalence test independently evaluates the
+actual emitted JSON Schema AST; it does not call typed-decoder grammar helpers, fails on unknown
+emitted keywords, covers every configured and hard boundary, and proves sensitivity with in-memory
+schema mutations. Every schema-accepted value MUST pass the typed decoder in the same semantic
+context. Byte-bounded model strings use an exact ASCII schema subset
+so JSON Schema character counts cannot admit a value that violates a UTF-8 byte ceiling. Path-kind
+branches encode their deterministic relative/absolute grammar in schema; filesystem existence,
+symlink, and workspace-containment facts remain semantic validation because schema cannot observe
+them. Provider schema acceptance is not runtime validation. Input structs deny unknown fields
+unless a field is intentionally forward-compatible. Model-visible defaults and limits come from
+the validated typed runtime tool configuration, and the registry fingerprint includes those
+effective semantics.
+
+The completed encoded-argument envelope accepted by the Stage 14 decoder is at most 524,288 bytes.
+This transport ceiling is intentionally larger than the 65,536-byte command field because JSON
+escaping can expand a schema-valid ASCII value; it MUST NOT silently narrow an advertised field
+limit. The typed decoder still applies field limits and duplicate-key rejection before any durable
+requested transition.
 
 ### Tool Registry
 
@@ -3595,17 +3613,50 @@ For each complete model tool call, the service:
 4. Parses and validates arguments into a typed input.
 5. Creates a stable `tool_execution_id` and `execution_id`.
 6. Injects work, workspace, workstation, deadline, output policy, and authority context; these are never trusted from hidden model fields.
-7. Commits `tool.execution_requested` and work `waiting_on_tool`.
-8. Evaluates the V0 authority policy and resolves requested to effective privilege.
-9. Checks cancellation again.
-10. Commits `tool.execution_dispatching` before machine access.
-11. Invokes the typed handler.
-12. The handler uses only the injected Workstation for machine access.
-13. Finalizes evidence artifacts.
-14. Commits the canonical result, cleanup evidence, and tool terminal event.
-15. Returns the bounded canonical model result to the agent loop.
+7. Freezes the one absolute monotonic deadline from the invocation start, requested/default tool
+   timeout, upstream Work deadline, and an already-active shutdown deadline.
+8. Commits `tool.execution_requested` and work `waiting_on_tool`.
+9. Checks cancellation again, obtains current Workstation capabilities, and evaluates the V0
+   authority policy to resolve requested to effective privilege.
+10. Uses the separate non-side-effecting Workstation preparation port to bind the exact
+    workstation/generation/workspace, validate capability and privilege feasibility, and resolve
+    adapter-observed cwd evidence without spawning, executing a command, reading tool content, or
+    creating machine state.
+11. Commits `tool.execution_dispatching` with that resolved evidence before machine access.
+12. Invokes the typed handler.
+13. The handler uses only the injected Workstation for machine access.
+14. Finalizes evidence artifacts.
+15. Commits the canonical result, cleanup evidence, and tool terminal event.
+16. Returns the bounded canonical model result to the agent loop.
 
 The service, not the handler or registry, owns journal ordering.
+
+The effective timeout is frozen once as one absolute process-local monotonic deadline before
+requested persistence or capability acquisition and carried unchanged through authority,
+preparation, dispatch, handler, and Workstation. It MUST NOT be reconstructed from a later `now`;
+expiration during any pre-handoff phase causes no machine operation. Only bounded duration
+evidence, never the monotonic instant, is durable.
+
+Shell handoff has an explicit pre-handoff state. If cancellation wins before the one handler future
+is first polled, that future is dropped unpolled, no Workstation action/cancellation call occurs,
+and the result is definitely cancelled. Once handoff is claimed, cancellation targets the exact
+`ExecutionId` while the service awaits that same lifecycle; no future is detached or later polled
+into starting after cancellation.
+
+Large `read_file` evidence artifacts are generic tool artifacts referenced by canonical result
+metadata, never stdout/stderr artifacts. Startup consistency validates their exact tool/work
+producer, role, hash, size, MIME/encoding, and reference cardinality. Shell result projection is
+bounded by actual canonical serialized bytes: UTF-8-safe inline fields shrink deterministically to
+remain within the V3 262,144-byte result ceiling while full stream artifacts, hashes, counts,
+omitted-byte truth, and definite process classification remain intact.
+
+The five Stage 14 crash hooks are active only with test failpoints: after requested commit, after
+dispatch-intent commit, after process spawn, after terminal observation and cleanup classification
+but before outcome commit, and after artifact rename before DB commit. Subprocess tests reach each
+hook only through its production callsite and use the real Tool Execution Service lifecycle,
+durable SQLite, production-compatible adapters, and markers to prove conservative recovery,
+zero-or-one side effect, no redispatch, coherent Work/journal projection, no duplicate outcome, and
+correct orphan handling.
 
 ### Authority decision seam
 
@@ -3628,7 +3679,15 @@ output:
   reason code
 ```
 
-The V0 policy allows registered local tools and both user/admin modes on the development workstation. It can still deny malformed, over-limit, cancelled, or mis-scoped requests. The decision snapshot is recorded with every execution.
+The V0 policy allows registered local tools on the development workstation. Administrative mode is
+allowed only for a tool that supports it, an explicit administrative request, a permitting policy
+decision, and a current Workstation capability snapshot that reports administrative privilege.
+Malformed, over-limit, cancelled, mis-scoped, stale-generation, unsupported-capability, and
+authority-widening requests are denied. The complete canonical evaluator evidence—not merely its
+compact decision snapshot—is recorded with every dispatched execution. It binds policy, decision,
+reason, requested/effective privilege, capability and bounded-request facts, workstation generation,
+workspace, Work/runtime identity, and tool identity without raw arguments, command, content, output,
+secrets, or process-local handles.
 
 This seam is not a mature Authority Service and does not machine-enforce natural-language prohibitions. Later it can call an external policy/credential plane without changing Tool Handler or model schemas.
 
@@ -3690,6 +3749,39 @@ Do not initially add methods named:
 - `deploy`.
 
 Those are higher-level tool/workflow semantics composed from generic execution until a repeated need justifies a typed primitive.
+
+### Non-side-effecting preparation seam
+
+The frozen five-method `Workstation` interface is not expanded for Stage 14. A separate
+provider-neutral `WorkstationPreparation` port exposes one cwd/execution preparation operation used
+only between the committed requested transaction and the dispatch-intent transaction. The
+LocalWorkstation implementation:
+
+- validates the exact Workstation ID and generation;
+- validates the exact workspace binding;
+- checks the required filesystem/foreground-execution capability and effective privilege
+  feasibility against its current capability snapshot;
+- resolves the requested logical cwd through the same adapter-owned path rules used by execution;
+- verifies that the resolved target is an existing directory; and
+- opens the resolved directory non-mutatingly, observes its directory type and stable filesystem
+  object identity, and returns `PreparedCwdEvidence`: adapter-observed `ResolvedPathEvidence` plus
+  device/inode identity bound to the workstation, generation, workspace, and requested logical cwd.
+
+Preparation MUST NOT spawn or execute a command, read requested tool content, create a cgroup or
+artifact, mutate the filesystem, persist or journal, or select broader authority. It is not a sixth
+Workstation method and carries no provider, model, context, or agent-loop type. The actual
+`Workstation.execute` call revalidates the request and uses its own opened-directory handle, so the
+prepared evidence is durable dispatch evidence rather than a transferable OS handle or an
+authorization token. The dispatch transaction durably records the canonical path, expected
+directory type, device, and inode in the existing versioned dispatch evidence JSON; no raw
+descriptor is serialized. Execution opens the committed resolved directory without following a
+final symlink, obtains metadata from that exact descriptor, and requires both the logical binding
+and the stable directory-object identity to match before spawn. The child cwd uses that same opened
+and validated descriptor, with no later pathname resolution. Symlink drift, same-path replacement,
+disappearance, generation mismatch, workspace mismatch, or object-type mismatch is a definite
+pre-start failure. The opened-directory handle stays process-local and never enters a durable or
+public protocol type. A preparation failure is definitively before dispatch and causes no machine
+action.
 
 ### Workstation capabilities
 

@@ -1247,6 +1247,23 @@ fn validate_tool_limits(raw: RawToolLimits) -> Result<ToolLimits, ConfigError> {
             upper: "limits.tools.run_shell_max_timeout_ms",
         });
     }
+    for (field, value) in [
+        (
+            "limits.tools.run_shell_default_timeout_ms",
+            limits.run_shell_default_timeout_ms,
+        ),
+        (
+            "limits.tools.run_shell_max_timeout_ms",
+            limits.run_shell_max_timeout_ms,
+        ),
+    ] {
+        if !value.is_multiple_of(1_000) {
+            return Err(ConfigError::InvalidToolLimit {
+                field,
+                reason: "must be an exact whole-second value for the V0 tool schema",
+            });
+        }
+    }
     if limits.per_stream_projection_bytes > limits.stdout_capture_bytes {
         return Err(ConfigError::CrossFieldLimitInversion {
             lower: "limits.tools.per_stream_projection_bytes",

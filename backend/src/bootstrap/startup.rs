@@ -15,9 +15,12 @@ use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteState
 use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
+use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
 use crate::application::runtime::{
     HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
 };
+use crate::application::tool_execution_service::{ToolExecutionService, ToolRuntimeLimits};
+use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::application::transport::{CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::config;
 use crate::bootstrap::health::Health;
@@ -32,9 +35,10 @@ use crate::ports::clock::Clock;
 use crate::ports::runtime_observation::RuntimeProcessObserver;
 use crate::ports::state_store::{
     BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, RuntimeStateStore,
-    StateStoreErrorKind, V0IdentityReference,
+    StateStoreErrorKind, ToolStateStore, V0IdentityReference,
 };
 use crate::ports::workstation::Workstation;
+use crate::ports::workstation_preparation::WorkstationPreparation;
 
 pub async fn run_from_env() -> Result<RunningBootstrap, StartupError> {
     let arguments: Vec<_> = std::env::args_os().collect();
@@ -235,6 +239,48 @@ pub async fn run(
     let (ws_shutdown, _) = tokio::sync::watch::channel(false);
     let controlled_shutdown: Arc<dyn crate::application::runtime::ControlledShutdown> =
         shutdown.clone();
+    let tool_registry = Arc::new(
+        ToolRegistry::v0(ToolSemanticPolicy {
+            read_file_default_bytes: config.limits().tools().read_file_default_bytes(),
+            read_file_max_bytes: config.limits().tools().read_file_max_bytes(),
+            run_shell_command_max_bytes: config.limits().tools().run_shell_command_max_bytes(),
+            run_shell_default_timeout_ms: config.limits().tools().run_shell_default_timeout_ms(),
+            run_shell_max_timeout_ms: config.limits().tools().run_shell_max_timeout_ms(),
+        })
+        .map_err(|_| StartupError::Configuration)?,
+    );
+    let authority: Arc<dyn AuthorityEvaluator> = Arc::new(V0AuthorityEvaluator);
+    let tool_state_store: Arc<dyn ToolStateStore> = state_store.clone();
+    let tool_workstation: Arc<dyn Workstation> = local_workstation.clone();
+    let workstation_preparation: Arc<dyn WorkstationPreparation> = local_workstation.clone();
+    let tool_artifact_store: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let tool_clock: Arc<dyn Clock> = clock.clone();
+    let tool_execution_service = Arc::new(
+        ToolExecutionService::new(
+            tool_registry,
+            authority,
+            tool_state_store,
+            tool_workstation,
+            workstation_preparation,
+            tool_artifact_store,
+            tool_clock,
+            ToolRuntimeLimits {
+                read_file_default_bytes: config.limits().tools().read_file_default_bytes(),
+                read_file_max_bytes: config.limits().tools().read_file_max_bytes(),
+                run_shell_command_max_bytes: config.limits().tools().run_shell_command_max_bytes(),
+                run_shell_default_timeout_ms: config
+                    .limits()
+                    .tools()
+                    .run_shell_default_timeout_ms(),
+                run_shell_max_timeout_ms: config.limits().tools().run_shell_max_timeout_ms(),
+                stdout_capture_bytes: config.limits().tools().stdout_capture_bytes(),
+                stderr_capture_bytes: config.limits().tools().stderr_capture_bytes(),
+                inline_model_result_bytes: config.limits().tools().inline_model_result_bytes(),
+                per_stream_projection_bytes: config.limits().tools().per_stream_projection_bytes(),
+            },
+        )
+        .map_err(|_| StartupError::WorkstationLifecycle)?,
+    );
     let http_state = HttpState::new(
         Arc::clone(&state_store),
         Arc::clone(&clock),
@@ -256,6 +302,7 @@ pub async fn run(
         runtime_instance_id: runtime.runtime_instance_id,
         workstation,
         local_workstation,
+        tool_execution_service,
         shutdown,
         mutation_admission,
         server,
@@ -338,6 +385,7 @@ pub struct RunningBootstrap {
     runtime_instance_id: RuntimeInstanceId,
     workstation: Arc<dyn Workstation>,
     local_workstation: Arc<LocalWorkstation>,
+    tool_execution_service: Arc<ToolExecutionService>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
     server: ServerHandle,
@@ -373,6 +421,11 @@ impl RunningBootstrap {
     #[must_use]
     pub fn workstation(&self) -> &Arc<dyn Workstation> {
         &self.workstation
+    }
+
+    #[must_use]
+    pub fn tool_execution_service(&self) -> &Arc<ToolExecutionService> {
+        &self.tool_execution_service
     }
 
     pub async fn wait_for_shutdown_request(&mut self) -> Result<(), StartupError> {

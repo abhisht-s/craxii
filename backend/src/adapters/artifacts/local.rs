@@ -292,6 +292,10 @@ impl ArtifactCapture for LocalArtifactCapture {
                 return Err(error(ArtifactStoreErrorKind::Storage));
             }
         }
+        #[cfg(feature = "test-failpoints")]
+        crate::test_failpoints::reach(
+            crate::test_failpoints::PhysicalHook::AfterArtifactRenameBeforeDbCommit,
+        );
         verify_path_digest(&final_path, digest, self.captured)?;
         Ok(FinalizedArtifact::from_durable_publication(
             self.artifact_id,

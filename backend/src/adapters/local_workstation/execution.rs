@@ -805,11 +805,6 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
             () = launch.entry.cause_changed.notified() => break,
         }
     }
-    #[cfg(feature = "test-failpoints")]
-    crate::test_failpoints::reach(
-        crate::test_failpoints::PhysicalHook::AfterToolProcessExitBeforeOutcomeCommit,
-    );
-
     launch.entry.set_terminating();
     let owned_cleanup = finish_owned_process_tree(
         runtime,
@@ -1823,17 +1818,35 @@ mod tests {
     use crate::ports::workstation::{
         ExecutionCapturePolicy, ExecutionCleanupPolicy, ExecutionStdinPolicy,
     };
+    use crate::ports::workstation_preparation::{
+        PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
+    };
 
     fn request() -> ExecutionRequest {
+        let workstation_id = WorkstationId::generate();
+        let generation = WorkstationGeneration::try_new(1).unwrap();
+        let workspace_id = WorkspaceId::generate();
+        let requested_cwd = LogicalPathReference::absolute("/").unwrap();
         ExecutionRequest {
             operation_id: OperationId::generate(),
             execution_id: ExecutionId::generate(),
             work_id: WorkId::generate(),
-            workstation_id: WorkstationId::generate(),
-            expected_generation: WorkstationGeneration::try_new(1).unwrap(),
-            workspace_id: WorkspaceId::generate(),
+            workstation_id,
+            expected_generation: generation,
+            workspace_id,
             command: "true".to_owned(),
-            requested_cwd: LogicalPathReference::absolute("/").unwrap(),
+            requested_cwd: requested_cwd.clone(),
+            prepared_cwd: PreparedCwdEvidence::new(
+                crate::domain::ResolvedPathEvidence::try_new(
+                    workstation_id,
+                    generation,
+                    workspace_id,
+                    requested_cwd,
+                    "/",
+                )
+                .unwrap(),
+                PreparedCwdObjectIdentity::try_new(1, 1, PreparedCwdObjectType::Directory).unwrap(),
+            ),
             effective_privilege: PrivilegeMode::User,
             stdin: ExecutionStdinPolicy::Closed,
             timeout: MonotonicDuration::from_millis(1_000),

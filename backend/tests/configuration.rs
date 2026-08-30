@@ -1,6 +1,9 @@
 use std::error::Error as _;
 use std::path::{Path, PathBuf};
 
+use craxii_server::application::tool_registry::{
+    ToolRegistry, ToolSemanticPolicy, validate_arguments,
+};
 use craxii_server::bootstrap::compatibility::{
     ARCHITECTURE_VERSION, CONFIGURATION_VERSION, MAX_SUPPORTED_SCHEMA_VERSION, PROTOCOL_VERSION,
 };
@@ -624,6 +627,95 @@ fn exact_architecture_maxima_are_accepted() {
             "run_shell_default_timeout_ms = 900000",
         );
     valid(&maxima);
+}
+
+#[test]
+fn shell_timeout_limits_must_be_exact_schema_seconds() {
+    for input in [
+        replace_once(
+            LOCAL,
+            "run_shell_default_timeout_ms = 120000",
+            "run_shell_default_timeout_ms = 120001",
+        ),
+        replace_once(
+            LOCAL,
+            "run_shell_max_timeout_ms = 900000",
+            "run_shell_max_timeout_ms = 899999",
+        ),
+    ] {
+        assert!(matches!(
+            invalid(&input),
+            ConfigError::InvalidToolLimit { .. }
+        ));
+    }
+}
+
+#[test]
+fn typed_nondefault_tool_config_drives_registry_schema_decoder_and_both_fingerprints() {
+    let changed = LOCAL
+        .replace(
+            "read_file_default_bytes = 1048576",
+            "read_file_default_bytes = 65536",
+        )
+        .replace(
+            "read_file_max_bytes = 8388608",
+            "read_file_max_bytes = 131072",
+        )
+        .replace(
+            "run_shell_command_max_bytes = 65536",
+            "run_shell_command_max_bytes = 4096",
+        )
+        .replace(
+            "run_shell_default_timeout_ms = 120000",
+            "run_shell_default_timeout_ms = 30000",
+        )
+        .replace(
+            "run_shell_max_timeout_ms = 900000",
+            "run_shell_max_timeout_ms = 60000",
+        );
+    let baseline = valid(LOCAL);
+    let configured = valid(&changed);
+    let tools = configured.limits().tools();
+    let registry = ToolRegistry::v0(ToolSemanticPolicy {
+        read_file_default_bytes: tools.read_file_default_bytes(),
+        read_file_max_bytes: tools.read_file_max_bytes(),
+        run_shell_command_max_bytes: tools.run_shell_command_max_bytes(),
+        run_shell_default_timeout_ms: tools.run_shell_default_timeout_ms(),
+        run_shell_max_timeout_ms: tools.run_shell_max_timeout_ms(),
+    })
+    .unwrap();
+    let baseline_tools = baseline.limits().tools();
+    let baseline_registry = ToolRegistry::v0(ToolSemanticPolicy {
+        read_file_default_bytes: baseline_tools.read_file_default_bytes(),
+        read_file_max_bytes: baseline_tools.read_file_max_bytes(),
+        run_shell_command_max_bytes: baseline_tools.run_shell_command_max_bytes(),
+        run_shell_default_timeout_ms: baseline_tools.run_shell_default_timeout_ms(),
+        run_shell_max_timeout_ms: baseline_tools.run_shell_max_timeout_ms(),
+    })
+    .unwrap();
+
+    assert_eq!(
+        validate_arguments(&registry.definitions()[0], br#"{"path":"x"}"#)
+            .unwrap()
+            .canonical_json(),
+        r#"{"max_bytes":65536,"path":"x","path_kind":"workspace_relative"}"#
+    );
+    assert_eq!(
+        validate_arguments(&registry.definitions()[1], br#"{"command":"true"}"#)
+            .unwrap()
+            .canonical_json(),
+        r#"{"command":"true","cwd":null,"privilege":"user","timeout_seconds":30}"#
+    );
+    assert_eq!(
+        registry.definitions()[0].input_schema()["oneOf"][0]["properties"]["max_bytes"]["default"],
+        65_536
+    );
+    assert_eq!(
+        registry.definitions()[1].input_schema()["properties"]["timeout_seconds"]["default"],
+        30
+    );
+    assert_ne!(registry.fingerprint(), baseline_registry.fingerprint());
+    assert_ne!(configured.fingerprint(), baseline.fingerprint());
 }
 
 #[test]

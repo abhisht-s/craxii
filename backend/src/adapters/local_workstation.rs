@@ -19,10 +19,11 @@ mod execution;
 use execution::{ExecutionCwd, ExecutionRuntime, ExecutionRuntimeConfig};
 
 use crate::domain::{
-    CanonicalByteCount, LogicalPathKind, LogicalPathReference, ResolvedPathEvidence, Sha256Digest,
-    UtcTimestamp, WorkspaceCapabilityRef, WorkspaceId, WorkspaceIdentity, WorkstationCapabilities,
-    WorkstationCapabilitiesInput, WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput,
-    WorkstationCapabilityLimits, WorkstationGeneration, WorkstationId, WorkstationIdentity,
+    CanonicalByteCount, LogicalPathKind, LogicalPathReference, PrivilegeMode, ResolvedPathEvidence,
+    Sha256Digest, UtcTimestamp, WorkspaceCapabilityRef, WorkspaceId, WorkspaceIdentity,
+    WorkstationCapabilities, WorkstationCapabilitiesInput, WorkstationCapabilityFlags,
+    WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits, WorkstationGeneration,
+    WorkstationId, WorkstationIdentity,
 };
 use crate::ports::artifact_store::ArtifactStore;
 use crate::ports::clock::Clock;
@@ -32,6 +33,11 @@ use crate::ports::workstation::{
     FileEncoding, FileReadRequest, FileReadResult, HARD_EXECUTION_STREAM_CAPTURE_BYTES,
     HARD_EXECUTION_TIMEOUT_MS, HARD_FILE_READ_MAX_BYTES, Workstation, WorkstationError,
     WorkstationErrorKind, WorkstationFileType, WorkstationFuture,
+};
+use crate::ports::workstation_preparation::{
+    PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
+    RequiredWorkstationCapability, WorkstationPreparation, WorkstationPreparationFuture,
+    WorkstationPreparationRequest, WorkstationPreparationResult,
 };
 
 const READ_BUFFER_BYTES: usize = 16_384;
@@ -341,25 +347,78 @@ impl LocalWorkstation {
         })
     }
 
-    fn prepare_execution_cwd(
+    fn prepare_committed_execution_cwd(
         &self,
-        requested: &LogicalPathReference,
+        request: &ExecutionRequest,
     ) -> Result<ExecutionCwd, WorkstationError> {
-        let target = self.resolve_existing_path(requested)?;
+        let committed = request.prepared_cwd.resolved_cwd();
+        if committed.workstation_id() != request.workstation_id
+            || committed.workstation_generation() != request.expected_generation
+            || committed.workspace_id() != request.workspace_id
+            || committed.requested_path() != &request.requested_cwd
+        {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+
+        let current = self.resolve_execution_cwd_evidence(&request.requested_cwd)?;
+        if &current != committed {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+
+        let committed_path = PathBuf::from(committed.resolved_absolute_path());
         let mut options = OpenOptions::new();
         options.read(true);
         #[cfg(unix)]
-        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY);
-        let directory = options
-            .open(&target.physical_path)
-            .map_err(map_path_error)?;
-        if !directory.metadata().map_err(map_io_error)?.is_dir() {
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW);
+        let directory = options.open(&committed_path).map_err(map_path_error)?;
+        let metadata = directory.metadata().map_err(map_io_error)?;
+        if !metadata.is_dir() {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+        let opened_identity = prepared_cwd_object_identity(&metadata)?;
+        if opened_identity != request.prepared_cwd.object_identity() {
             return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
         }
         Ok(ExecutionCwd {
             directory,
-            evidence: target.evidence,
+            evidence: committed.clone(),
         })
+    }
+
+    fn prepare_execution_cwd(
+        &self,
+        requested: &LogicalPathReference,
+    ) -> Result<PreparedCwdEvidence, WorkstationError> {
+        let target = self.resolve_existing_path(requested)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW);
+        let directory = options
+            .open(&target.physical_path)
+            .map_err(map_path_error)?;
+        let metadata = directory.metadata().map_err(map_io_error)?;
+        if !metadata.is_dir() {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+        Ok(PreparedCwdEvidence::new(
+            target.evidence,
+            prepared_cwd_object_identity(&metadata)?,
+        ))
+    }
+
+    fn resolve_execution_cwd_evidence(
+        &self,
+        requested: &LogicalPathReference,
+    ) -> Result<ResolvedPathEvidence, WorkstationError> {
+        let target = self.resolve_existing_path(requested)?;
+        if !std::fs::metadata(&target.physical_path)
+            .map_err(map_path_error)?
+            .is_dir()
+        {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+        Ok(target.evidence)
     }
 
     /// Closes admission and propagates the one original Stage 10 shutdown deadline.
@@ -489,7 +548,7 @@ impl Workstation for LocalWorkstation {
         if let Err(error) = validation {
             return Box::pin(async move { Err(error) });
         }
-        let cwd = self.prepare_execution_cwd(&request.requested_cwd);
+        let cwd = self.prepare_committed_execution_cwd(&request);
         let runtime = Arc::clone(&self.execution);
         Box::pin(async move { runtime.execute(request, cwd?).await })
     }
@@ -519,6 +578,50 @@ impl Workstation for LocalWorkstation {
             Ok(runtime
                 .cancel(request.operation_id, request.execution_id)
                 .await)
+        })
+    }
+}
+
+impl WorkstationPreparation for LocalWorkstation {
+    fn prepare(
+        &self,
+        request: WorkstationPreparationRequest,
+    ) -> WorkstationPreparationFuture<'_, WorkstationPreparationResult> {
+        let validation = self
+            .validate_identity(request.workstation_id, request.expected_generation)
+            .and_then(|()| self.validate_workspace(request.workspace_id))
+            .and_then(|()| {
+                let flags = self.capabilities.flags();
+                let capability_available = match request.required_capability {
+                    RequiredWorkstationCapability::FilesystemRead => flags.filesystem_read(),
+                    RequiredWorkstationCapability::ForegroundExecute => flags.foreground_execute(),
+                };
+                let privilege_available = match request.effective_privilege {
+                    PrivilegeMode::User => flags.privilege_user(),
+                    PrivilegeMode::Administrative => flags.privilege_administrative(),
+                };
+                if capability_available && privilege_available {
+                    Ok(())
+                } else {
+                    Err(WorkstationError::new(
+                        WorkstationErrorKind::UnsupportedCapability,
+                    ))
+                }
+            });
+        if let Err(error) = validation {
+            return Box::pin(async move { Err(error) });
+        }
+        let adapter = self.clone();
+        Box::pin(async move {
+            let prepared_cwd = tokio::task::spawn_blocking(move || {
+                adapter.prepare_execution_cwd(&request.requested_cwd)
+            })
+            .await
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::InternalWorkstationError))??;
+            Ok(WorkstationPreparationResult {
+                operation_id: request.operation_id,
+                prepared_cwd,
+            })
         })
     }
 }
@@ -622,6 +725,26 @@ pub(crate) fn stage13_capabilities(
 struct ResolvedTarget {
     physical_path: PathBuf,
     evidence: ResolvedPathEvidence,
+}
+
+#[cfg(unix)]
+fn prepared_cwd_object_identity(
+    metadata: &Metadata,
+) -> Result<PreparedCwdObjectIdentity, WorkstationError> {
+    PreparedCwdObjectIdentity::try_new(
+        metadata.dev(),
+        metadata.ino(),
+        PreparedCwdObjectType::Directory,
+    )
+}
+
+#[cfg(not(unix))]
+fn prepared_cwd_object_identity(
+    _metadata: &Metadata,
+) -> Result<PreparedCwdObjectIdentity, WorkstationError> {
+    Err(WorkstationError::new(
+        WorkstationErrorKind::UnsupportedCapability,
+    ))
 }
 
 #[derive(Eq, PartialEq)]
@@ -785,6 +908,49 @@ mod tests {
     const AT: &str = "2026-08-29T01:02:03.456789Z";
     static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    fn prepared_cwd_evidence(
+        workstation_id: WorkstationId,
+        generation: WorkstationGeneration,
+        workspace_id: WorkspaceId,
+        requested_cwd: LogicalPathReference,
+        physical_path: &Path,
+    ) -> PreparedCwdEvidence {
+        let canonical = std::fs::canonicalize(physical_path).unwrap();
+        let metadata = std::fs::metadata(&canonical).unwrap();
+        PreparedCwdEvidence::new(
+            ResolvedPathEvidence::try_new(
+                workstation_id,
+                generation,
+                workspace_id,
+                requested_cwd,
+                canonical.to_str().unwrap(),
+            )
+            .unwrap(),
+            prepared_cwd_object_identity(&metadata).unwrap(),
+        )
+    }
+
+    fn open_descriptors_for_directory(path: &Path) -> usize {
+        let expected = fs::metadata(path).unwrap();
+        fs::read_dir("/dev/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<i32>().ok())
+            .filter(|descriptor| {
+                let mut observed = std::mem::MaybeUninit::<nix::libc::stat>::uninit();
+                // SAFETY: `observed` points to writable storage for `fstat`; its bytes are read
+                // only when `fstat` reports success for the enumerated live descriptor.
+                let succeeded =
+                    unsafe { nix::libc::fstat(*descriptor, observed.as_mut_ptr()) } == 0;
+                succeeded && {
+                    // SAFETY: successful `fstat` initialized the complete `stat` value.
+                    let observed = unsafe { observed.assume_init() };
+                    observed.st_dev as u64 == expected.dev() && observed.st_ino == expected.ino()
+                }
+            })
+            .count()
+    }
+
     #[cfg(target_os = "macos")]
     struct InterruptedLeaderObserver {
         calls: AtomicUsize,
@@ -943,6 +1109,7 @@ mod tests {
         }
 
         fn execution_request(&self, command: impl Into<String>) -> ExecutionRequest {
+            let requested_cwd = LogicalPathReference::workspace_relative("cwd").unwrap();
             ExecutionRequest {
                 operation_id: OperationId::generate(),
                 execution_id: ExecutionId::generate(),
@@ -951,7 +1118,14 @@ mod tests {
                 expected_generation: self.workstation.generation(),
                 workspace_id: self.workstation.workspace_id(),
                 command: command.into(),
-                requested_cwd: LogicalPathReference::workspace_relative("cwd").unwrap(),
+                requested_cwd: requested_cwd.clone(),
+                prepared_cwd: prepared_cwd_evidence(
+                    self.workstation.workstation_id(),
+                    self.workstation.generation(),
+                    self.workstation.workspace_id(),
+                    requested_cwd,
+                    &self.workspace_root.join("cwd"),
+                ),
                 effective_privilege: PrivilegeMode::User,
                 stdin: ExecutionStdinPolicy::Closed,
                 timeout: MonotonicDuration::from_millis(10_000),
@@ -964,12 +1138,330 @@ mod tests {
             }
         }
 
+        fn preparation_request(&self) -> WorkstationPreparationRequest {
+            WorkstationPreparationRequest {
+                operation_id: OperationId::generate(),
+                workstation_id: self.workstation.workstation_id(),
+                expected_generation: self.workstation.generation(),
+                workspace_id: self.workstation.workspace_id(),
+                requested_cwd: LogicalPathReference::workspace_relative("cwd").unwrap(),
+                required_capability: RequiredWorkstationCapability::ForegroundExecute,
+                effective_privilege: PrivilegeMode::User,
+            }
+        }
+
+        async fn prepared_execution_request(
+            &self,
+            requested_cwd: LogicalPathReference,
+            command: &str,
+        ) -> ExecutionRequest {
+            let prepared = self
+                .workstation
+                .prepare(WorkstationPreparationRequest {
+                    requested_cwd: requested_cwd.clone(),
+                    ..self.preparation_request()
+                })
+                .await
+                .unwrap();
+            let mut request = self.execution_request(command);
+            request.requested_cwd = requested_cwd;
+            request.prepared_cwd = prepared.prepared_cwd;
+            request
+        }
+
         async fn execute(&self, command: impl Into<String>) -> ExecutionResult {
             self.workstation
                 .execute(self.execution_request(command))
                 .await
                 .unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn preparation_resolves_bound_cwd_without_creating_machine_side_effects() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let marker = fixture
+            .workspace_root
+            .join("preparation-must-not-create-this");
+        let request = fixture.preparation_request();
+        let operation_id = request.operation_id;
+        let result = fixture.workstation.prepare(request).await.unwrap();
+        assert_eq!(result.operation_id, operation_id);
+        assert_eq!(
+            result.prepared_cwd.resolved_cwd().requested_path(),
+            &LogicalPathReference::workspace_relative("cwd").unwrap()
+        );
+        assert_eq!(
+            result.prepared_cwd.resolved_cwd().resolved_absolute_path(),
+            fs::canonicalize(fixture.workspace_root.join("cwd"))
+                .unwrap()
+                .to_str()
+                .unwrap()
+        );
+        let identity = result.prepared_cwd.object_identity();
+        let metadata = fs::metadata(fixture.workspace_root.join("cwd")).unwrap();
+        assert_eq!(identity.device(), metadata.dev());
+        assert_eq!(identity.inode(), metadata.ino());
+        assert_eq!(identity.object_type(), PreparedCwdObjectType::Directory);
+        assert!(!marker.exists());
+        assert!(directory_names(&fixture._root.0.join("artifacts/sha256")).is_empty());
+    }
+
+    #[tokio::test]
+    async fn committed_cwd_drift_or_disappearance_fails_before_spawn() {
+        for drift in ["retarget", "disappear"] {
+            let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+            let old = fixture.workspace_root.join("old-target");
+            let new = fixture.workspace_root.join("new-target");
+            fs::create_dir(&old).unwrap();
+            fs::create_dir(&new).unwrap();
+            let logical = fixture.workspace_root.join("linked-cwd");
+            symlink(&old, &logical).unwrap();
+            let request = fixture
+                .prepared_execution_request(
+                    LogicalPathReference::workspace_relative("linked-cwd").unwrap(),
+                    "pwd > should-not-exist",
+                )
+                .await;
+            assert_eq!(
+                request.prepared_cwd.resolved_cwd().resolved_absolute_path(),
+                std::fs::canonicalize(&old).unwrap().to_str().unwrap()
+            );
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let workstation = fixture.workstation.clone();
+            let execute_barrier = Arc::clone(&barrier);
+            let execution = tokio::spawn(async move {
+                execute_barrier.wait().await;
+                workstation.execute(request).await
+            });
+            fs::remove_file(&logical).unwrap();
+            if drift == "retarget" {
+                symlink(&new, &logical).unwrap();
+            } else {
+                fs::remove_dir(&old).unwrap();
+            }
+            barrier.wait().await;
+            let error = execution.await.unwrap().unwrap_err();
+            assert!(matches!(
+                error.kind(),
+                WorkstationErrorKind::InvalidPath | WorkstationErrorKind::NotFound
+            ));
+            assert!(fixture.workstation.execution_lifecycle_events().is_empty());
+            assert!(!fixture.workspace_root.join("should-not-exist").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn same_path_directory_recreation_is_rejected_by_object_identity_before_spawn() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let cwd = fixture.workspace_root.join("cwd");
+        let request = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "touch same-path-marker",
+            )
+            .await;
+        let prepared_identity = request.prepared_cwd.object_identity();
+
+        let arrived = Arc::new(tokio::sync::Barrier::new(2));
+        let workstation = fixture.workstation.clone();
+        let task_barrier = Arc::clone(&arrived);
+        let execution = tokio::spawn(async move {
+            task_barrier.wait().await;
+            workstation.execute(request).await
+        });
+        fs::remove_dir(&cwd).unwrap();
+        fs::create_dir(fixture.workspace_root.join("inode-reuse-guard")).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        let replacement = prepared_cwd_object_identity(&fs::metadata(&cwd).unwrap()).unwrap();
+        assert_ne!(replacement, prepared_identity);
+        arrived.wait().await;
+
+        assert_eq!(
+            execution.await.unwrap().unwrap_err().kind(),
+            WorkstationErrorKind::InvalidPath
+        );
+        assert!(!cwd.join("same-path-marker").exists());
+        assert!(fixture.workstation.execution_lifecycle_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn directory_path_replaced_by_live_distinct_object_is_rejected_before_spawn() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let cwd = fixture.workspace_root.join("cwd");
+        let retained = fixture.workspace_root.join("prepared-cwd-retained");
+        let request = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "touch replacement-marker",
+            )
+            .await;
+        fs::rename(&cwd, &retained).unwrap();
+        fs::create_dir(&cwd).unwrap();
+        assert_ne!(
+            request.prepared_cwd.object_identity(),
+            prepared_cwd_object_identity(&fs::metadata(&cwd).unwrap()).unwrap()
+        );
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(request)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::InvalidPath
+        );
+        assert!(!cwd.join("replacement-marker").exists());
+        assert!(fixture.workstation.execution_lifecycle_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_directory_disappearance_is_rejected_before_spawn() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let cwd = fixture.workspace_root.join("cwd");
+        let request = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "touch disappeared-marker",
+            )
+            .await;
+        fs::remove_dir(&cwd).unwrap();
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(request)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::NotFound
+        );
+        assert!(fixture.workstation.execution_lifecycle_events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepared_cwd_descriptor_is_closed_after_success_failure_and_future_cancellation() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let cwd = fixture.workspace_root.join("cwd");
+        assert_eq!(open_descriptors_for_directory(&cwd), 0);
+
+        let success = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "true",
+            )
+            .await;
+        let execution = fixture.workstation.execute(success);
+        assert_eq!(open_descriptors_for_directory(&cwd), 1);
+        let result = execution.await;
+        if cfg!(target_os = "macos") {
+            result.unwrap();
+        } else {
+            assert_eq!(
+                result.unwrap_err().kind(),
+                WorkstationErrorKind::UnsupportedCapability
+            );
+        }
+        assert_eq!(open_descriptors_for_directory(&cwd), 0);
+
+        let mut failure = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "true",
+            )
+            .await;
+        let identity = failure.prepared_cwd.object_identity();
+        failure.prepared_cwd = PreparedCwdEvidence::new(
+            failure.prepared_cwd.resolved_cwd().clone(),
+            PreparedCwdObjectIdentity::try_new(
+                identity.device(),
+                identity.inode().checked_add(1).unwrap(),
+                PreparedCwdObjectType::Directory,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(failure)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::InvalidPath
+        );
+        assert_eq!(open_descriptors_for_directory(&cwd), 0);
+
+        let cancelled = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "true",
+            )
+            .await;
+        let future = fixture.workstation.execute(cancelled);
+        assert_eq!(open_descriptors_for_directory(&cwd), 1);
+        drop(future);
+        assert_eq!(open_descriptors_for_directory(&cwd), 0);
+    }
+
+    #[tokio::test]
+    async fn unchanged_committed_cwd_executes_exact_target_and_binding_mismatch_is_definite() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let marker = fixture.workspace_root.join("cwd/exact-target.txt");
+        let request = fixture
+            .prepared_execution_request(
+                LogicalPathReference::workspace_relative("cwd").unwrap(),
+                "pwd > exact-target.txt",
+            )
+            .await;
+        if cfg!(target_os = "macos") {
+            let result = fixture.workstation.execute(request.clone()).await.unwrap();
+            assert_eq!(
+                result.resolved_cwd,
+                request.prepared_cwd.resolved_cwd().clone()
+            );
+            assert!(marker.exists());
+        }
+
+        let mut wrong_generation = request.clone();
+        wrong_generation.expected_generation = WorkstationGeneration::try_new(1).unwrap();
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(wrong_generation)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::GenerationMismatch
+        );
+        let mut wrong_workspace = request;
+        wrong_workspace.workspace_id = WorkspaceId::generate();
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(wrong_workspace)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::WorkspaceNotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_rejects_stale_generation_and_unavailable_admin_before_resolution() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let mut stale = fixture.preparation_request();
+        stale.expected_generation = WorkstationGeneration::try_new(8).unwrap();
+        assert_eq!(
+            fixture.workstation.prepare(stale).await.unwrap_err().kind(),
+            WorkstationErrorKind::GenerationMismatch
+        );
+
+        let mut admin = fixture.preparation_request();
+        admin.effective_privilege = PrivilegeMode::Administrative;
+        assert_eq!(
+            fixture.workstation.prepare(admin).await.unwrap_err().kind(),
+            WorkstationErrorKind::UnsupportedCapability
+        );
     }
 
     async fn wait_for_path(path: &Path) {
@@ -1564,6 +2056,7 @@ mod tests {
         let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
         let operation_id = OperationId::generate();
         let execution_id = ExecutionId::generate();
+        let requested_cwd = LogicalPathReference::workspace_relative("cwd").unwrap();
         let execute = ExecutionRequest {
             operation_id,
             execution_id,
@@ -1572,7 +2065,14 @@ mod tests {
             expected_generation: fixture.workstation.generation(),
             workspace_id: fixture.workstation.workspace_id(),
             command: "printf 'stdout'; printf 'stderr' >&2".into(),
-            requested_cwd: LogicalPathReference::workspace_relative("cwd").unwrap(),
+            requested_cwd: requested_cwd.clone(),
+            prepared_cwd: prepared_cwd_evidence(
+                fixture.workstation.workstation_id(),
+                fixture.workstation.generation(),
+                fixture.workstation.workspace_id(),
+                requested_cwd,
+                &fixture.workspace_root.join("cwd"),
+            ),
             effective_privilege: PrivilegeMode::User,
             stdin: ExecutionStdinPolicy::Closed,
             timeout: MonotonicDuration::from_millis(1_000),
@@ -1775,8 +2275,7 @@ mod tests {
             LogicalPathReference::absolute(outside.to_str().unwrap()).unwrap(),
             LogicalPathReference::workspace_relative("cwd-link").unwrap(),
         ] {
-            let mut request = fixture.execution_request("pwd");
-            request.requested_cwd = requested;
+            let request = fixture.prepared_execution_request(requested, "pwd").await;
             let result = fixture.workstation.execute(request).await.unwrap();
             assert_eq!(
                 result.stdout.unwrap().projection,
@@ -1790,6 +2289,17 @@ mod tests {
 
         let mut missing = fixture.execution_request("true");
         missing.requested_cwd = LogicalPathReference::workspace_relative("missing-cwd").unwrap();
+        missing.prepared_cwd = PreparedCwdEvidence::new(
+            ResolvedPathEvidence::try_new(
+                fixture.workstation.workstation_id(),
+                fixture.workstation.generation(),
+                fixture.workstation.workspace_id(),
+                missing.requested_cwd.clone(),
+                fixture.workspace_root.join("missing-cwd").to_str().unwrap(),
+            )
+            .unwrap(),
+            PreparedCwdObjectIdentity::try_new(1, 1, PreparedCwdObjectType::Directory).unwrap(),
+        );
         assert_eq!(
             fixture
                 .workstation
@@ -1802,6 +2312,17 @@ mod tests {
         fs::write(fixture.workspace_root.join("cwd-file"), "not a directory").unwrap();
         let mut file = fixture.execution_request("true");
         file.requested_cwd = LogicalPathReference::workspace_relative("cwd-file").unwrap();
+        file.prepared_cwd = PreparedCwdEvidence::new(
+            ResolvedPathEvidence::try_new(
+                fixture.workstation.workstation_id(),
+                fixture.workstation.generation(),
+                fixture.workstation.workspace_id(),
+                file.requested_cwd.clone(),
+                fixture.workspace_root.join("cwd-file").to_str().unwrap(),
+            )
+            .unwrap(),
+            PreparedCwdObjectIdentity::try_new(1, 1, PreparedCwdObjectType::Directory).unwrap(),
+        );
         assert_eq!(
             fixture.workstation.execute(file).await.unwrap_err().kind(),
             WorkstationErrorKind::InvalidPath

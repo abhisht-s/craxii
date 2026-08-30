@@ -3,13 +3,37 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "test-failpoints")]
+use std::sync::Arc;
+#[cfg(feature = "test-failpoints")]
+use std::time::Duration;
 
 use sqlx::Row;
 
 use crate::adapters::artifacts::LocalArtifactStore;
+#[cfg(feature = "test-failpoints")]
+use crate::adapters::local_workstation::{LocalWorkstation, LocalWorkstationOptions};
+#[cfg(feature = "test-failpoints")]
+#[cfg(feature = "test-failpoints")]
+use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
+#[cfg(feature = "test-failpoints")]
+use crate::application::tool_execution_service::{
+    ToolExecutionCall, ToolExecutionService, ToolRuntimeLimits,
+};
+#[cfg(feature = "test-failpoints")]
+use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::domain::*;
 use crate::ports::artifact_store::{ArtifactStore, BeginArtifactCapture};
+#[cfg(feature = "test-failpoints")]
+use crate::ports::clock::{Clock, MonotonicInstant, TestClock};
 use crate::ports::state_store::*;
+#[cfg(feature = "test-failpoints")]
+use crate::ports::workstation::{HARD_FILE_READ_MAX_BYTES, Workstation};
+#[cfg(feature = "test-failpoints")]
+use crate::ports::workstation_preparation::WorkstationPreparation;
+use crate::ports::workstation_preparation::{
+    PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
+};
 
 use super::journal::{JournalAppendIntent, append_event, prepare_event};
 use super::transaction::WriteTransaction;
@@ -39,6 +63,13 @@ impl TestRoot {
     fn path(&self) -> &Path {
         &self.0
     }
+
+    #[cfg(feature = "test-failpoints")]
+    fn at(path: PathBuf) -> Self {
+        fs::create_dir_all(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(path)
+    }
 }
 
 impl Drop for TestRoot {
@@ -59,7 +90,10 @@ struct Fixture {
 }
 
 async fn fixture() -> Fixture {
-    let root = TestRoot::new();
+    fixture_at(TestRoot::new()).await
+}
+
+async fn fixture_at(root: TestRoot) -> Fixture {
     let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
     let artifact_store = LocalArtifactStore::initialize(&root.path().join("artifacts")).unwrap();
     let store = SqliteStateStore::new(guard.runtime().clone());
@@ -396,6 +430,40 @@ fn finalized_artifact(
     }
 }
 
+fn finalized_read_artifact(
+    fixture: &Fixture,
+    artifact_id: ArtifactId,
+    tool_id: ToolExecutionId,
+    bytes: &[u8],
+) -> PreparedArtifact {
+    let mut prepared = finalized_artifact(
+        fixture,
+        artifact_id,
+        ArtifactProducer::Tool(tool_id),
+        bytes,
+        bytes.len() as u64,
+        "read-file.txt",
+    );
+    prepared.metadata = ArtifactReference::new(ArtifactReferenceInput {
+        artifact_id,
+        craxii_id: fixture.identity.craxii_id,
+        producing_work_id: Some(fixture.work_id),
+        producer: ArtifactProducer::Tool(tool_id),
+        storage_key: ArtifactStorageKey::from_digest(Sha256Digest::hash_bytes(bytes)),
+        sha256: Sha256Digest::hash_bytes(bytes),
+        canonical_length: CanonicalByteCount::try_new(bytes.len() as u64).unwrap(),
+        observed_length: Some(CanonicalByteCount::try_new(bytes.len() as u64).unwrap()),
+        mime_type: ArtifactMimeType::try_new("text/plain").unwrap(),
+        encoding: Some(ArtifactEncoding::try_new("utf-8").unwrap()),
+        logical_name: Some(ArtifactLogicalName::try_new("read-file.txt").unwrap()),
+        retention: ArtifactRetention::CanonicalEvidence,
+        truncated: false,
+        compression: None,
+        created_at: T4.parse().unwrap(),
+    });
+    prepared
+}
+
 fn final_object_path(root: &Path, digest: Sha256Digest) -> PathBuf {
     let digest = digest.to_string();
     root.join("artifacts")
@@ -469,6 +537,139 @@ async fn completed_tool_fixture() -> (Fixture, ToolExecutionId) {
         .await
         .unwrap();
     (fixture, tool_id)
+}
+
+async fn completed_large_read_fixture() -> (Fixture, ToolExecutionId, ArtifactId) {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let arguments =
+        "{\"max_bytes\":65536,\"path\":\"large.txt\",\"path_kind\":\"workspace_relative\"}";
+    let (tool_id, requested_event, waiting) =
+        request_named_tool(&fixture, &model, 1, 4, "read_file", arguments).await;
+    let dispatch_event = dispatch_named_tool(
+        &fixture,
+        tool_id,
+        requested_event,
+        waiting,
+        "read_file",
+        "filesystem_read",
+    )
+    .await;
+    let bytes = vec![b'r'; 40_000];
+    let artifact_id = ArtifactId::generate();
+    let artifact = finalized_read_artifact(&fixture, artifact_id, tool_id, &bytes);
+    let digest = Sha256Digest::hash_bytes(&bytes);
+    let mut completion = successful_tool_completion(
+        &fixture,
+        tool_id,
+        waiting,
+        dispatch_event,
+        vec![artifact],
+        (None, None),
+        (None, None),
+    );
+    completion.outcome.evidence_artifact_ids = vec![artifact_id];
+    completion.outcome.result = Some(ToolResultEvidence {
+        result_kind: ToolResultClass::Success,
+        summary: "File read completed.".to_owned(),
+        fields: vec![
+            ("artifact_id".to_owned(), artifact_id.to_string()),
+            ("byte_length".to_owned(), bytes.len().to_string()),
+            ("duration_ms".to_owned(), "1".to_owned()),
+            (
+                "projection_omitted_bytes".to_owned(),
+                bytes.len().to_string(),
+            ),
+            ("requested_path".to_owned(), "large.txt".to_owned()),
+            (
+                "resolved_path".to_owned(),
+                "/workspace/large.txt".to_owned(),
+            ),
+            ("sha256".to_owned(), digest.to_string()),
+        ],
+    });
+    fixture
+        .store
+        .finish_tool_execution(completion)
+        .await
+        .unwrap();
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    (fixture, tool_id, artifact_id)
+}
+
+#[tokio::test]
+async fn large_read_generic_artifact_survives_sqlite_restart_without_stream_misuse() {
+    let (fixture, tool_id, artifact_id) = completed_large_read_fixture().await;
+    let root = fixture._root.path().to_owned();
+    {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        let row = sqlx::query(
+            "SELECT stdout_artifact_id, stderr_artifact_id, result_json \
+             FROM tool_executions WHERE tool_execution_id = ?",
+        )
+        .bind(tool_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        assert!(row.get::<Option<String>, _>("stdout_artifact_id").is_none());
+        assert!(row.get::<Option<String>, _>("stderr_artifact_id").is_none());
+        assert!(
+            row.get::<String, _>("result_json")
+                .contains(&artifact_id.to_string())
+        );
+    }
+    fixture.guard.shutdown().await;
+    assert!(verified_stage8_startup(&root).await);
+
+    let guard = SqliteRuntimeGuard::start(&root, 1).await.unwrap();
+    let store = SqliteStateStore::new(guard.runtime().clone());
+    let references = store.load_referenced_artifacts().await.unwrap();
+    let expected_digest = Sha256Digest::hash_bytes(&vec![b'r'; 40_000]);
+    let reference = references
+        .iter()
+        .find(|reference| reference.sha256() == expected_digest)
+        .unwrap();
+    assert_eq!(reference.captured_byte_count().get(), 40_000);
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ? \
+             AND producer_kind = 'tool_execution' AND producer_id = ? \
+             AND mime_type = 'text/plain' AND encoding = 'utf-8' \
+             AND logical_name = 'read-file.txt'",
+        )
+        .bind(artifact_id.to_string())
+        .bind(tool_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    drop(connection);
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn foreign_generic_read_artifact_is_rejected_by_startup_consistency() {
+    let (fixture, _, artifact_id) = completed_large_read_fixture().await;
+    {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        sqlx::query("UPDATE artifacts SET producer_id = ? WHERE artifact_id = ?")
+            .bind(ToolExecutionId::generate().to_string())
+            .bind(artifact_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+    }
+    let root = fixture._root.path().to_owned();
+    fixture.guard.shutdown().await;
+    assert!(!verified_stage8_startup(&root).await);
 }
 
 fn running_expectation(fixture: &Fixture, version: i64) -> WorkExpectation {
@@ -887,6 +1088,25 @@ async fn request_tool(
     tool_ordinal: i64,
     running_version: i64,
 ) -> (ToolExecutionId, JournalEventId, WorkExpectation) {
+    request_named_tool(
+        fixture,
+        model,
+        tool_ordinal,
+        running_version,
+        "run-shell",
+        "{\"command\":\"true\"}",
+    )
+    .await
+}
+
+async fn request_named_tool(
+    fixture: &Fixture,
+    model: &BegunModel,
+    tool_ordinal: i64,
+    running_version: i64,
+    tool_name: &str,
+    arguments_json: &str,
+) -> (ToolExecutionId, JournalEventId, WorkExpectation) {
     let tool_id = ToolExecutionId::generate();
     let requested_event = JournalEventId::generate();
     let waiting_version = running_version + 1;
@@ -905,11 +1125,11 @@ async fn request_tool(
                     ToolOrdinal::try_new(tool_ordinal).unwrap(),
                 ),
                 provider_tool_call_id: Some(format!("call-{tool_ordinal}")),
-                tool_name: ToolName::try_new("run-shell").unwrap(),
+                tool_name: ToolName::try_new(tool_name).unwrap(),
                 tool_version: ToolVersion::try_new("1.0.0").unwrap(),
                 tool_schema_version: 1,
-                arguments_json: "{\"command\":\"true\"}".to_owned(),
-                arguments_sha256: Sha256Digest::hash_bytes(b"{\"command\":\"true\"}"),
+                arguments_json: arguments_json.to_owned(),
+                arguments_sha256: Sha256Digest::hash_bytes(arguments_json.as_bytes()),
                 workstation_id: fixture.identity.workstation_id,
                 workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
                 workspace_id: fixture.identity.workspace_id,
@@ -966,7 +1186,49 @@ async fn dispatch_tool(
     requested_event: JournalEventId,
     waiting: WorkExpectation,
 ) -> JournalEventId {
+    dispatch_named_tool(
+        fixture,
+        tool_id,
+        requested_event,
+        waiting,
+        "run_shell",
+        "foreground_execute",
+    )
+    .await
+}
+
+async fn dispatch_named_tool(
+    fixture: &Fixture,
+    tool_id: ToolExecutionId,
+    requested_event: JournalEventId,
+    waiting: WorkExpectation,
+    tool_name: &str,
+    required_capability: &str,
+) -> JournalEventId {
     let dispatch_event = JournalEventId::generate();
+    let authority = AuthorityDecisionSnapshot::new(
+        AuthorityDecision::Allow,
+        PrivilegeMode::User,
+        AuthorityReasonCode::try_new("allowed").unwrap(),
+    );
+    let prepared_cwd = fixture_prepared_cwd(fixture);
+    let authority_evidence_json =
+        authority_evidence(fixture, tool_name, required_capability, &prepared_cwd);
+    assert_eq!(
+        serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(&authority_evidence_json).unwrap()
+        )
+        .unwrap(),
+        authority_evidence_json
+    );
+    assert!(
+        super::stage8_codec::validate_dispatch_evidence(
+            &authority_evidence_json,
+            &authority,
+            &prepared_cwd,
+        )
+        .is_ok()
+    );
     fixture
         .store
         .commit_tool_dispatch_intent(CommitToolDispatchIntentRequest {
@@ -976,20 +1238,10 @@ async fn dispatch_tool(
                 state: ToolExecutionState::Requested,
             },
             dispatch: ToolDispatchIntent {
-                authority: AuthorityDecisionSnapshot::new(
-                    AuthorityDecision::Allow,
-                    PrivilegeMode::User,
-                    AuthorityReasonCode::try_new("registered_tool").unwrap(),
-                ),
+                authority,
+                dispatch_evidence_json: authority_evidence_json,
                 effective_privilege: PrivilegeMode::User,
-                resolved_cwd: ResolvedPathEvidence::try_new(
-                    fixture.identity.workstation_id,
-                    WorkstationGeneration::try_new(1).unwrap(),
-                    fixture.identity.workspace_id,
-                    LogicalPathReference::absolute("/workspace").unwrap(),
-                    "/workspace",
-                )
-                .unwrap(),
+                prepared_cwd,
                 timeout_ms: 1_000,
                 output_policy: ToolOutputPolicy {
                     stdout_capture_limit: CanonicalByteCount::try_new(100).unwrap(),
@@ -1008,6 +1260,84 @@ async fn dispatch_tool(
         .await
         .unwrap();
     dispatch_event
+}
+
+fn fixture_prepared_cwd(fixture: &Fixture) -> PreparedCwdEvidence {
+    PreparedCwdEvidence::new(
+        ResolvedPathEvidence::try_new(
+            fixture.identity.workstation_id,
+            WorkstationGeneration::try_new(1).unwrap(),
+            fixture.identity.workspace_id,
+            LogicalPathReference::absolute("/workspace").unwrap(),
+            "/workspace",
+        )
+        .unwrap(),
+        PreparedCwdObjectIdentity::try_new(1, 1, PreparedCwdObjectType::Directory).unwrap(),
+    )
+}
+
+fn authority_evidence(
+    fixture: &Fixture,
+    tool_name: &str,
+    required_capability: &str,
+    prepared_cwd: &PreparedCwdEvidence,
+) -> String {
+    let resolved = prepared_cwd.resolved_cwd();
+    let identity = prepared_cwd.object_identity();
+    serde_json::to_string(&serde_json::json!({
+        "arguments_sha256": Sha256Digest::hash_bytes(b"{}").to_string(),
+        "authority_facts": {
+            "administrative_allowed": true,
+            "authority_widening_attempt": false,
+            "malformed_arguments": false,
+            "requested_stderr_bytes": 100,
+            "requested_stdout_bytes": 100,
+            "requested_timeout_ms": 1000,
+            "tool_allowed": true,
+            "work_cancelled": false
+        },
+        "canonical_argument_bytes": 2,
+        "capabilities": {
+            "cancel_execution": true,
+            "filesystem_read": true,
+            "foreground_execute": true,
+            "inspect_execution": true,
+            "max_execution_timeout_ms": 900000,
+            "max_stderr_bytes": 8388608,
+            "max_stdout_bytes": 8388608,
+            "privilege_administrative": false,
+            "privilege_user": true,
+            "workspace_present": true
+        },
+        "craxii_id": fixture.identity.craxii_id.to_string(),
+        "decision": "allow",
+        "effective_privilege": "user",
+        "policy": "v0-development-workstation",
+        "prepared_cwd": {
+            "device": identity.device(),
+            "inode": identity.inode(),
+            "object_type": "directory",
+            "requested_cwd": resolved.requested_path().canonical(),
+            "resolved_cwd": resolved.resolved_absolute_path(),
+            "version": 1,
+            "workspace_id": resolved.workspace_id().to_string(),
+            "workstation_generation": resolved.workstation_generation().get(),
+            "workstation_id": resolved.workstation_id().to_string()
+        },
+        "reason_code": "allowed",
+        "required_capability": required_capability,
+        "requested_privilege": "user",
+        "runtime_instance_id": fixture.runtime_id.to_string(),
+        "schema_version": 1,
+        "tool_name": tool_name,
+        "tool_version": "1.0.0",
+        "version": 2,
+        "work_id": fixture.work_id.to_string(),
+        "workspace_id": fixture.identity.workspace_id.to_string(),
+        "workstation_generation": 1,
+        "workstation_id": fixture.identity.workstation_id.to_string()
+    }))
+    .unwrap()
 }
 
 fn successful_tool_completion(
@@ -1041,6 +1371,7 @@ fn successful_tool_completion(
                 summary: "completed".to_owned(),
                 fields: Vec::new(),
             }),
+            evidence_artifact_ids: Vec::new(),
             stdout_artifact_id,
             stderr_artifact_id,
             stdout_counts,
@@ -2272,6 +2603,7 @@ async fn tool_request_dispatch_and_unknown_outcome_preserve_intent_before_action
         current_attempt: CurrentWorkAttempt::Tool(tool_id),
     };
     let dispatch_event = JournalEventId::generate();
+    let prepared_cwd = fixture_prepared_cwd(&fixture);
     fixture
         .store
         .commit_tool_dispatch_intent(CommitToolDispatchIntentRequest {
@@ -2284,17 +2616,16 @@ async fn tool_request_dispatch_and_unknown_outcome_preserve_intent_before_action
                 authority: AuthorityDecisionSnapshot::new(
                     AuthorityDecision::Allow,
                     PrivilegeMode::User,
-                    AuthorityReasonCode::try_new("registered_tool").unwrap(),
+                    AuthorityReasonCode::try_new("allowed").unwrap(),
+                ),
+                dispatch_evidence_json: authority_evidence(
+                    &fixture,
+                    "run_shell",
+                    "foreground_execute",
+                    &prepared_cwd,
                 ),
                 effective_privilege: PrivilegeMode::User,
-                resolved_cwd: ResolvedPathEvidence::try_new(
-                    fixture.identity.workstation_id,
-                    WorkstationGeneration::try_new(1).unwrap(),
-                    fixture.identity.workspace_id,
-                    LogicalPathReference::absolute("/workspace").unwrap(),
-                    "/workspace",
-                )
-                .unwrap(),
+                prepared_cwd,
                 timeout_ms: 1_000,
                 output_policy: ToolOutputPolicy {
                     stdout_capture_limit: CanonicalByteCount::try_new(100).unwrap(),
@@ -2332,6 +2663,7 @@ async fn tool_request_dispatch_and_unknown_outcome_preserve_intent_before_action
                 cancelled: None,
                 cleanup_confirmed: Some(false),
                 result: None,
+                evidence_artifact_ids: Vec::new(),
                 stdout_artifact_id: None,
                 stderr_artifact_id: None,
                 stdout_counts: None,
@@ -2461,6 +2793,7 @@ async fn tool_predispatch_denial_and_interruption_are_definite_and_never_dispatc
                     summary: "authority denied".to_owned(),
                     fields: Vec::new(),
                 }),
+                evidence_artifact_ids: Vec::new(),
                 stdout_artifact_id: None,
                 stderr_artifact_id: None,
                 stdout_counts: None,
@@ -2506,6 +2839,7 @@ async fn tool_predispatch_denial_and_interruption_are_definite_and_never_dispatc
                 cancelled: None,
                 cleanup_confirmed: None,
                 result: None,
+                evidence_artifact_ids: Vec::new(),
                 stdout_artifact_id: None,
                 stderr_artifact_id: None,
                 stdout_counts: None,
@@ -2514,7 +2848,18 @@ async fn tool_predispatch_denial_and_interruption_are_definite_and_never_dispatc
                 normalized_error: Some(NormalizedError::workstation(Certainty::Definite, None)),
             },
             artifacts: Vec::new(),
-            work_next: resumed(&fixture, 8),
+            work_next: WorkLifecycleSnapshot::try_new(WorkLifecycleSnapshotInput {
+                work_id: fixture.work_id,
+                state: WorkState::Interrupted,
+                projection_version: ProjectionVersion::try_new(8).unwrap(),
+                runtime_owner: None,
+                current_attempt: CurrentWorkAttempt::None,
+                cancellation_reason: None,
+                terminal_reason: Some(WorkTerminalReason::Interruption(
+                    WorkInterruptionReason::ToolInterruptedBeforeDispatch,
+                )),
+            })
+            .unwrap(),
             tool_event: EventIntent {
                 event_id: interrupted_event,
                 correlation_id: fixture.correlation_id,
@@ -2588,11 +2933,11 @@ async fn tool_predispatch_denial_and_interruption_are_definite_and_never_dispatc
             .windows(2)
             .any(|pair| pair == ["tool.execution_completed", "work.resumed"])
     );
-    assert!(
-        event_types
-            .windows(2)
-            .any(|pair| pair == ["tool.execution_interrupted_before_dispatch", "work.resumed"])
-    );
+    assert!(event_types.windows(2).any(|pair| pair
+        == [
+            "tool.execution_interrupted_before_dispatch",
+            "work.interrupted"
+        ]));
     drop(connection);
     fixture.guard.shutdown().await;
 }
@@ -3284,4 +3629,442 @@ async fn recovery_summary_tool_counter_corruption_fails_closed() {
         );
         fixture.guard.shutdown().await;
     }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+#[ignore = "subprocess-only Stage 14 crash-window worker"]
+async fn stage14_crash_window_child() {
+    if std::env::var("CRAXII_STAGE14_CRASH_CHILD").ok().as_deref() != Some("1") {
+        return;
+    }
+    let root = PathBuf::from(std::env::var_os("CRAXII_STAGE14_CRASH_ROOT").unwrap());
+    let hook = std::env::var("CRAXII_STAGE14_CRASH_HOOK").unwrap();
+    let fixture = fixture_at(TestRoot::at(root.clone())).await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let workspace_root = root.join("workspace");
+    let cwd = workspace_root.join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    fs::write(workspace_root.join("small.txt"), b"small\n").unwrap();
+    fs::write(workspace_root.join("large.txt"), vec![b'x'; 40_000]).unwrap();
+
+    let snapshot = fixture.store.load_bootstrap_snapshot().await.unwrap();
+    let call_workspace = WorkspaceIdentity::try_new(WorkspaceIdentityInput {
+        workspace_id: fixture.identity.workspace_id,
+        craxii_id: fixture.identity.craxii_id,
+        workstation_id: fixture.identity.workstation_id,
+        logical_name: "primary".to_owned(),
+        logical_root: LogicalPathReference::absolute(workspace_root.to_str().unwrap()).unwrap(),
+        created_at: T0.parse().unwrap(),
+    })
+    .unwrap();
+    let clock = Arc::new(TestClock::new(
+        T4.parse::<UtcTimestamp>().unwrap().to_offset_datetime(),
+        Duration::from_secs(10),
+    ));
+    let artifact_store = Arc::new(LocalArtifactStore::initialize(&root.join("artifacts")).unwrap());
+    let workstation_clock: Arc<dyn Clock> = clock.clone();
+    let workstation_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let local_workstation = Arc::new(
+        LocalWorkstation::new(
+            &snapshot.workstation,
+            &snapshot.workspace,
+            LocalWorkstationOptions {
+                default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+                configured_workspace_root: workspace_root.clone(),
+                read_hard_limit: HARD_FILE_READ_MAX_BYTES,
+                artifact_store: workstation_artifacts,
+                administrative_enabled: false,
+                delegated_cgroup_root: None,
+                clock: workstation_clock,
+            },
+        )
+        .unwrap(),
+    );
+    let policy = ToolSemanticPolicy {
+        read_file_default_bytes: 1_048_576,
+        read_file_max_bytes: HARD_FILE_READ_MAX_BYTES,
+        run_shell_command_max_bytes: 65_536,
+        run_shell_default_timeout_ms: 120_000,
+        run_shell_max_timeout_ms: 900_000,
+    };
+    let registry = Arc::new(ToolRegistry::v0(policy).unwrap());
+    let authority: Arc<dyn AuthorityEvaluator> = Arc::new(V0AuthorityEvaluator);
+    let state_store: Arc<dyn ToolStateStore> = Arc::new(fixture.store.clone());
+    let workstation: Arc<dyn Workstation> = local_workstation.clone();
+    let preparation: Arc<dyn WorkstationPreparation> = local_workstation;
+    let service_artifacts: Arc<dyn ArtifactStore> = artifact_store;
+    let service_clock: Arc<dyn Clock> = clock.clone();
+    let service = ToolExecutionService::new(
+        registry,
+        authority,
+        state_store,
+        workstation,
+        preparation,
+        service_artifacts,
+        service_clock,
+        ToolRuntimeLimits {
+            read_file_default_bytes: policy.read_file_default_bytes,
+            read_file_max_bytes: policy.read_file_max_bytes,
+            run_shell_command_max_bytes: policy.run_shell_command_max_bytes,
+            run_shell_default_timeout_ms: policy.run_shell_default_timeout_ms,
+            run_shell_max_timeout_ms: policy.run_shell_max_timeout_ms,
+            stdout_capture_bytes: 1_048_576,
+            stderr_capture_bytes: 1_048_576,
+            inline_model_result_bytes: 65_536,
+            per_stream_projection_bytes: 32_768,
+        },
+    )
+    .unwrap();
+
+    let source_model_event_id = {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        let id: String = sqlx::query_scalar(
+            "SELECT event_id FROM journal_events WHERE work_id = ? \
+             AND event_type = 'model.invocation_completed' ORDER BY journal_offset DESC LIMIT 1",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+        JournalEventId::parse_canonical(&id).unwrap()
+    };
+    let side_effect = root.join("machine-side-effect.marker");
+    let terminal = root.join("terminal-observed.marker");
+    let (tool_name, raw_arguments) = match hook.as_str() {
+        "after_tool_requested_commit" | "after_tool_dispatch_intent_commit" => (
+            "read_file",
+            serde_json::to_vec(&serde_json::json!({"path":"small.txt"})).unwrap(),
+        ),
+        "after_tool_process_spawn" | "after_tool_process_exit_before_outcome_commit" => {
+            let command = format!(
+                "printf 'one\\n' >> {}; printf 'definite\\n' > {}",
+                shell_quote_path(&side_effect),
+                shell_quote_path(&terminal),
+            );
+            (
+                "run_shell",
+                serde_json::to_vec(&serde_json::json!({"command":command,"cwd":"cwd"})).unwrap(),
+            )
+        }
+        "after_artifact_rename_before_db_commit" => (
+            "read_file",
+            serde_json::to_vec(&serde_json::json!({"path":"large.txt"})).unwrap(),
+        ),
+        _ => panic!("unknown Stage 14 crash hook"),
+    };
+    let invocation_now = clock.monotonic_now();
+    let work_deadline = MonotonicInstant::from_elapsed(
+        invocation_now
+            .elapsed()
+            .checked_add(Duration::from_secs(30))
+            .unwrap(),
+    );
+    let call = ToolExecutionCall {
+        craxii_id: fixture.identity.craxii_id,
+        work: resumed(&fixture, 4),
+        runtime_instance_id: fixture.runtime_id,
+        source_model_invocation_id: model.invocation_id,
+        source_model_event_id,
+        agent_step_no: AgentStepNo::try_new(1).unwrap(),
+        tool_ordinal: ToolOrdinal::try_new(1).unwrap(),
+        provider_tool_call_id: Some("stage14-crash-call-1".to_owned()),
+        tool_name: tool_name.to_owned(),
+        raw_arguments,
+        correlation_id: fixture.correlation_id,
+        workstation_id: fixture.identity.workstation_id,
+        workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
+        workspace: call_workspace,
+        work_deadline,
+        shutdown_deadline: None,
+        authority_constraints: Default::default(),
+        cancellation: None,
+    };
+
+    // SAFETY: this disposable subprocess selects its production failpoint immediately before the
+    // sole service call. No concurrent test in this process reads or mutates the environment.
+    unsafe { std::env::set_var("CRAXII_TEST_ABORT_AT_FAILPOINT", &hook) };
+    let result = service.execute_call(call).await;
+    std::mem::forget(fixture);
+    panic!("selected Stage 14 production crash failpoint did not abort: {result:?}");
+}
+
+#[cfg(feature = "test-failpoints")]
+fn shell_quote_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(feature = "test-failpoints")]
+fn stage14_side_effect_count(path: &Path) -> usize {
+    fs::read_to_string(path)
+        .ok()
+        .map_or(0, |contents| contents.lines().count())
+}
+
+#[cfg(feature = "test-failpoints")]
+async fn wait_for_stage14_shell_completion(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("spawned crash-window shell did not terminate");
+}
+
+#[cfg(feature = "test-failpoints")]
+async fn verify_stage14_crash_window(hook: &str) {
+    let root_path = std::env::temp_dir().join(format!(
+        "craxii-stage14-crash-{}-{}",
+        std::process::id(),
+        uuid::Uuid::now_v7()
+    ));
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            "adapters::sqlite::stage8_tests::stage14_crash_window_child",
+        ])
+        .env("CRAXII_STAGE14_CRASH_CHILD", "1")
+        .env("CRAXII_STAGE14_CRASH_ROOT", &root_path)
+        .env("CRAXII_STAGE14_CRASH_HOOK", hook)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "crash child unexpectedly survived"
+    );
+    assert!(
+        root_path.join("db/craxii.sqlite3").is_file(),
+        "crash child did not create its database; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let side_effect = root_path.join("machine-side-effect.marker");
+    let terminal_marker = root_path.join("terminal-observed.marker");
+    if matches!(
+        hook,
+        "after_tool_process_spawn" | "after_tool_process_exit_before_outcome_commit"
+    ) {
+        wait_for_stage14_shell_completion(&terminal_marker).await;
+    }
+    let side_effect_count_before_recovery = stage14_side_effect_count(&side_effect);
+    if hook == "after_tool_process_spawn" {
+        assert!(side_effect_count_before_recovery <= 1);
+    } else if hook == "after_tool_process_exit_before_outcome_commit" {
+        assert_eq!(side_effect_count_before_recovery, 1);
+    } else {
+        assert_eq!(side_effect_count_before_recovery, 0);
+    }
+
+    let root = TestRoot::at(root_path);
+    let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
+    let store = SqliteStateStore::new(guard.runtime().clone());
+    let artifact_store = LocalArtifactStore::initialize(&root.path().join("artifacts")).unwrap();
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    let row = sqlx::query(
+        "SELECT t.tool_execution_id, t.runtime_instance_id, t.work_id, t.state, \
+         w.craxii_id, w.conversation_id, w.workspace_id, w.correlation_id, \
+         r.workstation_id FROM tool_executions t \
+         JOIN work_items w ON w.work_id = t.work_id \
+         JOIN runtime_instances r ON r.runtime_instance_id = t.runtime_instance_id",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let tool_id =
+        ToolExecutionId::parse_canonical(&row.get::<String, _>("tool_execution_id")).unwrap();
+    let old_runtime =
+        RuntimeInstanceId::parse_canonical(&row.get::<String, _>("runtime_instance_id")).unwrap();
+    let work_id = WorkId::parse_canonical(&row.get::<String, _>("work_id")).unwrap();
+    let identity = V0IdentityReference {
+        craxii_id: CraxiiId::parse_canonical(&row.get::<String, _>("craxii_id")).unwrap(),
+        conversation_id: ConversationId::parse_canonical(&row.get::<String, _>("conversation_id"))
+            .unwrap(),
+        workstation_id: WorkstationId::parse_canonical(&row.get::<String, _>("workstation_id"))
+            .unwrap(),
+        workspace_id: WorkspaceId::parse_canonical(&row.get::<String, _>("workspace_id")).unwrap(),
+    };
+    let correlation_id =
+        CorrelationId::parse_canonical(&row.get::<String, _>("correlation_id")).unwrap();
+    let dispatched = hook != "after_tool_requested_commit";
+    assert_eq!(
+        row.get::<String, _>("state"),
+        if dispatched {
+            "dispatching"
+        } else {
+            "requested"
+        },
+        "crash child returned without reaching the selected hook; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let work_projection: (String, Option<String>) =
+        sqlx::query_as("SELECT state, current_tool_execution_id FROM work_items WHERE work_id = ?")
+            .bind(work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(work_projection.0, "waiting_on_tool");
+    let tool_id_text = tool_id.to_string();
+    assert_eq!(work_projection.1.as_deref(), Some(tool_id_text.as_str()));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM tool_executions WHERE tool_execution_id = ? \
+             AND completed_at IS NULL AND result_json IS NULL",
+        )
+        .bind(tool_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE work_id = ? \
+             AND event_type = 'tool.execution_dispatching'",
+        )
+        .bind(work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        i64::from(dispatched)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE work_id = ? AND event_type IN \
+             ('tool.execution_interrupted_before_dispatch','tool.execution_outcome_unknown')",
+        )
+        .bind(work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        0
+    );
+    drop(connection);
+
+    assert_eq!(
+        terminal_marker.is_file(),
+        matches!(
+            hook,
+            "after_tool_process_spawn" | "after_tool_process_exit_before_outcome_commit"
+        )
+    );
+
+    let fixture = Fixture {
+        _root: root,
+        guard,
+        store,
+        artifact_store,
+        identity,
+        runtime_id: old_runtime,
+        work_id,
+        correlation_id,
+    };
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    let current_runtime = create_stage10_recovery_runtime(&fixture).await;
+    let recovery = recover_fixture(&fixture, current_runtime).await;
+    assert_eq!(recovery.interrupted_work, 1);
+    assert_eq!(
+        recovery.tool_attempts_interrupted_before_dispatch,
+        u64::from(!dispatched)
+    );
+    assert_eq!(
+        recovery.tool_attempts_outcome_unknown,
+        u64::from(dispatched)
+    );
+    assert_eq!(
+        stage14_side_effect_count(&side_effect),
+        side_effect_count_before_recovery,
+        "startup recovery redispatched the command"
+    );
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM tool_executions WHERE tool_execution_id = ?",
+        )
+        .bind(tool_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        if dispatched {
+            "outcome_unknown"
+        } else {
+            "interrupted_before_dispatch"
+        }
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE work_id = ? AND event_type IN \
+             ('tool.execution_interrupted_before_dispatch','tool.execution_outcome_unknown')",
+        )
+        .bind(work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    let recovered_work: (String, Option<String>) =
+        sqlx::query_as("SELECT state, current_tool_execution_id FROM work_items WHERE work_id = ?")
+            .bind(work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(recovered_work, ("interrupted".to_owned(), None));
+    drop(connection);
+    if hook == "after_artifact_rename_before_db_commit" {
+        let referenced = fixture.store.load_referenced_artifacts().await.unwrap();
+        let keys = referenced
+            .into_iter()
+            .map(|reference| reference.storage_key().clone())
+            .collect();
+        let report = fixture
+            .artifact_store
+            .scan_orphans(&keys, T5.parse().unwrap())
+            .unwrap();
+        assert_eq!(report.orphans.len(), 1);
+    }
+    fixture.guard.shutdown().await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn crash_after_tool_requested_commit_recovers_without_redispatch() {
+    verify_stage14_crash_window("after_tool_requested_commit").await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn crash_after_tool_dispatch_intent_commit_recovers_outcome_unknown() {
+    verify_stage14_crash_window("after_tool_dispatch_intent_commit").await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn crash_after_tool_process_spawn_records_one_side_effect() {
+    verify_stage14_crash_window("after_tool_process_spawn").await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn crash_after_tool_process_exit_preserves_definite_observation_marker() {
+    verify_stage14_crash_window("after_tool_process_exit_before_outcome_commit").await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn crash_after_artifact_rename_recovers_and_reports_one_orphan() {
+    verify_stage14_crash_window("after_artifact_rename_before_db_commit").await;
 }

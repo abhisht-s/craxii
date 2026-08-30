@@ -539,6 +539,74 @@ struct StoredAuthorityDecisionV1 {
     reason_code: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAuthorityFactsV1 {
+    administrative_allowed: bool,
+    authority_widening_attempt: bool,
+    malformed_arguments: bool,
+    requested_stderr_bytes: u64,
+    requested_stdout_bytes: u64,
+    requested_timeout_ms: Option<u64>,
+    tool_allowed: bool,
+    work_cancelled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAuthorityCapabilitiesV1 {
+    cancel_execution: bool,
+    filesystem_read: bool,
+    foreground_execute: bool,
+    inspect_execution: bool,
+    max_execution_timeout_ms: u64,
+    max_stderr_bytes: u64,
+    max_stdout_bytes: u64,
+    privilege_administrative: bool,
+    privilege_user: bool,
+    workspace_present: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredPreparedCwdEvidenceV1 {
+    device: u64,
+    inode: u64,
+    object_type: String,
+    requested_cwd: String,
+    resolved_cwd: String,
+    version: u8,
+    workspace_id: String,
+    workstation_generation: i64,
+    workstation_id: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAuthorityEvidenceV1 {
+    arguments_sha256: String,
+    authority_facts: StoredAuthorityFactsV1,
+    canonical_argument_bytes: usize,
+    capabilities: StoredAuthorityCapabilitiesV1,
+    craxii_id: String,
+    decision: String,
+    effective_privilege: String,
+    policy: String,
+    prepared_cwd: Option<StoredPreparedCwdEvidenceV1>,
+    reason_code: String,
+    requested_privilege: String,
+    required_capability: Option<String>,
+    runtime_instance_id: String,
+    schema_version: Option<i64>,
+    tool_name: String,
+    tool_version: Option<String>,
+    version: u8,
+    work_id: String,
+    workspace_id: String,
+    workstation_generation: i64,
+    workstation_id: String,
+}
+
 pub(super) fn encode_authority(
     value: &AuthorityDecisionSnapshot,
 ) -> Result<String, SqliteAdapterError> {
@@ -779,18 +847,26 @@ pub(super) fn validate_authority(
     json: &str,
     require_allow: bool,
 ) -> Result<(), SqliteAdapterError> {
-    let value: StoredAuthorityDecisionV1 = from_bounded_json(json, MAX_CAPABILITIES_BYTES)?;
-    if value.version == 1
-        && matches!(value.decision.as_str(), "allow" | "deny")
-        && (!require_allow || value.decision == "allow")
-        && matches!(
-            value.effective_privilege.as_str(),
-            "user" | "administrative"
-        )
-        && (value.decision != "deny" || value.effective_privilege == "user")
-        && value.policy == "v0-development-workstation"
-        && valid_authority_reason_code(&value.reason_code)
+    if let Ok(value) = from_bounded_json::<StoredAuthorityDecisionV1>(json, MAX_CAPABILITIES_BYTES)
     {
+        return if value.version == 1
+            && matches!(value.decision.as_str(), "allow" | "deny")
+            && (!require_allow || value.decision == "allow")
+            && matches!(
+                value.effective_privilege.as_str(),
+                "user" | "administrative"
+            )
+            && (value.decision != "deny" || value.effective_privilege == "user")
+            && value.policy == "v0-development-workstation"
+            && valid_authority_reason_code(&value.reason_code)
+        {
+            Ok(())
+        } else {
+            Err(corrupt())
+        };
+    }
+    let value: StoredAuthorityEvidenceV1 = from_bounded_json(json, MAX_CAPABILITIES_BYTES)?;
+    if (!require_allow || value.decision == "allow") && valid_full_authority_evidence(&value) {
         Ok(())
     } else {
         Err(corrupt())
@@ -800,16 +876,171 @@ pub(super) fn validate_authority(
 fn valid_authority_reason_code(value: &str) -> bool {
     matches!(
         value,
-        "registered_tool"
+        "allowed"
+            | "registered_tool"
             | "policy_denied"
             | "malformed_request"
-            | "limit_exceeded"
             | "work_cancelled"
             | "scope_denied"
+            | "unregistered_tool"
+            | "malformed_arguments"
+            | "cancelled_work"
+            | "authority_widening"
+            | "explicit_constraint_denial"
+            | "wrong_workstation"
+            | "stale_generation"
+            | "wrong_workspace"
+            | "unsupported_capability"
+            | "administrative_unavailable"
+            | "limit_exceeded"
     )
 }
 
+pub(super) fn validate_authority_evidence(
+    json: &str,
+    expected: &AuthorityDecisionSnapshot,
+) -> Result<(), SqliteAdapterError> {
+    let value: StoredAuthorityEvidenceV1 = from_bounded_json(json, MAX_CAPABILITIES_BYTES)?;
+    let canonical = serde_json::to_string(
+        &serde_json::from_str::<serde_json::Value>(json).map_err(|_| invalid())?,
+    )
+    .map_err(|_| invalid())?;
+    let expected_decision = match expected.decision() {
+        AuthorityDecision::Allow => "allow",
+        AuthorityDecision::Deny => "deny",
+    };
+    let expected_privilege = match expected.effective_privilege() {
+        crate::domain::PrivilegeMode::User => "user",
+        crate::domain::PrivilegeMode::Administrative => "administrative",
+    };
+    if canonical != json
+        || !matches!(value.version, 1 | 2)
+        || value.decision != expected_decision
+        || value.effective_privilege != expected_privilege
+        || value.policy != expected.policy_version().as_str()
+        || value.reason_code != expected.reason_code().as_str()
+        || !valid_full_authority_evidence(&value)
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
+fn valid_full_authority_evidence(value: &StoredAuthorityEvidenceV1) -> bool {
+    let facts = &value.authority_facts;
+    let capabilities = &value.capabilities;
+    ((value.version == 1 && value.prepared_cwd.is_none())
+        || (value.version == 2
+            && value
+                .prepared_cwd
+                .as_ref()
+                .is_some_and(valid_prepared_cwd_evidence)))
+        && value.decision == "allow"
+        && value.reason_code == "allowed"
+        && matches!(
+            value.effective_privilege.as_str(),
+            "user" | "administrative"
+        )
+        && matches!(
+            value.requested_privilege.as_str(),
+            "user" | "administrative"
+        )
+        && value.policy == "v0-development-workstation"
+        && valid_authority_reason_code(&value.reason_code)
+        && crate::domain::Sha256Digest::parse_canonical(&value.arguments_sha256).is_ok()
+        && value.canonical_argument_bytes <= 65_536
+        && value.workstation_generation > 0
+        && value.schema_version.is_some_and(|version| version > 0)
+        && value
+            .tool_version
+            .as_ref()
+            .is_some_and(|version| !version.is_empty())
+        && value
+            .required_capability
+            .as_deref()
+            .is_some_and(|capability| {
+                matches!(capability, "filesystem_read" | "foreground_execute")
+            })
+        && !value.craxii_id.is_empty()
+        && !value.runtime_instance_id.is_empty()
+        && !value.tool_name.is_empty()
+        && !value.work_id.is_empty()
+        && !value.workspace_id.is_empty()
+        && !value.workstation_id.is_empty()
+        && facts.requested_timeout_ms.is_none_or(|timeout| timeout > 0)
+        && facts.requested_stdout_bytes <= capabilities.max_stdout_bytes
+        && facts.requested_stderr_bytes <= capabilities.max_stderr_bytes
+        && facts
+            .requested_timeout_ms
+            .is_none_or(|timeout| timeout <= capabilities.max_execution_timeout_ms)
+        && facts.tool_allowed
+        && !facts.authority_widening_attempt
+        && !facts.malformed_arguments
+        && !facts.work_cancelled
+        && capabilities.privilege_user
+        && capabilities.workspace_present
+        && (value.required_capability.as_deref() != Some("filesystem_read")
+            || capabilities.filesystem_read)
+        && (value.required_capability.as_deref() != Some("foreground_execute")
+            || capabilities.foreground_execute)
+        && (value.effective_privilege != "administrative"
+            || (facts.administrative_allowed && capabilities.privilege_administrative))
+}
+
+fn valid_prepared_cwd_evidence(value: &StoredPreparedCwdEvidenceV1) -> bool {
+    value.version == 1
+        && value.object_type == "directory"
+        && value.inode > 0
+        && value.workstation_generation > 0
+        && !value.workstation_id.is_empty()
+        && !value.workspace_id.is_empty()
+        && !value.requested_cwd.is_empty()
+        && value.requested_cwd.len() <= crate::domain::MAX_LOGICAL_PATH_BYTES
+        && !value.requested_cwd.contains(['\0', '\\'])
+        && value.resolved_cwd.starts_with('/')
+        && value.resolved_cwd.len() <= crate::domain::MAX_LOGICAL_PATH_BYTES
+        && !value.resolved_cwd.contains('\0')
+}
+
+pub(super) fn validate_dispatch_evidence(
+    json: &str,
+    expected_authority: &AuthorityDecisionSnapshot,
+    expected_cwd: &crate::ports::workstation_preparation::PreparedCwdEvidence,
+) -> Result<(), SqliteAdapterError> {
+    validate_authority_evidence(json, expected_authority)?;
+    let value: StoredAuthorityEvidenceV1 = from_bounded_json(json, MAX_CAPABILITIES_BYTES)?;
+    let prepared = value.prepared_cwd.ok_or_else(invalid)?;
+    let resolved = expected_cwd.resolved_cwd();
+    let identity = expected_cwd.object_identity();
+    if value.version != 2
+        || !valid_prepared_cwd_evidence(&prepared)
+        || prepared.workstation_id != resolved.workstation_id().to_string()
+        || prepared.workstation_generation != resolved.workstation_generation().get()
+        || prepared.workspace_id != resolved.workspace_id().to_string()
+        || prepared.requested_cwd != resolved.requested_path().canonical()
+        || prepared.resolved_cwd != resolved.resolved_absolute_path()
+        || prepared.device != identity.device()
+        || prepared.inode != identity.inode()
+        || !matches!(
+            identity.object_type(),
+            crate::ports::workstation_preparation::PreparedCwdObjectType::Directory
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 pub(super) fn validate_tool_result(json: &str) -> Result<ToolResultClass, SqliteAdapterError> {
+    decode_tool_result(json).map(|value| value.result_class)
+}
+
+pub(super) struct DecodedToolResult {
+    pub result_class: ToolResultClass,
+    pub fields: Vec<(String, String)>,
+}
+
+pub(super) fn decode_tool_result(json: &str) -> Result<DecodedToolResult, SqliteAdapterError> {
     let value: StoredToolResultV1 = from_bounded_json(json, MAX_OUTPUT_JSON_BYTES)?;
     let mut prior: Option<&str> = None;
     for (key, field) in &value.fields {
@@ -830,7 +1061,10 @@ pub(super) fn validate_tool_result(json: &str) -> Result<ToolResultClass, Sqlite
         && value.summary.len() <= 8_192
         && !value.summary.contains('\0')
     {
-        decode_tool_result_class(&value.result_kind)
+        Ok(DecodedToolResult {
+            result_class: decode_tool_result_class(&value.result_kind)?,
+            fields: value.fields,
+        })
     } else {
         Err(corrupt())
     }

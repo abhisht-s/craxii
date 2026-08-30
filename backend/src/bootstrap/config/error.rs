@@ -74,6 +74,10 @@ pub enum ConfigError {
         lower: &'static str,
         upper: &'static str,
     },
+    InvalidToolLimit {
+        field: &'static str,
+        reason: &'static str,
+    },
     InvalidShell {
         reason: &'static str,
     },
@@ -172,6 +176,9 @@ impl Display for ConfigError {
                 formatter,
                 "configuration limit {lower} must not exceed {upper}"
             ),
+            Self::InvalidToolLimit { field, reason } => {
+                write!(formatter, "invalid tool limit {field}: {reason}")
+            }
             Self::InvalidShell { reason } => {
                 write!(formatter, "invalid shell configuration: {reason}")
             }

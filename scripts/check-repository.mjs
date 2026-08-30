@@ -361,9 +361,9 @@ function verifyBootstrapSnapshotStructure(source) {
   return snapshotSource;
 }
 
-function stage14ImplementationLeaks(productionFiles) {
+function stage15ImplementationLeaks(productionFiles) {
   const leaks = [];
-  const generalImplementation = /struct\s+ToolRegistry\b|(?:async\s+)?fn\s+execute_tool\s*\(|reqwest|hyper::client|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(/;
+  const generalImplementation = /reqwest|hyper::client|\b(?:OpenAI|Anthropic)(?:Client|Adapter)\b|\b(?:struct|trait|impl)\s+ModelGateway\b|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(|\b(?:struct|impl)\s+RemoteWorkstation\b|\b(?:struct|impl)\s+Mcp(?:Client|Server|Transport)\b|\bfn\s+(?:register|load)_(?:plugin|dynamic_tool)s?\s*\(/;
   for (const file of productionFiles) {
     const source = stripRustComments(withoutRustTestModules(file.source));
     if (generalImplementation.test(source)) {
@@ -371,6 +371,704 @@ function stage14ImplementationLeaks(productionFiles) {
     }
   }
   return sortedStrings(new Set(leaks));
+}
+
+function stage14HandlerViolations(source) {
+  const production = stripRustComments(withoutRustTestModules(source));
+  const violations = [];
+  const forbidden = [
+    ['handler StateStore access', /\b(?:Tool)?StateStore\b/],
+    ['handler SQLx access', /\bsqlx\b|\bSqlite[A-Za-z0-9_]*\b/],
+    ['handler journal access', /\bJournal[A-Za-z0-9_]*\b|\bjournal(?:_|\b)/],
+    ['handler direct filesystem access', /\b(?:std|tokio)::fs\b|\b(?:File|OpenOptions)::open\s*\(/],
+    ['handler direct process access', /\b(?:std|tokio)::process\b|\bCommand::new\s*\(/],
+  ];
+  for (const [label, pattern] of forbidden) {
+    if (pattern.test(production)) violations.push(label);
+  }
+  if (/\.capabilities\s*\(|\.inspect_execution\s*\(|\.cancel_execution\s*\(/.test(production)) {
+    violations.push('handler owns a non-action Workstation lifecycle operation');
+  }
+  const functions = rustFunctionBlocks(production);
+  const inventory = stage14FunctionInventory(functions);
+  const analysis = newStage14CallGraphAnalysis(inventory, 'handler');
+  const invokes = functions.filter((block) => block.name === 'invoke');
+  const summary = invokes.reduce(
+    (combined, block) => mergeStage14Summaries(
+      combined,
+      analysis.region(block.body, stage14TypedWorkstationReceivers(block, false), block.name),
+    ),
+    emptyStage14Summary(),
+  );
+  if (summary.read !== 1) violations.push('read_file action is not single-shot from handler roots');
+  if (summary.execute !== 1) violations.push('execute action is not single-shot from handler roots');
+  if (summary.repeated) violations.push('handler machine operation is reachable through retry or recursion');
+  if (summary.depthExceeded) violations.push('handler helper call graph exceeded the finite analysis bound');
+  return violations;
+}
+
+const STAGE14_CALL_GRAPH_MAX_DEPTH = 16;
+
+function rustFunctionBlocks(source) {
+  const blocks = [];
+  const pattern = /\b(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\b/g;
+  for (const match of source.matchAll(pattern)) {
+    const parameters = source.indexOf('(', match.index);
+    if (parameters === -1) continue;
+    const parameterEnd = findMatchingDelimiter(source, parameters, '(', ')');
+    if (parameterEnd === -1) continue;
+    const opening = source.indexOf('{', parameterEnd);
+    const semicolon = source.indexOf(';', parameterEnd);
+    if (opening === -1 || (semicolon !== -1 && semicolon < opening)) continue;
+    const closing = findMatchingDelimiter(source, opening, '{', '}');
+    if (closing === -1) continue;
+    blocks.push({
+      name: match[1],
+      signature: source.slice(match.index, opening),
+      parameters: source.slice(parameters + 1, parameterEnd),
+      body: source.slice(opening + 1, closing),
+      source: source.slice(match.index, closing + 1),
+    });
+  }
+  return blocks;
+}
+
+function stage14FunctionInventory(functions) {
+  const inventory = new Map();
+  for (const block of functions) {
+    const definitions = inventory.get(block.name) ?? [];
+    definitions.push(block);
+    inventory.set(block.name, definitions);
+  }
+  return inventory;
+}
+
+function stage14TypedWorkstationReceivers(block, includeServiceField) {
+  const receivers = new Set();
+  for (const match of `${block.parameters},${block.body}`.matchAll(
+    /\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^,)]*\bWorkstation\b[^,)]*/g,
+  )) {
+    receivers.add(match[1]);
+  }
+  if (includeServiceField && /(?:^|,)\s*&(?:'\w+\s+)?self\b/.test(block.parameters)) {
+    receivers.add('self.workstation');
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const match of block.body.matchAll(
+      /\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)[^=;]*=\s*&?\s*((?:self\s*\.\s*)?[A-Za-z_][A-Za-z0-9_]*)\s*(?:\.\s*as_ref\s*\(\s*\))?\s*;/g,
+    )) {
+      const source = match[2].replace(/\s+/g, '');
+      if (receivers.has(source) && !receivers.has(match[1])) {
+        receivers.add(match[1]);
+        changed = true;
+      }
+    }
+  }
+  return receivers;
+}
+
+function emptyStage14Summary() {
+  return {
+    read: 0,
+    execute: 0,
+    handoff: 0,
+    cancel: 0,
+    cancelSites: [],
+    repeated: false,
+    cycle: false,
+    cycleSites: [],
+    depthExceeded: false,
+    visited: new Set(),
+  };
+}
+
+function mergeStage14Summaries(left, right, multiplier = 1) {
+  left.read += right.read * multiplier;
+  left.execute += right.execute * multiplier;
+  left.handoff += right.handoff * multiplier;
+  left.cancel += right.cancel * multiplier;
+  left.cancelSites.push(...right.cancelSites);
+  left.repeated ||= right.repeated || multiplier > 1 && stage14MachineActionCount(right) > 0;
+  left.cycle ||= right.cycle;
+  left.cycleSites.push(...right.cycleSites);
+  left.depthExceeded ||= right.depthExceeded;
+  for (const name of right.visited) left.visited.add(name);
+  return left;
+}
+
+function stage14MachineActionCount(summary) {
+  return summary.read + summary.execute + summary.handoff;
+}
+
+function stage14DirectSinks(body, receivers, sourceName, moduleKind) {
+  const summary = emptyStage14Summary();
+  for (const match of body.matchAll(
+    /\b((?:self\s*\.\s*)?[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(read_file|execute|cancel_execution)\s*\(/g,
+  )) {
+    const receiver = match[1].replace(/\s+/g, '');
+    if (!receivers.has(receiver)) continue;
+    if (match[2] === 'read_file') summary.read += 1;
+    else if (match[2] === 'execute') summary.execute += 1;
+    else {
+      summary.cancel += 1;
+      summary.cancelSites.push(sourceName);
+    }
+  }
+  for (const match of body.matchAll(
+    /\bWorkstation\s*::\s*(read_file|execute|cancel_execution)\s*\(\s*&?\s*([A-Za-z_][A-Za-z0-9_]*)/g,
+  )) {
+    if (!receivers.has(match[2])) continue;
+    if (match[1] === 'read_file') summary.read += 1;
+    else if (match[1] === 'execute') summary.execute += 1;
+    else {
+      summary.cancel += 1;
+      summary.cancelSites.push(sourceName);
+    }
+  }
+  if (moduleKind === 'service') {
+    summary.handoff += [...body.matchAll(/\bhandler\s*\.\s*invoke\s*\(/g)].length;
+  }
+  return summary;
+}
+
+function stage14LocalCallCounts(body, inventory) {
+  const calls = new Map();
+  for (const name of inventory.keys()) {
+    const callPattern = new RegExp(
+      `(?:\\bself\\s*\\.\\s*|\\bSelf\\s*::\\s*|(?<![A-Za-z0-9_.:]))${name}\\s*\\(`,
+      'g',
+    );
+    const count = [...body.matchAll(callPattern)].length;
+    if (count > 0) calls.set(name, count);
+  }
+  return calls;
+}
+
+function newStage14CallGraphAnalysis(inventory, moduleKind) {
+  const memo = new Map();
+  const visited = new Set();
+
+  const summarizeFunction = (name, depth, active) => {
+    if (memo.has(name)) return memo.get(name);
+    if (active.has(name)) {
+      const cycle = emptyStage14Summary();
+      cycle.cycle = true;
+      cycle.cycleSites.push(name);
+      return cycle;
+    }
+    if (depth > STAGE14_CALL_GRAPH_MAX_DEPTH) {
+      const exhausted = emptyStage14Summary();
+      exhausted.depthExceeded = true;
+      return exhausted;
+    }
+    const nextActive = new Set(active);
+    nextActive.add(name);
+    visited.add(name);
+    const result = emptyStage14Summary();
+    result.visited.add(name);
+    for (const block of inventory.get(name) ?? []) {
+      const receivers = stage14TypedWorkstationReceivers(block, moduleKind === 'service');
+      const direct = stage14DirectSinks(block.body, receivers, name, moduleKind);
+      mergeStage14Summaries(result, direct);
+      for (const [callee, count] of stage14LocalCallCounts(block.body, inventory)) {
+        const child = summarizeFunction(callee, depth + 1, nextActive);
+        mergeStage14Summaries(result, child, count);
+      }
+      if (
+        /\bloop\s*\{|\bwhile\s+[^;{]+\{|\bfor\s+[A-Za-z_][A-Za-z0-9_]*\s+in\b/.test(block.body) &&
+        stage14MachineActionCount(result) > 0
+      ) {
+        result.repeated = true;
+      }
+    }
+    if (result.cycle && stage14MachineActionCount(result) > 0) result.repeated = true;
+    memo.set(name, result);
+    return result;
+  };
+
+  return {
+    region(body, receivers = new Set(), sourceName = '<root>') {
+      const result = stage14DirectSinks(body, receivers, sourceName, moduleKind);
+      for (const [callee, count] of stage14LocalCallCounts(body, inventory)) {
+        mergeStage14Summaries(result, summarizeFunction(callee, 1, new Set()), count);
+      }
+      for (const name of visited) result.visited.add(name);
+      return result;
+    },
+  };
+}
+
+function stage14ServiceViolations(source) {
+  const production = stripRustComments(withoutRustTestModules(source));
+  const violations = [];
+  const functions = rustFunctionBlocks(production);
+  const executeBlock = functions.find((block) => block.name === 'execute_call');
+  if (!executeBlock) {
+    return ['execute_call is absent or malformed'];
+  }
+  const executeCall = executeBlock.body;
+  const inventory = stage14FunctionInventory(functions.filter((block) => block !== executeBlock));
+  const analysis = newStage14CallGraphAnalysis(inventory, 'service');
+  const serviceReceivers = stage14TypedWorkstationReceivers(executeBlock, true);
+  const requested = executeCall.indexOf('.request_tool_execution(');
+  const dispatch = executeCall.indexOf('.commit_tool_dispatch_intent(');
+  const handoff = executeCall.indexOf('handler.invoke(');
+  if (!(requested !== -1 && dispatch > requested && handoff > dispatch)) {
+    violations.push('machine handoff is not dominated by committed dispatch intent');
+  }
+  const beforeDispatch = dispatch === -1 ? executeCall : executeCall.slice(0, dispatch);
+  const preDispatch = analysis.region(beforeDispatch, serviceReceivers, 'execute_call');
+  if (stage14MachineActionCount(preDispatch) > 0) {
+    violations.push('pre-dispatch machine action is reachable');
+  }
+  if (preDispatch.depthExceeded) {
+    violations.push('pre-dispatch helper call graph exceeded the finite analysis bound');
+  }
+  const total = analysis.region(executeCall, serviceReceivers, 'execute_call');
+  if (stage14MachineActionCount(total) !== 1 || total.handoff !== 1) {
+    violations.push('one tool attempt does not have exactly one reachable machine handoff');
+  }
+  if (total.repeated) {
+    violations.push(`machine action is reachable through retry, loop, or recursion (${total.read}/${total.execute}/${total.handoff}; repeated=${total.repeated}; cycle=${total.cycle}; cycle_sites=${sortedStrings(new Set(total.cycleSites)).join(',')})`);
+  }
+  if (total.depthExceeded) {
+    violations.push('service helper call graph exceeded the finite analysis bound');
+  }
+  if (
+    total.cancelSites.some((site) => site !== 'await_handler') ||
+    total.cancel > 1 ||
+    total.cancel > 0 && !/handoff_started[\s\S]*cancellable_execution[\s\S]*cancellation_sent/.test(
+      (inventory.get('await_handler') ?? [])[0]?.body ?? '',
+    )
+  ) {
+    violations.push('cancel_execution escapes the active post-handoff cancellation path');
+  }
+  const freeze = executeCall.indexOf('freeze_tool_deadline(');
+  const afterFreeze = freeze === -1 ? '' : executeCall.slice(freeze);
+  if (
+    freeze === -1 ||
+    requested < freeze ||
+    /Instant\s*::\s*now\s*\(\s*\)\s*(?:\+|\.checked_add\s*\()[^;]*(?:effective_timeout|timeout)/.test(afterFreeze) ||
+    /monotonic_now\s*\(\s*\)\s*\.\s*elapsed\s*\(\s*\)\s*\.\s*checked_add/.test(afterFreeze)
+  ) {
+    violations.push('Stage 14 machine deadline is reconstructed after the freeze point');
+  }
+  return violations;
+}
+
+function stage14RegistryViolations(source) {
+  const production = stripRustComments(withoutRustTestModules(source));
+  const violations = [];
+  if (!/Self::try_new\s*\(\s*vec!\[\s*read_file_definition\(policy\)\s*,\s*run_shell_definition\(policy\)\s*,?\s*\]\s*\)/s.test(production)) {
+    violations.push('registry inventory or order differs');
+  }
+  if (!/pub const V0_TOOL_IMPLEMENTATION_VERSION:\s*&str\s*=\s*"1\.0\.0"/.test(production)) {
+    violations.push('tool implementation version differs');
+  }
+  if (!/pub const V0_TOOL_SCHEMA_VERSION:\s*i64\s*=\s*1\s*;/.test(production)) {
+    violations.push('tool schema version differs');
+  }
+  if (/pub\s+fn\s+(?:add|insert|register|remove|replace|load_plugin)\b/.test(production)) {
+    violations.push('dynamic registry mutation surface');
+  }
+  if (!/definitions:\s*Box<\[ToolDefinition\]>/.test(production) || !/fingerprint:\s*Sha256Digest/.test(production)) {
+    violations.push('registry is not immutable and fingerprinted');
+  }
+  if (!/Value::Array\s*\(\s*definitions\s*\.iter\(\)\s*\.map\(ToolDefinition::semantic_value\)/s.test(production)) {
+    violations.push('registry fingerprint does not use stable-order semantic definitions');
+  }
+  if (/fn\s+(?:read_file_definition|run_shell_definition)\b[\s\S]*?(?:SystemTime|Instant|process::id|Arc::as_ptr|as_ptr\s*\()/m.test(production)) {
+    violations.push('registry semantic definition contains runtime identity');
+  }
+  return violations;
+}
+
+function verifyStage14CheckerNegativeProbes(handlerSource, registrySource, serviceSource) {
+  let probeCount = 0;
+  const handlerCases = [
+    ['handler journaling', `${handlerSource}\nfn injected() { let _: JournalEventId; }`],
+    ['handler SQLx', `${handlerSource}\nfn injected() { sqlx::query("select 1"); }`],
+    ['read_file shell fallback', handlerSource.replace('.read_file(request)', '.execute(request)')],
+    ['direct filesystem read', `${handlerSource}\nfn injected() { std::fs::read("x"); }`],
+    ['run_shell direct Command', `${handlerSource}\nfn injected() { std::process::Command::new("sh"); }`],
+  ];
+  for (const [label, fixture] of handlerCases) {
+    assert(
+      stage14HandlerViolations(fixture).length > 0,
+      `checker negative probe was not rejected: ${label}`,
+    );
+    probeCount += 1;
+  }
+  const registryCases = [
+    ['dynamic registry mutation', `${registrySource}\nimpl ToolRegistry { pub fn register(&mut self) {} }`],
+    [
+      'third production tool',
+      registrySource.replace(
+        'vec![\n            read_file_definition(policy),\n            run_shell_definition(policy),\n        ]',
+        'vec![\n            read_file_definition(policy),\n            run_shell_definition(policy),\n            browser_definition(policy),\n        ]',
+      ),
+    ],
+  ];
+  for (const [label, fixture] of registryCases) {
+    assert(
+      stage14RegistryViolations(fixture).length > 0,
+      `checker negative probe was not rejected: ${label}`,
+    );
+    probeCount += 1;
+  }
+  const serviceCases = [
+    ['Workstation call before dispatch commit', serviceSource.replace(
+      'let dispatch_at = self.wall_now()?;',
+      'let _ = self.workstation.read_file(panic!("checker probe")).await; let dispatch_at = self.wall_now()?;',
+    )],
+    ['direct Workstation action plus handler', serviceSource.replace(
+      'let handler = resolve_handler(definition.handler());',
+      'let _ = self.workstation.execute(panic!("checker probe")).await; let handler = resolve_handler(definition.handler());',
+    )],
+    ['duplicate handler handoff', serviceSource.replace(
+      'handler.invoke(',
+      'handler.invoke(arguments.input(), handler_context.clone(), self.workstation.as_ref()); handler.invoke(',
+    )],
+  ];
+  for (const [label, fixture] of serviceCases) {
+    assert(stage14ServiceViolations(fixture).length > 0, `checker negative probe was not rejected: ${label}`);
+    probeCount += 1;
+  }
+  const helperPreDispatchRead = serviceSource
+    .replace(
+      'let dispatch_at = self.wall_now()?;',
+      'helper_pre_read(self.workstation.as_ref()).await; let dispatch_at = self.wall_now()?;',
+    )
+    .concat('\nasync fn helper_pre_read(machine: &dyn Workstation) { let _ = machine.read_file(todo!()).await; }\n');
+  assert(
+    stage14ServiceViolations(helperPreDispatchRead).length > 0,
+    'checker negative probe was not rejected: helper-mediated pre-dispatch read',
+  );
+  probeCount += 1;
+  const helperPreDispatchExecute = serviceSource
+    .replace(
+      'let dispatch_at = self.wall_now()?;',
+      'helper_pre_execute(self.workstation.as_ref()).await; let dispatch_at = self.wall_now()?;',
+    )
+    .concat('\nasync fn helper_pre_execute(renamed_machine: &dyn Workstation) { let _ = renamed_machine.execute(todo!()).await; }\n');
+  assert(
+    stage14ServiceViolations(helperPreDispatchExecute).length > 0,
+    'checker negative probe was not rejected: helper-mediated pre-dispatch execute with renamed receiver',
+  );
+  probeCount += 1;
+  const directReadAndHandler = serviceSource.replace(
+    'let handler = resolve_handler(definition.handler());',
+    'let _ = self.workstation.read_file(panic!("checker probe")).await; let handler = resolve_handler(definition.handler());',
+  );
+  assert(
+    stage14ServiceViolations(directReadAndHandler).length > 0,
+    'checker negative probe was not rejected: direct service read plus normal handler',
+  );
+  probeCount += 1;
+  const helperReadAndHandler = serviceSource
+    .replace(
+      'let handler = resolve_handler(definition.handler());',
+      'helper_after_dispatch(self.workstation.as_ref()).await; let handler = resolve_handler(definition.handler());',
+    )
+    .concat('\nasync fn helper_after_dispatch(machine: &dyn Workstation) { let _ = machine.read_file(todo!()).await; }\n');
+  assert(
+    stage14ServiceViolations(helperReadAndHandler).length > 0,
+    'checker negative probe was not rejected: helper read plus normal handler',
+  );
+  probeCount += 1;
+  const recursiveRetry = serviceSource
+    .replace(
+      'let handler = resolve_handler(definition.handler());',
+      'recursive_retry(self.workstation.as_ref()).await; let handler = resolve_handler(definition.handler());',
+    )
+    .concat(`
+      fn recursive_retry<'a>(machine: &'a dyn Workstation) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+          let _ = machine.read_file(todo!()).await;
+          recursive_retry(machine).await;
+        })
+      }
+    `);
+  assert(
+    stage14ServiceViolations(recursiveRetry).length > 0,
+    'checker negative probe was not rejected: recursive helper retry',
+  );
+  probeCount += 1;
+  const loopRetry = serviceSource
+    .replace(
+      'let handler = resolve_handler(definition.handler());',
+      'loop_retry(self.workstation.as_ref()).await; let handler = resolve_handler(definition.handler());',
+    )
+    .concat('\nasync fn loop_retry(machine: &dyn Workstation) { loop { let _ = machine.execute(todo!()).await; } }\n');
+  assert(
+    stage14ServiceViolations(loopRetry).length > 0,
+    'checker negative probe was not rejected: loop helper retry',
+  );
+  probeCount += 1;
+  const deadlineReconstruction = serviceSource.replace(
+    'let handler = resolve_handler(definition.handler());',
+    'let reconstructed_deadline = std::time::Instant::now() + Duration::from_millis(effective_timeout_ms); let handler = resolve_handler(definition.handler());',
+  );
+  assert(
+    stage14ServiceViolations(deadlineReconstruction).length > 0,
+    'checker negative probe was not rejected: post-freeze deadline reconstruction',
+  );
+  probeCount += 1;
+  const duplicateRead = handlerSource.replace(
+    'workstation\n                .read_file(request)',
+    'workstation.read_file(request.clone()).await?; workstation.read_file(request)',
+  );
+  assert(stage14HandlerViolations(duplicateRead).length > 0, 'checker negative probe was not rejected: duplicate direct read_file');
+  probeCount += 1;
+  const duplicateExecute = handlerSource.replace(
+    'workstation\n                .execute(request)',
+    'workstation.execute(request.clone()).await?; workstation.execute(request)',
+  );
+  assert(stage14HandlerViolations(duplicateExecute).length > 0, 'checker negative probe was not rejected: duplicate direct execute');
+  probeCount += 1;
+  const helperRetry = handlerSource
+    .replace('workstation\n                .read_file(request)', 'read_once(workstation, request.clone()).await?; read_once(workstation, request)')
+    .concat('\nasync fn read_once(workstation: &dyn Workstation, request: FileReadRequest) -> Result<FileReadResult, WorkstationError> { workstation.read_file(request).await }\n');
+  assert(stage14HandlerViolations(helperRetry).length > 0, 'checker negative probe was not rejected: helper-mediated second Workstation action');
+  probeCount += 1;
+
+  const harmlessHandlerChain = handlerSource
+    .replace('let request = FileReadRequest {', 'harmless_a(); let request = FileReadRequest {')
+    .concat('\nfn harmless_a() { harmless_b(); } fn harmless_b() {}\n');
+  assert(
+    stage14HandlerViolations(harmlessHandlerChain).length === 0,
+    'checker false-positive probe rejected harmless handler helpers',
+  );
+  const harmlessPreDispatch = serviceSource
+    .replace(
+      'let dispatch_at = self.wall_now()?;',
+      'harmless_service_a(); let dispatch_at = self.wall_now()?;',
+    )
+    .concat('\nfn harmless_service_a() { harmless_service_b(); } fn harmless_service_b() {}\n');
+  assert(
+    stage14ServiceViolations(harmlessPreDispatch).length === 0,
+    'checker false-positive probe rejected harmless pre-dispatch helpers',
+  );
+  const harmlessRetryName = serviceSource
+    .replace(
+      'let dispatch_at = self.wall_now()?;',
+      'harmless_retry(); let dispatch_at = self.wall_now()?;',
+    )
+    .concat('\nfn harmless_retry() { let _ = 1_u8.checked_add(1); }\n');
+  assert(
+    stage14ServiceViolations(harmlessRetryName).length === 0,
+    'checker false-positive probe rejected a retry-named helper without machine operations',
+  );
+  const preparationBeforeDispatch = serviceSource.replace(
+    'let dispatch_at = self.wall_now()?;',
+    'let _ = self.preparation.prepare(panic!("checker probe")).await; let dispatch_at = self.wall_now()?;',
+  );
+  assert(
+    stage14ServiceViolations(preparationBeforeDispatch).length === 0,
+    'checker false-positive probe rejected WorkstationPreparation before dispatch',
+  );
+  const testOnlyFake = serviceSource.concat(`
+    #[cfg(test)]
+    mod injected_test_only {
+      async fn fake(machine: &dyn Workstation) {
+        let _ = machine.read_file(todo!()).await;
+        let _ = machine.execute(todo!()).await;
+      }
+    }
+  `);
+  assert(
+    stage14ServiceViolations(testOnlyFake).length === 0,
+    'checker false-positive probe rejected test-only fake Workstation code',
+  );
+  const unreachableLocalInternals = serviceSource.concat(`
+    fn stage13_local_workstation_internal(local: &LocalWorkstation) {
+      let _ = local.execute(todo!());
+    }
+  `);
+  assert(
+    stage14ServiceViolations(unreachableLocalInternals).length === 0,
+    'checker false-positive probe rejected unreachable Stage 13 LocalWorkstation internals',
+  );
+  const executeRouter = `
+    Router::new()
+      .route("/health/live", get(liveness))
+      .route("/health/ready", get(readiness))
+      .route("/bootstrap", get(bootstrap))
+      .route("/conversations/{conversation_id}/messages", post(message))
+      .route("/work-items/{work_id}/cancel", post(cancel))
+      .route("/events", get(events))
+      .route("/tools/{name}/execute", post(execute));`;
+  expectStructuralRejection('public tool endpoint', () => verifyStage11RouteInventory(executeRouter));
+  probeCount += 1;
+  assert(
+    stage15ImplementationLeaks([{ path: 'application/provider.rs', source: 'async fn invoke_model() {}' }]).length === 1,
+    'checker negative probe was not rejected: provider import or model invocation',
+  );
+  probeCount += 1;
+  assert(
+    stage15ImplementationLeaks([{ path: 'application/context_assembler.rs', source: 'struct ContextAssembler;' }]).length === 1,
+    'checker negative probe was not rejected: context assembler',
+  );
+  probeCount += 1;
+  assert(
+    stage15ImplementationLeaks([{ path: 'application/agent_loop.rs', source: 'async fn run_agent_loop() {}' }]).length === 1,
+    'checker negative probe was not rejected: agent loop',
+  );
+  probeCount += 1;
+  for (const [label, path, source] of [
+    ['ModelGateway', 'ports/model_gateway.rs', 'pub trait ModelGateway {}'],
+    ['OpenAI provider client', 'adapters/openai.rs', 'struct OpenAIClient;'],
+    ['MCP transport', 'adapters/mcp.rs', 'struct McpTransport;'],
+    ['RemoteWorkstation', 'adapters/remote.rs', 'struct RemoteWorkstation;'],
+    ['dynamic plugin registration', 'application/plugins.rs', 'fn register_plugins() {}'],
+  ]) {
+    assert(stage15ImplementationLeaks([{ path, source }]).length === 1, `checker negative probe was not rejected: ${label}`);
+    probeCount += 1;
+  }
+  const failpointIsGated = (source) =>
+    !/\breach\s*\(/.test(source) ||
+    /#\[cfg\(feature = "test-failpoints"\)\][\s\S]{0,120}\breach\s*\(/.test(source);
+  assert(
+    failpointIsGated('#[cfg(feature = "test-failpoints")] fn call() { reach(); }') &&
+      !failpointIsGated('fn call() { reach(); }'),
+    'checker negative probe was not rejected: failpoint release leakage',
+  );
+  probeCount += 1;
+  return probeCount;
+}
+
+function verifyStage14ToolStructure(rustRoot, productionFiles) {
+  const applicationRoot = join(rustRoot, 'application');
+  const portsRoot = join(rustRoot, 'ports');
+  const registry = readFileSync(join(applicationRoot, 'tool_registry.rs'), 'utf8');
+  const handlers = readFileSync(join(applicationRoot, 'tool_handlers.rs'), 'utf8');
+  const authority = readFileSync(join(applicationRoot, 'authority.rs'), 'utf8');
+  const service = readFileSync(join(applicationRoot, 'tool_execution_service.rs'), 'utf8');
+  const preparation = readFileSync(join(portsRoot, 'workstation_preparation.rs'), 'utf8');
+  const bootstrap = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
+  const failpoints = readFileSync(join(rustRoot, 'test_failpoints.rs'), 'utf8');
+  const artifactStore = readFileSync(join(rustRoot, 'adapters', 'artifacts', 'local.rs'), 'utf8');
+  const execution = readFileSync(join(rustRoot, 'adapters', 'local_workstation', 'execution.rs'), 'utf8');
+  const stage8Tests = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'stage8_tests.rs'), 'utf8');
+
+  assert(stage14RegistryViolations(registry).length === 0, `Stage 14 registry invariant differs: ${stage14RegistryViolations(registry).join(', ')}`);
+  assert(stage14HandlerViolations(handlers).length === 0, `Stage 14 handler boundary differs: ${stage14HandlerViolations(handlers).join(', ')}`);
+  assert(stage14ServiceViolations(service).length === 0, `Stage 14 service dispatch boundary differs: ${stage14ServiceViolations(service).join(', ')}`);
+  assert(/pub trait AuthorityEvaluator:\s*Send\s*\+\s*Sync/.test(authority), 'Stage 14 typed authority evaluator seam is absent');
+  assert(authority.includes('v0-development-workstation'), 'Stage 14 stable authority policy name differs');
+  for (const reason of [
+    'unregistered_tool', 'malformed_arguments', 'cancelled_work', 'authority_widening',
+    'wrong_workstation', 'stale_generation', 'wrong_workspace', 'unsupported_capability',
+    'administrative_unavailable', 'limit_exceeded',
+  ]) {
+    assert(authority.includes(`"${reason}"`), `Stage 14 authority reason is absent: ${reason}`);
+  }
+  const preparationTrait = extractRustNamedBlock(
+    preparation,
+    /pub\s+trait\s+WorkstationPreparation\b/,
+    'WorkstationPreparation trait',
+  );
+  assert(equalStringArrays(rustMethodNames(preparationTrait), ['prepare']), 'Stage 14 preparation seam must expose exactly prepare');
+  assert(/spawn_blocking/.test(readFileSync(join(rustRoot, 'adapters', 'local_workstation.rs'), 'utf8')), 'LocalWorkstation preparation must resolve adapter-observed cwd');
+
+  const productionService = stripRustComments(withoutRustTestModules(service));
+  const deadlineFreeze = productionService.indexOf('freeze_tool_deadline(');
+  const requested = productionService.indexOf('.request_tool_execution(');
+  const requestedHook = productionService.indexOf('AfterToolRequestedCommit');
+  const capabilities = productionService.indexOf('.capabilities(');
+  const prepared = productionService.indexOf('.prepare(');
+  const dispatch = productionService.indexOf('.commit_tool_dispatch_intent(');
+  const dispatchHook = productionService.indexOf('AfterToolDispatchIntentCommit');
+  const handler = productionService.indexOf('handler.invoke(');
+  assert(
+    deadlineFreeze !== -1 && requested > deadlineFreeze && requestedHook > requested && capabilities > requestedHook && prepared > capabilities &&
+      dispatch > prepared && dispatchHook > dispatch && handler > dispatchHook,
+    'Stage 14 deadline/requested/preparation/dispatch/Workstation ordering differs',
+  );
+  assert([...productionService.matchAll(/handler\.invoke\s*\(/g)].length === 1, 'Stage 14 service may hand off to a handler exactly once');
+  for (const operation of ['request_tool_execution', 'commit_tool_dispatch_intent', 'finish_tool_execution']) {
+    assert(productionService.includes(`.${operation}(`), `ToolExecutionService does not own ${operation}`);
+  }
+  assert(!/tokio::process|std::process::Command|Command::new|(?:std|tokio)::fs/.test(productionService), 'ToolExecutionService bypasses Workstation or ArtifactStore');
+  assert(/CatchHandlerPanic/.test(productionService) && /persist_outcome_unknown/.test(productionService), 'Stage 14 conservative handler panic boundary is absent');
+  assert(
+    /effective_outer_deadline/.test(productionService) && /freeze_tool_deadline/.test(productionService) &&
+      !/effective_timeout_and_deadline/.test(productionService),
+    'Stage 14 frozen minimum deadline composition is absent',
+  );
+  assert(
+    /PreparedCwdEvidence/.test(preparation) && /PreparedCwdObjectIdentity/.test(preparation) &&
+      /device/.test(preparation) && /inode/.test(preparation),
+    'Stage 14 stable cwd object-identity evidence is absent',
+  );
+  const crashWorker = extractRustFunction(stage8Tests, 'stage14_crash_window_child');
+  assert(
+    /ToolExecutionService::new\s*\(/.test(crashWorker) &&
+      /LocalWorkstation::new\s*\(/.test(crashWorker) &&
+      /\.execute_call\s*\(/.test(crashWorker) &&
+      !/test_failpoints\s*::\s*reach\s*\(/.test(crashWorker),
+    'Stage 14 crash worker must reach failpoints only through the production service lifecycle',
+  );
+
+  for (const construction of ['ToolRegistry::v0(ToolSemanticPolicy', 'V0AuthorityEvaluator', 'ToolExecutionService::new(']) {
+    assert(bootstrap.includes(construction), `Stage 14 bootstrap composition is absent: ${construction}`);
+  }
+  for (const hook of [
+    'AfterToolRequestedCommit', 'AfterToolDispatchIntentCommit', 'AfterToolProcessSpawn',
+    'AfterToolProcessExitBeforeOutcomeCommit', 'AfterArtifactRenameBeforeDbCommit',
+  ]) {
+    assert(failpoints.includes(hook), `Stage 14 failpoint inventory is absent: ${hook}`);
+  }
+  assert(/#\[cfg\(feature = "test-failpoints"\)\][\s\S]{0,160}AfterArtifactRenameBeforeDbCommit/.test(artifactStore), 'artifact rename failpoint is not feature-gated');
+  assert(/#\[cfg\(feature = "test-failpoints"\)\][\s\S]{0,160}AfterToolProcessSpawn/.test(execution), 'process-spawn failpoint is not feature-gated');
+  const finishShell = extractRustFunction(productionService, 'finish_run_shell');
+  const cleanupKnown = finishShell.indexOf('result.execution_id != execution_id');
+  const exitHook = finishShell.indexOf('AfterToolProcessExitBeforeOutcomeCommit');
+  const outcomeCommit = finishShell.indexOf('.finish_tool_execution(');
+  assert(
+    /#\[cfg\(feature = "test-failpoints"\)\][\s\S]{0,180}AfterToolProcessExitBeforeOutcomeCommit/.test(finishShell) &&
+      cleanupKnown !== -1 && exitHook > cleanupKnown && outcomeCommit > exitHook,
+    'process-exit failpoint is not after terminal cleanup classification and before outcome commit',
+  );
+
+  for (const testName of [
+    'v0_registry_inventory_order_versions_and_lookup_are_exact',
+    'duplicate_registry_is_rejected_and_fingerprint_is_deterministic_and_sensitive',
+    'duplicate_keys_are_rejected_recursively_before_typed_decode',
+    'read_file_orders_both_commits_before_machine_action_and_commits_result_before_return',
+    'validation_unknown_admin_and_request_failure_never_dispatch',
+    'run_shell_maps_definite_result_classes_without_retry',
+    'run_shell_effective_deadline_is_the_minimum_and_never_widens_privilege_or_cwd',
+    'requested_capability_preparation_and_dispatch_all_consume_the_frozen_budget',
+    'deadline_expiry_during_requested_persistence_prevents_capability_and_machine_action',
+    'deadline_expiry_during_capability_acquisition_prevents_preparation_and_dispatch',
+    'deadline_expiry_during_preparation_prevents_dispatch_and_machine_action',
+    'active_shutdown_absolute_deadline_shortens_the_same_frozen_deadline',
+    'dispatch_failure_and_outcome_failure_do_not_repeat_machine_action',
+    'duplicate_logical_call_is_rejected_before_a_second_dispatch',
+    'cleanup_ambiguity_and_handler_panic_commit_outcome_unknown_without_redispatch',
+    'handler_panic_before_handoff_is_caught_without_a_workstation_call',
+    'cancellation_before_intent_requested_and_active_execution_are_distinct',
+    'large_read_is_generic_artifact_backed_without_stream_column_reuse',
+    'artifact_finalization_failure_after_handoff_is_durable_outcome_unknown',
+    'emitted_schema_evaluator_matches_typed_decoder_boundary_matrix',
+    'emitted_schema_mutations_prove_evaluator_decoder_independence',
+    'crash_after_tool_requested_commit_recovers_without_redispatch',
+    'crash_after_tool_dispatch_intent_commit_recovers_outcome_unknown',
+    'crash_after_tool_process_spawn_records_one_side_effect',
+    'crash_after_tool_process_exit_preserves_definite_observation_marker',
+    'crash_after_artifact_rename_recovers_and_reports_one_orphan',
+  ]) {
+    assert(new RegExp(`(?:async\\s+)?fn\\s+${testName}\\s*\\(`).test(`${registry}\n${service}\n${stage8Tests}`), `Stage 14 permanent test inventory is missing ${testName}`);
+  }
+  const stage15Modules = productionFiles
+    .map((file) => file.path)
+    .filter((path) => /(?:^|\/)(?:provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
+  const stage15Leaks = stage15ImplementationLeaks(productionFiles);
+  assert(stage15Modules.length === 0 && stage15Leaks.length === 0, `Stage 15+ implementation is forbidden in Stage 14: ${[...stage15Modules, ...stage15Leaks].join(', ')}`);
+  return verifyStage14CheckerNegativeProbes(handlers, registry, service);
 }
 
 function stage13ProcessBoundaryLeaks(productionFiles) {
@@ -900,8 +1598,8 @@ function verifyStage13WorkstationStructure(rustRoot, productionFiles) {
   const inspectMethod = extractRustFunction(workstationImpl, 'inspect_execution');
   const cancelMethod = extractRustFunction(workstationImpl, 'cancel_execution');
   assert(
-    /prepare_execution_cwd/.test(executeMethod) && /runtime\.execute\(request, cwd\?\)\.await/.test(executeMethod),
-    'Stage 13 execute must resolve cwd and delegate to the owned execution runtime',
+    /prepare_committed_execution_cwd/.test(executeMethod) && /runtime\.execute\(request, cwd\?\)\.await/.test(executeMethod),
+    'Stage 13 execute must validate committed cwd evidence and delegate to the owned execution runtime',
   );
   assert(
     /self\.execution\s*\.inspect/.test(inspectMethod) && /runtime\s*\.cancel/.test(cancelMethod),
@@ -1178,10 +1876,10 @@ function verifyStage13CheckerNegativeProbes() {
     stage13ProcessBoundaryLeaks(processEscape).length === 1,
     'checker negative probe was not rejected: process API outside LocalWorkstation',
   );
-  const stage14 = [{ path: 'application/tool_registry.rs', source: 'struct ToolRegistry;' }];
+  const stage15 = [{ path: 'application/provider.rs', source: 'async fn invoke_model() {}' }];
   assert(
-    stage14ImplementationLeaks(stage14).length === 1,
-    'checker negative probe was not rejected: Stage 14 Tool Registry implementation',
+    stage15ImplementationLeaks(stage15).length === 1,
+    'checker negative probe was not rejected: Stage 15 provider implementation',
   );
   const missingStage10Deadline = stage13DeadlinePropagationViolations(
     'self.local_workstation.begin_execution_shutdown(); self.local_workstation.shutdown_executions_before(deadline);',
@@ -1835,7 +2533,11 @@ function verifyStage13Boundaries() {
     'FinalizedArtifact fields must remain private',
   );
   const durablePublicationCallSites = rustFiles
-    .filter((path) => readFileSync(path, 'utf8').includes('FinalizedArtifact::from_durable_publication('))
+    .filter((path) =>
+      withoutRustTestModules(readFileSync(path, 'utf8')).includes(
+        'FinalizedArtifact::from_durable_publication(',
+      ),
+    )
     .map((path) => relative(rustRoot, path));
   assert(
     equalStringArrays(durablePublicationCallSites, ['adapters/artifacts/local.rs']),
@@ -2238,25 +2940,20 @@ function verifyStage13Boundaries() {
       !/^\s*(?:rustls|native-tls|openssl|tower-http-cors|cors)\s*=/mi.test(cargoManifest),
     'forbidden direct Hyper/HTTP/production WebSocket/TLS/CORS dependency is present',
   );
-  const laterStageModuleLeaks = rustFiles
-    .filter((path) => !/_tests\.rs$/.test(path))
-    .map((path) => relative(rustRoot, path))
-    .filter((path) => /(?:^|\/)(?:process-executor|process_executor|tool-registry|tool_registry|provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
   const productionImplementationFiles = rustFiles
     .filter((path) => !/_tests\.rs$/.test(path))
     .map((path) => ({
       path: relative(rustRoot, path),
       source: readFileSync(path, 'utf8'),
     }));
-  const laterStageImplementationLeaks = stage14ImplementationLeaks(productionImplementationFiles);
-  assert(
-    laterStageModuleLeaks.length === 0 &&
-      laterStageImplementationLeaks.length === 0,
-    `Stage 14+ tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 13: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
-  );
-
   verifyStage13WorkstationStructure(rustRoot, productionImplementationFiles);
-  const checkerNegativeProbeCount = verifyStage13CheckerNegativeProbes();
+  const stage13CheckerNegativeProbeCount = verifyStage13CheckerNegativeProbes();
+  const stage14CheckerNegativeProbeCount = verifyStage14ToolStructure(
+    rustRoot,
+    productionImplementationFiles,
+  );
+  const checkerNegativeProbeCount =
+    stage13CheckerNegativeProbeCount + stage14CheckerNegativeProbeCount;
 
   assert(
     /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest) &&
@@ -2278,6 +2975,8 @@ function verifyStage13Boundaries() {
     tableCount: actualStage6Tables.length + actualStage7Tables.length + actualStage8Tables.length,
     indexCount: actualIndexes.length,
     checkerNegativeProbeCount,
+    stage13CheckerNegativeProbeCount,
+    stage14CheckerNegativeProbeCount,
   };
 }
 
@@ -2336,10 +3035,16 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage13 = verifyStage13Boundaries();
+  const stage14 = verifyStage13Boundaries();
 
-  assert(directDependencyCount > 0 && stage13.checkerNegativeProbeCount === 19, 'checker summary evidence is incomplete');
-  console.log('Stage 13 structural invariants passed.');
+  assert(
+    directDependencyCount > 0 &&
+      stage14.stage13CheckerNegativeProbeCount === 19 &&
+      stage14.stage14CheckerNegativeProbeCount === 30 &&
+      stage14.checkerNegativeProbeCount === 49,
+    'checker summary evidence is incomplete',
+  );
+  console.log('Stage 14 structural invariants passed.');
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
   process.exitCode = 1;

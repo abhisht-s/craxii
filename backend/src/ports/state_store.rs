@@ -16,11 +16,11 @@ use crate::domain::{
     CraxiiPrincipal, CurrentWorkAttempt, DeviceId, IdempotencyKey, JournalEventId, JournalOffset,
     LogicalInvocationId, LogicalPathReference, Message, MessageCommandReceipt, MessageContent,
     MessageId, ModelAttemptReference, ModelInvocationId, ModelInvocationState, NormalizedError,
-    PrivilegeMode, ProjectionVersion, ProviderModelReference, ResolvedPathEvidence,
-    RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeStartEvidence, RuntimeStoppingV1,
-    Sha256Digest, ToolExecutionId, ToolExecutionState, ToolLifecycleReference, ToolName,
-    ToolResultClass, ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState,
-    WorkspaceId, WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
+    PrivilegeMode, ProjectionVersion, ProviderModelReference, RuntimeInstanceId,
+    RuntimeRecoveryPerformedV1, RuntimeStartEvidence, RuntimeStoppingV1, Sha256Digest,
+    ToolExecutionId, ToolExecutionState, ToolLifecycleReference, ToolName, ToolResultClass,
+    ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId,
+    WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
     WorkstationIdentity,
 };
 use crate::ports::artifact_store::FinalizedArtifact;
@@ -398,8 +398,10 @@ impl PreparedToolExecution {
 
 pub struct ToolDispatchIntent {
     pub authority: AuthorityDecisionSnapshot,
+    /// Exact canonical authority plus prepared-cwd evidence durably bound to this dispatch.
+    pub dispatch_evidence_json: String,
     pub effective_privilege: PrivilegeMode,
-    pub resolved_cwd: ResolvedPathEvidence,
+    pub prepared_cwd: crate::ports::workstation_preparation::PreparedCwdEvidence,
     pub timeout_ms: u64,
     pub output_policy: ToolOutputPolicy,
     pub dispatch_intent_at: UtcTimestamp,
@@ -420,6 +422,9 @@ pub struct ToolResultEvidence {
     pub fields: Vec<(String, String)>,
 }
 
+/// Existing V3 `tool_executions.result_json` byte ceiling.
+pub const MAX_TOOL_RESULT_JSON_BYTES: usize = 262_144;
+
 pub struct ToolTerminalOutcome {
     pub state: ToolExecutionState,
     /// Optional deny evidence for a definite completed-before-dispatch result.
@@ -432,6 +437,8 @@ pub struct ToolTerminalOutcome {
     pub cancelled: Option<bool>,
     pub cleanup_confirmed: Option<bool>,
     pub result: Option<ToolResultEvidence>,
+    /// Generic canonical-evidence artifacts referenced from `result`, not stream columns.
+    pub evidence_artifact_ids: Vec<ArtifactId>,
     pub stdout_artifact_id: Option<ArtifactId>,
     pub stderr_artifact_id: Option<ArtifactId>,
     pub stdout_counts: Option<ToolStreamCounts>,

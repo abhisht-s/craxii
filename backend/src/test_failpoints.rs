@@ -2,7 +2,7 @@
 //!
 //! This module is absent unless the non-default `test-failpoints` feature is
 //! explicitly enabled. Architecture failpoints remain reserved until their owning
-//! stage installs a reviewed hook; Stage 13 activates its two process boundaries.
+//! stage installs a reviewed hook; Stage 14 activates the complete tool boundary set.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -603,12 +603,12 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &MODEL_RESPONSE,
         OwningStage::Stage17,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterToolRequestedCommit,
         &TOOL_REQUESTED,
         OwningStage::Stage14,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterToolDispatchIntentCommit,
         &TOOL_DISPATCH,
         OwningStage::Stage14,
@@ -623,7 +623,7 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &PROCESS_EXIT,
         OwningStage::Stage13,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterArtifactRenameBeforeDbCommit,
         &ARTIFACT_RENAME,
         OwningStage::Stage8,
@@ -1134,14 +1134,17 @@ mod tests {
     }
 
     #[test]
-    fn registry_metadata_is_complete_typed_and_has_exact_stage13_activation() {
+    fn registry_metadata_is_complete_typed_and_has_exact_stage14_activation() {
         for spec in REGISTRY {
             let active = matches!(
                 spec.architecture_name,
                 FailpointName::AfterMessageTransactionCommit
                     | FailpointName::AfterWorkClaimCommit
+                    | FailpointName::AfterToolRequestedCommit
+                    | FailpointName::AfterToolDispatchIntentCommit
                     | FailpointName::AfterToolProcessSpawn
                     | FailpointName::AfterToolProcessExitBeforeOutcomeCommit
+                    | FailpointName::AfterArtifactRenameBeforeDbCommit
                     | FailpointName::AfterCancelRequestedCommit
                     | FailpointName::DuringGracefulShutdown
             );

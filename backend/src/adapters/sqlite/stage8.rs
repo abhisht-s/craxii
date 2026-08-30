@@ -24,13 +24,13 @@ use super::error::{SqliteAdapterError, SqliteFailureKind};
 use super::journal::{CommittedJournalPosition, JournalAppendIntent, append_event, prepare_event};
 use super::projection::{ProjectionMutationError, WorkProjectionTimes, guarded_work_update};
 use super::stage8_codec::{
-    decode_model_capabilities, encode_attempt_error, encode_authority, encode_eligibility_cutoff,
-    encode_model_capabilities, encode_model_usage, encode_normalized_output, encode_omissions,
-    encode_output_policy, encode_provider_options, encode_required_capabilities,
-    encode_tool_result, encode_transform, validate_attempt_error, validate_authority,
-    validate_eligibility_cutoff, validate_normalized_output, validate_omissions,
-    validate_output_policy, validate_provider_options, validate_required_capabilities,
-    validate_tool_result, validate_transform,
+    decode_model_capabilities, decode_tool_result, encode_attempt_error, encode_authority,
+    encode_eligibility_cutoff, encode_model_capabilities, encode_model_usage,
+    encode_normalized_output, encode_omissions, encode_output_policy, encode_provider_options,
+    encode_required_capabilities, encode_tool_result, encode_transform, validate_attempt_error,
+    validate_authority, validate_dispatch_evidence, validate_eligibility_cutoff,
+    validate_normalized_output, validate_omissions, validate_output_policy,
+    validate_provider_options, validate_required_capabilities, validate_transform,
 };
 use super::state_store::{SqliteStateStore, map_port_error};
 use super::transaction::WriteTransaction;
@@ -1524,6 +1524,12 @@ async fn dispatch_tool(
             != CurrentWorkAttempt::Tool(request.expected_tool.tool_execution_id)
         || request.dispatch.authority.decision() != AuthorityDecision::Allow
         || request.dispatch.authority.effective_privilege() != request.dispatch.effective_privilege
+        || validate_dispatch_evidence(
+            &request.dispatch.dispatch_evidence_json,
+            &request.dispatch.authority,
+            &request.dispatch.prepared_cwd,
+        )
+        .is_err()
         || request.dispatch.timeout_ms == 0
         || request.dispatch.timeout_ms > 900_000
     {
@@ -1565,13 +1571,33 @@ async fn dispatch_tool(
         .map_err(|_| corrupt())?;
     if Some(runtime_id) != request.expected_work.runtime_owner
         || row.try_get::<String, _>("workstation_id")?
-            != request.dispatch.resolved_cwd.workstation_id().to_string()
+            != request
+                .dispatch
+                .prepared_cwd
+                .resolved_cwd()
+                .workstation_id()
+                .to_string()
         || row.try_get::<i64, _>("workstation_generation")?
-            != request.dispatch.resolved_cwd.workstation_generation().get()
+            != request
+                .dispatch
+                .prepared_cwd
+                .resolved_cwd()
+                .workstation_generation()
+                .get()
         || row.try_get::<String, _>("workspace_id")?
-            != request.dispatch.resolved_cwd.workspace_id().to_string()
+            != request
+                .dispatch
+                .prepared_cwd
+                .resolved_cwd()
+                .workspace_id()
+                .to_string()
         || row.try_get::<String, _>("requested_cwd")?
-            != request.dispatch.resolved_cwd.requested_path().canonical()
+            != request
+                .dispatch
+                .prepared_cwd
+                .resolved_cwd()
+                .requested_path()
+                .canonical()
         || row.try_get::<String, _>("requested_at")?
             > request.dispatch.dispatch_intent_at.to_string()
     {
@@ -1583,9 +1609,15 @@ async fn dispatch_tool(
          output_policy_json = ?, dispatch_intent_at = ? WHERE tool_execution_id = ? \
          AND work_id = ? AND runtime_instance_id = ? AND state = 'requested'",
     )
-    .bind(request.dispatch.resolved_cwd.resolved_absolute_path())
+    .bind(
+        request
+            .dispatch
+            .prepared_cwd
+            .resolved_cwd()
+            .resolved_absolute_path(),
+    )
     .bind(privilege(request.dispatch.effective_privilege))
-    .bind(encode_authority(&request.dispatch.authority)?)
+    .bind(&request.dispatch.dispatch_evidence_json)
     .bind(i64::try_from(request.dispatch.timeout_ms).map_err(|_| invalid())?)
     .bind(encode_output_policy(request.dispatch.output_policy)?)
     .bind(request.dispatch.dispatch_intent_at.to_string())
@@ -1707,11 +1739,28 @@ async fn finish_tool(
 ) -> Result<CommitReceipt, SqliteAdapterError> {
     let outcome = &request.outcome;
     if !outcome.state.is_terminal()
-        || request.expected_work.state != WorkState::WaitingOnTool
+        || !matches!(
+            request.expected_work.state,
+            WorkState::WaitingOnTool | WorkState::CancelRequested
+        )
         || request.expected_work.current_attempt
             != CurrentWorkAttempt::Tool(request.expected_tool.tool_execution_id)
         || request.work_next.current_attempt() != CurrentWorkAttempt::None
         || request.work_event.causation_event_id != Some(request.tool_event.event_id)
+        || (request.expected_work.state == WorkState::WaitingOnTool
+            && !matches!(
+                request.work_next.state(),
+                WorkState::Running | WorkState::Interrupted
+            ))
+        || (request.expected_work.state == WorkState::CancelRequested
+            && !matches!(
+                request.work_next.state(),
+                WorkState::Cancelled | WorkState::Interrupted
+            ))
+        || (matches!(
+            outcome.state,
+            ToolExecutionState::InterruptedBeforeDispatch | ToolExecutionState::OutcomeUnknown
+        ) && request.work_next.state() != WorkState::Interrupted)
     {
         return Err(invalid());
     }
@@ -1727,6 +1776,7 @@ async fn finish_tool(
                     || outcome.cleanup_confirmed.is_some()
                     || outcome.stdout_counts.is_some()
                     || outcome.stderr_counts.is_some()
+                    || !outcome.evidence_artifact_ids.is_empty()
                     || outcome.stdout_artifact_id.is_some()
                     || outcome.stderr_artifact_id.is_some()
                     || outcome.truncated
@@ -1796,6 +1846,7 @@ async fn finish_tool(
                 || outcome.result.is_some()
                 || outcome.stdout_counts.is_some()
                 || outcome.stderr_counts.is_some()
+                || !outcome.evidence_artifact_ids.is_empty()
                 || outcome.stdout_artifact_id.is_some()
                 || outcome.stderr_artifact_id.is_some()
                 || outcome.normalized_error.is_none()
@@ -1834,6 +1885,7 @@ async fn finish_tool(
                 || outcome.result.is_some()
                 || outcome.stdout_counts.is_some()
                 || outcome.stderr_counts.is_some()
+                || !outcome.evidence_artifact_ids.is_empty()
                 || outcome.stdout_artifact_id.is_some()
                 || outcome.stderr_artifact_id.is_some()
                 || outcome
@@ -1900,7 +1952,15 @@ async fn finish_tool(
     let referenced = [outcome.stdout_artifact_id, outcome.stderr_artifact_id]
         .into_iter()
         .flatten()
+        .chain(outcome.evidence_artifact_ids.iter().copied())
         .collect::<HashSet<_>>();
+    if referenced.len()
+        != outcome.evidence_artifact_ids.len()
+            + usize::from(outcome.stdout_artifact_id.is_some())
+            + usize::from(outcome.stderr_artifact_id.is_some())
+    {
+        return Err(invalid());
+    }
     require_exact_artifact_set(&indexed, &referenced, &referenced)?;
     for (artifact_id, counts) in [
         (outcome.stdout_artifact_id, outcome.stdout_counts),
@@ -2392,17 +2452,33 @@ pub(super) async fn verify_stage8_consistency(
             }
             "tool_execution" => {
                 let _: crate::domain::ToolExecutionId = parse_uuid(&producer_id)?;
-                sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM tool_executions WHERE tool_execution_id = ? \
-                     AND work_id = ? AND (stdout_artifact_id = ? OR stderr_artifact_id = ?)",
+                let producer = sqlx::query(
+                    "SELECT stdout_artifact_id, stderr_artifact_id, result_json \
+                     FROM tool_executions WHERE tool_execution_id = ? AND work_id = ?",
                 )
                 .bind(&producer_id)
                 .bind(work_id.to_string())
-                .bind(artifact_id.to_string())
-                .bind(artifact_id.to_string())
-                .fetch_one(&mut *connection)
+                .fetch_optional(&mut *connection)
                 .await
-                .map_err(SqliteAdapterError::from_sqlx)?
+                .map_err(SqliteAdapterError::from_sqlx)?;
+                producer.map_or(Ok(0), |producer| {
+                    let stdout: Option<String> = producer.try_get("stdout_artifact_id")?;
+                    let stderr: Option<String> = producer.try_get("stderr_artifact_id")?;
+                    let generic = producer
+                        .try_get::<Option<String>, _>("result_json")?
+                        .map(|json| decode_tool_result(&json))
+                        .transpose()?
+                        .is_some_and(|result| {
+                            result.fields.iter().any(|(key, value)| {
+                                key == "artifact_id" && value == &artifact_id.to_string()
+                            })
+                        });
+                    Ok::<i64, SqliteAdapterError>(i64::from(
+                        stdout.as_deref() == Some(artifact_id.to_string().as_str())
+                            || stderr.as_deref() == Some(artifact_id.to_string().as_str())
+                            || generic,
+                    ))
+                })?
             }
             _ => return Err(corrupt()),
         };
@@ -2617,7 +2693,7 @@ pub(super) async fn verify_stage8_consistency(
             .map_err(|_| corrupt())?;
         let tool_ordinal = crate::domain::ToolOrdinal::try_new(row.try_get("tool_ordinal")?)
             .map_err(|_| corrupt())?;
-        crate::domain::ToolName::try_new(row.try_get::<String, _>("tool_name")?)
+        let tool_name = crate::domain::ToolName::try_new(row.try_get::<String, _>("tool_name")?)
             .map_err(|_| corrupt())?;
         crate::domain::ToolVersion::try_new(row.try_get::<String, _>("tool_version")?)
             .map_err(|_| corrupt())?;
@@ -2702,14 +2778,14 @@ pub(super) async fn verify_stage8_consistency(
                 ) || (state == ToolExecutionState::Completed && was_dispatched),
             )?;
         }
-        let result_class = row
+        let decoded_result = row
             .try_get::<Option<String>, _>("result_json")?
-            .map(|json| validate_tool_result(&json))
+            .map(|json| decode_tool_result(&json))
             .transpose()?;
-        if (state == ToolExecutionState::Completed) != result_class.is_some() {
+        if (state == ToolExecutionState::Completed) != decoded_result.is_some() {
             return Err(corrupt());
         }
-        if let Some(result_class) = result_class {
+        if let Some(result_class) = decoded_result.as_ref().map(|value| value.result_class) {
             let dispatched = row
                 .try_get::<Option<String>, _>("dispatch_intent_at")?
                 .is_some();
@@ -2798,7 +2874,9 @@ pub(super) async fn verify_stage8_consistency(
                      AND producing_work_id = ? AND producer_kind = 'tool_execution' \
                      AND producer_id = ? AND captured_byte_count = ? \
                      AND observed_byte_count = ? \
-                     AND truncated = (observed_byte_count > captured_byte_count)",
+                     AND truncated = (observed_byte_count > captured_byte_count) \
+                     AND mime_type = 'application/octet-stream' AND encoding IS NULL \
+                     AND logical_name = ?",
                 )
                 .bind(artifact_id)
                 .bind(work_id.to_string())
@@ -2811,6 +2889,11 @@ pub(super) async fn verify_stage8_consistency(
                     row.try_get::<Option<i64>, _>(observed_column)?
                         .ok_or_else(corrupt)?,
                 )
+                .bind(if column == "stdout_artifact_id" {
+                    "stdout.bin"
+                } else {
+                    "stderr.bin"
+                })
                 .fetch_one(&mut *connection)
                 .await
                 .map_err(SqliteAdapterError::from_sqlx)?;
@@ -2818,6 +2901,66 @@ pub(super) async fn verify_stage8_consistency(
                     return Err(corrupt());
                 }
             }
+        }
+
+        let stdout_artifact = row.try_get::<Option<String>, _>("stdout_artifact_id")?;
+        let stderr_artifact = row.try_get::<Option<String>, _>("stderr_artifact_id")?;
+        let mut referenced_artifacts = HashSet::new();
+        if let Some(id) = stdout_artifact.as_ref() {
+            referenced_artifacts.insert(id.clone());
+        }
+        if let Some(id) = stderr_artifact.as_ref() {
+            referenced_artifacts.insert(id.clone());
+        }
+        if let Some(result) = &decoded_result {
+            let fields = result.fields.iter().cloned().collect::<HashMap<_, _>>();
+            if let Some(generic_id) = fields.get("artifact_id") {
+                if tool_name.as_str() != "read_file" {
+                    return Err(corrupt());
+                }
+                let _: ArtifactId = parse_uuid(generic_id)?;
+                if !referenced_artifacts.insert(generic_id.clone()) {
+                    return Err(corrupt());
+                }
+                let expected_sha = fields.get("sha256").ok_or_else(corrupt)?;
+                let expected_length = fields
+                    .get("byte_length")
+                    .ok_or_else(corrupt)?
+                    .parse::<i64>()
+                    .map_err(|_| corrupt())?;
+                let coherent: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM artifacts WHERE artifact_id = ? \
+                     AND producing_work_id = ? AND producer_kind = 'tool_execution' \
+                     AND producer_id = ? AND sha256 = ? AND captured_byte_count = ? \
+                     AND observed_byte_count = ? AND truncated = 0 \
+                     AND mime_type = 'text/plain' AND encoding = 'utf-8' \
+                     AND logical_name = 'read-file.txt'",
+                )
+                .bind(generic_id)
+                .bind(work_id.to_string())
+                .bind(id.to_string())
+                .bind(expected_sha)
+                .bind(expected_length)
+                .bind(expected_length)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(SqliteAdapterError::from_sqlx)?;
+                if coherent != 1 {
+                    return Err(corrupt());
+                }
+            }
+        }
+        let producer_artifact_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM artifacts WHERE producing_work_id = ? \
+             AND producer_kind = 'tool_execution' AND producer_id = ?",
+        )
+        .bind(work_id.to_string())
+        .bind(id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?;
+        if producer_artifact_count != referenced_artifacts.len() as i64 {
+            return Err(corrupt());
         }
     }
 

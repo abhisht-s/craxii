@@ -12,6 +12,7 @@ use crate::domain::{
 };
 use crate::ports::artifact_store::FinalizedArtifact;
 use crate::ports::clock::MonotonicInstant;
+use crate::ports::workstation_preparation::PreparedCwdEvidence;
 
 /// Default maximum accepted by the model-facing read-file request constructor.
 pub const DEFAULT_FILE_READ_MAX_BYTES: u64 = 1_048_576;
@@ -333,6 +334,8 @@ pub struct ExecutionRequest {
     pub workspace_id: WorkspaceId,
     pub command: String,
     pub requested_cwd: LogicalPathReference,
+    /// Exact adapter-prepared cwd path/object evidence already committed before this call.
+    pub prepared_cwd: PreparedCwdEvidence,
     pub effective_privilege: PrivilegeMode,
     pub stdin: ExecutionStdinPolicy,
     pub timeout: MonotonicDuration,
@@ -353,6 +356,7 @@ impl Debug for ExecutionRequest {
             .field("workspace_id", &self.workspace_id)
             .field("command", &"[REDACTED]")
             .field("requested_cwd", &"[REDACTED]")
+            .field("prepared_cwd", &"[REDACTED]")
             .field("effective_privilege", &self.effective_privilege)
             .field("stdin", &self.stdin)
             .field("timeout", &self.timeout)
