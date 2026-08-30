@@ -384,6 +384,8 @@ fn bootstrap_request() -> LoadOrBootstrapIdentityRequest {
             workspace_logical_name: "primary".into(),
             workspace_logical_root: "/secret/workspace".into(),
             workspace_resolved_root: "/secret/resolved/workspace".into(),
+            execution_capabilities:
+                crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
         },
     }
 }

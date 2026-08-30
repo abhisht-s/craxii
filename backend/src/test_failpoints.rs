@@ -1,8 +1,8 @@
 //! Test-only deterministic crash-boundary foundation.
 //!
 //! This module is absent unless the non-default `test-failpoints` feature is
-//! explicitly enabled. Architecture failpoints are registered here but remain
-//! reserved until their owning stages install reviewed product hooks.
+//! explicitly enabled. Architecture failpoints remain reserved until their owning
+//! stage installs a reviewed hook; Stage 13 activates its two process boundaries.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -613,12 +613,12 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &TOOL_DISPATCH,
         OwningStage::Stage14,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterToolProcessSpawn,
         &PROCESS_SPAWN,
         OwningStage::Stage13,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterToolProcessExitBeforeOutcomeCommit,
         &PROCESS_EXIT,
         OwningStage::Stage13,
@@ -1134,12 +1134,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_metadata_is_complete_typed_and_has_exact_stage10_activation() {
+    fn registry_metadata_is_complete_typed_and_has_exact_stage13_activation() {
         for spec in REGISTRY {
             let active = matches!(
                 spec.architecture_name,
                 FailpointName::AfterMessageTransactionCommit
                     | FailpointName::AfterWorkClaimCommit
+                    | FailpointName::AfterToolProcessSpawn
+                    | FailpointName::AfterToolProcessExitBeforeOutcomeCommit
                     | FailpointName::AfterCancelRequestedCommit
                     | FailpointName::DuringGracefulShutdown
             );

@@ -220,7 +220,7 @@ fn local_fixture_fingerprint_is_an_exact_stable_sha256() {
     assert_eq!(parsed.fingerprint(), loaded.fingerprint());
     assert_eq!(
         parsed.fingerprint().as_str(),
-        "sha256:465ec709482b05bd590eb8a07c8f9bd34e83defc299b61305b630820acb38e0a"
+        "sha256:43bb265b4219927aba58b30d5faed036321feed35e3061fa3203cab9de8191c5"
     );
 }
 
@@ -985,6 +985,36 @@ fn shell_auth_tracing_and_shutdown_values_are_closed_enums_or_positive() {
 
     for (old, new) in cases {
         invalid(&replace_once(LOCAL, old, new));
+    }
+}
+
+#[test]
+fn delegated_cgroup_root_is_an_absolute_normalized_child_of_cgroup_v2() {
+    let configured = replace_once(
+        LOCAL,
+        "administrative_enabled = false",
+        "administrative_enabled = false\ndelegated_cgroup_root = \"/sys/fs/cgroup/system.slice/craxii-server.service/craxii-executions\"",
+    );
+    assert_eq!(
+        valid(&configured).shell().delegated_cgroup_root(),
+        Some(std::path::Path::new(
+            "/sys/fs/cgroup/system.slice/craxii-server.service/craxii-executions"
+        ))
+    );
+    for unsafe_root in [
+        "relative/craxii-executions",
+        "/sys/fs/cgroup",
+        "/sys/fs/cgroup/system.slice/../../tmp/craxii-executions",
+    ] {
+        let candidate = replace_once(
+            LOCAL,
+            "administrative_enabled = false",
+            &format!("administrative_enabled = false\ndelegated_cgroup_root = \"{unsafe_root}\""),
+        );
+        assert!(matches!(
+            invalid(&candidate),
+            ConfigError::InvalidShell { .. }
+        ));
     }
 }
 

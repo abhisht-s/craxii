@@ -2,12 +2,14 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::adapters::artifacts::LocalArtifactStore;
 use crate::adapters::http::{ConnectionRegistry, HttpState, ServerHandle};
-use crate::adapters::local_workstation::LocalWorkstation;
+use crate::adapters::local_workstation::{
+    LocalWorkstation, LocalWorkstationOptions, observe_execution_support,
+};
 use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
@@ -75,8 +77,10 @@ pub async fn run(
     )
     .await
     .map_err(StartupError::from_sqlite)?;
-    let artifact_store = LocalArtifactStore::initialize(config.paths().artifact_root())
-        .map_err(StartupError::from_artifact_initialization)?;
+    let artifact_store = Arc::new(
+        LocalArtifactStore::initialize(config.paths().artifact_root())
+            .map_err(StartupError::from_artifact_initialization)?,
+    );
     let observation = bootstrap_observation(&config)?;
     let created_at =
         UtcTimestamp::from_offset_datetime(clock.utc_now().map_err(|_| StartupError::Clock)?)
@@ -132,19 +136,27 @@ pub async fn run(
     )
     .map_err(|_| StartupError::Configuration)?;
     let workstation_clock: Arc<dyn Clock> = clock.clone();
-    let local_workstation = LocalWorkstation::new(
-        &snapshot.workstation,
-        &snapshot.workspace,
-        default_shell,
-        config.paths().primary_workspace_root(),
-        config.limits().tools().read_file_max_bytes(),
-        workstation_clock,
-    )
-    .map_err(|_| StartupError::WorkstationLifecycle)?;
+    let workstation_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let local_workstation = Arc::new(
+        LocalWorkstation::new(
+            &snapshot.workstation,
+            &snapshot.workspace,
+            LocalWorkstationOptions {
+                default_shell,
+                configured_workspace_root: config.paths().primary_workspace_root().to_owned(),
+                read_hard_limit: config.limits().tools().read_file_max_bytes(),
+                artifact_store: workstation_artifacts,
+                administrative_enabled: config.shell().administrative_enabled(),
+                delegated_cgroup_root: config.shell().delegated_cgroup_root().map(Path::to_owned),
+                clock: workstation_clock,
+            },
+        )
+        .map_err(|_| StartupError::WorkstationLifecycle)?,
+    );
     if local_workstation.capabilities_snapshot() != &snapshot.workstation_capabilities {
         return Err(StartupError::DatabaseIntegrity);
     }
-    let workstation: Arc<dyn Workstation> = Arc::new(local_workstation);
+    let workstation: Arc<dyn Workstation> = local_workstation.clone();
     let observation = SystemRuntimeProcessObserver
         .observe()
         .map_err(|_| StartupError::RuntimeLifecycle)?;
@@ -243,6 +255,7 @@ pub async fn run(
         orphan_report,
         runtime_instance_id: runtime.runtime_instance_id,
         workstation,
+        local_workstation,
         shutdown,
         mutation_admission,
         server,
@@ -287,6 +300,11 @@ fn bootstrap_observation(
         .to_owned();
     let generation = i64::try_from(config.workstation().initial_generation())
         .map_err(|_| StartupError::Configuration)?;
+    let execution = observe_execution_support(
+        config.shell().executable(),
+        config.shell().administrative_enabled(),
+        config.shell().delegated_cgroup_root(),
+    );
     Ok(BootstrapObservation {
         initial_generation: WorkstationGeneration::try_new(generation)
             .map_err(|_| StartupError::Configuration)?,
@@ -299,6 +317,12 @@ fn bootstrap_observation(
             .to_owned(),
         workspace_logical_root: configured_workspace_root,
         workspace_resolved_root: workspace_root,
+        execution_capabilities: crate::ports::state_store::ExecutionCapabilityObservation {
+            foreground_execute: execution.foreground,
+            privilege_administrative: execution.administrative,
+            process_group_cleanup: execution.process_group,
+            cgroup_cleanup: execution.cgroup,
+        },
     })
 }
 
@@ -309,10 +333,11 @@ fn bootstrap_observation(
 pub struct RunningBootstrap {
     application: ApplicationShell,
     sqlite_runtime: SqliteRuntimeGuard,
-    artifact_store: LocalArtifactStore,
+    artifact_store: Arc<LocalArtifactStore>,
     orphan_report: ArtifactOrphanReport,
     runtime_instance_id: RuntimeInstanceId,
     workstation: Arc<dyn Workstation>,
+    local_workstation: Arc<LocalWorkstation>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
     server: ServerHandle,
@@ -331,8 +356,8 @@ impl RunningBootstrap {
     }
 
     #[must_use]
-    pub const fn artifact_store(&self) -> &LocalArtifactStore {
-        &self.artifact_store
+    pub fn artifact_store(&self) -> &LocalArtifactStore {
+        self.artifact_store.as_ref()
     }
 
     #[must_use]
@@ -377,7 +402,7 @@ impl RunningBootstrap {
 
     pub async fn shutdown(self) -> Result<(), StartupError> {
         let mut runtime_cleanup_failed = false;
-        self.shutdown.latch_shutdown_request();
+        let deadline = self.shutdown.latch_shutdown_request();
         match self.application.health().snapshot().state() {
             crate::bootstrap::health::HealthState::LiveUnready
             | crate::bootstrap::health::HealthState::Ready => self
@@ -389,19 +414,24 @@ impl RunningBootstrap {
             | crate::bootstrap::health::HealthState::Fatal => {}
         }
         self.server.stop_accepting();
+        self.local_workstation.begin_execution_shutdown(deadline);
         self.mutation_admission.close_and_wait().await;
         if self.shutdown.request().await.is_err() {
             runtime_cleanup_failed = true;
         }
-        let deadline = self.shutdown.monotonic_deadline().await.ok();
+        if self
+            .local_workstation
+            .shutdown_executions_before(deadline)
+            .await
+            .is_err()
+        {
+            runtime_cleanup_failed = true;
+        }
         self.server.close_websockets();
         if self.shutdown.finish().await.is_err() {
             runtime_cleanup_failed = true;
         }
-        let server_result = match deadline {
-            Some(deadline) => self.server.join_before(deadline).await,
-            None => self.server.join().await,
-        };
+        let server_result = self.server.join_before(deadline).await;
         self.sqlite_runtime.shutdown().await;
         if let Err(error) = server_result {
             Err(StartupError::ServerLifecycle(error))
@@ -605,6 +635,22 @@ mod tests {
             source.kind(),
             crate::adapters::http::ServerErrorKind::InjectedSharedFailure
         );
+    }
+
+    #[test]
+    fn execution_ownership_join_precedes_sqlite_close_in_bootstrap_shutdown() {
+        let shutdown = include_str!("startup.rs");
+        let begin = shutdown
+            .find("begin_execution_shutdown(deadline)")
+            .expect("Stage 10 deadline is propagated when execution shutdown begins");
+        let join = shutdown
+            .find("shutdown_executions_before(deadline)")
+            .expect("execution supervisors are joined under the original deadline");
+        let sqlite_close = shutdown
+            .find("self.sqlite_runtime.shutdown().await")
+            .expect("SQLite has an explicit final shutdown point");
+        assert!(begin < join);
+        assert!(join < sqlite_close);
     }
 
     #[test]

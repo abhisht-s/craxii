@@ -83,6 +83,8 @@ async fn fixture() -> Fixture {
                 workspace_logical_name: "primary".to_owned(),
                 workspace_logical_root: "/workspace".to_owned(),
                 workspace_resolved_root: "/workspace".to_owned(),
+                execution_capabilities:
+                    crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
             },
         })
         .await
@@ -2627,6 +2629,8 @@ async fn artifact_publish_crash_child() {
                 workspace_logical_name: "primary".to_owned(),
                 workspace_logical_root: "/workspace".to_owned(),
                 workspace_resolved_root: "/workspace".to_owned(),
+                execution_capabilities:
+                    crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
             },
         })
         .await
@@ -2709,6 +2713,8 @@ async fn populated_v2_migrates_to_v3_without_changing_stage7_identity_or_old_fin
                 workspace_logical_name: "primary".to_owned(),
                 workspace_logical_root: "/workspace".to_owned(),
                 workspace_resolved_root: "/workspace".to_owned(),
+                execution_capabilities:
+                    crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
             },
         })
         .await

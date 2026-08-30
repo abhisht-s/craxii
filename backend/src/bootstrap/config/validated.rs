@@ -570,6 +570,7 @@ pub struct ShellConfig {
     pub(super) environment_policy: ShellEnvironmentPolicy,
     pub(super) inherited_variables: Vec<String>,
     pub(super) administrative_enabled: bool,
+    pub(super) delegated_cgroup_root: Option<PathBuf>,
 }
 
 impl ShellConfig {
@@ -587,6 +588,10 @@ impl ShellConfig {
 
     pub fn administrative_enabled(&self) -> bool {
         self.administrative_enabled
+    }
+
+    pub fn delegated_cgroup_root(&self) -> Option<&Path> {
+        self.delegated_cgroup_root.as_deref()
     }
 }
 
@@ -1330,11 +1335,26 @@ fn validate_shell(raw: RawShell) -> Result<ShellConfig, ConfigError> {
             reason: "V0 inherited_variables must be empty",
         });
     }
+    let delegated_cgroup_root = raw.delegated_cgroup_root.map(PathBuf::from);
+    if delegated_cgroup_root.as_deref().is_some_and(|root| {
+        !root.is_absolute()
+            || root == Path::new("/")
+            || root == Path::new("/sys/fs/cgroup")
+            || !root.starts_with("/sys/fs/cgroup/")
+            || root
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    }) {
+        return Err(ConfigError::InvalidShell {
+            reason: "delegated_cgroup_root must be an absolute child of /sys/fs/cgroup",
+        });
+    }
     Ok(ShellConfig {
         executable: PathBuf::from(raw.executable),
         environment_policy,
         inherited_variables: raw.inherited_variables,
         administrative_enabled: raw.administrative_enabled,
+        delegated_cgroup_root,
     })
 }
 

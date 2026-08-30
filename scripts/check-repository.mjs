@@ -361,9 +361,9 @@ function verifyBootstrapSnapshotStructure(source) {
   return snapshotSource;
 }
 
-function stage13ImplementationLeaks(productionFiles) {
+function stage14ImplementationLeaks(productionFiles) {
   const leaks = [];
-  const generalImplementation = /tokio::process|std::process::Command|Command::new|struct\s+ToolRegistry\b|(?:async\s+)?fn\s+execute_tool\s*\(|reqwest|hyper::client|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(/;
+  const generalImplementation = /struct\s+ToolRegistry\b|(?:async\s+)?fn\s+execute_tool\s*\(|reqwest|hyper::client|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(/;
   for (const file of productionFiles) {
     const source = stripRustComments(withoutRustTestModules(file.source));
     if (generalImplementation.test(source)) {
@@ -371,6 +371,19 @@ function stage13ImplementationLeaks(productionFiles) {
     }
   }
   return sortedStrings(new Set(leaks));
+}
+
+function stage13ProcessBoundaryLeaks(productionFiles) {
+  return productionFiles
+    .filter((file) => {
+      const source = stripRustComments(withoutRustTestModules(file.source));
+      const ownsProcesses = /tokio::process|std::process::Command|Command::new|\bkillpg\s*\(|\bsetsid\s*\(|cgroup\.kill|cgroup\.procs/.test(source);
+      const localBoundary = file.path === 'adapters/local_workstation.rs' ||
+        file.path.startsWith('adapters/local_workstation/');
+      return ownsProcesses && !localBoundary;
+    })
+    .map((file) => file.path)
+    .sort();
 }
 
 function extractRustNamedBlock(source, pattern, label) {
@@ -403,44 +416,396 @@ function stage12ModelFilesystemLeaks(productionFiles) {
   return sortedStrings(new Set(leaks));
 }
 
-function localWorkstationViolations(source) {
+function stage13ExecutionViolations(source) {
   const production = stripRustComments(withoutRustTestModules(source));
   const violations = [];
-  if (/tokio::process|std::process|Command::new|\.spawn\s*\(/.test(production)) {
-    violations.push('process execution');
+  if (/Command::new\s*\(/.test(production) && !/\.env_clear\s*\(\)/.test(production)) {
+    violations.push('ambient environment inheritance');
   }
-  if (
-    /foreground_execute\s*:\s*true|cancel_execution\s*:\s*true|inspect_execution\s*:\s*true|privilege_administrative\s*:\s*true|process_group_cleanup\s*:\s*true|cgroup_cleanup\s*:\s*true/.test(
-      production,
-    )
-  ) {
-    violations.push('future capability advertised true');
+  if (/\.read_to_(?:end|string)\s*\(/.test(production)) {
+    violations.push('unbounded output buffering');
   }
-  if (
-    /\bstd::fs::(?:read|read_to_string)\s*\(|\.read_to_(?:end|string)\s*\(/.test(production)
-  ) {
-    violations.push('unbounded file read');
+  if (/\.kill\s*\(\s*\)\s*\.await/.test(production) && !/killpg|cgroup\.kill/.test(production)) {
+    violations.push('parent-only kill');
   }
-  if (
-    /\.starts_with\s*\([^)]*(?:workspace|root)|(?:workspace|root)[^;\n]*\.starts_with\s*\(/.test(
-      production,
-    )
-  ) {
-    violations.push('prefix-based path confinement');
+  if (/tokio::spawn\s*\(/.test(production) && !/(?:let\s+\w+\s*=|join\s*:\s*Some\s*\()\s*tokio::spawn\s*\(/.test(production)) {
+    violations.push('detached lifecycle task');
+  }
+  if (/ExecutionId[^;\n]*(?:pid|pgid)|ExecutionId::[^;\n]*(?:pid|pgid)/i.test(production)) {
+    violations.push('PID-as-ExecutionId');
+  }
+  if (/(?:\.env|command\.arg)\s*\([^;]*(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|SSH_AUTH_SOCK)/.test(production)) {
+    violations.push('provider or ambient secret inclusion');
+  }
+  if (/tracing::(?:trace|debug|info|warn|error)!\([^;]*(?:request\.command|resolved_cwd|cgroup_path|\bstdout\s*=|\bstderr\s*=|\bcommand\s*=)/s.test(production)) {
+    violations.push('raw sensitive tracing');
+  }
+  if (/privilege_administrative:\s*true|cgroup_cleanup:\s*true/.test(production)) {
+    violations.push('optimistic privileged capability');
   }
   return violations;
 }
 
-function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
+function stage13DeadlinePropagationViolations(startup, execution) {
+  const violations = [];
+  if (
+    !/let\s+deadline\s*=\s*self\.shutdown\.latch_shutdown_request\(\)/.test(startup) ||
+    !/begin_execution_shutdown\(deadline\)/.test(startup) ||
+    !/shutdown_executions_before\(deadline\)/.test(startup)
+  ) {
+    violations.push('Stage 10 deadline not propagated unchanged');
+  }
+  if (
+    !/fn\s+effective_cleanup_remaining\s*\(/.test(execution) ||
+    !/request_remaining\.min\(shutdown_remaining\)/.test(execution) ||
+    !/finish_owned_process_tree[\s\S]*effective_cleanup_remaining\(request_deadline\)/.test(execution)
+  ) {
+    violations.push('request-only cleanup deadline');
+  }
+  return violations;
+}
+
+function stage13OwnershipBoundaryViolations(execution) {
+  const violations = [];
+  const execute = extractRustFunction(execution, 'execute');
+  const shutdown = extractRustFunction(execution, 'begin_shutdown');
+  const manager = extractRustFunction(execution, 'manager_loop');
+  const supervise = extractRustFunction(execution, 'supervise');
+  const superviseInner = extractRustFunction(execution, 'supervise_inner');
+  const claimSpawn = extractRustFunction(execution, 'claim_spawn');
+  const reservationScopeMatch = /\{\s*let\s+mut\s+registry\s*=\s*lock\(&self\.registry\)/.exec(execute);
+  let reservationScope = '';
+  let reservationScopeEnd = -1;
+  if (reservationScopeMatch) {
+    const opening = execute.indexOf('{', reservationScopeMatch.index);
+    const closing = findMatchingDelimiter(execute, opening, '{', '}');
+    if (closing !== -1) {
+      reservationScope = execute.slice(opening, closing + 1);
+      reservationScopeEnd = closing;
+    }
+  }
+  const reservation = reservationScope.search(/registry\s*\.entries\s*\.insert\s*\(/);
+  const admissionRejection = reservationScope.lastIndexOf('WorkstationUnavailable');
+  const duplicateRejection = reservationScope.search(/registry\s*\.entries\s*\.contains_key\s*\(/);
+  if (
+    !/struct\s+ExecutionRegistry\s*\{[\s\S]*admission_open:\s*bool[\s\S]*entries:\s*HashMap<ExecutionId, Arc<ExecutionEntry>>/.test(execution) ||
+    !/if\s+!registry\.admission_open/.test(reservationScope) ||
+    reservation === -1 ||
+    admissionRejection === -1 ||
+    admissionRejection > reservation ||
+    duplicateRejection === -1 ||
+    duplicateRejection > reservation
+  ) {
+    violations.push('reservation not atomic ownership boundary');
+  }
+  if (
+    /admission_open|WorkstationUnavailable/.test(`${manager}\n${superviseInner}`) ||
+    !/fn\s+claim_spawn\s*\(/.test(execution) ||
+    !/pre_spawn_terminal_result/.test(execution)
+  ) {
+    violations.push('post-reservation admission rejection');
+  }
+  const managerOwnershipRelease = execute.indexOf('self.ensure_manager()');
+  const managerDispatch = execute.search(/\.send\s*\(\s*ManagerCommand::Launch\s*\(/);
+  const supervisorDispatch = manager.search(/supervisors\s*\.spawn\s*\(\s*supervise\s*\(/);
+  const supervisorHandoff = supervise.search(/supervise_inner\s*\(\s*&runtime\s*,\s*launch\s*\)/);
+  const spawnClaim = superviseInner.search(/launch\s*\.entry\s*\.claim_spawn\s*\(\s*\)/);
+  const processSpawn = superviseInner.search(/\bcommand\s*\.spawn\s*\(\s*\)/);
+  const registryInsertions = execution.match(/registry\s*\.entries\s*\.insert\s*\(/g) ?? [];
+  const processSpawns = execution.match(/\bcommand\s*\.spawn\s*\(\s*\)/g) ?? [];
+  if (
+    reservation === -1 ||
+    reservationScopeEnd === -1 ||
+    managerOwnershipRelease < reservationScopeEnd ||
+    managerDispatch < managerOwnershipRelease ||
+    supervisorDispatch === -1 ||
+    supervisorHandoff === -1 ||
+    spawnClaim === -1 ||
+    processSpawn < spawnClaim ||
+    registryInsertions.length !== 1 ||
+    processSpawns.length !== 1 ||
+    /\bcommand\s*\.spawn\s*\(/.test(`${execute}\n${manager}`) ||
+    !/ExecutionPhase::Reserved/.test(claimSpawn) ||
+    !/lifecycle\.phase\s*=\s*ExecutionPhase::Spawning/.test(claimSpawn)
+  ) {
+    violations.push('execution ownership reservation does not precede OS process spawn');
+  }
+  const lockIndex = shutdown.indexOf('lock(&self.registry)');
+  const closeIndex = shutdown.indexOf('registry.admission_open = false');
+  const latchIndex = shutdown.indexOf('entry.latch(TerminalCause::Shutdown)');
+  if (
+    lockIndex === -1 ||
+    closeIndex < lockIndex ||
+    latchIndex < closeIndex ||
+    !/registry\.entries\.values\s*\(\)/.test(shutdown)
+  ) {
+    violations.push('shutdown does not atomically close and latch reserved entries');
+  }
+  return violations;
+}
+
+const STAGE13_EINTR_HELPER_MAX_DEPTH = 16;
+
+function rustTopLevelFunctions(source) {
+  const functions = new Map();
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    const next = source[index + 1];
+    if (quote !== null) {
+      if (escaped) escaped = false;
+      else if (character === '\\') escaped = true;
+      else if (character === quote) quote = null;
+      continue;
+    }
+    if (
+      character === '"' ||
+      (character === "'" && (source[index + 2] === "'" || (next === '\\' && source[index + 3] === "'")))
+    ) {
+      quote = character;
+      continue;
+    }
+    if (character === '{') {
+      depth += 1;
+      continue;
+    }
+    if (character === '}') {
+      depth -= 1;
+      continue;
+    }
+    if (
+      depth !== 0 ||
+      !source.startsWith('fn', index) ||
+      /[A-Za-z0-9_]/.test(source[index - 1] ?? '') ||
+      !/\s/.test(source[index + 2] ?? '')
+    ) {
+      continue;
+    }
+    const signature = /^fn\s+([A-Za-z_][A-Za-z0-9_]*)\b/.exec(source.slice(index));
+    if (!signature) continue;
+    const opening = source.indexOf('{', index + signature[0].length);
+    assert(opening !== -1, `Rust function ${signature[1]} has no body`);
+    const closing = findMatchingDelimiter(source, opening, '{', '}');
+    assert(closing !== -1, `Rust function ${signature[1]} has an unbalanced body`);
+    const definitions = functions.get(signature[1]) ?? [];
+    definitions.push({
+      source: source.slice(index, closing + 1),
+      body: source.slice(opening + 1, closing),
+    });
+    functions.set(signature[1], definitions);
+    index = closing;
+  }
+  return functions;
+}
+
+function rustLocalFunctionCalls(source, localFunctionNames) {
+  const calls = new Set();
+  for (const match of source.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+    if (localFunctionNames.has(match[1])) calls.add(match[1]);
+  }
+  return calls;
+}
+
+function callsConcreteWaitidObserver(source) {
+  if (
+    /\bself\s*\.\s*observe\s*\(/.test(source) ||
+    /<\s*(?:(?:crate|self|super|[A-Za-z_][A-Za-z0-9_]*)\s*::\s*)*WaitIdLeaderObserver\s+as\s+(?:(?:crate|self|super|[A-Za-z_][A-Za-z0-9_]*)\s*::\s*)*LeaderObserver\s*>\s*::\s*observe\s*\(/.test(source) ||
+    /<\s*Self\s+as\s+(?:(?:crate|self|super|[A-Za-z_][A-Za-z0-9_]*)\s*::\s*)*LeaderObserver\s*>\s*::\s*observe\s*\(/.test(source) ||
+    /\bWaitIdLeaderObserver\s*(?:::|\.)\s*observe\s*\(/.test(source) ||
+    /\bLeaderObserver\s*::\s*observe\s*\(\s*self\b/.test(source)
+  ) {
+    return true;
+  }
+
+  const concreteReceivers = new Set();
+  for (const match of source.matchAll(
+    /\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&?\s*(?:'[A-Za-z_][A-Za-z0-9_]*\s+)?(?:mut\s+)?(?:(?:crate|self|super|[A-Za-z_][A-Za-z0-9_]*)\s*::\s*)*WaitIdLeaderObserver\b/g,
+  )) {
+    concreteReceivers.add(match[1]);
+  }
+  for (const match of source.matchAll(
+    /\blet\s+(?:mut\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*&?\s*(?:(?:crate|self|super|[A-Za-z_][A-Za-z0-9_]*)\s*::\s*)*WaitIdLeaderObserver\b/g,
+  )) {
+    concreteReceivers.add(match[1]);
+  }
+  return [...concreteReceivers].some((receiver) =>
+    new RegExp(
+      `(?:\\b${receiver}\\s*\\.\\s*observe|\\bLeaderObserver\\s*::\\s*observe\\s*\\(\\s*&?\\s*${receiver}\\b)`,
+    ).test(source),
+  );
+}
+
+function stage13EintrPath(normalize) {
+  const condition = /\bif\s+(?:error\s*==\s*nix::libc::EINTR|nix::libc::EINTR\s*==\s*error)\s*\{/.exec(normalize);
+  if (!condition) return null;
+  const opening = condition.index + condition[0].lastIndexOf('{');
+  const closing = findMatchingDelimiter(normalize, opening, '{', '}');
+  assert(closing !== -1, 'Stage 13 EINTR normalization branch has unbalanced braces');
+  const errorNormalization = normalize.lastIndexOf('let error', condition.index);
+  return {
+    branch: normalize.slice(opening + 1, closing),
+    source: normalize.slice(errorNormalization === -1 ? condition.index : errorNormalization, closing + 1),
+  };
+}
+
+function stage13EintrHelperAnalysis(execution, observe, normalize, eintrPath) {
+  const localFunctions = rustTopLevelFunctions(execution);
+  const localFunctionNames = new Set(localFunctions.keys());
+  const observerCalls = rustLocalFunctionCalls(observe, localFunctionNames);
+  observerCalls.delete('normalize_waitid_attempt');
+  const eintrCalls = rustLocalFunctionCalls(eintrPath?.source ?? '', localFunctionNames);
+  const initialCalls = new Set([...observerCalls, ...eintrCalls]);
+  initialCalls.delete('normalize_waitid_attempt');
+
+  const visited = new Set();
+  const edges = new Map();
+  const reachableSources = [];
+  const queue = [...initialCalls].map((name) => ({ name, depth: 1 }));
+  let dangerousRetry = false;
+  let normalizationCycle = eintrCalls.has('normalize_waitid_attempt');
+  let depthExceeded = false;
+
+  while (queue.length > 0) {
+    const { name, depth } = queue.shift();
+    if (visited.has(name)) continue;
+    visited.add(name);
+    const definitions = localFunctions.get(name) ?? [];
+    const callees = new Set();
+    for (const definition of definitions) {
+      reachableSources.push(definition.source);
+      if (
+        /\bwaitid\s*\(/.test(definition.source) ||
+        callsConcreteWaitidObserver(definition.source)
+      ) {
+        dangerousRetry = true;
+      }
+      for (const callee of rustLocalFunctionCalls(definition.body, localFunctionNames)) {
+        if (callee === 'normalize_waitid_attempt') normalizationCycle = true;
+        else callees.add(callee);
+      }
+    }
+    edges.set(name, callees);
+    for (const callee of callees) {
+      if (visited.has(callee)) continue;
+      if (depth >= STAGE13_EINTR_HELPER_MAX_DEPTH) {
+        depthExceeded = true;
+      } else {
+        queue.push({ name: callee, depth: depth + 1 });
+      }
+    }
+  }
+
+  const indegree = new Map([...visited].map((name) => [name, 0]));
+  for (const [caller, callees] of edges) {
+    if (!visited.has(caller)) continue;
+    for (const callee of callees) {
+      if (visited.has(callee)) indegree.set(callee, indegree.get(callee) + 1);
+    }
+  }
+  const acyclicQueue = [...indegree]
+    .filter(([, degree]) => degree === 0)
+    .map(([name]) => name);
+  let acyclicCount = 0;
+  while (acyclicQueue.length > 0) {
+    const name = acyclicQueue.shift();
+    acyclicCount += 1;
+    for (const callee of edges.get(name) ?? []) {
+      if (!indegree.has(callee)) continue;
+      const degree = indegree.get(callee) - 1;
+      indegree.set(callee, degree);
+      if (degree === 0) acyclicQueue.push(callee);
+    }
+  }
+
+  return {
+    cooperativeResult: [eintrPath?.branch ?? '', ...reachableSources].some((source) =>
+      /(?:return\s+)?Ok\s*\(\s*LeaderObservationStatus::Interrupted\s*\)/.test(source),
+    ),
+    synchronousRetry:
+      dangerousRetry || normalizationCycle || depthExceeded || acyclicCount !== visited.size,
+  };
+}
+
+function stage13WaitidEintrViolations(execution) {
+  const violations = [];
+  const observerImpl = extractRustNamedBlock(
+    execution,
+    /impl\s+LeaderObserver\s+for\s+WaitIdLeaderObserver\s*\{/,
+    'Stage 13 waitid leader observer',
+  );
+  const observe = extractRustFunction(observerImpl, 'observe');
+  const normalize = extractRustFunction(execution, 'normalize_waitid_attempt');
+  const eintrPath = stage13EintrPath(normalize);
+  const helperAnalysis = stage13EintrHelperAnalysis(execution, observe, normalize, eintrPath);
+  const cooperativeEintrResult = helperAnalysis.cooperativeResult;
+  const observerReturnsNormalizer =
+    /normalize_waitid_attempt\s*\(\s*result\s*,\s*observed_pid\s*,\s*error\s*\)\s*\}$/.test(observe);
+  if (
+    (observe.match(/\bwaitid\s*\(/g) ?? []).length !== 1 ||
+    !/\bWNOWAIT\b/.test(observe) ||
+    /\bloop\s*\{|\bcontinue\b|\bEINTR\b/.test(observe) ||
+    callsConcreteWaitidObserver(observe) ||
+    !observerReturnsNormalizer ||
+    /\bwaitid\s*\(|\bloop\s*\{|\bcontinue\b/.test(normalize) ||
+    callsConcreteWaitidObserver(normalize) ||
+    (normalize.match(/\bnix::libc::EINTR\b/g) ?? []).length !== 1 ||
+    !cooperativeEintrResult ||
+    helperAnalysis.synchronousRetry
+  ) {
+    violations.push('unbounded synchronous EINTR retry');
+  }
+  if (
+    !observerReturnsNormalizer ||
+    !cooperativeEintrResult
+  ) {
+    violations.push('EINTR is not normalized cooperatively');
+  }
+  if (
+    !/nix::libc::EINTR[\s\S]*LeaderObservationStatus::Interrupted/.test(execution) ||
+    !/Pending\s*\|\s*LeaderObservationStatus::Interrupted/.test(execution) ||
+    !/tokio::select!/.test(execution) ||
+    !/GROUP_POLL_INTERVAL/.test(execution)
+  ) {
+    violations.push('interrupted observation bypasses async deadline control');
+  }
+  return violations;
+}
+
+function stage13StableGroupOrderingViolations(execution, finishOwnedTree) {
+  const violations = [];
+  const release = finishOwnedTree.indexOf('release_for_reap()');
+  const tryReap = finishOwnedTree.indexOf('child.try_wait()');
+  const finalSignal = finishOwnedTree.lastIndexOf('signal_owned_tree(');
+  if (
+    !/waitid\s*\(/.test(execution) ||
+    !/WNOWAIT/.test(execution) ||
+    !/struct\s+StableProcessGroup\b/.test(execution)
+  ) {
+    violations.push('leader exit observed by reaping');
+  }
+  if (release === -1 || tryReap === -1 || finalSignal === -1 || finalSignal > release || release > tryReap) {
+    violations.push('stale PGID signal after leader identity release');
+  }
+  return violations;
+}
+
+function verifyStage13WorkstationStructure(rustRoot, productionFiles) {
   const portPath = join(rustRoot, 'ports', 'workstation.rs');
   const adapterPath = join(rustRoot, 'adapters', 'local_workstation.rs');
-  assert(existsSync(portPath), 'Stage 12 Workstation port is absent');
-  assert(existsSync(adapterPath), 'Stage 12 LocalWorkstation adapter is absent');
+  const executionPath = join(rustRoot, 'adapters', 'local_workstation', 'execution.rs');
+  assert(existsSync(portPath), 'Stage 13 Workstation port is absent');
+  assert(existsSync(adapterPath), 'Stage 13 LocalWorkstation adapter is absent');
+  assert(existsSync(executionPath), 'Stage 13 owned execution runtime is absent');
 
   const port = readFileSync(portPath, 'utf8');
   const adapter = readFileSync(adapterPath, 'utf8');
+  const execution = readFileSync(executionPath, 'utf8');
   const portProduction = stripRustComments(withoutRustTestModules(port));
   const adapterProduction = stripRustComments(withoutRustTestModules(adapter));
+  const executionProduction = stripRustComments(withoutRustTestModules(execution));
   const workstationTraits = productionFiles.reduce(
     (count, file) => count + (stripRustComments(withoutRustTestModules(file.source)).match(/\btrait\s+Workstation\b/g) ?? []).length,
     0,
@@ -458,7 +823,7 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
   const trait = extractRustNamedBlock(
     portProduction,
     /\bpub\s+trait\s+Workstation\s*:[^{]+\{/,
-    'Stage 12 Workstation trait',
+    'Stage 13 Workstation trait',
   );
   assert(
     equalStringArrays(rustMethodNames(trait), [
@@ -481,6 +846,8 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
     'WorkstationId',
     'WorkstationGeneration',
     'WorkspaceId',
+    'ExecutionId',
+    'WorkId',
     'LogicalPathReference',
     'WorkstationFuture',
   ]) {
@@ -499,6 +866,10 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
     'unsupported_capability',
     'timeout',
     'cancelled',
+    'spawn_failed',
+    'signal_terminated',
+    'inspection_not_found',
+    'cleanup_failed',
     'io_error',
     'internal_workstation_error',
   ]) {
@@ -513,7 +884,7 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
   const workstationImpl = extractRustNamedBlock(
     adapterProduction,
     /\bimpl\s+Workstation\s+for\s+LocalWorkstation\s*\{/,
-    'Stage 12 LocalWorkstation implementation',
+    'Stage 13 LocalWorkstation implementation',
   );
   assert(
     equalStringArrays(rustMethodNames(workstationImpl), [
@@ -525,29 +896,109 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
     ]),
     `LocalWorkstation methods differ: ${rustMethodNames(workstationImpl).join(', ')}`,
   );
-  for (const method of ['execute', 'inspect_execution', 'cancel_execution']) {
-    const body = extractRustFunction(workstationImpl, method);
-    assert(
-      /UnsupportedCapability/.test(body) &&
-        !/tokio::process|std::process|Command::new|\.spawn\s*\(|HashMap|Pid/.test(body),
-      `Stage 12 ${method} must remain unsupported-only without process state`,
-    );
-  }
+  const executeMethod = extractRustFunction(workstationImpl, 'execute');
+  const inspectMethod = extractRustFunction(workstationImpl, 'inspect_execution');
+  const cancelMethod = extractRustFunction(workstationImpl, 'cancel_execution');
+  assert(
+    /prepare_execution_cwd/.test(executeMethod) && /runtime\.execute\(request, cwd\?\)\.await/.test(executeMethod),
+    'Stage 13 execute must resolve cwd and delegate to the owned execution runtime',
+  );
+  assert(
+    /self\.execution\s*\.inspect/.test(inspectMethod) && /runtime\s*\.cancel/.test(cancelMethod),
+    'Stage 13 inspect/cancel must be real execution-runtime operations',
+  );
 
-  const capabilities = extractRustFunction(adapterProduction, 'stage12_capabilities');
+  const capabilities = extractRustFunction(adapterProduction, 'stage13_capabilities');
   assert(
     /cpu_architecture:\s*std::env::consts::ARCH/.test(capabilities) &&
       /os_release:\s*std::env::consts::OS/.test(capabilities) &&
       /filesystem_read:\s*true/.test(capabilities) &&
       /privilege_user:\s*true/.test(capabilities) &&
-      /foreground_execute:\s*false/.test(capabilities) &&
-      /cancel_execution:\s*false/.test(capabilities) &&
-      /inspect_execution:\s*false/.test(capabilities) &&
-      /privilege_administrative:\s*false/.test(capabilities) &&
-      /process_group_cleanup:\s*false/.test(capabilities) &&
-      /cgroup_cleanup:\s*false/.test(capabilities) &&
-      /WorkstationCapabilityLimits::try_new\(0, 0, 0\)/.test(capabilities),
-    'LocalWorkstation Stage 12 capability truth differs',
+      /foreground_execute:\s*support\.foreground/.test(capabilities) &&
+      /cancel_execution:\s*support\.foreground/.test(capabilities) &&
+      /inspect_execution:\s*support\.foreground/.test(capabilities) &&
+      /privilege_administrative:\s*support\.administrative/.test(capabilities) &&
+      /process_group_cleanup:\s*support\.process_group/.test(capabilities) &&
+      /cgroup_cleanup:\s*support\.cgroup/.test(capabilities) &&
+      /HARD_EXECUTION_TIMEOUT_MS/.test(capabilities) &&
+      (capabilities.match(/HARD_EXECUTION_STREAM_CAPTURE_BYTES/g) ?? []).length === 2,
+    'LocalWorkstation Stage 13 capability observation or limits differ',
+  );
+
+  const processBoundaryLeaks = stage13ProcessBoundaryLeaks(productionFiles);
+  assert(
+    processBoundaryLeaks.length === 0,
+    `process APIs escaped LocalWorkstation lifecycle ownership: ${processBoundaryLeaks.join(', ')}`,
+  );
+  assert(
+    /entries:\s*HashMap<ExecutionId, Arc<ExecutionEntry>>/.test(executionProduction) &&
+      /registry\.entries\.contains_key\(&request\.execution_id\)/.test(executionProduction) &&
+      /\.insert\(request\.execution_id/.test(executionProduction) &&
+      /registry\.entries\.remove\(&execution_id\)/.test(executionProduction) &&
+      !/ExecutionId::[^;\n]*(?:pid|pgid)/i.test(executionProduction),
+    'Stage 13 registry must be keyed by ExecutionId and reject duplicate live ownership',
+  );
+  assert(
+    stage13OwnershipBoundaryViolations(executionProduction).length === 0,
+    `Stage 13 reservation-ownership violations: ${stage13OwnershipBoundaryViolations(executionProduction).join(', ')}`,
+  );
+  assert(
+    stage13WaitidEintrViolations(executionProduction).length === 0,
+    `Stage 13 waitid EINTR violations: ${stage13WaitidEintrViolations(executionProduction).join(', ')}`,
+  );
+  assert(
+    /Command::new\(SUDO_PATH\)/.test(executionProduction) &&
+      /Command::new\(shell\)/.test(executionProduction) &&
+      /\.arg\("--noprofile"\)[\s\S]*\.arg\("--norc"\)[\s\S]*\.arg\("-o"\)[\s\S]*\.arg\("pipefail"\)[\s\S]*\.arg\("-c"\)[\s\S]*\.arg\(&request\.command\)/.test(executionProduction) &&
+      /\.stdin\(Stdio::null\(\)\)/.test(executionProduction) &&
+      (executionProduction.match(/\.env_clear\(\)/g) ?? []).length >= 2 &&
+      !/ExecutionEnvironmentVariable|environment:\s*(?:Vec|HashMap)/.test(portProduction),
+    'Stage 13 launch must use fixed Bash argv, a closed stdin, and an exact cleared environment',
+  );
+  for (const variable of ['HOME', 'USER', 'LOGNAME', 'SHELL', 'LANG', 'PATH', 'CRAXII_WORK_ID', 'CRAXII_WORKSPACE_ID']) {
+    assert(executionProduction.includes(`"${variable}"`), `Stage 13 child environment is missing ${variable}`);
+  }
+  const childEnvironment = extractRustFunction(executionProduction, 'child_environment');
+  assert(
+    !/(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY|SSH_AUTH_SOCK)/.test(childEnvironment),
+    'Stage 13 production child launcher mentions forbidden ambient/provider secrets',
+  );
+  assert(
+    /\.pre_exec\(/.test(executionProduction) && /libc::fchdir/.test(executionProduction) &&
+      /libc::setsid/.test(executionProduction) && /killpg/.test(executionProduction) &&
+      /Signal::SIGTERM/.test(executionProduction) && /Signal::SIGKILL/.test(executionProduction) &&
+      /child\.try_wait\(\)/.test(executionProduction),
+    'Stage 13 process session ownership or TERM/KILL/reap cleanup is incomplete',
+  );
+  const finishOwnedTree = extractRustFunction(executionProduction, 'finish_owned_process_tree');
+  assert(
+    stage13StableGroupOrderingViolations(executionProduction, finishOwnedTree).length === 0,
+    `Stage 13 stable process-group violations: ${stage13StableGroupOrderingViolations(executionProduction, finishOwnedTree).join(', ')}`,
+  );
+  for (const token of ['cgroup.procs', 'cgroup.kill', 'cgroup.events']) {
+    assert(executionProduction.includes(token), `Stage 13 Linux cgroup implementation is missing ${token}`);
+  }
+  assert(
+      /let mut drains = JoinSet::new\(\)/.test(executionProduction) &&
+      (executionProduction.match(/drains\.spawn\(drain_stream/g) ?? []).length === 2 &&
+      /while !drains\.is_empty\(\)/.test(executionProduction) &&
+      /drains\.join_next_with_id\(\)/.test(executionProduction) &&
+      /drains\.abort_all\(\)/.test(executionProduction) &&
+      /HARD_EXECUTION_STREAM_CAPTURE_BYTES/.test(executionProduction) &&
+      /observed\.overflowing_add/.test(executionProduction) &&
+      !/\.read_to_end\s*\(/.test(executionProduction),
+    'Stage 13 stdout/stderr capture must be concurrent, bounded, saturating, and fully drained',
+  );
+  assert(
+    /manager:\s*Mutex<Option<ManagerOwnership>>/.test(executionProduction) &&
+      /join:\s*Option<JoinHandle<\(\)>>/.test(executionProduction) &&
+      /let mut supervisors = JoinSet::new\(\)/.test(executionProduction) &&
+      /supervisors\.join_next_with_id\(\)/.test(executionProduction),
+    'Stage 13 lifecycle tasks must retain, join, and observe supervisor ownership',
+  );
+  assert(
+    stage13ExecutionViolations(execution).length === 0,
+    `Stage 13 execution safety violations: ${stage13ExecutionViolations(execution).join(', ')}`,
   );
 
   const resolver = extractRustFunction(adapterProduction, 'resolve_existing_path');
@@ -575,10 +1026,6 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
       /truncated:\s*false/.test(blockingRead),
     'Stage 12 descriptor-based bounded strict-UTF-8 read structure is incomplete',
   );
-  assert(
-    localWorkstationViolations(adapter).length === 0,
-    `LocalWorkstation structural violations: ${localWorkstationViolations(adapter).join(', ')}`,
-  );
   const filesystemLeaks = stage12ModelFilesystemLeaks(productionFiles);
   assert(
     filesystemLeaks.length === 0,
@@ -587,13 +1034,20 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
 
   const startup = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
   assert(
-    /LocalWorkstation::new\([\s\S]*config\.paths\(\)\.primary_workspace_root\(\)[\s\S]*config\.limits\(\)\.tools\(\)\.read_file_max_bytes\(\)/.test(
-      startup,
-    ) &&
-      /let workstation:\s*Arc<dyn Workstation>\s*=\s*Arc::new\(local_workstation\)/.test(startup) &&
+    stage13DeadlinePropagationViolations(startup, executionProduction).length === 0,
+    `Stage 13 shutdown-deadline violations: ${stage13DeadlinePropagationViolations(startup, executionProduction).join(', ')}`,
+  );
+  assert(
+    /LocalWorkstation::new\([\s\S]*LocalWorkstationOptions/.test(startup) &&
+      /let local_workstation = Arc::new\(\s*LocalWorkstation::new/.test(startup) &&
+      /let workstation:\s*Arc<dyn Workstation>\s*=\s*local_workstation\.clone\(\)/.test(startup) &&
       /workstation:\s*Arc<dyn Workstation>/.test(startup) &&
+      /local_workstation\.begin_execution_shutdown\(deadline\)/.test(startup) &&
+      /shutdown_executions_before\(deadline\)/.test(startup) &&
+      startup.indexOf('shutdown_executions_before(deadline)') <
+        startup.indexOf('self.sqlite_runtime.shutdown().await') &&
       !/mark_ready\s*\(/.test(startup),
-    'Stage 12 bootstrap must retain configured LocalWorkstation while remaining live_unready',
+    'Stage 13 bootstrap must retain and shut down LocalWorkstation under the Stage 10 deadline while remaining live_unready',
   );
 
   const stateStore = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'state_store.rs'), 'utf8');
@@ -602,7 +1056,7 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
     /UPDATE workstations SET capabilities_json = \?, last_seen_at = \?/.test(refresh) &&
       /UPDATE workspaces SET local_resolved_root = \?/.test(refresh) &&
       !/UPDATE journal_events/.test(refresh),
-    'Stage 12 current capability/root refresh is incomplete or rewrites journal history',
+    'Stage 13 current capability/root refresh is incomplete or rewrites journal history',
   );
 
   const pathTests = readFileSync(join(rustRoot, 'domain', 'path.rs'), 'utf8');
@@ -610,7 +1064,7 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
   for (const [source, testName] of [
     [port, 'fake_proves_the_port_has_no_local_descriptor_or_path_handle_requirement'],
     [port, 'operation_and_execution_ids_are_distinct_uuidv7_domain_types'],
-    [adapter, 'capabilities_are_exact_truthful_stage12_runtime_facts'],
+    [adapter, 'capabilities_are_exact_truthful_stage13_runtime_facts'],
     [adapter, 'identity_generation_and_workspace_guards_precede_path_io'],
     [adapter, 'normal_utf8_empty_multibyte_bom_newlines_nul_and_hashes_are_exact'],
     [adapter, 'absolute_nested_unicode_and_control_character_paths_are_supported_and_redacted'],
@@ -623,20 +1077,49 @@ function verifyStage12WorkstationStructure(rustRoot, productionFiles) {
     [adapter, 'deterministic_mutation_growth_and_shrink_are_changed_during_read'],
     [adapter, 'expired_and_inflight_deadlines_are_honest_without_cancellation_claims'],
     [adapter, 'read_has_no_target_or_directory_side_effects'],
-    [adapter, 'stage13_methods_are_guarded_and_unsupported_with_zero_process_mutation'],
+    [adapter, 'stage13_executes_bash_with_separate_capture_and_terminal_registry_removal'],
+    [adapter, 'execution_form_quoting_pipes_redirection_profiles_and_fresh_shell_are_exact'],
+    [adapter, 'exact_child_environment_excludes_parent_secrets_and_stdin_is_closed_without_tty'],
+    [adapter, 'cwd_relative_absolute_outside_symlink_missing_file_and_open_handle_race_are_honest'],
+    [adapter, 'output_empty_separate_simultaneous_binary_and_newlines_are_exact'],
+    [adapter, 'capture_ceiling_continues_draining_and_projection_is_head_tail'],
+    [adapter, 'exit_signal_spawn_and_request_validation_results_remain_distinct'],
+    [adapter, 'registry_inspect_duplicate_cancel_repeat_concurrent_and_natural_race_are_coherent'],
+    [adapter, 'caller_drop_keeps_execution_owned_and_shutdown_closes_admission_and_joins'],
+    [adapter, 'shutdown_and_execution_reservation_have_only_two_atomic_outcomes'],
+    [adapter, 'natural_exit_cleanup_signals_descendants_before_releasing_leader_identity'],
+    [adapter, 'cancellation_cleanup_signals_before_releasing_leader_identity'],
+    [adapter, 'timeout_cleanup_signals_before_releasing_leader_identity'],
+    [adapter, 'shutdown_cleanup_uses_original_deadline_and_releases_identity_after_signals'],
+    [adapter, 'stage10_expired_deadline_forces_kill_reports_uncertain_and_joins_before_return'],
+    [adapter, 'repeated_waitid_eintr_yields_to_shutdown_cancellation_and_stage10_deadline'],
+    [adapter, 'timeout_and_completion_remove_background_children_with_term_kill_escalation'],
+    [adapter, 'execution_debug_and_errors_redact_command_cwd_environment_and_output_canaries'],
+    [execution, 'first_terminal_cause_wins_cancel_timeout_and_natural_exit_races'],
+    [execution, 'waitid_eintr_is_one_cooperative_nonterminal_observation'],
+    [execution, 'launcher_argv_and_user_admin_environment_are_exact'],
+    [adapter, 'linux_target_ubuntu_nonroot_systemd_cgroup_git_and_service_contract'],
+    [adapter, 'linux_target_user_admin_identity_clean_environment_and_cgroup_cleanup'],
+    [adapter, 'linux_target_cgroup_kills_session_escape_and_repeated_process_trees'],
+    [adapter, 'linux_target_crash_marker_probe_execution'],
+    [adapter, 'linux_target_docker_disposable_service_crash_restart_and_reboot_leak_harness'],
     [pathTests, 'workspace_relative_paths_normalize_lexically'],
     [pathTests, 'workspace_relative_escape_and_empty_results_are_rejected'],
     [pathTests, 'absolute_paths_normalize_and_clamp_at_root'],
     [pathTests, 'backslash_and_nul_are_rejected_for_both_kinds'],
     [pathTests, 'canonical_utf8_boundary_is_exact'],
     [pathTests, 'debug_redacts_path_text'],
-    [stage7Tests, 'stage12_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event'],
+    [stage7Tests, 'stage13_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event'],
   ]) {
     assert(
       new RegExp(`(?:async\\s+)?fn\\s+${testName}\\s*\\(`).test(source),
-      `Stage 12 permanent test inventory is missing ${testName}`,
+      `Stage 13 permanent test inventory is missing ${testName}`,
     );
   }
+  assert(
+    existsSync(join(repositoryRoot, 'scripts', 'verify-stage13-ubuntu-target')),
+    'Stage 13 Ubuntu target-verification harness is absent',
+  );
 }
 
 function expectStructuralRejection(label, operation) {
@@ -649,67 +1132,20 @@ function expectStructuralRejection(label, operation) {
   assert(rejected, `checker negative probe was not rejected: ${label}`);
 }
 
-function verifyStage12CheckerNegativeProbes() {
-  const allowedRouter = `
-    Router::new()
-      .route("/health/live", get(liveness))
-      .route("/health/ready", get(readiness))
-      .route("/bootstrap", get(bootstrap).delete(remove_bootstrap))
-      .route("/conversations/{conversation_id}/messages", post(message))
-      .route("/work-items/{work_id}/cancel", post(cancel))
-      .route("/events", get(events));`;
-  expectStructuralRejection('DELETE /v1/bootstrap', () => verifyStage11RouteInventory(allowedRouter));
-
-  const poolBackedSnapshot = `
-    async fn load_client_bootstrap_inner(&self) -> Result<ClientBootstrapCandidate, Error> {
-      let mut transaction = self.pool.begin().await?;
-      let head = query("SELECT max(journal_offset) FROM journal_events")
-        .fetch_one(&mut *transaction).await?;
-      let roots = query("roots").fetch_all(&mut *transaction).await?;
-      let messages = query("messages").fetch_all(&mut *transaction).await?;
-      let work = query("work").fetch_all(&mut *transaction).await?;
-      let tools = query("tools").fetch_all(&mut *transaction).await?;
-      let leaked = query("leaked").fetch_all(&self.pool).await?;
-      transaction.commit().await?;
-      Ok(ClientBootstrapCandidate { head, roots, messages, work, tools, leaked })
-    }`;
-  expectStructuralRejection('pool-backed bootstrap projection', () =>
-    verifyBootstrapSnapshotStructure(poolBackedSnapshot),
+function verifyStage13CheckerNegativeProbes() {
+  const executionPath = join(
+    repositoryRoot,
+    'backend',
+    'src',
+    'adapters',
+    'local_workstation',
+    'execution.rs',
   );
-
-  const directFilesystemFixture = [{
-    path: 'application/tool_service.rs',
-    source: 'fn read(path: &str) { let _ = std::fs::read_to_string(path); }',
-  }];
-  assert(
-    stage12ModelFilesystemLeaks(directFilesystemFixture).length === 1,
-    'checker negative probe was not rejected: direct application filesystem read',
+  const executionSource = readFileSync(executionPath, 'utf8');
+  const executionProduction = stripRustComments(
+    withoutRustTestModules(executionSource),
   );
-
-  const stage13Fixture = [{
-    path: 'adapters/local_workstation.rs',
-    source: `
-      pub struct LocalWorkstation;
-      impl LocalWorkstation {
-        pub fn execute(&self) { std::process::Command::new("sh").spawn().unwrap(); }
-      }`,
-  }];
-  assert(
-    stage13ImplementationLeaks(stage13Fixture).length === 1,
-    'checker negative probe was not rejected: concrete Stage 13 process implementation',
-  );
-  assert(
-    localWorkstationViolations(stage13Fixture[0].source).includes('process execution'),
-    'checker negative probe was not rejected: LocalWorkstation process spawning',
-  );
-  assert(
-    localWorkstationViolations('fn capabilities() { foreground_execute: true }').includes(
-      'future capability advertised true',
-    ),
-    'checker negative probe was not rejected: execute capability advertised true',
-  );
-
-  const filesystemRouter = `
+  const executeRouter = `
     Router::new()
       .route("/health/live", get(liveness))
       .route("/health/ready", get(readiness))
@@ -717,21 +1153,251 @@ function verifyStage12CheckerNegativeProbes() {
       .route("/conversations/{conversation_id}/messages", post(message))
       .route("/work-items/{work_id}/cancel", post(cancel))
       .route("/events", get(events))
-      .route("/files/{path}", get(file));`;
-  expectStructuralRejection('filesystem HTTP route', () => verifyStage11RouteInventory(filesystemRouter));
+      .route("/workstations/{id}/execute", post(execute));`;
+  expectStructuralRejection('execute HTTP route', () => verifyStage11RouteInventory(executeRouter));
+
+  const cases = [
+    ['ambient environment inheritance', 'fn launch() { Command::new("/bin/bash").spawn(); }'],
+    ['provider or ambient secret inclusion', 'fn env() { command.env("OPENAI_API_KEY", secret); }'],
+    ['parent-only kill', 'async fn stop() { child.kill().await; }'],
+    ['unbounded output buffering', 'async fn drain() { stdout.read_to_end(&mut bytes).await; }'],
+    ['detached lifecycle task', 'fn launch() { tokio::spawn(async { supervise().await }); }'],
+    ['PID-as-ExecutionId', 'fn id(pid: u32) { ExecutionId::from_pid(pid); }'],
+    ['raw sensitive tracing', 'fn log(request: R) { tracing::info!(command = request.command); }'],
+    ['optimistic privileged capability', 'fn capabilities() { privilege_administrative: true, cgroup_cleanup: true }'],
+  ];
+  for (const [violation, fixture] of cases) {
+    assert(
+      stage13ExecutionViolations(fixture).includes(violation),
+      `checker negative probe was not rejected: ${violation}`,
+    );
+  }
+
+  const processEscape = [{ path: 'application/tool_service.rs', source: 'fn run() { Command::new("bash"); }' }];
   assert(
-    localWorkstationViolations('fn read_file(path: &Path) { File::open(path).unwrap().read_to_end(&mut Vec::new()); }').includes(
-      'unbounded file read',
-    ),
-    'checker negative probe was not rejected: unbounded LocalWorkstation read',
+    stage13ProcessBoundaryLeaks(processEscape).length === 1,
+    'checker negative probe was not rejected: process API outside LocalWorkstation',
+  );
+  const stage14 = [{ path: 'application/tool_registry.rs', source: 'struct ToolRegistry;' }];
+  assert(
+    stage14ImplementationLeaks(stage14).length === 1,
+    'checker negative probe was not rejected: Stage 14 Tool Registry implementation',
+  );
+  const missingStage10Deadline = stage13DeadlinePropagationViolations(
+    'self.local_workstation.begin_execution_shutdown(); self.local_workstation.shutdown_executions_before(deadline);',
+    'fn cleanup(request: Request) { terminate(request.deadline); }',
   );
   assert(
-    localWorkstationViolations('fn resolve(path: &Path) { path.starts_with(workspace_root); }').includes(
-      'prefix-based path confinement',
-    ),
-    'checker negative probe was not rejected: prefix-based fake confinement',
+    missingStage10Deadline.includes('Stage 10 deadline not propagated unchanged') &&
+      missingStage10Deadline.includes('request-only cleanup deadline'),
+    'checker negative probe was not rejected: request-only shutdown cleanup deadline',
   );
-  return 9;
+  const staleGroupFixture = `
+    struct StableProcessGroup;
+    fn finish_owned_process_tree() {
+      let status = child.try_wait();
+      let released = process_group.release_for_reap();
+      signal_owned_tree(&process_group);
+    }
+    fn observe() { waitid(P_PID, pid, WNOWAIT); }`;
+  const staleFinish = extractRustFunction(staleGroupFixture, 'finish_owned_process_tree');
+  assert(
+    stage13StableGroupOrderingViolations(staleGroupFixture, staleFinish)
+      .includes('stale PGID signal after leader identity release'),
+    'checker negative probe was not rejected: stale PGID signal after reap',
+  );
+  const postReservationRejection = `
+    struct ExecutionRegistry {
+      admission_open: bool,
+      entries: HashMap<ExecutionId, Arc<ExecutionEntry>>,
+    }
+    fn execute() {
+      let mut registry = lock(&self.registry);
+      if !registry.admission_open { return WorkstationUnavailable; }
+      if registry.entries.contains_key(&request.execution_id) { return SpawnFailed; }
+      registry.entries.insert(request.execution_id, entry);
+      let sender = self.ensure_manager();
+      sender.send(ManagerCommand::Launch(launch));
+    }
+    fn begin_shutdown() {
+      let mut registry = lock(&self.registry);
+      registry.admission_open = false;
+      for entry in registry.entries.values() { entry.latch(TerminalCause::Shutdown); }
+    }
+    fn claim_spawn() {
+      let phase = ExecutionPhase::Reserved;
+      lifecycle.phase = ExecutionPhase::Spawning;
+      pre_spawn_terminal_result();
+    }
+    fn supervise() { supervise_inner(&runtime, launch); }
+    fn supervise_inner() {
+      launch.entry.claim_spawn();
+      command.spawn();
+    }
+    fn manager_loop() {
+      supervisors.spawn(supervise(runtime, launch));
+      if !runtime.admission_open { return WorkstationUnavailable; }
+    }`;
+  assert(
+    stage13OwnershipBoundaryViolations(postReservationRejection)
+      .includes('post-reservation admission rejection'),
+    'checker negative probe was not rejected: post-reservation admission rejection',
+  );
+  const executeProduction = extractRustFunction(executionProduction, 'execute');
+  const reservationStatement = /registry\s*\.entries\s*\.insert\s*\(\s*request\.execution_id\s*,\s*Arc::clone\(&entry\)\s*\)\s*;/.exec(executeProduction)?.[0];
+  assert(reservationStatement, 'checker reservation-after-spawn mutation source is absent');
+  const reservationAfterSpawn = executionProduction
+    .replace(reservationStatement, '')
+    .replace(
+      /let\s+mut\s+child\s*=\s*match\s+command\.spawn\(\)\s*\{/,
+      (spawn) => `${spawn}\n${reservationStatement}`,
+    );
+  assert(
+    reservationAfterSpawn.indexOf(reservationStatement) >
+      reservationAfterSpawn.indexOf('command.spawn()'),
+    'checker reservation-after-spawn mutation was not constructed',
+  );
+  assert(
+    stage13OwnershipBoundaryViolations(reservationAfterSpawn)
+      .includes('execution ownership reservation does not precede OS process spawn'),
+    'checker negative probe was not rejected: reservation after OS process spawn',
+  );
+  const unboundedEintrRetry = `
+    enum LeaderObservationStatus { Pending, Interrupted, Terminal }
+    struct WaitIdLeaderObserver;
+    impl LeaderObserver for WaitIdLeaderObserver {
+      fn observe() {
+        loop {
+          waitid(P_PID, pid, WNOWAIT);
+          if error == EINTR { continue; }
+        }
+      }
+    }
+    fn supervise() {
+      match status { Pending | LeaderObservationStatus::Interrupted => {} }
+      tokio::select! { _ = GROUP_POLL_INTERVAL => {} }
+    }
+    fn normalize_waitid_attempt() { nix::libc::EINTR; LeaderObservationStatus::Interrupted; }`;
+  assert(
+    stage13WaitidEintrViolations(unboundedEintrRetry)
+      .includes('unbounded synchronous EINTR retry'),
+    'checker negative probe was not rejected: unbounded synchronous EINTR retry',
+  );
+  const recursiveEintrRetry = executionProduction.replace(
+    /normalize_waitid_attempt\(result, observed_pid, error\)/,
+    `if error == Some(nix::libc::EINTR) {
+            self.observe(pid)
+        } else {
+            normalize_waitid_attempt(result, observed_pid, error)
+        }`,
+  );
+  assert(
+    recursiveEintrRetry !== executionProduction,
+    'checker recursive-EINTR mutation source is absent',
+  );
+  assert(
+    stage13WaitidEintrViolations(recursiveEintrRetry)
+      .includes('unbounded synchronous EINTR retry'),
+    'checker negative probe was not rejected: recursive EINTR retry',
+  );
+
+  const errorNormalization = 'let error = error.unwrap_or(nix::libc::EIO);';
+  assert(
+    executionProduction.includes(errorNormalization),
+    'checker helper-chain EINTR mutation source is absent',
+  );
+  const withEintrPathHelper = (call, helpers) => `${executionProduction.replace(
+    errorNormalization,
+    `let error = {
+        ${call};
+        error.unwrap_or(nix::libc::EIO)
+    };`,
+  )}
+${helpers}`;
+
+  const helperToSameObserver = withEintrPathHelper(
+    'let _ = eintr_retry_observer(&WaitIdLeaderObserver, 1)',
+    `fn eintr_retry_observer(
+        observer: &WaitIdLeaderObserver,
+        pid: i32,
+    ) -> std::io::Result<LeaderObservationStatus> {
+        observer.observe(pid)
+    }`,
+  );
+  const multiHopFullyQualifiedObserver = withEintrPathHelper(
+    'let _ = eintr_observer_helper_a(&WaitIdLeaderObserver, 1)',
+    `fn eintr_observer_helper_a(
+        observer: &WaitIdLeaderObserver,
+        pid: i32,
+    ) -> std::io::Result<LeaderObservationStatus> {
+        eintr_observer_helper_b(observer, pid)
+    }
+    fn eintr_observer_helper_b(
+        observer: &WaitIdLeaderObserver,
+        pid: i32,
+    ) -> std::io::Result<LeaderObservationStatus> {
+        <WaitIdLeaderObserver as LeaderObserver>::observe(observer, pid)
+    }`,
+  );
+  assert(
+    [helperToSameObserver, multiHopFullyQualifiedObserver].every((fixture) =>
+      stage13WaitidEintrViolations(fixture).includes('unbounded synchronous EINTR retry'),
+    ),
+    'checker negative probe was not rejected: same-observer EINTR helper retry chain',
+  );
+
+  const multiHopSecondWaitid = withEintrPathHelper(
+    'eintr_waitid_helper_a(1)',
+    `fn eintr_waitid_helper_a(pid: i32) {
+        eintr_waitid_helper_b(pid);
+    }
+    fn eintr_waitid_helper_b(pid: i32) {
+        let mut siginfo: nix::libc::siginfo_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            nix::libc::waitid(
+                nix::libc::P_PID,
+                pid as nix::libc::id_t,
+                &raw mut siginfo,
+                nix::libc::WEXITED | nix::libc::WNOHANG | nix::libc::WNOWAIT,
+            );
+        }
+    }`,
+  );
+  assert(
+    stage13WaitidEintrViolations(multiHopSecondWaitid)
+      .includes('unbounded synchronous EINTR retry'),
+    'checker negative probe was not rejected: second waitid through EINTR helper chain',
+  );
+
+  const cooperativeHelperChain = executionProduction.replace(
+    'Ok(LeaderObservationStatus::Interrupted)',
+    'eintr_interrupted_helper_a()',
+  );
+  assert(
+    cooperativeHelperChain !== executionProduction,
+    'checker cooperative helper-chain mutation source is absent',
+  );
+  const falsePositiveScope = stripRustComments(withoutRustTestModules(`${cooperativeHelperChain}
+    fn eintr_interrupted_helper_a() -> std::io::Result<LeaderObservationStatus> {
+      eintr_interrupted_helper_b()
+    }
+    fn eintr_interrupted_helper_b() -> std::io::Result<LeaderObservationStatus> {
+      Ok(LeaderObservationStatus::Interrupted)
+    }
+    fn unrelated_recursion(depth: usize) {
+      if depth > 0 { unrelated_recursion(depth - 1); }
+    }
+    fn unrelated_loop() { loop { break; } }
+    fn unrelated_waitid_reference() { waitid(P_PID, pid, WNOWAIT); }
+    #[cfg(test)]
+    mod injected_observer {
+      fn observe() { loop { waitid(P_PID, pid, WNOWAIT); continue; } }
+    }`));
+  assert(
+    stage13WaitidEintrViolations(falsePositiveScope).length === 0,
+    'checker false-positive probe rejected cooperative helper depth, unrelated recursion, loops, or waitid references',
+  );
+  return 19;
 }
 
 function verifyDirectDependencies(metadata, workspacePackages) {
@@ -898,7 +1564,7 @@ function trackedFiles() {
   return result.stdout.split('\0').filter(Boolean);
 }
 
-function verifyStage12Boundaries() {
+function verifyStage13Boundaries() {
   const rustRoot = join(repositoryRoot, 'backend', 'src');
   const sqliteRoot = join(rustRoot, 'adapters', 'sqlite');
   const rustFiles = walkFiles(rustRoot).filter((path) => path.endsWith('.rs'));
@@ -1582,19 +2248,20 @@ function verifyStage12Boundaries() {
       path: relative(rustRoot, path),
       source: readFileSync(path, 'utf8'),
     }));
-  const laterStageImplementationLeaks = stage13ImplementationLeaks(productionImplementationFiles);
+  const laterStageImplementationLeaks = stage14ImplementationLeaks(productionImplementationFiles);
   assert(
     laterStageModuleLeaks.length === 0 &&
       laterStageImplementationLeaks.length === 0,
-    `Stage 13+ process/tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 12: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
+    `Stage 14+ tool/provider/context/runner/assistant/draft implementation is forbidden in Stage 13: ${[...laterStageModuleLeaks, ...laterStageImplementationLeaks].join(', ')}`,
   );
 
-  verifyStage12WorkstationStructure(rustRoot, productionImplementationFiles);
-  const checkerNegativeProbeCount = verifyStage12CheckerNegativeProbes();
+  verifyStage13WorkstationStructure(rustRoot, productionImplementationFiles);
+  const checkerNegativeProbeCount = verifyStage13CheckerNegativeProbes();
 
   assert(
-    /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest),
-    'Tokio features must equal the Stage 10 set plus only Stage 11 net/io-util',
+    /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest) &&
+      /^nix\s*=\s*\{[^\n]*features\s*=\s*\["fs", "process", "signal"\][^\n]*\}$/m.test(cargoManifest),
+    'Stage 13 Tokio process and nix process/signal feature sets differ',
   );
 
   const trackedAdminResidue = trackedFiles().filter((path) =>
@@ -1669,10 +2336,10 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage12 = verifyStage12Boundaries();
+  const stage13 = verifyStage13Boundaries();
 
-  assert(directDependencyCount > 0 && stage12.checkerNegativeProbeCount === 9, 'checker summary evidence is incomplete');
-  console.log('Stage 12 structural invariants passed.');
+  assert(directDependencyCount > 0 && stage13.checkerNegativeProbeCount === 19, 'checker summary evidence is incomplete');
+  console.log('Stage 13 structural invariants passed.');
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
   process.exitCode = 1;

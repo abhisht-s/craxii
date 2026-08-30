@@ -238,6 +238,7 @@ pub struct ShutdownController<S, C> {
     correlation_id: CorrelationId,
     grace_period_ms: u64,
     requested: std::sync::atomic::AtomicBool,
+    monotonic_deadline: std::sync::OnceLock<tokio::time::Instant>,
     state: tokio::sync::Mutex<Option<ShutdownState>>,
     failure: tokio::sync::Mutex<Option<RuntimeControlError>>,
     heartbeat: tokio::sync::Mutex<Option<HeartbeatTask>>,
@@ -287,6 +288,7 @@ where
             correlation_id,
             grace_period_ms,
             requested: std::sync::atomic::AtomicBool::new(false),
+            monotonic_deadline: std::sync::OnceLock::new(),
             state: tokio::sync::Mutex::new(None),
             failure: tokio::sync::Mutex::new(None),
             heartbeat: tokio::sync::Mutex::new(Some(heartbeat)),
@@ -314,13 +316,16 @@ where
     /// The later async `request` work still owns claim quiescence, the durable stopping event,
     /// heartbeat join, and Work cancellation. Splitting this nonblocking latch lets bootstrap stop
     /// listener acceptance without creating a transport-local expected-exit authority.
-    pub fn latch_shutdown_request(&self) {
+    pub fn latch_shutdown_request(&self) -> tokio::time::Instant {
         self.requested
             .store(true, std::sync::atomic::Ordering::Release);
+        *self.monotonic_deadline.get_or_init(|| {
+            tokio::time::Instant::now() + Duration::from_millis(self.grace_period_ms)
+        })
     }
 
     pub async fn request(&self) -> Result<ShutdownReceipt, RuntimeControlError> {
-        self.latch_shutdown_request();
+        let monotonic_deadline = self.latch_shutdown_request();
         let mut state = self.state.lock().await;
         if let Some(existing) = *state {
             return Ok(ShutdownReceipt {
@@ -329,10 +334,10 @@ where
             });
         }
         let shutdown_requested_at = now(self.clock.as_ref())?;
-        let monotonic_deadline =
-            tokio::time::Instant::now() + Duration::from_millis(self.grace_period_ms);
-        let milliseconds =
-            i64::try_from(self.grace_period_ms).map_err(|_| RuntimeControlError::Clock)?;
+        let remaining_ms = monotonic_deadline
+            .saturating_duration_since(tokio::time::Instant::now())
+            .as_millis();
+        let milliseconds = i64::try_from(remaining_ms).map_err(|_| RuntimeControlError::Clock)?;
         let wall_deadline = shutdown_requested_at
             .to_offset_datetime()
             .checked_add(time::Duration::milliseconds(milliseconds))
@@ -416,10 +421,9 @@ where
     }
 
     pub async fn monotonic_deadline(&self) -> Result<tokio::time::Instant, RuntimeControlError> {
-        self.state
-            .lock()
-            .await
-            .map(|state| state.monotonic_deadline)
+        self.monotonic_deadline
+            .get()
+            .copied()
             .ok_or(RuntimeControlError::InvalidShutdown)
     }
 

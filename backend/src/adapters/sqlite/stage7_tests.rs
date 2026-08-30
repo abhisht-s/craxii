@@ -65,6 +65,8 @@ fn observation() -> BootstrapObservation {
         workspace_logical_name: "primary".into(),
         workspace_logical_root: "/workspace".into(),
         workspace_resolved_root: "/tmp/craxii-workspace".into(),
+        execution_capabilities:
+            crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
     }
 }
 
@@ -888,7 +890,7 @@ async fn first_bootstrap_and_reopen_are_exact_atomic_and_idempotent() {
 }
 
 #[tokio::test]
-async fn stage12_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event()
+async fn stage13_refreshes_current_capabilities_root_and_last_seen_without_rewriting_initial_event()
 {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
@@ -936,6 +938,13 @@ async fn stage12_refreshes_current_capabilities_root_and_last_seen_without_rewri
     let mut refresh = request();
     refresh.created_at = "2026-08-29T02:03:04.567890Z".parse().unwrap();
     refresh.observation.workspace_resolved_root = "/tmp/craxii-workspace-relocated".into();
+    refresh.observation.execution_capabilities =
+        crate::ports::state_store::ExecutionCapabilityObservation {
+            foreground_execute: true,
+            privilege_administrative: false,
+            process_group_cleanup: true,
+            cgroup_cleanup: false,
+        };
     let receipt = store.load_or_bootstrap_v0_identity(refresh).await.unwrap();
     assert!(!receipt.created);
     assert!(receipt.commit.events.is_none());
@@ -945,30 +954,32 @@ async fn stage12_refreshes_current_capabilities_root_and_last_seen_without_rewri
     let flags = snapshot.workstation_capabilities.flags();
     assert!(flags.filesystem_read());
     assert!(flags.privilege_user());
-    assert!(!flags.foreground_execute());
-    assert!(!flags.cancel_execution());
-    assert!(!flags.inspect_execution());
+    assert!(flags.foreground_execute());
+    assert!(flags.cancel_execution());
+    assert!(flags.inspect_execution());
     assert!(!flags.privilege_administrative());
+    assert!(flags.process_group_cleanup());
+    assert!(!flags.cgroup_cleanup());
     assert_eq!(
         snapshot
             .workstation_capabilities
             .limits()
             .max_execution_timeout_ms(),
-        0
+        900_000
     );
     assert_eq!(
         snapshot
             .workstation_capabilities
             .limits()
             .max_stdout_bytes(),
-        0
+        8_388_608
     );
     assert_eq!(
         snapshot
             .workstation_capabilities
             .limits()
             .max_stderr_bytes(),
-        0
+        8_388_608
     );
 
     let mut connection = guard.runtime().acquire().await.unwrap();

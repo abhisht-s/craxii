@@ -14,24 +14,41 @@ use std::path::Component;
 
 use time::OffsetDateTime;
 
+mod execution;
+
+use execution::{ExecutionCwd, ExecutionRuntime, ExecutionRuntimeConfig};
+
 use crate::domain::{
     CanonicalByteCount, LogicalPathKind, LogicalPathReference, ResolvedPathEvidence, Sha256Digest,
     UtcTimestamp, WorkspaceCapabilityRef, WorkspaceId, WorkspaceIdentity, WorkstationCapabilities,
     WorkstationCapabilitiesInput, WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput,
     WorkstationCapabilityLimits, WorkstationGeneration, WorkstationId, WorkstationIdentity,
 };
+use crate::ports::artifact_store::ArtifactStore;
 use crate::ports::clock::Clock;
 use crate::ports::workstation::{
     CancellationResult, CapabilitiesRequest, CapabilitiesResult, ExecutionCancellationRequest,
     ExecutionInspection, ExecutionInspectionRequest, ExecutionRequest, ExecutionResult,
-    FileEncoding, FileReadRequest, FileReadResult, HARD_FILE_READ_MAX_BYTES, Workstation,
-    WorkstationError, WorkstationErrorKind, WorkstationFileType, WorkstationFuture,
+    FileEncoding, FileReadRequest, FileReadResult, HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+    HARD_EXECUTION_TIMEOUT_MS, HARD_FILE_READ_MAX_BYTES, Workstation, WorkstationError,
+    WorkstationErrorKind, WorkstationFileType, WorkstationFuture,
 };
 
 const READ_BUFFER_BYTES: usize = 16_384;
 
 #[cfg(test)]
 type ReadHook = Arc<dyn Fn(ReadHookPoint, &Path) + Send + Sync>;
+
+/// Explicit construction dependencies and Stage 13 host policy.
+pub struct LocalWorkstationOptions {
+    pub default_shell: LogicalPathReference,
+    pub configured_workspace_root: PathBuf,
+    pub read_hard_limit: u64,
+    pub artifact_store: Arc<dyn ArtifactStore>,
+    pub administrative_enabled: bool,
+    pub delegated_cgroup_root: Option<PathBuf>,
+    pub clock: Arc<dyn Clock>,
+}
 
 /// The sole production adapter for model-directed local machine primitives.
 #[derive(Clone)]
@@ -44,6 +61,7 @@ pub struct LocalWorkstation {
     read_hard_limit: u64,
     capabilities: WorkstationCapabilities,
     clock: Arc<dyn Clock>,
+    execution: Arc<ExecutionRuntime>,
     #[cfg(test)]
     read_hook: Option<ReadHook>,
 }
@@ -53,11 +71,17 @@ impl LocalWorkstation {
     pub fn new(
         workstation: &WorkstationIdentity,
         workspace: &WorkspaceIdentity,
-        default_shell: LogicalPathReference,
-        configured_workspace_root: &Path,
-        read_hard_limit: u64,
-        clock: Arc<dyn Clock>,
+        options: LocalWorkstationOptions,
     ) -> Result<Self, WorkstationError> {
+        let LocalWorkstationOptions {
+            default_shell,
+            configured_workspace_root,
+            read_hard_limit,
+            artifact_store,
+            administrative_enabled,
+            delegated_cgroup_root,
+            clock,
+        } = options;
         if workspace.workstation_id() != workstation.workstation_id()
             || read_hard_limit == 0
             || read_hard_limit > HARD_FILE_READ_MAX_BYTES
@@ -71,7 +95,7 @@ impl LocalWorkstation {
         }
 
         let resolved_workspace_root =
-            std::fs::canonicalize(configured_workspace_root).map_err(map_constructor_error)?;
+            std::fs::canonicalize(&configured_workspace_root).map_err(map_constructor_error)?;
         if !resolved_workspace_root.is_absolute()
             || resolved_workspace_root
                 .to_str()
@@ -85,13 +109,28 @@ impl LocalWorkstation {
             return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
         }
 
-        let capabilities = stage12_capabilities(
+        let support = observe_execution_support(
+            Path::new(default_shell.canonical()),
+            administrative_enabled,
+            delegated_cgroup_root.as_deref(),
+        );
+        let capabilities = stage13_capabilities(
             workstation.workstation_id(),
             workstation.generation(),
             workspace.workspace_id(),
             workspace.logical_root().clone(),
             default_shell,
+            support.clone(),
         )?;
+        let execution = ExecutionRuntime::new(
+            artifact_store,
+            Arc::clone(&clock),
+            ExecutionRuntimeConfig {
+                shell: PathBuf::from(capabilities.default_shell().canonical()),
+                administrative_capable: support.administrative,
+                cgroup_root: support.cgroup_root,
+            },
+        );
 
         Ok(Self {
             workstation_id: workstation.workstation_id(),
@@ -102,6 +141,7 @@ impl LocalWorkstation {
             read_hard_limit,
             capabilities,
             clock,
+            execution,
             #[cfg(test)]
             read_hook: None,
         })
@@ -301,6 +341,40 @@ impl LocalWorkstation {
         })
     }
 
+    fn prepare_execution_cwd(
+        &self,
+        requested: &LogicalPathReference,
+    ) -> Result<ExecutionCwd, WorkstationError> {
+        let target = self.resolve_existing_path(requested)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(nix::libc::O_CLOEXEC | nix::libc::O_DIRECTORY);
+        let directory = options
+            .open(&target.physical_path)
+            .map_err(map_path_error)?;
+        if !directory.metadata().map_err(map_io_error)?.is_dir() {
+            return Err(WorkstationError::new(WorkstationErrorKind::InvalidPath));
+        }
+        Ok(ExecutionCwd {
+            directory,
+            evidence: target.evidence,
+        })
+    }
+
+    /// Closes admission and propagates the one original Stage 10 shutdown deadline.
+    pub fn begin_execution_shutdown(&self, deadline: tokio::time::Instant) {
+        self.execution.begin_shutdown(deadline);
+    }
+
+    /// Reaps, drains, verifies, and joins every owned execution under the Stage 10 deadline.
+    pub async fn shutdown_executions_before(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), WorkstationError> {
+        self.execution.shutdown_before(deadline).await
+    }
+
     #[cfg(test)]
     fn with_read_hook(
         mut self,
@@ -308,6 +382,38 @@ impl LocalWorkstation {
     ) -> Self {
         self.read_hook = Some(Arc::new(hook));
         self
+    }
+
+    #[cfg(test)]
+    fn with_execution_shell(mut self, shell: PathBuf) -> Self {
+        Arc::get_mut(&mut self.execution)
+            .expect("test construction has one execution-runtime owner")
+            .set_shell_for_test(shell);
+        self
+    }
+
+    #[cfg(test)]
+    fn set_leader_observer(&mut self, observer: Arc<dyn execution::LeaderObserver>) {
+        Arc::get_mut(&mut self.execution)
+            .expect("test construction has one execution-runtime owner")
+            .set_leader_observer_for_test(observer);
+    }
+
+    #[cfg(test)]
+    fn with_execution_gate(
+        self,
+        point: execution::ExecutionTestPoint,
+        arrived: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    ) -> Self {
+        self.execution
+            .set_execution_gate_for_test(point, arrived, release);
+        self
+    }
+
+    #[cfg(test)]
+    fn execution_lifecycle_events(&self) -> Vec<&'static str> {
+        self.execution.lifecycle_events()
     }
 
     #[cfg(test)]
@@ -328,6 +434,7 @@ impl Debug for LocalWorkstation {
             .field("logical_workspace_root", &"[REDACTED]")
             .field("resolved_workspace_root", &"[REDACTED]")
             .field("read_hard_limit", &self.read_hard_limit)
+            .field("execution_runtime", &"[REDACTED]")
             .finish_non_exhaustive()
     }
 }
@@ -376,15 +483,15 @@ impl Workstation for LocalWorkstation {
     }
 
     fn execute(&self, request: ExecutionRequest) -> WorkstationFuture<'_, ExecutionResult> {
-        let result = self
+        let validation = self
             .validate_identity(request.workstation_id, request.expected_generation)
-            .and_then(|()| self.validate_workspace(request.workspace_id))
-            .and_then(|()| {
-                Err(WorkstationError::new(
-                    WorkstationErrorKind::UnsupportedCapability,
-                ))
-            });
-        Box::pin(async move { result })
+            .and_then(|()| self.validate_workspace(request.workspace_id));
+        if let Err(error) = validation {
+            return Box::pin(async move { Err(error) });
+        }
+        let cwd = self.prepare_execution_cwd(&request.requested_cwd);
+        let runtime = Arc::clone(&self.execution);
+        Box::pin(async move { runtime.execute(request, cwd?).await })
     }
 
     fn inspect_execution(
@@ -394,9 +501,8 @@ impl Workstation for LocalWorkstation {
         let result = self
             .validate_identity(request.workstation_id, request.expected_generation)
             .and_then(|()| {
-                Err(WorkstationError::new(
-                    WorkstationErrorKind::UnsupportedCapability,
-                ))
+                self.execution
+                    .inspect(request.operation_id, request.execution_id)
             });
         Box::pin(async move { result })
     }
@@ -405,24 +511,70 @@ impl Workstation for LocalWorkstation {
         &self,
         request: ExecutionCancellationRequest,
     ) -> WorkstationFuture<'_, CancellationResult> {
-        let result = self
-            .validate_identity(request.workstation_id, request.expected_generation)
-            .and_then(|()| {
-                Err(WorkstationError::new(
-                    WorkstationErrorKind::UnsupportedCapability,
-                ))
-            });
-        Box::pin(async move { result })
+        let validation =
+            self.validate_identity(request.workstation_id, request.expected_generation);
+        let runtime = Arc::clone(&self.execution);
+        Box::pin(async move {
+            validation?;
+            Ok(runtime
+                .cancel(request.operation_id, request.execution_id)
+                .await)
+        })
     }
 }
 
-/// Constructs the exact truthful Stage 12 snapshot without process execution.
-pub(crate) fn stage12_capabilities(
+#[derive(Clone, Debug)]
+pub(crate) struct LocalExecutionSupport {
+    pub(crate) foreground: bool,
+    pub(crate) administrative: bool,
+    pub(crate) process_group: bool,
+    pub(crate) cgroup: bool,
+    cgroup_root: Option<PathBuf>,
+}
+
+/// Performs safe host probes for the Stage 13 capability snapshot.
+pub(crate) fn observe_execution_support(
+    shell: &Path,
+    administrative_enabled: bool,
+    delegated_cgroup_root: Option<&Path>,
+) -> LocalExecutionSupport {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
+    let shell_available = shell == Path::new("/bin/bash")
+        && std::fs::metadata(shell).is_ok_and(|metadata| {
+            metadata.is_file() && {
+                #[cfg(unix)]
+                {
+                    metadata.permissions().mode() & 0o111 != 0
+                }
+                #[cfg(not(unix))]
+                {
+                    false
+                }
+            }
+        });
+    let cgroup_root = execution::probe_cgroup_root(delegated_cgroup_root);
+    let cgroup = cgroup_root.is_some();
+    let foreground = shell_available && (cfg!(target_os = "macos") || cgroup);
+    let administrative =
+        foreground && execution::probe_admin(administrative_enabled, cgroup_root.as_deref());
+    LocalExecutionSupport {
+        foreground,
+        administrative,
+        process_group: foreground,
+        cgroup,
+        cgroup_root,
+    }
+}
+
+/// Constructs the exact truthful Stage 13 local snapshot.
+pub(crate) fn stage13_capabilities(
     workstation_id: WorkstationId,
     generation: WorkstationGeneration,
     workspace_id: WorkspaceId,
     logical_workspace_root: LogicalPathReference,
     default_shell: LogicalPathReference,
+    support: LocalExecutionSupport,
 ) -> Result<WorkstationCapabilities, WorkstationError> {
     WorkstationCapabilities::try_new(WorkstationCapabilitiesInput {
         workstation_id,
@@ -432,16 +584,32 @@ pub(crate) fn stage12_capabilities(
         default_shell,
         flags: WorkstationCapabilityFlags::new(WorkstationCapabilityFlagsInput {
             filesystem_read: true,
-            foreground_execute: false,
-            cancel_execution: false,
-            inspect_execution: false,
+            foreground_execute: support.foreground,
+            cancel_execution: support.foreground,
+            inspect_execution: support.foreground,
             privilege_user: true,
-            privilege_administrative: false,
-            process_group_cleanup: false,
-            cgroup_cleanup: false,
+            privilege_administrative: support.administrative,
+            process_group_cleanup: support.process_group,
+            cgroup_cleanup: support.cgroup,
         }),
-        limits: WorkstationCapabilityLimits::try_new(0, 0, 0)
-            .map_err(|_| WorkstationError::new(WorkstationErrorKind::InternalWorkstationError))?,
+        limits: WorkstationCapabilityLimits::try_new(
+            if support.foreground {
+                HARD_EXECUTION_TIMEOUT_MS
+            } else {
+                0
+            },
+            if support.foreground {
+                HARD_EXECUTION_STREAM_CAPTURE_BYTES
+            } else {
+                0
+            },
+            if support.foreground {
+                HARD_EXECUTION_STREAM_CAPTURE_BYTES
+            } else {
+                0
+            },
+        )
+        .map_err(|_| WorkstationError::new(WorkstationErrorKind::InternalWorkstationError))?,
         workspaces: vec![
             WorkspaceCapabilityRef::try_new(workspace_id, logical_workspace_root).map_err(
                 |_| WorkstationError::new(WorkstationErrorKind::InternalWorkstationError),
@@ -548,7 +716,13 @@ fn map_constructor_error(error: std::io::Error) -> WorkstationError {
 fn map_path_error(error: std::io::Error) -> WorkstationError {
     if matches!(
         error.raw_os_error(),
-        Some(nix::libc::ELOOP | nix::libc::ENXIO | nix::libc::ENODEV | nix::libc::EOPNOTSUPP,)
+        Some(
+            nix::libc::ELOOP
+                | nix::libc::ENOTDIR
+                | nix::libc::ENXIO
+                | nix::libc::ENODEV
+                | nix::libc::EOPNOTSUPP,
+        )
     ) {
         return WorkstationError::new(WorkstationErrorKind::InvalidPath);
     }
@@ -586,24 +760,52 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::Path;
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
+    use nix::sys::signal::kill;
     use nix::sys::stat::Mode;
-    use nix::unistd::mkfifo;
+    use nix::unistd::{Pid, mkfifo};
 
     use super::*;
+    use crate::adapters::artifacts::LocalArtifactStore;
     use crate::domain::{
-        CraxiiId, ExecutionId, HostingProvider, MonotonicDuration, OperationId, PrivilegeMode,
-        WorkspaceIdentityInput, WorkstationIdentityInput,
+        Certainty, CraxiiId, ExecutionId, HostingProvider, MonotonicDuration, OperationId,
+        PrivilegeMode, WorkspaceIdentityInput, WorkstationIdentityInput,
     };
     use crate::ports::clock::{MonotonicInstant, TestClock};
     use crate::ports::workstation::{
-        DEFAULT_FILE_READ_MAX_BYTES, ExecutionCapturePolicy, ExecutionCleanupPolicy,
-        ExecutionStdinPolicy,
+        DEFAULT_FILE_READ_MAX_BYTES, ExecutionCancellationState, ExecutionCapturePolicy,
+        ExecutionCleanupPolicy, ExecutionResultKind, ExecutionStdinPolicy,
+        HARD_EXECUTION_COMMAND_MAX_BYTES,
     };
 
     const AT: &str = "2026-08-29T01:02:03.456789Z";
+    static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[cfg(target_os = "macos")]
+    struct InterruptedLeaderObserver {
+        calls: AtomicUsize,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl InterruptedLeaderObserver {
+        const fn new() -> Self {
+            Self {
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl execution::LeaderObserver for InterruptedLeaderObserver {
+        fn observe(&self, _pid: i32) -> std::io::Result<execution::LeaderObservationStatus> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(execution::LeaderObservationStatus::Interrupted)
+        }
+    }
 
     struct TestRoot(PathBuf);
 
@@ -633,6 +835,7 @@ mod tests {
         _root: TestRoot,
         workspace_root: PathBuf,
         workstation: LocalWorkstation,
+        artifact_store: Arc<LocalArtifactStore>,
         clock: Arc<TestClock>,
     }
 
@@ -642,9 +845,19 @@ mod tests {
         }
 
         fn with_logical_root(read_hard_limit: u64, logical_root: &str) -> Self {
+            Self::with_execution_target(read_hard_limit, logical_root, false, None)
+        }
+
+        fn with_execution_target(
+            read_hard_limit: u64,
+            logical_root: &str,
+            administrative_enabled: bool,
+            delegated_cgroup_root: Option<PathBuf>,
+        ) -> Self {
             let root = TestRoot::new();
             let workspace_root = root.workspace();
             fs::create_dir(&workspace_root).unwrap();
+            fs::create_dir(workspace_root.join("cwd")).unwrap();
             let workstation_id = WorkstationId::generate();
             let workspace_id = WorkspaceId::generate();
             let craxii_id = CraxiiId::generate();
@@ -675,19 +888,27 @@ mod tests {
                 OffsetDateTime::UNIX_EPOCH,
                 Duration::from_secs(1),
             ));
+            let artifact_store =
+                Arc::new(LocalArtifactStore::initialize(&root.0.join("artifacts")).unwrap());
             let workstation = LocalWorkstation::new(
                 &workstation_identity,
                 &workspace,
-                LogicalPathReference::absolute("/bin/sh").unwrap(),
-                &workspace_root,
-                read_hard_limit,
-                clock.clone(),
+                LocalWorkstationOptions {
+                    default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+                    configured_workspace_root: workspace_root.clone(),
+                    read_hard_limit,
+                    artifact_store: artifact_store.clone(),
+                    administrative_enabled,
+                    delegated_cgroup_root,
+                    clock: clock.clone(),
+                },
             )
             .unwrap();
             Self {
                 _root: root,
                 workspace_root,
                 workstation,
+                artifact_store,
                 clock,
             }
         }
@@ -720,6 +941,80 @@ mod tests {
                 .read_file(self.relative(path, max_bytes))
                 .await
         }
+
+        fn execution_request(&self, command: impl Into<String>) -> ExecutionRequest {
+            ExecutionRequest {
+                operation_id: OperationId::generate(),
+                execution_id: ExecutionId::generate(),
+                work_id: crate::domain::WorkId::generate(),
+                workstation_id: self.workstation.workstation_id(),
+                expected_generation: self.workstation.generation(),
+                workspace_id: self.workstation.workspace_id(),
+                command: command.into(),
+                requested_cwd: LogicalPathReference::workspace_relative("cwd").unwrap(),
+                effective_privilege: PrivilegeMode::User,
+                stdin: ExecutionStdinPolicy::Closed,
+                timeout: MonotonicDuration::from_millis(10_000),
+                deadline: MonotonicInstant::from_elapsed(Duration::from_secs(60)),
+                capture: ExecutionCapturePolicy {
+                    stdout_max_bytes: HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+                    stderr_max_bytes: HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+                },
+                cleanup: ExecutionCleanupPolicy::ProcessGroupAndCgroup,
+            }
+        }
+
+        async fn execute(&self, command: impl Into<String>) -> ExecutionResult {
+            self.workstation
+                .execute(self.execution_request(command))
+                .await
+                .unwrap()
+        }
+    }
+
+    async fn wait_for_path(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_stable_process_group_order(events: &[&'static str]) {
+        let leader_observed = events
+            .iter()
+            .position(|event| *event == "leader_terminal_observed")
+            .expect("the direct child terminal state is observed without reaping");
+        let cleanup_finished = events
+            .iter()
+            .position(|event| *event == "descendant_cleanup_finished")
+            .expect("descendant cleanup is proved while leader identity is stable");
+        let released_for_reap = events
+            .iter()
+            .position(|event| *event == "leader_identity_released_for_reap")
+            .expect("stable group ownership is explicitly consumed before reap");
+        let leader_reaped = events
+            .iter()
+            .position(|event| *event == "leader_reaped")
+            .expect("the direct child is reaped");
+        assert!(leader_observed < cleanup_finished);
+        assert!(cleanup_finished < released_for_reap);
+        assert!(released_for_reap < leader_reaped);
+        let signals: Vec<_> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| (*event == "process_group_signalled").then_some(index))
+            .collect();
+        assert!(!signals.is_empty());
+        assert!(signals.into_iter().all(|index| index < released_for_reap));
+        assert!(
+            events[leader_reaped + 1..]
+                .iter()
+                .all(|event| *event != "process_group_signalled")
+        );
     }
 
     #[test]
@@ -809,7 +1104,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capabilities_are_exact_truthful_stage12_runtime_facts() {
+    async fn capabilities_are_exact_truthful_stage13_runtime_facts() {
         let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
         let operation_id = OperationId::generate();
         let result = fixture
@@ -826,15 +1121,28 @@ mod tests {
         let flags = capabilities.flags();
         assert!(flags.filesystem_read());
         assert!(flags.privilege_user());
-        assert!(!flags.foreground_execute());
-        assert!(!flags.cancel_execution());
-        assert!(!flags.inspect_execution());
+        assert_eq!(flags.foreground_execute(), cfg!(target_os = "macos"));
+        assert_eq!(flags.cancel_execution(), cfg!(target_os = "macos"));
+        assert_eq!(flags.inspect_execution(), cfg!(target_os = "macos"));
         assert!(!flags.privilege_administrative());
-        assert!(!flags.process_group_cleanup());
+        assert_eq!(flags.process_group_cleanup(), cfg!(target_os = "macos"));
         assert!(!flags.cgroup_cleanup());
-        assert_eq!(capabilities.limits().max_execution_timeout_ms(), 0);
-        assert_eq!(capabilities.limits().max_stdout_bytes(), 0);
-        assert_eq!(capabilities.limits().max_stderr_bytes(), 0);
+        let expected_timeout = if cfg!(target_os = "macos") {
+            900_000
+        } else {
+            0
+        };
+        let expected_capture = if cfg!(target_os = "macos") {
+            8_388_608
+        } else {
+            0
+        };
+        assert_eq!(
+            capabilities.limits().max_execution_timeout_ms(),
+            expected_timeout
+        );
+        assert_eq!(capabilities.limits().max_stdout_bytes(), expected_capture);
+        assert_eq!(capabilities.limits().max_stderr_bytes(), expected_capture);
         assert_eq!(capabilities.cpu_architecture(), std::env::consts::ARCH);
         assert_eq!(capabilities.os_release(), std::env::consts::OS);
         assert_eq!(capabilities.workspaces().len(), 1);
@@ -1252,68 +1560,951 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage13_methods_are_guarded_and_unsupported_with_zero_process_mutation() {
+    async fn stage13_executes_bash_with_separate_capture_and_terminal_registry_removal() {
         let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
-        let marker = fixture.workspace_root.join("must-not-exist");
         let operation_id = OperationId::generate();
         let execution_id = ExecutionId::generate();
         let execute = ExecutionRequest {
             operation_id,
             execution_id,
+            work_id: crate::domain::WorkId::generate(),
             workstation_id: fixture.workstation.workstation_id(),
             expected_generation: fixture.workstation.generation(),
             workspace_id: fixture.workstation.workspace_id(),
-            command: format!("touch {}", marker.display()),
-            requested_cwd: LogicalPathReference::workspace_relative("src").unwrap(),
+            command: "printf 'stdout'; printf 'stderr' >&2".into(),
+            requested_cwd: LogicalPathReference::workspace_relative("cwd").unwrap(),
             effective_privilege: PrivilegeMode::User,
-            environment: Vec::new(),
             stdin: ExecutionStdinPolicy::Closed,
             timeout: MonotonicDuration::from_millis(1_000),
             deadline: MonotonicInstant::from_elapsed(Duration::from_secs(30)),
             capture: ExecutionCapturePolicy {
-                stdout_max_bytes: 0,
-                stderr_max_bytes: 0,
+                stdout_max_bytes: 1_024,
+                stderr_max_bytes: 1_024,
             },
             cleanup: ExecutionCleanupPolicy::ProcessGroupAndCgroup,
         };
+        if !cfg!(target_os = "macos") {
+            assert_eq!(
+                fixture
+                    .workstation
+                    .execute(execute)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                WorkstationErrorKind::UnsupportedCapability
+            );
+            return;
+        }
+        let result = fixture.workstation.execute(execute).await.unwrap();
+        assert_eq!(
+            result.result_kind,
+            crate::ports::workstation::ExecutionResultKind::Exited
+        );
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(result.stdout.unwrap().projection, "stdout");
+        assert_eq!(result.stderr.unwrap().projection, "stderr");
+        assert!(result.cleanup.confirmed());
+        let inspection = fixture
+            .workstation
+            .inspect_execution(ExecutionInspectionRequest {
+                operation_id,
+                execution_id,
+                workstation_id: fixture.workstation.workstation_id(),
+                expected_generation: fixture.workstation.generation(),
+            })
+            .await;
+        match inspection {
+            Ok(inspection) => assert_eq!(
+                inspection.state,
+                crate::ports::workstation::ExecutionInspectionState::Terminal
+            ),
+            Err(error) => assert_eq!(error.kind(), WorkstationErrorKind::InspectionNotFound),
+        }
+        let cancellation = fixture
+            .workstation
+            .cancel_execution(ExecutionCancellationRequest {
+                operation_id,
+                execution_id,
+                workstation_id: fixture.workstation.workstation_id(),
+                expected_generation: fixture.workstation.generation(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            cancellation.state,
+            crate::ports::workstation::ExecutionCancellationState::AlreadyTerminal
+                | crate::ports::workstation::ExecutionCancellationState::NotFound
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn execution_form_quoting_pipes_redirection_profiles_and_fresh_shell_are_exact() {
+        let _environment = ENVIRONMENT_LOCK.lock().await;
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let bash_env = fixture._root.0.join("hostile-bash-env");
+        fs::write(&bash_env, "export PROFILE_CANARY=loaded\n").unwrap();
+        // SAFETY: this test serializes its temporary process-environment mutation and restores it
+        // before releasing the guard. The child launcher must clear this value.
+        unsafe { std::env::set_var("BASH_ENV", &bash_env) };
+        let result = fixture
+            .execute(
+                "value='a b;$(printf not-interpolated)'; printf '%s' \"$value\" | sed 's/not-/still-/' ; printf 'redirected' > redirected.txt; printf '|%s' \"${PROFILE_CANARY-unset}\"",
+            )
+            .await;
+        // SAFETY: paired restoration under the serialized test guard above.
+        unsafe { std::env::remove_var("BASH_ENV") };
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.unwrap().projection,
+            "a b;$(printf still-interpolated)|unset"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.workspace_root.join("cwd/redirected.txt")).unwrap(),
+            "redirected"
+        );
+
+        let first = fixture
+            .execute("export CRAXII_TRANSIENT=present; cd /; pwd")
+            .await;
+        assert_eq!(first.stdout.unwrap().projection, "/\n");
+        let second = fixture
+            .execute("printf '%s|' \"${CRAXII_TRANSIENT-unset}\"; pwd")
+            .await;
+        let canonical_cwd = fs::canonicalize(fixture.workspace_root.join("cwd")).unwrap();
+        assert_eq!(
+            second.stdout.unwrap().projection,
+            format!("unset|{}\n", canonical_cwd.display())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_child_environment_excludes_parent_secrets_and_stdin_is_closed_without_tty() {
+        use std::os::fd::AsRawFd as _;
+
+        let _environment = ENVIRONMENT_LOCK.lock().await;
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        for (name, value) in [
+            ("OPENAI_API_KEY", "openai-secret-canary"),
+            ("ANTHROPIC_API_KEY", "anthropic-secret-canary"),
+            ("AWS_SECRET_ACCESS_KEY", "aws-secret-canary"),
+            ("CRAXII_GENERIC_SECRET_CANARY", "generic-secret-canary"),
+        ] {
+            // SAFETY: serialized and restored before the test releases its guard.
+            unsafe { std::env::set_var(name, value) };
+        }
+        let request = fixture.execution_request(
+            "env | LC_ALL=C sort; if read line; then printf 'STDIN=open'; else printf 'STDIN=eof'; fi; if test -t 0; then printf '|TTY=yes'; else printf '|TTY=no'; fi",
+        );
+        let work_id = request.work_id;
+        let workspace_id = request.workspace_id;
+        let result = fixture.workstation.execute(request).await.unwrap();
+        for name in [
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "CRAXII_GENERIC_SECRET_CANARY",
+        ] {
+            // SAFETY: paired restoration under the serialized test guard above.
+            unsafe { std::env::remove_var(name) };
+        }
+        let stdout = result.stdout.unwrap().projection;
+        for required in [
+            "HOME=/home/craxii",
+            "USER=craxii",
+            "LOGNAME=craxii",
+            "SHELL=/bin/bash",
+            "LANG=C.UTF-8",
+            concat!(
+                "PATH=",
+                "/home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            ),
+            &format!("CRAXII_WORK_ID={work_id}"),
+            &format!("CRAXII_WORKSPACE_ID={workspace_id}"),
+            "STDIN=eof|TTY=no",
+        ] {
+            assert!(stdout.contains(required), "missing {required}");
+        }
+        for forbidden in [
+            "openai-secret-canary",
+            "anthropic-secret-canary",
+            "aws-secret-canary",
+            "generic-secret-canary",
+            "SSH_AUTH_SOCK=",
+            "HTTP_PROXY=",
+            "HTTPS_PROXY=",
+            "RUST_LOG=",
+        ] {
+            assert!(!stdout.contains(forbidden), "inherited {forbidden}");
+        }
+
+        let descriptor_file = fs::File::open(fixture.workspace_root.join("cwd")).unwrap();
+        let descriptor = descriptor_file.as_raw_fd();
+        // SAFETY: fcntl operates on the live descriptor owned by `descriptor_file`.
+        let flags = unsafe { nix::libc::fcntl(descriptor, nix::libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        // SAFETY: the descriptor remains live and only its close-on-exec flag is changed.
+        assert_ne!(
+            unsafe {
+                nix::libc::fcntl(
+                    descriptor,
+                    nix::libc::F_SETFD,
+                    flags & !nix::libc::FD_CLOEXEC,
+                )
+            },
+            -1
+        );
+        let descriptor_result = fixture
+            .execute(format!(
+                "if test -e /dev/fd/{descriptor}; then printf inherited; else printf closed; fi"
+            ))
+            .await;
+        assert_eq!(descriptor_result.stdout.unwrap().projection, "closed");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cwd_relative_absolute_outside_symlink_missing_file_and_open_handle_race_are_honest() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let outside = fixture._root.0.join("outside-cwd");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, fixture.workspace_root.join("cwd-link")).unwrap();
+
+        for requested in [
+            LogicalPathReference::absolute(outside.to_str().unwrap()).unwrap(),
+            LogicalPathReference::workspace_relative("cwd-link").unwrap(),
+        ] {
+            let mut request = fixture.execution_request("pwd");
+            request.requested_cwd = requested;
+            let result = fixture.workstation.execute(request).await.unwrap();
+            assert_eq!(
+                result.stdout.unwrap().projection,
+                format!("{}\n", fs::canonicalize(&outside).unwrap().display())
+            );
+            assert_eq!(
+                result.resolved_cwd.resolved_absolute_path(),
+                fs::canonicalize(&outside).unwrap().to_str().unwrap()
+            );
+        }
+
+        let mut missing = fixture.execution_request("true");
+        missing.requested_cwd = LogicalPathReference::workspace_relative("missing-cwd").unwrap();
         assert_eq!(
             fixture
                 .workstation
-                .execute(execute)
+                .execute(missing)
                 .await
                 .unwrap_err()
                 .kind(),
+            WorkstationErrorKind::NotFound
+        );
+        fs::write(fixture.workspace_root.join("cwd-file"), "not a directory").unwrap();
+        let mut file = fixture.execution_request("true");
+        file.requested_cwd = LogicalPathReference::workspace_relative("cwd-file").unwrap();
+        assert_eq!(
+            fixture.workstation.execute(file).await.unwrap_err().kind(),
+            WorkstationErrorKind::InvalidPath
+        );
+
+        let request = fixture.execution_request("touch opened-object-marker");
+        let execution = fixture.workstation.execute(request);
+        let opened = fixture.workspace_root.join("opened-cwd-object");
+        fs::rename(fixture.workspace_root.join("cwd"), &opened).unwrap();
+        fs::create_dir(fixture.workspace_root.join("cwd")).unwrap();
+        execution.await.unwrap();
+        assert!(opened.join("opened-object-marker").is_file());
+        assert!(
+            !fixture
+                .workspace_root
+                .join("cwd/opened-object-marker")
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn output_empty_separate_simultaneous_binary_and_newlines_are_exact() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let empty = fixture.execute("true").await;
+        assert_eq!(empty.stdout.unwrap().observed_bytes, 0);
+        assert_eq!(empty.stderr.unwrap().observed_bytes, 0);
+
+        let separate = fixture
+            .execute("printf 'out\r\nline\n'; printf 'err-no-newline' >&2")
+            .await;
+        assert_eq!(
+            separate.stdout.unwrap().projection.as_bytes(),
+            b"out\r\nline\n"
+        );
+        assert_eq!(separate.stderr.unwrap().projection, "err-no-newline");
+
+        let binary = fixture.execute("printf '\\377\\000A'").await;
+        let stream = binary.stdout.unwrap();
+        assert_eq!(stream.observed_bytes, 3);
+        assert!(stream.projection_had_utf8_replacement);
+        let bytes = fixture
+            .artifact_store
+            .read_verified(stream.artifact.object_reference())
+            .unwrap();
+        assert_eq!(bytes, [0xff, 0x00, b'A']);
+        assert_eq!(stream.artifact.sha256(), Sha256Digest::hash_bytes(&bytes));
+
+        let simultaneous = fixture
+            .execute("(head -c 524288 /dev/zero | tr '\\000' o) & (head -c 524288 /dev/zero | tr '\\000' e >&2) & wait")
+            .await;
+        assert_eq!(simultaneous.stdout.unwrap().observed_bytes, 524_288);
+        assert_eq!(simultaneous.stderr.unwrap().observed_bytes, 524_288);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn capture_ceiling_continues_draining_and_projection_is_head_tail() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        for length in [
+            HARD_EXECUTION_STREAM_CAPTURE_BYTES - 1,
+            HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+        ] {
+            let exact = fixture
+                .execute(format!("head -c {length} /dev/zero | tr '\\000' x"))
+                .await;
+            let stream = exact.stdout.unwrap();
+            assert_eq!(stream.observed_bytes, length);
+            assert_eq!(stream.captured_bytes, length);
+            assert_eq!(stream.omitted_bytes, 0);
+            assert!(!stream.truncated);
+        }
+        let result = fixture
+            .execute(format!(
+                "printf HEAD; head -c {} /dev/zero | tr '\\000' x; printf TAIL",
+                HARD_EXECUTION_STREAM_CAPTURE_BYTES
+            ))
+            .await;
+        let stream = result.stdout.unwrap();
+        assert_eq!(
+            stream.observed_bytes,
+            HARD_EXECUTION_STREAM_CAPTURE_BYTES + 8
+        );
+        assert_eq!(stream.captured_bytes, HARD_EXECUTION_STREAM_CAPTURE_BYTES);
+        assert_eq!(stream.omitted_bytes, 8);
+        assert!(stream.truncated);
+        assert_eq!(stream.projection.len(), 32_768);
+        assert!(stream.projection.starts_with("HEAD"));
+        assert!(stream.projection.ends_with("TAIL"));
+        assert_eq!(
+            stream.projection_omitted_bytes,
+            stream.observed_bytes - 32_768
+        );
+        let captured = fixture
+            .artifact_store
+            .read_verified(stream.artifact.object_reference())
+            .unwrap();
+        assert_eq!(captured.len(), HARD_EXECUTION_STREAM_CAPTURE_BYTES as usize);
+        assert!(captured.starts_with(b"HEAD"));
+        assert!(!captured.ends_with(b"TAIL"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exit_signal_spawn_and_request_validation_results_remain_distinct() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        for (command, expected) in [
+            ("true", Some(0)),
+            ("exit 42", Some(42)),
+            ("command-that-does-not-exist", Some(127)),
+        ] {
+            let result = fixture.execute(command).await;
+            assert_eq!(
+                result.result_kind,
+                crate::ports::workstation::ExecutionResultKind::Exited
+            );
+            assert_eq!(result.exit_code, expected);
+        }
+        let signal = fixture.execute("kill -TERM $$").await;
+        assert_eq!(
+            signal.result_kind,
+            crate::ports::workstation::ExecutionResultKind::Signaled
+        );
+        assert_eq!(
+            signal.terminating_signal,
+            Some(i64::from(nix::libc::SIGTERM))
+        );
+
+        let missing_fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let missing_request = missing_fixture.execution_request("true");
+        let missing_shell = missing_fixture
+            .workstation
+            .with_execution_shell(missing_fixture._root.0.join("missing-bash"));
+        let result = missing_shell.execute(missing_request).await.unwrap();
+        assert_eq!(
+            result.result_kind,
+            crate::ports::workstation::ExecutionResultKind::SpawnFailed
+        );
+        assert!(!result.start_observed);
+        assert!(result.cleanup.confirmed());
+
+        let denied_path = fixture._root.0.join("not-executable-bash");
+        fs::write(&denied_path, "#!/bin/bash\n").unwrap();
+        fs::set_permissions(&denied_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let denied_fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let denied_request = denied_fixture.execution_request("true");
+        let denied_shell = denied_fixture.workstation.with_execution_shell(denied_path);
+        let denied = denied_shell.execute(denied_request).await.unwrap();
+        assert_eq!(
+            denied.result_kind,
+            crate::ports::workstation::ExecutionResultKind::SpawnFailed
+        );
+
+        for command in ["", "\0", &"x".repeat(HARD_EXECUTION_COMMAND_MAX_BYTES + 1)] {
+            let request = fixture.execution_request(command);
+            assert_eq!(
+                fixture
+                    .workstation
+                    .execute(request)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                WorkstationErrorKind::SpawnFailed
+            );
+        }
+        let mut too_long = fixture.execution_request("true");
+        too_long.timeout = MonotonicDuration::from_millis(HARD_EXECUTION_TIMEOUT_MS + 1);
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(too_long)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::SpawnFailed
+        );
+        let mut expired = fixture.execution_request("true");
+        expired.deadline = MonotonicInstant::from_elapsed(Duration::from_secs(1));
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(expired)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::Timeout
+        );
+        let mut admin = fixture.execution_request("true");
+        admin.effective_privilege = PrivilegeMode::Administrative;
+        assert_eq!(
+            fixture.workstation.execute(admin).await.unwrap_err().kind(),
             WorkstationErrorKind::UnsupportedCapability
         );
-        assert!(!marker.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn registry_inspect_duplicate_cancel_repeat_concurrent_and_natural_race_are_coherent() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let started = fixture.workspace_root.join("started");
+        let request =
+            fixture.execution_request(format!("touch '{}'; exec /bin/sleep 60", started.display()));
+        let execution_id = request.execution_id;
+        let workstation = fixture.workstation.clone();
+        let running = tokio::spawn(async move { workstation.execute(request).await.unwrap() });
+        wait_for_path(&started).await;
+        let inspection = fixture
+            .workstation
+            .inspect_execution(ExecutionInspectionRequest {
+                operation_id: OperationId::generate(),
+                execution_id,
+                workstation_id: fixture.workstation.workstation_id(),
+                expected_generation: fixture.workstation.generation(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            inspection.state,
+            crate::ports::workstation::ExecutionInspectionState::Running
+        );
+
+        let mut duplicate = fixture.execution_request("touch duplicate-must-not-run");
+        duplicate.execution_id = execution_id;
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(duplicate)
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::SpawnFailed
+        );
+        assert!(
+            !fixture
+                .workspace_root
+                .join("cwd/duplicate-must-not-run")
+                .exists()
+        );
+
+        let cancel_request = ExecutionCancellationRequest {
+            operation_id: OperationId::generate(),
+            execution_id,
+            workstation_id: fixture.workstation.workstation_id(),
+            expected_generation: fixture.workstation.generation(),
+        };
+        let first = {
+            let workstation = fixture.workstation.clone();
+            tokio::spawn(async move { workstation.cancel_execution(cancel_request).await.unwrap() })
+        };
+        let second = {
+            let workstation = fixture.workstation.clone();
+            tokio::spawn(async move { workstation.cancel_execution(cancel_request).await.unwrap() })
+        };
+        assert_eq!(
+            first.await.unwrap().state,
+            crate::ports::workstation::ExecutionCancellationState::Confirmed
+        );
+        assert_eq!(
+            second.await.unwrap().state,
+            crate::ports::workstation::ExecutionCancellationState::Confirmed
+        );
+        let terminal = running.await.unwrap();
+        assert_eq!(
+            terminal.result_kind,
+            crate::ports::workstation::ExecutionResultKind::Cancelled
+        );
+        assert!(terminal.cleanup.confirmed());
+        assert_eq!(
+            fixture
+                .workstation
+                .cancel_execution(cancel_request)
+                .await
+                .unwrap()
+                .state,
+            crate::ports::workstation::ExecutionCancellationState::AlreadyTerminal
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            fixture
+                .workstation
+                .cancel_execution(cancel_request)
+                .await
+                .unwrap()
+                .state,
+            crate::ports::workstation::ExecutionCancellationState::NotFound
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn caller_drop_keeps_execution_owned_and_shutdown_closes_admission_and_joins() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let started = fixture.workspace_root.join("caller-dropped");
+        let request =
+            fixture.execution_request(format!("touch '{}'; exec /bin/sleep 60", started.display()));
+        let execution_id = request.execution_id;
+        let workstation = fixture.workstation.clone();
+        let caller = tokio::spawn(async move { workstation.execute(request).await });
+        wait_for_path(&started).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
         assert_eq!(
             fixture
                 .workstation
                 .inspect_execution(ExecutionInspectionRequest {
-                    operation_id,
+                    operation_id: OperationId::generate(),
                     execution_id,
                     workstation_id: fixture.workstation.workstation_id(),
                     expected_generation: fixture.workstation.generation(),
                 })
                 .await
+                .unwrap()
+                .state,
+            crate::ports::workstation::ExecutionInspectionState::Running
+        );
+        let shutdown_deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+        fixture
+            .workstation
+            .begin_execution_shutdown(shutdown_deadline);
+        let blocked = fixture.execution_request("touch after-shutdown");
+        assert_eq!(
+            fixture
+                .workstation
+                .execute(blocked)
+                .await
                 .unwrap_err()
                 .kind(),
-            WorkstationErrorKind::UnsupportedCapability
+            WorkstationErrorKind::WorkstationUnavailable
         );
+        fixture
+            .workstation
+            .shutdown_executions_before(shutdown_deadline)
+            .await
+            .unwrap();
         assert_eq!(
             fixture
                 .workstation
                 .cancel_execution(ExecutionCancellationRequest {
-                    operation_id,
+                    operation_id: OperationId::generate(),
                     execution_id,
                     workstation_id: fixture.workstation.workstation_id(),
                     expected_generation: fixture.workstation.generation(),
                 })
                 .await
+                .unwrap()
+                .state,
+            crate::ports::workstation::ExecutionCancellationState::NotFound
+        );
+        assert!(!fixture.workspace_root.join("cwd/after-shutdown").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_and_execution_reservation_have_only_two_atomic_outcomes() {
+        let before_fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let arrived = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let workstation = before_fixture.workstation.clone().with_execution_gate(
+            execution::ExecutionTestPoint::BeforeReservation,
+            Arc::clone(&arrived),
+            Arc::clone(&release),
+        );
+        let marker = before_fixture
+            .workspace_root
+            .join("cwd/shutdown-won-before-reservation");
+        let request = before_fixture.execution_request(format!("touch '{}'", marker.display()));
+        let execution_id = request.execution_id;
+        let executing = {
+            let workstation = workstation.clone();
+            tokio::spawn(async move { workstation.execute(request).await })
+        };
+        arrived.wait().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        workstation.begin_execution_shutdown(deadline);
+        assert_eq!(
+            workstation
+                .inspect_execution(ExecutionInspectionRequest {
+                    operation_id: OperationId::generate(),
+                    execution_id,
+                    workstation_id: workstation.workstation_id(),
+                    expected_generation: workstation.generation(),
+                })
+                .await
                 .unwrap_err()
                 .kind(),
-            WorkstationErrorKind::UnsupportedCapability
+            WorkstationErrorKind::InspectionNotFound
         );
+        release.wait().await;
+        assert_eq!(
+            executing.await.unwrap().unwrap_err().kind(),
+            WorkstationErrorKind::WorkstationUnavailable
+        );
+        workstation
+            .shutdown_executions_before(deadline)
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+
+        let reserved_fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let arrived = Arc::new(tokio::sync::Barrier::new(2));
+        let release = Arc::new(tokio::sync::Barrier::new(2));
+        let workstation = reserved_fixture.workstation.clone().with_execution_gate(
+            execution::ExecutionTestPoint::AfterReservation,
+            Arc::clone(&arrived),
+            Arc::clone(&release),
+        );
+        let marker = reserved_fixture
+            .workspace_root
+            .join("cwd/reservation-won-before-shutdown");
+        let request = reserved_fixture.execution_request(format!("touch '{}'", marker.display()));
+        let execution_id = request.execution_id;
+        let executing = {
+            let workstation = workstation.clone();
+            tokio::spawn(async move { workstation.execute(request).await })
+        };
+        arrived.wait().await;
+        assert_eq!(
+            workstation
+                .inspect_execution(ExecutionInspectionRequest {
+                    operation_id: OperationId::generate(),
+                    execution_id,
+                    workstation_id: workstation.workstation_id(),
+                    expected_generation: workstation.generation(),
+                })
+                .await
+                .unwrap()
+                .state,
+            crate::ports::workstation::ExecutionInspectionState::Running
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        workstation.begin_execution_shutdown(deadline);
+        release.wait().await;
+        let result = executing.await.unwrap().unwrap();
+        assert_eq!(result.execution_id, execution_id);
+        assert_eq!(result.result_kind, ExecutionResultKind::Cancelled);
+        assert!(!result.start_observed);
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        assert_eq!(result.certainty, Certainty::Definite);
+        assert!(result.error.is_none());
+        assert!(result.stdout.is_none());
+        assert!(result.stderr.is_none());
+        assert!(result.cleanup.confirmed());
+        workstation
+            .shutdown_executions_before(deadline)
+            .await
+            .unwrap();
+        assert!(!marker.exists());
+        let events = workstation.execution_lifecycle_events();
+        assert!(events.contains(&"owned_pre_spawn_cancelled"));
+        assert!(!events.contains(&"spawn_claimed"));
+        assert!(!events.contains(&"process_group_signalled"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn natural_exit_cleanup_signals_descendants_before_releasing_leader_identity() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let result = fixture.execute("/bin/sleep 60 & exit 0").await;
+        assert_eq!(result.result_kind, ExecutionResultKind::Exited);
+        assert!(result.cleanup.confirmed());
+        assert_stable_process_group_order(&fixture.workstation.execution_lifecycle_events());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn cancellation_cleanup_signals_before_releasing_leader_identity() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let started = fixture.workspace_root.join("cancel-order-started");
+        let request =
+            fixture.execution_request(format!("touch '{}'; exec /bin/sleep 60", started.display()));
+        let execution_id = request.execution_id;
+        let workstation = fixture.workstation.clone();
+        let running = tokio::spawn(async move { workstation.execute(request).await.unwrap() });
+        wait_for_path(&started).await;
+        let cancelled = fixture
+            .workstation
+            .cancel_execution(ExecutionCancellationRequest {
+                operation_id: OperationId::generate(),
+                execution_id,
+                workstation_id: fixture.workstation.workstation_id(),
+                expected_generation: fixture.workstation.generation(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancelled.state, ExecutionCancellationState::Confirmed);
+        assert_eq!(
+            running.await.unwrap().result_kind,
+            ExecutionResultKind::Cancelled
+        );
+        assert_stable_process_group_order(&fixture.workstation.execution_lifecycle_events());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn timeout_cleanup_signals_before_releasing_leader_identity() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let mut request = fixture.execution_request("exec /bin/sleep 60");
+        request.timeout = MonotonicDuration::from_millis(25);
+        let result = fixture.workstation.execute(request).await.unwrap();
+        assert_eq!(result.result_kind, ExecutionResultKind::TimedOut);
+        assert!(result.cleanup.confirmed());
+        assert_stable_process_group_order(&fixture.workstation.execution_lifecycle_events());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shutdown_cleanup_uses_original_deadline_and_releases_identity_after_signals() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let started = fixture.workspace_root.join("shutdown-order-started");
+        let request =
+            fixture.execution_request(format!("touch '{}'; exec /bin/sleep 60", started.display()));
+        let workstation = fixture.workstation.clone();
+        let running = tokio::spawn(async move { workstation.execute(request).await.unwrap() });
+        wait_for_path(&started).await;
+        let stage10_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        fixture
+            .workstation
+            .begin_execution_shutdown(stage10_deadline);
+        fixture
+            .workstation
+            .shutdown_executions_before(stage10_deadline)
+            .await
+            .unwrap();
+        assert_eq!(
+            running.await.unwrap().result_kind,
+            ExecutionResultKind::Cancelled
+        );
+        assert_stable_process_group_order(&fixture.workstation.execution_lifecycle_events());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn stage10_expired_deadline_forces_kill_reports_uncertain_and_joins_before_return() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let started = fixture.workspace_root.join("short-shutdown-started");
+        let pid_file = fixture.workspace_root.join("short-shutdown-pid");
+        let mut request = fixture.execution_request(format!(
+            "echo $$ > '{}'; touch '{}'; trap '' TERM; while :; do :; done",
+            pid_file.display(),
+            started.display()
+        ));
+        request.timeout = MonotonicDuration::from_millis(60_000);
+        let workstation = fixture.workstation.clone();
+        let running = tokio::spawn(async move { workstation.execute(request).await.unwrap() });
+        wait_for_path(&started).await;
+        let stage10_deadline = tokio::time::Instant::now();
+        let began = Instant::now();
+        fixture
+            .workstation
+            .begin_execution_shutdown(stage10_deadline);
+        let error = fixture
+            .workstation
+            .shutdown_executions_before(stage10_deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), WorkstationErrorKind::CleanupFailed);
+        assert_eq!(error.certainty(), Certainty::OutcomeUnknown);
+        assert!(began.elapsed() < Duration::from_millis(500));
+        let result = running.await.unwrap();
+        assert_eq!(result.result_kind, ExecutionResultKind::CleanupFailed);
+        assert_eq!(result.certainty, Certainty::OutcomeUnknown);
+        assert!(!result.cleanup.confirmed());
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while kill(Pid::from_raw(pid), None) != Err(nix::errno::Errno::ESRCH) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn repeated_waitid_eintr_yields_to_shutdown_cancellation_and_stage10_deadline() {
+        let mut fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let observer = Arc::new(InterruptedLeaderObserver::new());
+        fixture.workstation.set_leader_observer(observer.clone());
+        let started = fixture.workspace_root.join("eintr-started");
+        let pid_file = fixture.workspace_root.join("eintr-pid");
+        let request = fixture.execution_request(format!(
+            "echo $$ > '{}'; touch '{}'; trap '' TERM; while :; do :; done",
+            pid_file.display(),
+            started.display()
+        ));
+        let workstation = fixture.workstation.clone();
+        let running = tokio::spawn(async move { workstation.execute(request).await.unwrap() });
+        wait_for_path(&started).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while observer.calls.load(Ordering::Relaxed) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let stage10_deadline = tokio::time::Instant::now() + Duration::from_millis(75);
+        let began = Instant::now();
+        fixture
+            .workstation
+            .begin_execution_shutdown(stage10_deadline);
+        let error = fixture
+            .workstation
+            .shutdown_executions_before(stage10_deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), WorkstationErrorKind::CleanupFailed);
+        assert_eq!(error.certainty(), Certainty::OutcomeUnknown);
+        assert!(began.elapsed() < Duration::from_secs(1));
+
+        let result = running.await.unwrap();
+        assert!(result.start_observed);
+        assert_eq!(result.result_kind, ExecutionResultKind::CleanupFailed);
+        assert_eq!(result.certainty, Certainty::OutcomeUnknown);
+        assert!(result.cancelled);
+        assert!(!result.cleanup.confirmed());
+        let calls = observer.calls.load(Ordering::Relaxed);
+        assert!(calls >= 3);
+        assert!(calls < 100, "cooperative polling made {calls} observations");
+        assert!(
+            !fixture
+                .workstation
+                .execution_lifecycle_events()
+                .contains(&"leader_terminal_observed")
+        );
+
+        let pid = fs::read_to_string(pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while kill(Pid::from_raw(pid), None) != Err(nix::errno::Errno::ESRCH) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn timeout_and_completion_remove_background_children_with_term_kill_escalation() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let pid_file = fixture.workspace_root.join("background-pid");
+        let completed = fixture
+            .execute(format!(
+                "/bin/sleep 60 & echo $! > '{}'; exit 0",
+                pid_file.display()
+            ))
+            .await;
+        assert_eq!(
+            completed.result_kind,
+            crate::ports::workstation::ExecutionResultKind::Exited
+        );
+        assert!(completed.cleanup.confirmed());
+        let pid: i32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+
+        let mut timeout = fixture.execution_request("trap '' TERM; while :; do :; done");
+        timeout.timeout = MonotonicDuration::from_millis(50);
+        timeout.deadline = MonotonicInstant::from_elapsed(Duration::from_secs(12));
+        let timed_out = fixture.workstation.execute(timeout).await.unwrap();
+        assert_eq!(
+            timed_out.result_kind,
+            crate::ports::workstation::ExecutionResultKind::TimedOut
+        );
+        assert!(timed_out.timed_out);
+        assert!(timed_out.cleanup.confirmed());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn execution_debug_and_errors_redact_command_cwd_environment_and_output_canaries() {
+        let fixture = Fixture::new(HARD_FILE_READ_MAX_BYTES);
+        let command_canary = "command-secret-canary";
+        let cwd_canary = fixture.workspace_root.join("cwd").display().to_string();
+        let request =
+            fixture.execution_request(format!("printf 'output-secret-canary'; # {command_canary}"));
+        let request_debug = format!("{request:?}");
+        assert!(!request_debug.contains(command_canary));
+        assert!(!request_debug.contains(&cwd_canary));
+        let result = fixture.workstation.execute(request).await.unwrap();
+        let result_debug = format!("{result:?}");
+        assert!(!result_debug.contains(command_canary));
+        assert!(!result_debug.contains("output-secret-canary"));
+        assert!(!result_debug.contains(&cwd_canary));
+        assert!(result_debug.contains("[REDACTED]"));
+        let error = WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed);
+        assert_eq!(error.to_string(), "cleanup_failed");
+        assert!(!format!("{error:?}").contains(command_canary));
     }
 
     #[cfg(target_os = "linux")]
@@ -1346,6 +2537,164 @@ mod tests {
             assert!(release.lines().any(|line| line == "ID=ubuntu"));
             assert!(release.lines().any(|line| line == "VERSION_ID=\"24.04\""));
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires the deferred Ubuntu 24.04 x86-64 systemd target"]
+    async fn linux_target_ubuntu_nonroot_systemd_cgroup_git_and_service_contract() {
+        assert_eq!(std::env::consts::ARCH, "x86_64");
+        // SAFETY: geteuid has no pointer or lifetime preconditions.
+        assert_ne!(unsafe { nix::libc::geteuid() }, 0);
+        let release = fs::read_to_string("/etc/os-release").unwrap();
+        assert!(release.lines().any(|line| line == "ID=ubuntu"));
+        assert!(release.lines().any(|line| line == "VERSION_ID=\"24.04\""));
+        assert!(Path::new("/bin/bash").is_file());
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        );
+        let unit = std::env::var("CRAXII_STAGE13_SYSTEMD_UNIT").unwrap();
+        let properties = std::process::Command::new("/usr/bin/systemctl")
+            .args([
+                "show",
+                &unit,
+                "--property=User",
+                "--property=Delegate",
+                "--property=KillMode",
+            ])
+            .output()
+            .unwrap();
+        assert!(properties.status.success());
+        let properties = String::from_utf8(properties.stdout).unwrap();
+        assert!(properties.lines().any(|line| line == "User=craxii"));
+        assert!(properties.lines().any(|line| line == "Delegate=yes"));
+        assert!(
+            properties
+                .lines()
+                .any(|line| line == "KillMode=control-group")
+        );
+        let root = PathBuf::from(std::env::var("CRAXII_STAGE13_CGROUP_ROOT").unwrap());
+        assert!(observe_execution_support(Path::new("/bin/bash"), false, Some(&root)).cgroup);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires delegated cgroup v2 and reviewed sudo -n policy"]
+    async fn linux_target_user_admin_identity_clean_environment_and_cgroup_cleanup() {
+        let root = PathBuf::from(std::env::var("CRAXII_STAGE13_CGROUP_ROOT").unwrap());
+        let fixture = Fixture::with_execution_target(
+            HARD_FILE_READ_MAX_BYTES,
+            "/srv/craxii/workspaces/primary",
+            true,
+            Some(root),
+        );
+        let flags = fixture.workstation.capabilities_snapshot().flags();
+        assert!(flags.foreground_execute());
+        assert!(flags.process_group_cleanup());
+        assert!(flags.cgroup_cleanup());
+        assert!(flags.privilege_administrative());
+
+        let user = fixture.execute("id -u; env | LC_ALL=C sort").await;
+        assert_ne!(
+            user.stdout.as_ref().unwrap().projection.lines().next(),
+            Some("0")
+        );
+        assert!(user.cleanup.confirmed());
+        let mut admin = fixture.execution_request("id -u; env | LC_ALL=C sort");
+        admin.effective_privilege = PrivilegeMode::Administrative;
+        let admin = fixture.workstation.execute(admin).await.unwrap();
+        let output = &admin.stdout.as_ref().unwrap().projection;
+        assert_eq!(output.lines().next(), Some("0"));
+        for required in ["HOME=/root", "USER=root", "LOGNAME=root", "SHELL=/bin/bash"] {
+            assert!(output.lines().any(|line| line == required));
+        }
+        for forbidden in [
+            "OPENAI_API_KEY=",
+            "AWS_SECRET_ACCESS_KEY=",
+            "SSH_AUTH_SOCK=",
+        ] {
+            assert!(!output.contains(forbidden));
+        }
+        assert!(admin.cleanup.confirmed());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires delegated cgroup v2 target for session-escape and stress proof"]
+    async fn linux_target_cgroup_kills_session_escape_and_repeated_process_trees() {
+        let root = PathBuf::from(std::env::var("CRAXII_STAGE13_CGROUP_ROOT").unwrap());
+        let fixture = Fixture::with_execution_target(
+            HARD_FILE_READ_MAX_BYTES,
+            "/srv/craxii/workspaces/primary",
+            false,
+            Some(root.clone()),
+        );
+        for ordinal in 0..25 {
+            let pid_file = fixture
+                .workspace_root
+                .join(format!("escaped-{ordinal}.pid"));
+            let result = fixture
+                .execute(format!(
+                    "/usr/bin/setsid /bin/sleep 60 & echo $! > '{}'; (/bin/sleep 60 &) ; exit 0",
+                    pid_file.display()
+                ))
+                .await;
+            assert!(result.cleanup.confirmed(), "iteration {ordinal}");
+            let pid: i32 = fs::read_to_string(pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(
+                kill(Pid::from_raw(pid), None),
+                Err(nix::errno::Errno::ESRCH)
+            );
+        }
+        let residual: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("01"))
+            .collect();
+        assert!(residual.is_empty());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-failpoints"))]
+    #[tokio::test]
+    #[ignore = "subprocess-only crash marker probe for the deferred systemd harness"]
+    async fn linux_target_crash_marker_probe_execution() {
+        let root = PathBuf::from(std::env::var("CRAXII_STAGE13_CGROUP_ROOT").unwrap());
+        let fixture = Fixture::with_execution_target(
+            HARD_FILE_READ_MAX_BYTES,
+            "/srv/craxii/workspaces/primary",
+            false,
+            Some(root),
+        );
+        let mut request = fixture
+            .execution_request("trap '' TERM; exec -a craxii-stage13-crash-child /bin/sleep 60");
+        request.timeout = MonotonicDuration::from_millis(50);
+        request.deadline = MonotonicInstant::from_elapsed(Duration::from_secs(12));
+        let _ = fixture.workstation.execute(request).await;
+        panic!("selected Stage 13 crash marker did not abort the subprocess");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires disposable Docker/systemd service and crash/restart target harness"]
+    fn linux_target_docker_disposable_service_crash_restart_and_reboot_leak_harness() {
+        let harness = std::env::var("CRAXII_STAGE13_CRASH_HARNESS").unwrap();
+        assert!(Path::new(&harness).is_absolute());
+        let status = std::process::Command::new(harness)
+            .arg("--verify-target")
+            .stdin(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     fn directory_names(root: &Path) -> BTreeSet<String> {

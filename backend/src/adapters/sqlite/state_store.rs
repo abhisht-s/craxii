@@ -321,7 +321,25 @@ impl PreparedBootstrap {
         let default_shell =
             LogicalPathReference::absolute(request.observation.default_shell.clone())
                 .map_err(|_| inconsistent())?;
-        let limits = WorkstationCapabilityLimits::try_new(0, 0, 0).map_err(|_| inconsistent())?;
+        let execution = request.observation.execution_capabilities;
+        let limits = WorkstationCapabilityLimits::try_new(
+            if execution.foreground_execute {
+                900_000
+            } else {
+                0
+            },
+            if execution.foreground_execute {
+                8_388_608
+            } else {
+                0
+            },
+            if execution.foreground_execute {
+                8_388_608
+            } else {
+                0
+            },
+        )
+        .map_err(|_| inconsistent())?;
         let capabilities = WorkstationCapabilities::try_new(WorkstationCapabilitiesInput {
             workstation_id: request.proposed.workstation_id,
             generation: request.observation.initial_generation,
@@ -330,13 +348,13 @@ impl PreparedBootstrap {
             default_shell,
             flags: WorkstationCapabilityFlags::new(WorkstationCapabilityFlagsInput {
                 filesystem_read: true,
-                foreground_execute: false,
-                cancel_execution: false,
-                inspect_execution: false,
+                foreground_execute: execution.foreground_execute,
+                cancel_execution: execution.foreground_execute,
+                inspect_execution: execution.foreground_execute,
                 privilege_user: true,
-                privilege_administrative: false,
-                process_group_cleanup: false,
-                cgroup_cleanup: false,
+                privilege_administrative: execution.privilege_administrative,
+                process_group_cleanup: execution.process_group_cleanup,
+                cgroup_cleanup: execution.cgroup_cleanup,
             }),
             limits,
             workspaces: vec![
@@ -509,6 +527,7 @@ async fn validate_existing_bootstrap_in_write(
             workspace_logical_name: request.observation.workspace_logical_name.clone(),
             workspace_logical_root: request.observation.workspace_logical_root.clone(),
             workspace_resolved_root: request.observation.workspace_resolved_root.clone(),
+            execution_capabilities: request.observation.execution_capabilities,
         },
     })?;
     if root.workstation.generation() != request.observation.initial_generation

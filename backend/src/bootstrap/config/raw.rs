@@ -180,6 +180,8 @@ pub(super) struct RawShell {
     #[serde(default)]
     pub(super) inherited_variables: Vec<String>,
     pub(super) administrative_enabled: bool,
+    #[serde(default)]
+    pub(super) delegated_cgroup_root: Option<String>,
 }
 
 #[derive(Deserialize)]

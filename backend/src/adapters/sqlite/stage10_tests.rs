@@ -77,6 +77,8 @@ fn observation() -> BootstrapObservation {
         workspace_logical_name: "primary".into(),
         workspace_logical_root: "/workspace".into(),
         workspace_resolved_root: "/tmp/craxii-stage10-workspace".into(),
+        execution_capabilities:
+            crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
     }
 }
 

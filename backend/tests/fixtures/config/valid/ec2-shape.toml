@@ -84,6 +84,7 @@ executable = "/bin/bash"
 environment_policy = "clean"
 inherited_variables = []
 administrative_enabled = true
+delegated_cgroup_root = "/sys/fs/cgroup/system.slice/craxii-server.service/craxii-executions"
 
 [device_auth]
 source = "provisioned_sqlite"

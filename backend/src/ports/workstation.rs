@@ -7,8 +7,10 @@ use std::pin::Pin;
 use crate::domain::{
     CanonicalByteCount, Certainty, ExecutionId, LogicalPathReference, MonotonicDuration,
     NormalizedError, OperationId, PrivilegeMode, ResolvedPathEvidence, Retryability, Sha256Digest,
-    UtcTimestamp, WorkspaceId, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
+    UtcTimestamp, WorkId, WorkspaceId, WorkstationCapabilities, WorkstationGeneration,
+    WorkstationId,
 };
+use crate::ports::artifact_store::FinalizedArtifact;
 use crate::ports::clock::MonotonicInstant;
 
 /// Default maximum accepted by the model-facing read-file request constructor.
@@ -16,6 +18,30 @@ pub const DEFAULT_FILE_READ_MAX_BYTES: u64 = 1_048_576;
 
 /// Absolute LocalWorkstation read ceiling.
 pub const HARD_FILE_READ_MAX_BYTES: u64 = 8_388_608;
+
+/// Fixed Stage 13 Bash command-string ceiling.
+pub const HARD_EXECUTION_COMMAND_MAX_BYTES: usize = 65_536;
+
+/// Default Stage 13 foreground runtime budget.
+pub const DEFAULT_EXECUTION_TIMEOUT_MS: u64 = 120_000;
+
+/// Hard Stage 13 foreground runtime budget.
+pub const HARD_EXECUTION_TIMEOUT_MS: u64 = 900_000;
+
+/// Per-stream raw capture ceiling.
+pub const HARD_EXECUTION_STREAM_CAPTURE_BYTES: u64 = 8_388_608;
+
+/// Per-stream model/display projection ceiling.
+pub const EXECUTION_STREAM_PROJECTION_BYTES: usize = 32_768;
+
+/// Retained head in a shortened model/display projection.
+pub const EXECUTION_STREAM_PROJECTION_HEAD_BYTES: usize = 24 * 1_024;
+
+/// Retained tail in a shortened model/display projection.
+pub const EXECUTION_STREAM_PROJECTION_TAIL_BYTES: usize = 8 * 1_024;
+
+/// TERM grace before mandatory KILL escalation.
+pub const EXECUTION_TERM_GRACE_MS: u64 = 5_000;
 
 /// Boxed future used by the Workstation port without an async-trait dependency.
 pub type WorkstationFuture<'a, T> =
@@ -34,6 +60,10 @@ pub enum WorkstationErrorKind {
     FileTooLarge,
     ChangedDuringRead,
     UnsupportedCapability,
+    SpawnFailed,
+    SignalTerminated,
+    InspectionNotFound,
+    CleanupFailed,
     Timeout,
     Cancelled,
     IoError,
@@ -55,6 +85,10 @@ impl WorkstationErrorKind {
             Self::FileTooLarge => "file_too_large",
             Self::ChangedDuringRead => "changed_during_read",
             Self::UnsupportedCapability => "unsupported_capability",
+            Self::SpawnFailed => "spawn_failed",
+            Self::SignalTerminated => "signal_terminated",
+            Self::InspectionNotFound => "inspection_not_found",
+            Self::CleanupFailed => "cleanup_failed",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
             Self::IoError => "io_error",
@@ -66,7 +100,7 @@ impl WorkstationErrorKind {
     #[must_use]
     pub const fn retryability(self) -> Retryability {
         match self {
-            Self::Timeout | Self::ChangedDuringRead => Retryability::Bounded,
+            Self::Timeout | Self::ChangedDuringRead | Self::SpawnFailed => Retryability::Bounded,
             Self::WorkstationUnavailable | Self::PermissionDenied => Retryability::OperatorAction,
             Self::GenerationMismatch
             | Self::WorkspaceNotFound
@@ -75,6 +109,9 @@ impl WorkstationErrorKind {
             | Self::BinaryContent
             | Self::FileTooLarge
             | Self::UnsupportedCapability
+            | Self::SignalTerminated
+            | Self::InspectionNotFound
+            | Self::CleanupFailed
             | Self::Cancelled
             | Self::IoError
             | Self::InternalWorkstationError => Retryability::Never,
@@ -88,6 +125,7 @@ pub struct WorkstationError {
     kind: WorkstationErrorKind,
     byte_length: Option<CanonicalByteCount>,
     sha256: Option<Sha256Digest>,
+    certainty: Certainty,
 }
 
 impl WorkstationError {
@@ -97,6 +135,7 @@ impl WorkstationError {
             kind,
             byte_length: None,
             sha256: None,
+            certainty: Certainty::Definite,
         }
     }
 
@@ -110,6 +149,17 @@ impl WorkstationError {
             kind,
             byte_length: Some(byte_length),
             sha256,
+            certainty: Certainty::Definite,
+        }
+    }
+
+    #[must_use]
+    pub const fn uncertain(kind: WorkstationErrorKind) -> Self {
+        Self {
+            kind,
+            byte_length: None,
+            sha256: None,
+            certainty: Certainty::OutcomeUnknown,
         }
     }
 
@@ -133,10 +183,15 @@ impl WorkstationError {
         self.sha256
     }
 
+    #[must_use]
+    pub const fn certainty(&self) -> Certainty {
+        self.certainty
+    }
+
     /// Projects to the repository-wide safe normalized envelope.
     #[must_use]
     pub const fn normalized(&self) -> NormalizedError {
-        NormalizedError::workstation_classified(self.retryability(), Certainty::Definite, None)
+        NormalizedError::workstation_classified(self.retryability(), self.certainty, None)
     }
 }
 
@@ -154,6 +209,7 @@ impl Debug for WorkstationError {
             .field("retryability", &self.retryability())
             .field("byte_length", &self.byte_length)
             .field("sha256", &self.sha256)
+            .field("certainty", &self.certainty)
             .finish()
     }
 }
@@ -247,13 +303,6 @@ impl Debug for FileReadResult {
     }
 }
 
-/// Clean child-environment entry reserved for Stage 13 execution.
-#[derive(Clone, Eq, PartialEq)]
-pub struct ExecutionEnvironmentVariable {
-    pub name: String,
-    pub value: String,
-}
-
 /// Dependency-neutral child standard-input policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionStdinPolicy {
@@ -273,18 +322,18 @@ pub enum ExecutionCleanupPolicy {
     ProcessGroupAndCgroup,
 }
 
-/// Canonical Stage 13-shaped execution request; unsupported by Stage 12.
+/// Canonical Stage 13 foreground execution request.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ExecutionRequest {
     pub operation_id: OperationId,
     pub execution_id: ExecutionId,
+    pub work_id: WorkId,
     pub workstation_id: WorkstationId,
     pub expected_generation: WorkstationGeneration,
     pub workspace_id: WorkspaceId,
     pub command: String,
     pub requested_cwd: LogicalPathReference,
     pub effective_privilege: PrivilegeMode,
-    pub environment: Vec<ExecutionEnvironmentVariable>,
     pub stdin: ExecutionStdinPolicy,
     pub timeout: MonotonicDuration,
     pub deadline: MonotonicInstant,
@@ -292,27 +341,143 @@ pub struct ExecutionRequest {
     pub cleanup: ExecutionCleanupPolicy,
 }
 
+impl Debug for ExecutionRequest {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionRequest")
+            .field("operation_id", &self.operation_id)
+            .field("execution_id", &self.execution_id)
+            .field("work_id", &self.work_id)
+            .field("workstation_id", &self.workstation_id)
+            .field("expected_generation", &self.expected_generation)
+            .field("workspace_id", &self.workspace_id)
+            .field("command", &"[REDACTED]")
+            .field("requested_cwd", &"[REDACTED]")
+            .field("effective_privilege", &self.effective_privilege)
+            .field("stdin", &self.stdin)
+            .field("timeout", &self.timeout)
+            .field("deadline", &self.deadline)
+            .field("capture", &self.capture)
+            .field("cleanup", &self.cleanup)
+            .finish()
+    }
+}
+
 /// Closed execution terminal classes reserved for Stage 13.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecutionResultKind {
     Exited,
-    Signalled,
+    Signaled,
     TimedOut,
     Cancelled,
     SpawnFailed,
     CleanupFailed,
 }
 
-/// Dependency-neutral execution result reserved for Stage 13.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// Final independent stream evidence and bounded display projection.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ExecutionStreamResult {
+    pub artifact: FinalizedArtifact,
+    pub projection: String,
+    pub projection_had_utf8_replacement: bool,
+    pub observed_bytes: u64,
+    pub captured_bytes: u64,
+    pub omitted_bytes: u64,
+    pub projection_omitted_bytes: u64,
+    pub observed_count_saturated: bool,
+    pub truncated: bool,
+}
+
+impl Debug for ExecutionStreamResult {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionStreamResult")
+            .field("artifact", &self.artifact)
+            .field("projection", &"[REDACTED]")
+            .field(
+                "projection_had_utf8_replacement",
+                &self.projection_had_utf8_replacement,
+            )
+            .field("observed_bytes", &self.observed_bytes)
+            .field("captured_bytes", &self.captured_bytes)
+            .field("omitted_bytes", &self.omitted_bytes)
+            .field("projection_omitted_bytes", &self.projection_omitted_bytes)
+            .field("observed_count_saturated", &self.observed_count_saturated)
+            .field("truncated", &self.truncated)
+            .finish()
+    }
+}
+
+/// Proof assembled before a definitive terminal result is handed off.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionCleanupEvidence {
+    pub direct_child_reaped: bool,
+    pub stdout_drain_joined: bool,
+    pub stderr_drain_joined: bool,
+    pub process_group_empty: bool,
+    pub cgroup_empty: Option<bool>,
+    pub cgroup_removed: Option<bool>,
+}
+
+impl ExecutionCleanupEvidence {
+    #[must_use]
+    pub const fn confirmed(self) -> bool {
+        self.direct_child_reaped
+            && self.stdout_drain_joined
+            && self.stderr_drain_joined
+            && self.process_group_empty
+            && !matches!(self.cgroup_empty, Some(false))
+            && !matches!(self.cgroup_removed, Some(false))
+    }
+}
+
+/// Dependency-neutral complete execution result.
+#[derive(Clone, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub operation_id: OperationId,
     pub execution_id: ExecutionId,
+    pub start_observed: bool,
+    pub requested_cwd: LogicalPathReference,
+    pub resolved_cwd: ResolvedPathEvidence,
+    pub effective_privilege: PrivilegeMode,
+    pub command_sha256: Sha256Digest,
     pub result_kind: ExecutionResultKind,
     pub exit_code: Option<i64>,
     pub terminating_signal: Option<i64>,
+    pub timed_out: bool,
+    pub cancelled: bool,
     pub duration: MonotonicDuration,
-    pub cleanup_confirmed: bool,
+    pub stdout: Option<ExecutionStreamResult>,
+    pub stderr: Option<ExecutionStreamResult>,
+    pub cleanup: ExecutionCleanupEvidence,
+    pub error: Option<WorkstationError>,
+    pub certainty: Certainty,
+}
+
+impl Debug for ExecutionResult {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ExecutionResult")
+            .field("operation_id", &self.operation_id)
+            .field("execution_id", &self.execution_id)
+            .field("start_observed", &self.start_observed)
+            .field("requested_cwd", &"[REDACTED]")
+            .field("resolved_cwd", &"[REDACTED]")
+            .field("effective_privilege", &self.effective_privilege)
+            .field("command_sha256", &self.command_sha256)
+            .field("result_kind", &self.result_kind)
+            .field("exit_code", &self.exit_code)
+            .field("terminating_signal", &self.terminating_signal)
+            .field("timed_out", &self.timed_out)
+            .field("cancelled", &self.cancelled)
+            .field("duration", &self.duration)
+            .field("stdout", &self.stdout)
+            .field("stderr", &self.stderr)
+            .field("cleanup", &self.cleanup)
+            .field("error", &self.error)
+            .field("certainty", &self.certainty)
+            .finish()
+    }
 }
 
 /// Explicit identity for an execution inspection.
@@ -572,6 +737,26 @@ mod tests {
             (
                 WorkstationErrorKind::UnsupportedCapability,
                 "unsupported_capability",
+                Retryability::Never,
+            ),
+            (
+                WorkstationErrorKind::SpawnFailed,
+                "spawn_failed",
+                Retryability::Bounded,
+            ),
+            (
+                WorkstationErrorKind::SignalTerminated,
+                "signal_terminated",
+                Retryability::Never,
+            ),
+            (
+                WorkstationErrorKind::InspectionNotFound,
+                "inspection_not_found",
+                Retryability::Never,
+            ),
+            (
+                WorkstationErrorKind::CleanupFailed,
+                "cleanup_failed",
                 Retryability::Never,
             ),
             (

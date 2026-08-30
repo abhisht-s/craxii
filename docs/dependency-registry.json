@@ -49,14 +49,16 @@
       "dependency_kind": "normal",
       "approved_compatible_requirement": "^0.31",
       "enabled_features": [
-        "fs"
+        "fs",
+        "process",
+        "signal"
       ],
       "default_features": false,
       "optional": false,
       "target_restriction": null,
       "approval_status": "approved",
       "approver_role": "repository/project owner",
-      "approval_date": "2026-08-27",
+      "approval_date": "2026-08-29",
       "decision_record_path": "docs/dependencies/nix.md"
     },
     {
@@ -129,6 +131,7 @@
         "io-util",
         "macros",
         "net",
+        "process",
         "rt-multi-thread",
         "signal",
         "sync",
@@ -139,7 +142,7 @@
       "target_restriction": null,
       "approval_status": "approved",
       "approver_role": "repository/project owner",
-      "approval_date": "2026-08-28",
+      "approval_date": "2026-08-29",
       "decision_record_path": "docs/dependencies/tokio.md"
     },
     {

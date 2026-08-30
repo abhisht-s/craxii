@@ -246,6 +246,13 @@ impl ConfigFingerprint {
             "shell.administrative_enabled",
             config.shell.administrative_enabled,
         );
+        canonical.bool(
+            "shell.has_delegated_cgroup_root",
+            config.shell.delegated_cgroup_root.is_some(),
+        );
+        if let Some(root) = &config.shell.delegated_cgroup_root {
+            canonical.path("shell.delegated_cgroup_root", root);
+        }
 
         canonical.string(
             "device_auth.source",

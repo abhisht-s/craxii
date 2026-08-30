@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="606bcc5f37c8a8e7ba0e8b55ae43a9e3c331d109d6a79205967f5b510f90dd70">
+  <meta name="craxii-source-sha256" content="e3032c7d0a31c0b66cc6adae440f8ff7205693bd114866c821210d150d47fff2">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>606bcc5f37c8a8e7…</code></p>
+        <p>Source SHA-256:<br><code>e3032c7d0a31c0b6…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 293 detailed subsections, and 337 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 294 detailed subsections, and 337 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -4027,7 +4027,7 @@ PRAGMA temp_store = MEMORY;
   <p><strong>Plain-English significance:</strong> This freezes the safe foundation beneath later persistence: one local owner, one reviewed SQLite build, exact durability settings, and a version-zero boundary that cannot accidentally create product data.</p>
   <p class="real-life-example"><strong>Real-life example:</strong> Before installing records in a vault, verify the room, lock, fireproofing, access policy, and inventory ledger. Stage 5 proves that shell while deliberately leaving the records shelves empty for Stage 6.</p>
 </aside>
-<p>The V0 implementation uses SQLx <code>0.9</code> with only <code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, and <code>macros</code>; Tokio <code>1.53</code> with only <code>macros</code>, <code>rt-multi-thread</code>, <code>sync</code>, <code>time</code>, and <code>signal</code>; and nix <code>0.31</code> with only <code>fs</code>. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside <code>adapters/sqlite</code>; neither application nor the <code>StateStore</code> port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio signal support is owned only by binary composition; Stage 10 adds no <code>tokio-util</code>, <code>futures</code>, or other direct async dependency.</p>
+<p>The V0 implementation uses SQLx <code>0.9</code> with only <code>sqlite-bundled</code>, <code>runtime-tokio</code>, <code>migrate</code>, and <code>macros</code>; Tokio <code>1.53</code> with only <code>io-util</code>, <code>macros</code>, <code>net</code>, <code>process</code>, <code>rt-multi-thread</code>, <code>signal</code>, <code>sync</code>, and <code>time</code>; and nix <code>0.31</code> with only <code>fs</code>, <code>process</code>, and <code>signal</code>. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside <code>adapters/sqlite</code>; neither application nor the <code>StateStore</code> port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio process support is confined to LocalWorkstation, Tokio signal support remains owned by binary composition plus LocalWorkstation child supervision, and nix process/signal support is confined to reviewed Unix lifecycle adapters. No <code>tokio-util</code>, new futures crate, or other direct async dependency is added for Stage 13.</p>
 <p>The database path is exactly <code>&lt;state_root&gt;/db/craxii.sqlite3</code> and the process-lock path is exactly <code>&lt;state_root&gt;/locks/craxii.lock</code>. <code>state_root</code> MUST preexist; Stage 5 may create only its <code>db/</code> and <code>locks/</code> children. Those directories are mode <code>0700</code>, and new database and lock files are mode <code>0600</code>. Production provisioning owns <code>state_root</code>, user ownership, and any <code>chown</code>; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production <code>:memory:</code> mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.</p>
 <p>The mounted filesystem MUST be locally classified before use. Linux V0 allows ext2/3/4, XFS, Btrfs, tmpfs, and overlayfs. macOS V0 allows APFS and HFS/HFS+. Known remote classes including NFS, SMB/CIFS, 9p, Ceph, and identifiable network-style FUSE mounts are rejected, and unknown classes fail closed. This classification does not prove EBS backing.</p>
 <p>In addition to the required pragmas above, every connection MUST apply and verify:</p>
@@ -5248,6 +5248,10 @@ default workspace IDs and logical roots
 <li>The map is ephemeral and scoped to one runtime instance.</li>
 <li><code>inspect_execution</code> returns observed live/terminal status only for handles known to the current runtime.</li>
 <li>After process restart, an absent handle cannot prove nonexecution. Recovery relies on the durable dispatch state and uses <code>outcome_unknown</code>.</li>
+<li>The live registry is keyed only by <code>ExecutionId</code>, rejects a duplicate live ID before spawn, and
+owns one observed supervisor plus its drain tasks until terminal cleanup. Dropping the caller
+awaiting <code>execute</code> does not transfer or abandon that ownership. Terminal entries exist only for
+coherent result handoff and are then removed; this is not durable terminal history.</li>
 </ul>
 <h3>Foreground-only contract</h3>
 <aside class="explain-card level-3" data-source-heading="Foreground-only contract">
@@ -5273,11 +5277,24 @@ default workspace IDs and logical roots
 <li>a new Unix process group/session;</li>
 <li><code>kill_on_drop</code> as defense in depth, not the primary cleanup mechanism;</li>
 <li>membership in a per-execution cgroup v2 subtree or equivalent systemd-created scope;</li>
-<li>direct-child reaping;</li>
+<li>non-reaping direct-child terminal observation followed by descendant cleanup while the waitable
+session leader still pins its PID/process-group identity, then direct-child reaping;</li>
 <li>concurrent stdout/stderr drains;</li>
 <li>cgroup emptiness verification before terminal cleanup is reported.</li>
 </ul>
+<p>No Unix cleanup path may deliver a process-group signal after the waitable leader identity has been
+released. Natural exit, cancellation, timeout, and shutdown MUST all complete their final
+process-group signal and quiescence proof before reaping the leader. Linux cgroup identity remains
+the definitive containment authority; numeric process-group signalling is only early escalation
+there, and <code>cgroup.kill</code> plus cgroup emptiness remain valid independently of PID/PGID reuse.</p>
 <p>The systemd backend unit uses <code>KillMode=control-group</code> so backend death kills ordinary descendant processes. Per-execution cgroups allow cancellation to target one command tree.</p>
+<p>On Linux the validated shell configuration supplies an optional absolute
+<code>delegated_cgroup_root</code>, which MUST be a child of <code>/sys/fs/cgroup</code>. Linux foreground execution is
+advertised only when LocalWorkstation can create, inspect, and remove an empty probe cgroup beneath
+that exact root. Every execution creates one child named from its non-PID <code>ExecutionId</code>; the narrow
+child <code>pre_exec</code> performs <code>fchdir</code>, <code>setsid</code>, and a write of <code>0</code> to that already-created
+<code>cgroup.procs</code> before Bash code can run. On macOS, local verification may advertise only the
+process-session/group approximation: cgroup and administrative capability remain false.</p>
 <p>Tokio documents that a child continues by default when its handle is dropped; <code>kill_on_drop</code> affects the direct child and is not a substitute for descendant cleanup. See <a href="https://docs.rs/tokio/latest/tokio/process/struct.Child.html"><code>tokio::process::Child</code></a>.</p>
 <p>An intentionally hostile root process can escape local cleanup. V0&#39;s guarantee is against ordinary compilers, test runners, shells, and accidental daemonization, not adversarial root code.</p>
 <h3>Privilege semantics</h3>
@@ -5293,6 +5310,12 @@ default workspace IDs and logical roots
 </ul>
 <p>The backend process itself runs as <code>craxii</code>, not root. Administrative execution uses an explicit <code>sudo -n</code> path or equivalent controlled launcher. The final command environment is constructed from scratch after elevation; the backend environment is never preserved wholesale.</p>
 <p>The sudo policy permits Craxii to administer this development workstation autonomously. It is intentionally broad. Every elevated call records requested and effective privilege.</p>
+<p>The reviewed V0 administrative launcher is exactly absolute <code>/usr/bin/sudo -n</code>, followed by
+absolute <code>/usr/bin/env -i</code>, the fixed root allowlist, and the same direct Bash argument sequence.
+Administrative capability remains false unless configuration enables it and a noninteractive,
+side-effect-free runtime probe observes root identity, the clean root values, and working delegated
+cgroup ownership. <code>sudo -E</code>, a password prompt, a root backend, setuid backend, and an unreviewed
+helper daemon are forbidden.</p>
 <p>The model-facing <code>run_shell</code> input may request administrative mode. That request is not self-authorizing: Tool Execution Service resolves it through the V0 authority evaluator and records the decision.</p>
 <h3>Why one Unix user</h3>
 <aside class="explain-card level-3" data-source-heading="Why one Unix user">
@@ -5449,6 +5472,11 @@ CRAXII_WORKSPACE_ID=&lt;non-secret ID&gt;
 <li>open file descriptors other than standard streams and launcher control handles.</li>
 </ul>
 <p>Project commands may set ordinary variables inside the shell string. That does not grant access to secrets absent from the machine environment.</p>
+<p><code>ExecutionRequest</code> contains no generic environment vector or override. It carries the canonical
+nonsecret <code>WorkId</code> and <code>WorkspaceId</code>; LocalWorkstation alone derives the two Craxii variables. The
+launcher calls <code>env_clear</code>, sets only the eight listed values, marks every observed unrelated parent
+descriptor close-on-exec, and uses <code>/dev/null</code> for stdin. Bash may maintain its own documented shell
+variables after exec; that does not authorize additional parent environment inheritance.</p>
 <h3>Output capture</h3>
 <aside class="explain-card level-3" data-source-heading="Output capture">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -5500,6 +5528,31 @@ process-tree cleanup status
 <li>Return <code>timed_out=true</code> only after observation/cleanup.</li>
 <li>If cleanup is unconfirmed, use <code>outcome_unknown</code> and interrupt work.</li>
 </ul>
+<p>The execution runtime budget and the absolute Workstation operation deadline are distinct monotonic
+bounds. Cancellation, timeout, natural exit, and shutdown race through one first-cause latch.
+Shutdown uses the already-latched Stage 10 absolute deadline; LocalWorkstation closes only new
+execute admission, cancels live entries, joins supervisors/drains, and does not create a secondary
+deadline or a second shutdown authority.</p>
+<p>Execute admission and insertion into the live <code>ExecutionId</code> registry share one short-held authority
+lock. Before insertion the execution is unowned and shutdown may reject it; successful insertion is
+the ownership boundary, after which shutdown must cancel and join that owned lifecycle rather than
+reclassifying it as unavailable or spawn-failed. A per-entry first-cause/spawn claim decides whether
+shutdown cancellation prevents OS spawn with <code>start_observed=false</code> or whether an already claimed
+spawn proceeds under ownership into the ordinary TERM/KILL/reap/drain path. No registry lock is held
+across a spawn, OS call, or await.</p>
+<p>Direct-child terminal observation uses one non-reaping
+<code>waitid(WEXITED | WNOHANG | WNOWAIT)</code> attempt per cooperative supervisor poll. <code>EINTR</code> is an
+interrupted nonterminal observation, not exit, liveness proof, <code>ECHILD</code>, or cleanup failure; control
+returns to the async cancellation and deadline machinery before another attempt. A zero observed PID
+is pending, true terminal states retain the waitable leader until descendant cleanup releases the
+stable group identity, and only then may the child be reaped.</p>
+<h3>Stage 13 target verification status</h3>
+<p>Stage 13 production code, macOS/Unix-process-group tests, Linux cgroup/admin code, Linux-gated tests,
+and crash-marker harnesses are implemented locally. Ubuntu 24.04 x86-64 execution under the real
+non-root <code>craxii</code> systemd unit with <code>Delegate=yes</code>, <code>KillMode=control-group</code>, reviewed <code>sudo -n</code>,
+Docker, service restart, and reboot leak scans is a target-environment acceptance gate. Deferring
+that gate does not permit optimistic Linux cgroup/admin capability flags and does not block Stage 14
+implementation after the local Stage 13 gate passes.</p>
 <h3>Administrative operations</h3>
 <aside class="explain-card level-3" data-source-heading="Administrative operations">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -5891,6 +5944,15 @@ The server execution task is observed by an explicit transport supervisor. Unexp
 return, precise serve failure, or task panic marks fatal, requests that existing Stage 10
 controller, and preserves the originating typed cause while transport ownership drains within the
 controller&#39;s original deadline.</p>
+<p>LocalWorkstation receives that exact original absolute Stage 10 deadline when execution admission
+closes. For each already-owned execution its effective cleanup deadline is the earlier of the
+execution request deadline and the Stage 10 deadline; TERM grace, KILL escalation, descendant and
+cgroup proof, direct-child reap, drain joins, supervisor join, and terminal registry handoff MUST
+NOT extend it. If proof cannot complete by the Stage 10 deadline, the supervisor performs the
+strongest immediately available group/cgroup/direct-child kill action, reports cleanup uncertainty,
+and still joins its nonblocking terminal handoff before bootstrap closes SQLite. Bootstrap reports
+shutdown failure; it neither creates a later cleanup deadline nor leaves a supervisor able to use
+runtime state after SQLite closure.</p>
 <p>Repository checks for this surface are structural guards over method/path construction,
 authentication placement, snapshot/replay source relationships, permanent test inventory, and
 stage exclusions. They do not prove runtime behavior; deterministic Rust unit and integration
@@ -8389,7 +8451,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-29T07:43:16.530Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>606bcc5f37c8a8e7ba0e8b55ae43a9e3c331d109d6a79205967f5b510f90dd70</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-29T22:03:34.595Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>e3032c7d0a31c0b66cc6adae440f8ff7205693bd114866c821210d150d47fff2</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

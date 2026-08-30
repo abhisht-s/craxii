@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${CARGO_HOME:-${HOME:?}/.cargo}/bin:${PATH:-}"
+cargo_executable="${CARGO_HOME:-${HOME:?}/.cargo}/bin/cargo"
+
+verify_no_execution_residue() {
+  phase="$1"
+  if /usr/bin/pgrep -f 'craxii-stage13-crash-child' >/dev/null; then
+    echo "error: ${phase} leaked a Stage 13 child" >&2
+    exit 1
+  fi
+  if find "${CRAXII_STAGE13_CGROUP_ROOT}" -mindepth 1 -maxdepth 1 -type d -print -quit | grep -q .; then
+    echo "error: ${phase} left execution cgroup residue" >&2
+    exit 1
+  fi
+}
+
+require_target() {
+  test "$(uname -m)" = "x86_64"
+  grep -qx 'ID=ubuntu' /etc/os-release
+  grep -qx 'VERSION_ID="24.04"' /etc/os-release
+  test "$(id -u)" -ne 0
+  test "$(id -un)" = "craxii"
+  test -x /bin/bash
+  test -x /usr/bin/git
+  test -x /usr/bin/systemctl
+  test -x "${cargo_executable}"
+  test -n "${CRAXII_STAGE13_SYSTEMD_UNIT:-}"
+  test -n "${CRAXII_STAGE13_CGROUP_ROOT:-}"
+  test -d "${CRAXII_STAGE13_CGROUP_ROOT}"
+  test -f "${CRAXII_STAGE13_CGROUP_ROOT}/cgroup.controllers"
+  test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=User --value)" = "craxii"
+  test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=Delegate --value)" = "yes"
+  test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=KillMode --value)" = "control-group"
+  sudo -n /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/id -u | grep -qx '0'
+}
+
+run_crash_probe() {
+  marker_variable="$1"
+  marker_name="$2"
+  unit_name="craxii-stage13-${marker_name//_/-}-$$"
+  if sudo -n /usr/bin/systemd-run \
+    --quiet --wait \
+    --unit="${unit_name}" \
+    --property=User=craxii \
+    --property=Delegate=yes \
+    --property=KillMode=control-group \
+    --setenv="CRAXII_STAGE13_CGROUP_ROOT=${CRAXII_STAGE13_CGROUP_ROOT}" \
+    --setenv="PATH=$(dirname "${cargo_executable}"):/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    --setenv="${marker_variable}=${marker_name}" \
+    /bin/bash --noprofile --norc -o pipefail -c \
+    "cd '${repository_root}' && '${cargo_executable}' test --locked --features test-failpoints --lib adapters::local_workstation::tests::linux_target_crash_marker_probe_execution -- --ignored --exact"; then
+    echo "error: crash marker ${marker_name} did not abort" >&2
+    exit 1
+  fi
+  unit_result="$(systemctl show "${unit_name}.service" --property=Result --property=ExecMainCode --property=ExecMainStatus)"
+  if ! grep -qx 'Result=signal' <<<"${unit_result}" ||
+    ! grep -qx 'ExecMainCode=killed' <<<"${unit_result}" ||
+    ! grep -qx 'ExecMainStatus=6' <<<"${unit_result}"; then
+    echo "error: crash marker ${marker_name} failed for a reason other than expected SIGABRT" >&2
+    exit 1
+  fi
+  verify_no_execution_residue "crash marker ${marker_name}"
+  sudo -n /usr/bin/systemctl reset-failed "${unit_name}.service"
+  test "$(systemctl show "${unit_name}.service" --property=LoadState --value 2>/dev/null || true)" != "loaded"
+}
+
+verify_service_restart_cleanup() {
+  sudo -n /usr/bin/systemctl restart "${CRAXII_STAGE13_SYSTEMD_UNIT}"
+  systemctl is-active --quiet "${CRAXII_STAGE13_SYSTEMD_UNIT}"
+  verify_no_execution_residue "service restart"
+}
+
+verify_target() {
+  require_target
+  sudo -n /usr/bin/env -i \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    /usr/bin/docker run --rm hello-world >/dev/null
+  disposable="craxii-stage13-disposable-$$"
+  sudo -n /usr/bin/systemd-run --quiet --wait --collect \
+    --unit="${disposable}" \
+    --property=User=craxii \
+    --property=Delegate=yes \
+    --property=KillMode=control-group \
+    /bin/true
+  run_crash_probe CRAXII_TEST_ABORT_AT_FAILPOINT after_tool_process_spawn
+  run_crash_probe CRAXII_TEST_ABORT_AT_FAILPOINT after_tool_process_exit_before_outcome_commit
+  run_crash_probe CRAXII_TEST_ABORT_AT_STAGE13_MARKER during_term_kill
+  run_crash_probe CRAXII_TEST_ABORT_AT_STAGE13_MARKER after_cleanup
+  verify_service_restart_cleanup
+}
+
+case "${1:-}" in
+  --verify-target)
+    verify_target
+    ;;
+  --record-pre-reboot)
+    require_target
+    state_file="${CRAXII_STAGE13_REBOOT_STATE:-/var/tmp/craxii-stage13-reboot-state}"
+    umask 077
+    {
+      cat /proc/sys/kernel/random/boot_id
+      printf '%s\n' "${CRAXII_STAGE13_SYSTEMD_UNIT}"
+    } >"${state_file}"
+    ;;
+  --verify-post-reboot)
+    require_target
+    state_file="${CRAXII_STAGE13_REBOOT_STATE:-/var/tmp/craxii-stage13-reboot-state}"
+    previous_boot="$(sed -n '1p' "${state_file}")"
+    test "${previous_boot}" != "$(cat /proc/sys/kernel/random/boot_id)"
+    verify_no_execution_residue "reboot"
+    ;;
+  "")
+    require_target
+    cd "${repository_root}"
+    cargo test --locked --lib adapters::local_workstation::tests::linux_target_ubuntu_nonroot_systemd_cgroup_git_and_service_contract -- --ignored --exact
+    cargo test --locked --lib adapters::local_workstation::tests::linux_target_user_admin_identity_clean_environment_and_cgroup_cleanup -- --ignored --exact
+    cargo test --locked --lib adapters::local_workstation::tests::linux_target_cgroup_kills_session_escape_and_repeated_process_trees -- --ignored --exact
+    verify_target
+    ;;
+  *)
+    echo "usage: scripts/verify-stage13-ubuntu-target [--verify-target|--record-pre-reboot|--verify-post-reboot]" >&2
+    exit 2
+    ;;
+esac

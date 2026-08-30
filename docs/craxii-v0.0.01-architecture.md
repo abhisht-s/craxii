@@ -2803,7 +2803,7 @@ Do not add performance pragmas without documenting durability effects.
 
 ### Stage 5 SQLite runtime contract
 
-The V0 implementation uses SQLx `0.9` with only `sqlite-bundled`, `runtime-tokio`, `migrate`, and `macros`; Tokio `1.53` with only `macros`, `rt-multi-thread`, `sync`, `time`, and `signal`; and nix `0.31` with only `fs`. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside `adapters/sqlite`; neither application nor the `StateStore` port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio signal support is owned only by binary composition; Stage 10 adds no `tokio-util`, `futures`, or other direct async dependency.
+The V0 implementation uses SQLx `0.9` with only `sqlite-bundled`, `runtime-tokio`, `migrate`, and `macros`; Tokio `1.53` with only `io-util`, `macros`, `net`, `process`, `rt-multi-thread`, `signal`, `sync`, and `time`; and nix `0.31` with only `fs`, `process`, and `signal`. SQLx and its bundled SQLite amalgamation own SQLite access, with no system SQLite dependency. SQLx types MUST remain inside `adapters/sqlite`; neither application nor the `StateStore` port may expose a pool, connection, transaction, query, row, SQL, database path, generic CRUD, or callback for arbitrary transaction work. Tokio process support is confined to LocalWorkstation, Tokio signal support remains owned by binary composition plus LocalWorkstation child supervision, and nix process/signal support is confined to reviewed Unix lifecycle adapters. No `tokio-util`, new futures crate, or other direct async dependency is added for Stage 13.
 
 The database path is exactly `<state_root>/db/craxii.sqlite3` and the process-lock path is exactly `<state_root>/locks/craxii.lock`. `state_root` MUST preexist; Stage 5 may create only its `db/` and `locks/` children. Those directories are mode `0700`, and new database and lock files are mode `0600`. Production provisioning owns `state_root`, user ownership, and any `chown`; runtime MUST NOT accept a SQLite URL, URI query parameters, or a production `:memory:` mode. Missing, non-directory, symlink-leaf, unexpected-type, group/world-accessible, or reliably detectable multi-link state objects fail closed.
 
@@ -3817,6 +3817,10 @@ Static analysis or code review SHOULD enforce this boundary by module visibility
 - The map is ephemeral and scoped to one runtime instance.
 - `inspect_execution` returns observed live/terminal status only for handles known to the current runtime.
 - After process restart, an absent handle cannot prove nonexecution. Recovery relies on the durable dispatch state and uses `outcome_unknown`.
+- The live registry is keyed only by `ExecutionId`, rejects a duplicate live ID before spawn, and
+  owns one observed supervisor plus its drain tasks until terminal cleanup. Dropping the caller
+  awaiting `execute` does not transfer or abandon that ownership. Terminal entries exist only for
+  coherent result handoff and are then removed; this is not durable terminal history.
 
 ### Foreground-only contract
 
@@ -3834,11 +3838,26 @@ Every foreground execution MUST have:
 - a new Unix process group/session;
 - `kill_on_drop` as defense in depth, not the primary cleanup mechanism;
 - membership in a per-execution cgroup v2 subtree or equivalent systemd-created scope;
-- direct-child reaping;
+- non-reaping direct-child terminal observation followed by descendant cleanup while the waitable
+  session leader still pins its PID/process-group identity, then direct-child reaping;
 - concurrent stdout/stderr drains;
 - cgroup emptiness verification before terminal cleanup is reported.
 
+No Unix cleanup path may deliver a process-group signal after the waitable leader identity has been
+released. Natural exit, cancellation, timeout, and shutdown MUST all complete their final
+process-group signal and quiescence proof before reaping the leader. Linux cgroup identity remains
+the definitive containment authority; numeric process-group signalling is only early escalation
+there, and `cgroup.kill` plus cgroup emptiness remain valid independently of PID/PGID reuse.
+
 The systemd backend unit uses `KillMode=control-group` so backend death kills ordinary descendant processes. Per-execution cgroups allow cancellation to target one command tree.
+
+On Linux the validated shell configuration supplies an optional absolute
+`delegated_cgroup_root`, which MUST be a child of `/sys/fs/cgroup`. Linux foreground execution is
+advertised only when LocalWorkstation can create, inspect, and remove an empty probe cgroup beneath
+that exact root. Every execution creates one child named from its non-PID `ExecutionId`; the narrow
+child `pre_exec` performs `fchdir`, `setsid`, and a write of `0` to that already-created
+`cgroup.procs` before Bash code can run. On macOS, local verification may advertise only the
+process-session/group approximation: cgroup and administrative capability remain false.
 
 Tokio documents that a child continues by default when its handle is dropped; `kill_on_drop` affects the direct child and is not a substitute for descendant cleanup. See [`tokio::process::Child`](https://docs.rs/tokio/latest/tokio/process/struct.Child.html).
 
@@ -3854,6 +3873,13 @@ There are two explicit domain values:
 The backend process itself runs as `craxii`, not root. Administrative execution uses an explicit `sudo -n` path or equivalent controlled launcher. The final command environment is constructed from scratch after elevation; the backend environment is never preserved wholesale.
 
 The sudo policy permits Craxii to administer this development workstation autonomously. It is intentionally broad. Every elevated call records requested and effective privilege.
+
+The reviewed V0 administrative launcher is exactly absolute `/usr/bin/sudo -n`, followed by
+absolute `/usr/bin/env -i`, the fixed root allowlist, and the same direct Bash argument sequence.
+Administrative capability remains false unless configuration enables it and a noninteractive,
+side-effect-free runtime probe observes root identity, the clean root values, and working delegated
+cgroup ownership. `sudo -E`, a password prompt, a root backend, setuid backend, and an unreviewed
+helper daemon are forbidden.
 
 The model-facing `run_shell` input may request administrative mode. That request is not self-authorizing: Tool Execution Service resolves it through the V0 authority evaluator and records the decision.
 
@@ -3988,6 +4014,12 @@ Explicitly absent unless a future authority adapter injects them for one operati
 
 Project commands may set ordinary variables inside the shell string. That does not grant access to secrets absent from the machine environment.
 
+`ExecutionRequest` contains no generic environment vector or override. It carries the canonical
+nonsecret `WorkId` and `WorkspaceId`; LocalWorkstation alone derives the two Craxii variables. The
+launcher calls `env_clear`, sets only the eight listed values, marks every observed unrelated parent
+descriptor close-on-exec, and uses `/dev/null` for stdin. Bash may maintain its own documented shell
+variables after exec; that does not authorize additional parent environment inheritance.
+
 ### Output capture
 
 - Drain stdout and stderr concurrently from process start.
@@ -4027,6 +4059,36 @@ Exit code zero is normally success. A nonzero exit is still `state=completed`, `
 - Reap and verify cgroup cleanup.
 - Return `timed_out=true` only after observation/cleanup.
 - If cleanup is unconfirmed, use `outcome_unknown` and interrupt work.
+
+The execution runtime budget and the absolute Workstation operation deadline are distinct monotonic
+bounds. Cancellation, timeout, natural exit, and shutdown race through one first-cause latch.
+Shutdown uses the already-latched Stage 10 absolute deadline; LocalWorkstation closes only new
+execute admission, cancels live entries, joins supervisors/drains, and does not create a secondary
+deadline or a second shutdown authority.
+
+Execute admission and insertion into the live `ExecutionId` registry share one short-held authority
+lock. Before insertion the execution is unowned and shutdown may reject it; successful insertion is
+the ownership boundary, after which shutdown must cancel and join that owned lifecycle rather than
+reclassifying it as unavailable or spawn-failed. A per-entry first-cause/spawn claim decides whether
+shutdown cancellation prevents OS spawn with `start_observed=false` or whether an already claimed
+spawn proceeds under ownership into the ordinary TERM/KILL/reap/drain path. No registry lock is held
+across a spawn, OS call, or await.
+
+Direct-child terminal observation uses one non-reaping
+`waitid(WEXITED | WNOHANG | WNOWAIT)` attempt per cooperative supervisor poll. `EINTR` is an
+interrupted nonterminal observation, not exit, liveness proof, `ECHILD`, or cleanup failure; control
+returns to the async cancellation and deadline machinery before another attempt. A zero observed PID
+is pending, true terminal states retain the waitable leader until descendant cleanup releases the
+stable group identity, and only then may the child be reaped.
+
+### Stage 13 target verification status
+
+Stage 13 production code, macOS/Unix-process-group tests, Linux cgroup/admin code, Linux-gated tests,
+and crash-marker harnesses are implemented locally. Ubuntu 24.04 x86-64 execution under the real
+non-root `craxii` systemd unit with `Delegate=yes`, `KillMode=control-group`, reviewed `sudo -n`,
+Docker, service restart, and reboot leak scans is a target-environment acceptance gate. Deferring
+that gate does not permit optimistic Linux cgroup/admin capability flags and does not block Stage 14
+implementation after the local Stage 13 gate passes.
 
 ### Administrative operations
 
@@ -4391,6 +4453,16 @@ The server execution task is observed by an explicit transport supervisor. Unexp
 return, precise serve failure, or task panic marks fatal, requests that existing Stage 10
 controller, and preserves the originating typed cause while transport ownership drains within the
 controller's original deadline.
+
+LocalWorkstation receives that exact original absolute Stage 10 deadline when execution admission
+closes. For each already-owned execution its effective cleanup deadline is the earlier of the
+execution request deadline and the Stage 10 deadline; TERM grace, KILL escalation, descendant and
+cgroup proof, direct-child reap, drain joins, supervisor join, and terminal registry handoff MUST
+NOT extend it. If proof cannot complete by the Stage 10 deadline, the supervisor performs the
+strongest immediately available group/cgroup/direct-child kill action, reports cleanup uncertainty,
+and still joins its nonblocking terminal handoff before bootstrap closes SQLite. Bootstrap reports
+shutdown failure; it neither creates a later cleanup deadline nor leaves a supervisor able to use
+runtime state after SQLite closure.
 
 Repository checks for this surface are structural guards over method/path construction,
 authentication placement, snapshot/replay source relationships, permanent test inventory, and

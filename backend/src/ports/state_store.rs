@@ -468,6 +468,28 @@ pub struct BootstrapObservation {
     pub workspace_logical_name: String,
     pub workspace_logical_root: String,
     pub workspace_resolved_root: String,
+    pub execution_capabilities: ExecutionCapabilityObservation,
+}
+
+/// Host-probed Stage 13 execution facts carried into current capability refresh.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecutionCapabilityObservation {
+    pub foreground_execute: bool,
+    pub privilege_administrative: bool,
+    pub process_group_cleanup: bool,
+    pub cgroup_cleanup: bool,
+}
+
+impl ExecutionCapabilityObservation {
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            foreground_execute: false,
+            privilege_administrative: false,
+            process_group_cleanup: false,
+            cgroup_cleanup: false,
+        }
+    }
 }
 
 pub struct LoadOrBootstrapIdentityReceipt {

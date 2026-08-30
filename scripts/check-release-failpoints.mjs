@@ -59,12 +59,12 @@ try {
   for (const name of requiredFailpoints) {
     assert(
       !binary.includes(Buffer.from(name)),
-      `standard release binary contains reserved failpoint name ${name}`,
+      `standard release binary contains test failpoint name ${name}`,
     );
   }
 
   console.log(
-    'Release failpoint inspection passed: hidden control unrecognized, protocol magic absent, 14 reserved names absent',
+    'Release failpoint inspection passed: hidden control unrecognized, protocol magic absent, 14 test names absent',
   );
 } catch (error) {
   console.error(`Release failpoint inspection failed: ${error.message}`);
