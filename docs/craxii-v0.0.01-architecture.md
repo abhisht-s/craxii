@@ -2992,13 +2992,9 @@ V0 does not summarize, semantically retrieve, compact, or silently drop eligible
 The assembler accepts:
 
 ```text
-craxii_id
 work_id
-selected ModelTarget
-context policy version
-system prompt version
-eligible work/input relationships
-tool definition snapshot
+immutable ModelSelectionResult
+assembler/context-policy/prompt versions
 ```
 
 It returns:
@@ -3016,7 +3012,7 @@ ContextPackage
   package hash
 ```
 
-The provider adapter translates this package to wire types. The assembler does not know Reqwest, OpenAI JSON field names, WebSocket deltas, or SQL rows.
+The provider adapter translates this package to wire types. The assembler does not know Reqwest, OpenAI JSON field names, WebSocket deltas, or SQL rows. It reads through a narrow read-only `ContextSourceStore`; it does not receive the mutating State Store, selector, fallback target list, Workstation, Tool Execution Service, or provider. One assembly loads all durable eligibility facts under one bounded SQLite read transaction. The clock supplies only nonsemantic `created_at` metadata.
 
 ### Context eligibility
 
@@ -3027,11 +3023,11 @@ Eligible history is:
 1. Current system/developer instructions by explicit version.
 2. Current Workstation capability summary and logical workspace identity.
 3. Tool definitions registered for the selected model target.
-4. Committed conversation input and output items belonging to work ordinals less than `N`, in causal order.
+4. Every accepted prior user message and committed eligible output belonging to conversation work ordinals less than `N`, in causal order, including accepted input whose Work later failed, was interrupted, or was cancelled.
 5. The trigger input attached to work `N`.
 6. Completed model output items and observed tool results already produced inside work `N`.
 7. Synthetic interruption/unknown-outcome status items for earlier terminal work when relevant.
-8. Provider-native continuation items only when the selected adapter declares them eligible and the durable source record is present.
+8. Provider-native continuation items only when the durable source exists; provider, provider-model, and target configuration version match the selected target; selected capability and typed native option both permit reasoning continuation; the source is the immediately preceding completed logical invocation in the same permitted Work/agent-step chain; it is not the sole semantic history; and no later interrupted or `provider_outcome_unknown` model attempt or `outcome_unknown` tool execution forms an intervening barrier. The eligibility snapshot therefore includes completed/interrupted/provider-unknown model boundaries and definite/unknown tool boundaries in durable causal order, not only completed output rows.
 
 Ineligible history is:
 
@@ -3045,6 +3041,12 @@ Ineligible history is:
 - provider conversation history fetched as the sole source;
 - UI-only local text.
 
+The active trigger is loaded only through its exact `work_item_inputs` `trigger` relationship and is rendered exactly once. Every history query binds the active conversation and proves Work ownership. A later accepted Work at ordinal `N+1` is excluded from Work `N` regardless of commit time or journal offset. When `N+1` eventually assembles, a result committed for prior ordinal `N` after `N+1` was accepted is visible if it is durable at assembly time.
+
+Completed normalized output preserves original item order, including intermediate text, complete tool calls, structured data, refusal, provider-exposed reasoning summary, and compatible continuation. Reasoning summary remains a distinct provider-neutral historical item and is never converted to assistant text or used for hidden/private chain-of-thought. Partial/draft content, incomplete arguments, provider-outcome-unknown model content, and unknown correctness-bearing output are not ordinary history.
+
+A prior Work's committed final assistant Message is authoritative conversational output and is rendered exactly once; terminal model text representing that same final answer is not also rendered. Intermediate completed output that led to tool calls remains eligible. An ordinary tool result requires one definite observed Stage 14 result paired to its unique call by Work, conversation, source model invocation, agent step, tool ordinal, provider call ID, and tool name. Orphan, duplicate, mismatched, cross-Work, and cross-conversation results fail closed.
+
 ### Prior interrupted and failed work
 
 Earlier accepted user messages remain eligible even if their work failed or was interrupted; they are part of the relationship. Only observed outputs become ordinary output items. The assembler adds a structured synthetic status item for:
@@ -3056,17 +3058,23 @@ Earlier accepted user messages remain eligible even if their work failed or was 
 
 The synthetic item is generated from journal facts, listed in the context manifest, and makes uncertainty explicit. It never converts unknown into failure or success.
 
+A cancelled prior Work gets no invented cancellation status. Its accepted user input and any durable observed output remain eligible. A tool `outcome_unknown` record is never rendered as an ordinary success or failure result; its synthetic status states that execution may have occurred, its outcome is unknown, and repetition must not be assumed safe. Interrupted model attempts contribute no partial output.
+
 ### Ordering
 
 Canonical item ordering is:
 
-1. system/developer instruction blocks;
-2. prior work in conversation ordinal order;
-3. within a work item, content by agent step and tool ordinal;
-4. active work trigger;
-5. active work model/tool trace to date.
+1. system instruction blocks;
+2. developer instruction blocks;
+3. durable Workstation capability summary;
+4. logical workspace identity;
+5. stable `read_file`, then `run_shell`, tool definitions;
+6. prior work in conversation ordinal order;
+7. within a work item, content by agent step, original model output position, and tool ordinal, with an observed paired result immediately after its call;
+8. active work trigger;
+9. active work model/tool trace to date.
 
-`journal_offset` breaks ties between events in the same logical position. Provider adapters may translate roles/items but may not reorder causal tool-call/result pairs.
+`journal_offset` breaks ties between events in the same logical position and a stable durable ID is the final tie-breaker. Wall-clock time and map iteration never define canonical order. Provider adapters may translate roles/items but may not reorder causal tool-call/result pairs.
 
 ### Full-history cutoff
 
@@ -3086,9 +3094,9 @@ This prevents a later queued message committed during assembly from leaking into
 Model selection supplies:
 
 - advertised context window;
-- maximum requested output tokens;
-- required safety reserve;
-- provider/model token-estimation implementation or conservative fallback.
+- configured requested output tokens;
+- the exact configured estimator identity/version;
+- typed provider-native options.
 
 The assembler enforces:
 
@@ -3098,11 +3106,13 @@ estimated_input_tokens + reserved_output_tokens <= context_window_tokens
 
 V0 sets provider truncation to disabled. It never asks the provider to drop the beginning of history automatically.
 
-If an exact model tokenizer is unavailable, the adapter MUST use a documented conservative upper-bound estimator. It may fail early but must not silently underestimate known structure. Provider-reported token usage is recorded after completion and compared with estimates to improve V0.0.02 decisions.
+`reserved_output_tokens` is exactly the selected target's configured `requested_output_tokens`; there is no second additive Stage 16 safety-reserve field. The estimator includes conservative instruction, text/structured, tool definition, tool call/result, opaque continuation, framing, and provider-native overhead units. Its returned identity/version MUST equal the selected target configuration. Estimator failure or mismatch fails closed; no alternate estimator is chosen. Equality in the fit formula passes and one token over fails.
+
+The complete compact canonical provider-neutral `ModelRequest` MUST also be at most 16,777,216 bytes. The assembler fully constructs and canonically serializes the request, measures its actual UTF-8 bytes, and enforces this ceiling before checking estimator identity or invoking the estimator. Exactly 16 MiB is permitted; one byte over fails explicitly as `context_limit_exceeded` without truncation or estimator work, even if that estimator would mismatch, fail, or overflow. All eligible history is mandatory: no windowing, oldest-turn pruning, retrieval, summarization, compression, clipping, tool or instruction removal, reduced output limit, or target fallback is permitted to make context fit.
 
 ### Context manifest
 
-The context manifest is created and committed before the provider call. It records, in final rendered order:
+The context manifest is prepared before the provider call and committed only in Stage 17's atomic first-attempt transaction with its ordered source rows, invocation intent, Work transition, and journal events. Stage 16 never independently persists a successful manifest. A context-limit failure creates no fake manifest or model invocation. The manifest records, in final rendered order:
 
 - every source event, message, invocation output, tool result, artifact, or synthetic status item;
 - source hash and current record ID;
@@ -3117,6 +3127,12 @@ The context manifest is created and committed before the provider call. It recor
 - rendered request hash and optional redacted request artifact.
 
 The manifest provides provenance. It does not duplicate raw history or replace source records.
+
+Every source row has a contiguous one-based position, exact kind, exactly one durable identity category, role/item class, the SHA-256 of canonical durable source semantics before transformation, rendered byte contribution, and explicit transform. Normal tool history uses bounded Stage 14 projections plus artifact descriptors/hashes rather than arbitrary full artifact bytes. Artifact bytes are read only through verified artifact APIs when explicit content or reconstruction verification requires them; missing, corrupt, or partial data fails closed.
+
+The authoritative request hash is SHA-256 of the final canonical `ModelRequest`, including generated context/logical invocation IDs, selected target, instructions, ordered items, exact tools, tool choice, fixed `parallel=false`, requested output, and typed provider-native options, with no timestamp. The manifest hash covers the canonical semantic manifest envelope and ordered sources, including generated immutable IDs, but excludes its own hash field, `created_at`, assembly latency, storage paths, telemetry, and nonsemantic SQLite details. Reconstruction starts from the prepared/stored manifest and its source rows in recorded position order, reloads only those exact durable identities, verifies ownership/type/source hashes and every manifest-bound target/version/prompt/toolset/estimator identity, rebuilds with the committed IDs, and requires exact request bytes, request hash, and manifest hash. It MUST NOT query current eligibility, substitute a newer equivalent source, or reorder from current database state. A retry of an old prepared package therefore reconstructs identically after later eligible tool/model evidence or later Work acceptance changes what a fresh assembly would select.
+
+The Stage 16 structural checker freezes the named prior-history queries to `conversation_work_ordinal < active_ordinal` and traverses assembler-reachable helpers with bounded, alias-aware provenance. The single final-request constructor MUST preserve the complete frozen canonical input and complete stable Stage 14 tool projection, MUST copy the selected target's configured requested-output limit exactly, and MUST feed that same final `ModelRequest` to canonical serialization, the byte gate, estimation, hashing, packaging, and return. The checker follows the `ToolExecutionState::OutcomeUnknown` return topology through helpers and conservative macro boundaries: that branch may return only synthetic uncertainty and never an ordinary `ToolResult`, even if a synthetic marker is separately constructed and discarded. Its compiling negative mutations cover broader/removal/offset/application-filtered causal cutoffs, direct and helper-mediated reselection, request/source/tool/output shortening, and direct/helper/alias/wrapper-mediated unknown-to-`ToolResult` conversion; positive controls retain immutable selection/input/tool inspection, exact full-value moves, bounded Stage 14 projections, definite tool results, synthetic unknown status and helper chains, complete-request byte inspection, and diagnostics-only sampling.
 
 ### Context instrumentation
 

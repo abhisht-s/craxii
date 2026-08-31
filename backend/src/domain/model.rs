@@ -635,6 +635,9 @@ pub enum ModelInputItem {
     HistoricalRefusal {
         content_parts: Vec<ModelTextPart>,
     },
+    HistoricalReasoningSummary {
+        content_parts: Vec<ModelTextPart>,
+    },
     StructuredData {
         data: Value,
     },
@@ -668,6 +671,10 @@ impl fmt::Debug for ModelInputItem {
                 .field("result_bytes", &json_bytes(result)),
             Self::HistoricalRefusal { content_parts } => debug
                 .field("kind", &"historical_refusal")
+                .field("content_part_count", &content_parts.len())
+                .field("content_bytes", &text_part_bytes(content_parts)),
+            Self::HistoricalReasoningSummary { content_parts } => debug
+                .field("kind", &"historical_reasoning_summary")
                 .field("content_part_count", &content_parts.len())
                 .field("content_bytes", &text_part_bytes(content_parts)),
             Self::StructuredData { data } => debug
@@ -707,6 +714,14 @@ impl ModelInputItem {
     ) -> Result<Self, ModelContractError> {
         require_parts(&content_parts)?;
         Ok(Self::HistoricalRefusal { content_parts })
+    }
+
+    /// Constructs provider-exposed historical reasoning summary without reclassifying it as text.
+    pub fn historical_reasoning_summary(
+        content_parts: Vec<ModelTextPart>,
+    ) -> Result<Self, ModelContractError> {
+        require_parts(&content_parts)?;
+        Ok(Self::HistoricalReasoningSummary { content_parts })
     }
 
     pub fn structured_data(data: Value) -> Result<Self, ModelContractError> {
@@ -759,6 +774,10 @@ impl ModelInputItem {
                 "content_parts": text_values(content_parts),
                 "kind": "historical_refusal",
             }),
+            Self::HistoricalReasoningSummary { content_parts } => json!({
+                "content_parts": text_values(content_parts),
+                "kind": "historical_reasoning_summary",
+            }),
             Self::StructuredData { data } => json!({"data": data, "kind": "structured_data"}),
             Self::SyntheticRuntimeStatus { status, details } => json!({
                 "details": details,
@@ -770,6 +789,12 @@ impl ModelInputItem {
                 "kind": "provider_opaque_continuation",
             }),
         }
+    }
+
+    /// Exact compact canonical bytes used by Stage 16 contribution accounting.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json_bytes(&self.semantic_value())
     }
 }
 
@@ -805,6 +830,12 @@ impl ModelToolDefinition {
         &self.name
     }
 
+    /// Exact compact canonical model-visible definition bytes.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        canonical_json_bytes(&self.semantic_value())
+    }
+
     fn semantic_value(&self) -> Value {
         json!({
             "description": self.description.as_str(),
@@ -814,6 +845,18 @@ impl ModelToolDefinition {
             "schema_version": self.schema_version.get(),
         })
     }
+}
+
+/// Exact ordered model-visible toolset fingerprint used by Stage 16 request provenance.
+#[must_use]
+pub fn model_toolset_fingerprint(definitions: &[ModelToolDefinition]) -> Sha256Digest {
+    let semantic = Value::Array(
+        definitions
+            .iter()
+            .map(ModelToolDefinition::semantic_value)
+            .collect(),
+    );
+    Sha256Digest::hash_bytes(&canonical_json_bytes(&semantic))
 }
 
 /// Closed V0 provider-neutral tool choice policy.

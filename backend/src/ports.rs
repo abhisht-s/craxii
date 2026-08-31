@@ -2,6 +2,7 @@
 
 pub mod artifact_store;
 pub mod clock;
+pub mod context_source_store;
 pub mod device_credentials;
 pub mod model_provider;
 pub mod runtime_observation;

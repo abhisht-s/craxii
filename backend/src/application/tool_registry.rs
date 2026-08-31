@@ -179,6 +179,11 @@ impl ToolDefinition {
             "side_effect": self.side_effect.as_str(),
         }))
     }
+
+    /// Canonical full durable definition semantics used for per-source provenance.
+    pub(crate) fn canonical_semantic_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(&self.semantic_value()).expect("semantic tool definition serializes")
+    }
 }
 
 /// Startup-built ordered registry with no mutation surface.
@@ -233,6 +238,28 @@ impl ToolRegistry {
 
     pub const fn fingerprint(&self) -> Sha256Digest {
         self.fingerprint
+    }
+
+    /// Exact ordered provider-neutral request-tool projection fingerprint.
+    #[must_use]
+    pub fn model_projection_fingerprint(&self) -> Sha256Digest {
+        let semantic = Value::Array(
+            self.definitions
+                .iter()
+                .map(|definition| {
+                    canonicalize_json(json!({
+                        "description": definition.description,
+                        "implementation_version": definition.implementation_version.as_str(),
+                        "input_schema": definition.input_schema,
+                        "name": definition.name.as_str(),
+                        "schema_version": definition.schema_version.get(),
+                    }))
+                })
+                .collect(),
+        );
+        Sha256Digest::hash_bytes(
+            &serde_json::to_vec(&semantic).expect("model-visible tool projection serializes"),
+        )
     }
 
     pub const fn semantic_policy(&self) -> ToolSemanticPolicy {

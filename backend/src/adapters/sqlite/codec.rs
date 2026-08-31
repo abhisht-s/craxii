@@ -754,7 +754,11 @@ fn valid_persisted_normalized_error(
             false,
         ),
         "context_error" => (
-            "context_error",
+            if stored.code == "context_limit_exceeded" {
+                "context_limit_exceeded"
+            } else {
+                "context_error"
+            },
             "The requested context cannot be processed.",
             &["never"][..],
             false,

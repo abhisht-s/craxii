@@ -268,7 +268,8 @@ pub use model::{
     ModelStreamEvent, ModelStreamProviderErrorKind, ModelStreamState, ModelTarget,
     ModelTargetIdentity, ModelTargetInput, ModelTextPart, ModelToolCallId, ModelToolChoicePolicy,
     ModelToolDefinition, ProviderEvidenceId, ProviderMetadata, ProviderMetadataValue,
-    ProviderNativeOptions, ProviderOpaqueEvidence, TokenEstimatorIdentity, validate_model_stream,
+    ProviderNativeOptions, ProviderOpaqueEvidence, TokenEstimatorIdentity,
+    model_toolset_fingerprint, validate_model_stream,
 };
 pub use path::{LogicalPathKind, LogicalPathReference, MAX_LOGICAL_PATH_BYTES};
 pub use runtime::{

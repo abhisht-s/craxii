@@ -2,6 +2,7 @@
 
 #[allow(dead_code)] // Stage 6 freezes codecs before Stage 7 composes repository reads/writes.
 mod codec;
+mod context_source_store;
 mod error;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.
 mod journal;

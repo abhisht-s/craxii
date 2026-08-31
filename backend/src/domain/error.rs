@@ -140,6 +140,8 @@ impl ErrorCode {
     pub const STATE_CONFLICT: Self = Self("state_conflict");
     /// The generic context code.
     pub const CONTEXT_ERROR: Self = Self("context_error");
+    /// Mandatory eligible context plus requested output exceeds the selected target or byte limit.
+    pub const CONTEXT_LIMIT_EXCEEDED: Self = Self("context_limit_exceeded");
     /// The generic model-selection code.
     pub const MODEL_SELECTION_ERROR: Self = Self("model_selection_error");
     /// The generic provider code.
@@ -158,7 +160,7 @@ impl ErrorCode {
     pub const INTERNAL_INVARIANT_ERROR: Self = Self("internal_invariant_error");
 
     /// The exact Stage 3.3 allowlist in stable declaration order.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::DOMAIN_VALIDATION,
         Self::AUTHENTICATION_ERROR,
         Self::CLIENT_PROTOCOL_ERROR,
@@ -166,6 +168,7 @@ impl ErrorCode {
         Self::STORAGE_ERROR,
         Self::STATE_CONFLICT,
         Self::CONTEXT_ERROR,
+        Self::CONTEXT_LIMIT_EXCEEDED,
         Self::MODEL_SELECTION_ERROR,
         Self::PROVIDER_ERROR,
         Self::TOOL_VALIDATION_ERROR,
@@ -256,6 +259,7 @@ impl<'de> Deserialize<'de> for ErrorCode {
                             "storage_error",
                             "state_conflict",
                             "context_error",
+                            "context_limit_exceeded",
                             "model_selection_error",
                             "provider_error",
                             "tool_validation_error",
@@ -773,6 +777,20 @@ impl NormalizedError {
         )
     }
 
+    /// Constructs the exact definite, nonretryable Stage 16 full-history limit failure.
+    #[must_use]
+    pub const fn context_limit_exceeded() -> Self {
+        Self {
+            category: ErrorCategory::ContextError,
+            code: ErrorCode::CONTEXT_LIMIT_EXCEEDED,
+            retryability: Retryability::Never,
+            certainty: Certainty::Definite,
+            safe_message: SafeMessage::CONTEXT,
+            source_status: None,
+            internal_detail: None,
+        }
+    }
+
     /// Constructs a generic model-selection failure.
     #[must_use]
     pub const fn model_selection() -> Self {
@@ -1117,6 +1135,7 @@ mod tests {
             "storage_error",
             "state_conflict",
             "context_error",
+            "context_limit_exceeded",
             "model_selection_error",
             "provider_error",
             "tool_validation_error",
@@ -1127,7 +1146,7 @@ mod tests {
             "internal_invariant_error",
         ];
 
-        assert_eq!(ErrorCode::ALL.len(), 15);
+        assert_eq!(ErrorCode::ALL.len(), 16);
         for (code, literal) in ErrorCode::ALL.into_iter().zip(expected) {
             assert_eq!(code.as_str(), literal);
             assert!(literal.is_ascii());

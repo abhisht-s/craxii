@@ -217,6 +217,7 @@ pub struct PreparedContextSource {
 }
 
 /// Exact immutable manifest facts produced later by Stage 16 and persisted by Stage 8.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedContextManifest {
     pub context_manifest_id: crate::domain::ContextManifestId,
     pub work_id: WorkId,
