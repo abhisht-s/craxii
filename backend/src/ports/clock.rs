@@ -27,6 +27,10 @@ impl MonotonicInstant {
     pub fn checked_duration_since(self, earlier: Self) -> Option<Duration> {
         self.elapsed.checked_sub(earlier.elapsed)
     }
+
+    pub fn checked_add(self, duration: Duration) -> Option<Self> {
+        self.elapsed.checked_add(duration).map(Self::from_elapsed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

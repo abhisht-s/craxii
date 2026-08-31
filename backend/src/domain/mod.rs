@@ -179,6 +179,7 @@ mod evidence;
 mod ids;
 mod journal;
 mod lifecycle;
+pub mod model;
 mod path;
 mod runtime;
 mod sequence;
@@ -258,6 +259,16 @@ pub use lifecycle::{
     decide_next_model_attempt, decide_tool_cancellation, decide_tool_transition,
     decide_work_transition, ensure_work_progression_allowed, failpoint_semantic_expectation,
     is_legal_model_pair, is_legal_tool_pair, is_legal_work_pair,
+};
+pub use model::{
+    CanonicalModelToolCall, MAX_MODEL_COMPONENT_BYTES, MAX_MODEL_OUTPUT_ITEMS,
+    MAX_MODEL_TOOL_ARGUMENT_BYTES, MAX_NORMALIZED_MODEL_RESPONSE_BYTES, ModelConfigReference,
+    ModelContractError, ModelContractErrorKind, ModelInputItem, ModelInputRole, ModelOutputItem,
+    ModelRequest, ModelRequestInput, ModelResponse, ModelResponseInput, ModelStopReason,
+    ModelStreamEvent, ModelStreamProviderErrorKind, ModelStreamState, ModelTarget,
+    ModelTargetIdentity, ModelTargetInput, ModelTextPart, ModelToolCallId, ModelToolChoicePolicy,
+    ModelToolDefinition, ProviderEvidenceId, ProviderMetadata, ProviderMetadataValue,
+    ProviderNativeOptions, ProviderOpaqueEvidence, TokenEstimatorIdentity, validate_model_stream,
 };
 pub use path::{LogicalPathKind, LogicalPathReference, MAX_LOGICAL_PATH_BYTES};
 pub use runtime::{

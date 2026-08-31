@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="f8c06b464c8d4b921bf73ff6f2e957b22648c2ca3fdaa05916733d5ec06224ae">
+  <meta name="craxii-source-sha256" content="2d3e94e34c0ec76d349dcd7f92092101624be0ae5485dd850c74901aa56f382c">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>f8c06b464c8d4b92…</code></p>
+        <p>Source SHA-256:<br><code>2d3e94e34c0ec76d…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -466,7 +466,7 @@ th { background: #f0f2f4; }
   <h2 id="companion-intro-title" class="companion-title">The complete normative architecture, with a plain-English layer</h2>
   <p>This HTML contains the complete rendered content of the authoritative Markdown source. It adds explanatory panels after every major section and detailed subsection. The panels preserve the technical vocabulary and then connect it to a concrete physical-world analogy or product situation.</p>
   <div class="normative-note"><strong>Authority rule:</strong> the architecture text rendered from <code>craxii-v0.0.01-architecture.md</code> is normative. The compact companion paragraphs, glossary, visual diagrams, final flowchart, and use-case story are teaching aids. If an analogy ever appears to simplify away a constraint, the normative architecture wins.</div>
-  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 295 detailed subsections, and 337 nearby plain-English explanations.</p>
+  <p class="companion-stats"><strong>Coverage:</strong> one complete authoritative source, 63 major sections, 296 detailed subsections, and 337 nearby plain-English explanations.</p>
   <h3>Reading model</h3>
   <p>Read the original architecture wording first, especially every <strong>MUST</strong> and <strong>MUST NOT</strong>. The compact companion paragraph beside each section explains its significance and supplies a physical-world example without replacing the technical rule.</p>
   <p>The visual architecture maps reconnect the detailed contracts into complete flows. The final PTG signup narrative then follows a realistic responsibility through durable acceptance, queueing, context, inference, tools, restart, reconnect, and an ambiguous side effect.</p>
@@ -497,7 +497,7 @@ th { background: #f0f2f4; }
     <div><dt>Trust domain</dt><dd>The area in which compromise can reach the other assets. In V0, the whole VM is deliberately one such area.</dd></div>
     <div><dt>Regenerable</dt><dd>State that can be recreated from authoritative sources, such as a build cache or rendered context.</dd></div>
   </dl>
-</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 4<br><strong>Last updated:</strong> 2026-08-28<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
+</section><!-- markdownlint-disable MD013 --><p><strong>Status:</strong> Authoritative implementation source of truth<br><strong>Architecture version:</strong> V0.0.01<br><strong>Document revision:</strong> 5<br><strong>Last updated:</strong> 2026-08-31<br><strong>Audience:</strong> Craxii engineering, Codex, ChatGPT, reviewers, and future contributors<br><strong>Supersedes for V0.0.01:</strong> <code>CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md</code> and the V0 recommendations in <code>docs/temp/craxii-v0.0.01-architecture-review.md</code></p>
 <p>This document is the normative architecture for implementing Craxii V0.0.01. It is not a tutorial, product pitch, or survey of alternatives. It defines what the version must prove, where every important responsibility lives, which state is authoritative, how commands and side effects are ordered, how failures are represented, and which seams must survive later extraction of Craxii&#39;s durable core from its first workstation.</p>
 <p>The separate credential and identity architecture remains the long-term direction for authority and identity. Where that mature design asks for external control-plane services or project isolation that V0.0.01 explicitly defers, this document governs the V0 implementation.</p>
 <h2>How to read this document</h2>
@@ -4529,7 +4529,8 @@ provider API
 <li>required capabilities;</li>
 <li>selection reason <code>explicit</code> or <code>configured_default</code>;</li>
 <li>target configuration version;</li>
-<li>timestamp.</li>
+<li>no wall-clock timestamp in the pure in-memory Stage 15 result; Stage 17 persistence records
+observed invocation lifecycle timestamps.</li>
 </ul>
 <p>No cost optimization, learned routing, fallback ladder, or task classifier is implemented.</p>
 <h3>Canonical model request</h3>
@@ -4752,6 +4753,136 @@ classify_error(provider_error)
 <li>maximum work-item wall time: 30 minutes, excluding time queued.</li>
 </ul>
 <p>Exceeding a loop/content limit creates a definite normalized failure; it never silently drops calls or continues infinitely.</p>
+<h3>Stage 15 canonical contract freeze</h3>
+<p>Stage 15 is the provider-neutral contract layer, not a model runtime. It introduces no migration,
+provider call persistence, Context Assembler, Model Gateway, agent loop, production WorkRunner,
+real provider HTTP, public model endpoint, or client draft stream. Production remains
+<code>live_unready</code>.</p>
+<p>Configured targets are loaded once from validated startup configuration into an immutable snapshot
+ordered by ascending <code>ModelTargetId</code>. The published snapshot stores targets as the private immutable
+<code>Box&lt;[ModelTarget]&gt;</code> produced at the end of construction. Mutable vectors or validation maps are
+permitted only as constructor-local builders; the published snapshot exposes no mutable receiver,
+mutable target-storage reference, replacement collection, setter, lock/cell wrapper, or helper path
+that can mutate or replace its catalog. Target identity reuses <code>ModelTargetId</code>, <code>ProviderId</code>,
+<code>ProviderModelId</code>, and positive target-configuration version. Each target preserves enabled state,
+safe endpoint/account configuration references, the complete canonical capability/limit snapshot,
+requested output tokens, estimator ID/version, and validated typed native options. There is no
+dynamic registration, alias, discovery, availability state, fallback ladder, or second catalog
+fingerprint; the global runtime configuration fingerprint binds catalog semantics.</p>
+<p>The deterministic selector either validates and selects the explicit target or validates and
+selects the configured default. It never substitutes another target or silently removes a
+requirement. Each branch calls the same exact-ID lookup/validation path with either the explicit
+<code>ModelTargetId</code> or configured default <code>ModelTargetId</code>; the selected target can have no collection,
+index, iteration, candidate, or fallback provenance. Missing, disabled, or incapable lookup results
+propagate as their branch-specific errors. The result preserves the selected target snapshot,
+<code>explicit|configured_default</code> reason, all considered target IDs in snapshot order, required
+capabilities, and target configuration version.</p>
+<p>Canonical request and response values use compact recursively key-ordered JSON and SHA-256 for
+stable semantic hashing. Vector order is semantic. Stage 15 request hashes are reusable fixture
+identity only; Stage 16 owns the authoritative hash after final context rendering. Requests always
+freeze <code>parallel_tool_calls=false</code>. Responses preserve the seven ordered output variants defined
+above, exact raw and parsed tool arguments, provider IDs, usage, optional provider continuation,
+and bounded typed metadata. The hard normalized boundaries are 64 output items, 65,536 actual
+UTF-8 bytes per complete raw tool-argument string, and 262,144 actual compact serialized bytes per
+normalized response. Canonical response construction validates the observed-order input vector by
+immutable iteration and moves that same vector unchanged into the response. Provider normalization
+MUST normalize each observed semantic item through a one-input to one-output-or-error function and
+append each result in observed order; it MUST NOT expose the canonical vector mutably, reorder it,
+or use filtering, folding, partitioning, or subset helpers to decide whether an item survives.
+Unknown items therefore become retained canonical evidence or an explicit error, never absence.
+Overflow rejects the response without truncating or dropping an item.</p>
+<p>Usage is nonnegative and signed-64-bit-compatible, with cached input no greater than input,
+reasoning no greater than output, and total exactly input plus output under checked arithmetic.
+The response constructor MUST enforce this terminal-consistency matrix without discarding an item:</p>
+<ul>
+<li><code>completed</code> requires text or structured data, forbids a tool call, refusal, or unknown item, and
+permits reasoning summary or provider-opaque evidence only alongside normal answer content;</li>
+<li><code>tool_continuation</code> requires at least one complete tool call, forbids refusal, structured data,
+and unknown items, and may retain accompanying text, reasoning summary, or provider-opaque
+evidence in provider order;</li>
+<li><code>refusal</code> requires refusal content and forbids normal text, structured data, tool calls, reasoning
+summary, and unknown items; provider-opaque evidence may accompany it;</li>
+<li><code>incomplete_provider_limit</code> may retain non-executable text, structured data, reasoning summary,
+or provider-opaque evidence, but forbids tool calls, refusal, and unknown items;</li>
+<li><code>cancelled</code> has no exposed semantic output and may retain only provider-opaque evidence; and</li>
+<li><code>provider_failure</code> has no usable answer, executable tool call, structured data, refusal, or
+reasoning summary. It may retain bounded provider-opaque or unknown diagnostic evidence, but an
+unknown item still fails supported-semantics validation.</li>
+</ul>
+<p>Permanent response validation MUST use an independently declared stop-reason × semantic-class
+matrix covering all six stop reasons and all seven canonical semantic classes (42 single-semantic
+cells), plus explicit meaningful mixed-item cases. Expected validity MUST NOT be derived from the
+response constructor or a production semantic classifier, allowed-mask helper, or compatibility
+function.</p>
+<p>Unknown provider items and events retain bounded hashed evidence and fail closed when semantics are
+required. Reasoning output is limited to provider-exposed summary; no hidden/private chain-of-
+thought type exists.</p>
+<p>The internal stream contract records started identity, text/reasoning/refusal deltas, tool start and
+bounded argument deltas, tool completion, structured data, usage, explicit <code>usage_unavailable</code>,
+completion, provider error, and unknown event evidence. One small state machine preserves item
+ordinal/call identity and enforces one initial started event, no event before it, unique call IDs,
+exact start/delta/completion identity, the aggregate argument bound, no open call at successful
+completion, exactly one usage result immediately before exactly one terminal event, and no event
+after usage or terminality. A successful normalized response MUST use exactly one <code>usage</code> event,
+whose value equals the terminal response usage. A provider-error terminal MUST use exactly one of
+<code>usage</code> or <code>usage_unavailable</code>; zero usage is never synthesized. The terminal response target MUST
+equal the started target. No validator may reorder events to repair an invalid stream.</p>
+<p>Provider-error terminal mapping preserves certainty: authentication, authorization, invalid
+request, unknown model, context, safety/refusal, and internal failures are definite provider
+failure; rate limit, temporary unavailable, and transport-before-response are definite transient
+failure; cancellation is cancellation; transport-after-possible-processing and provider-outcome-
+unknown are outcome ambiguity; timeout-before-output and timeout-after-output remain distinct; and
+malformed, oversized, or unsupported responses are protocol failure. A timeout-before-output or
+transient-before-output terminal after semantic output, and a timeout-after-output terminal before
+semantic output, are contradictory and MUST fail validation. No such terminal is <code>completed</code>. The
+contract is not an HTTP/SSE contract.</p>
+<p>The object-safe provider and token-estimator ports receive already-selected provider-neutral
+values. Retry classification is pure and permits at most initial plus two retries. Only definite
+transient failure before semantic output is eligible. Authentication/authorization/request/model/
+schema/context/refusal/malformed/unsupported/cancellation/ambiguous/deadline-exhausted and every
+post-output failure are nonretryable. Backoff is pure full jitter with 250 ms base, 5-second local
+cap, and Retry-After capped at 30 seconds; it never sleeps in Stage 15 tests.</p>
+<p>One attempt freezes the minimum of absolute Work, shutdown, provider-invocation, and retry-budget
+deadlines. The default provider limit is five minutes and stream idle ceiling is 60 seconds. A
+known absolute deadline is passed unchanged rather than reconstructed from a fresh relative
+timeout. Cancellation is provider-neutral and awaitable. <code>ScriptedProvider</code> retains the injected
+monotonic clock, absolute deadline, idle timeout, last valid activity, cancellation token, and the
+same semantic-output predicate used by retry classification. Before each event and after each
+release barrier it checks cancellation, then overall and idle expiry. Cancellation wins a same-
+observation race; <code>now &gt;= threshold</code> is expired. Timeout before semantic output is the definite
+pre-output classification, while timeout after text, tool, refusal, structured data, reasoning
+summary, or unknown semantic evidence is the nonretryable post-output classification.</p>
+<p>The deterministic <code>ScriptedProvider</code> is Stage 15&#39;s only concrete provider adapter and is never
+composed as a live provider. It matches target/request hash or fixture key/prior tool result/
+invocation ordinal/attempt, emits ordered provider-neutral events or classified errors, and uses
+injected release barriers rather than sleeps. It records redacted IDs, hashes, counts, ordering,
+cancellation, and terminal classification while retaining exact requests only through explicit
+test-safe capture access. A program with any step after its first emitted terminal event or terminal
+failure is rejected before the first event; capture distinguishes completion, provider failure,
+cancellation, outcome unknown, timeout, script mismatch, and invalid program. Its canonical
+scripted estimator uses immutable estimator identity plus target identity and exact normalized unit
+sequence as the lookup key. Repeated equivalent input returns the same nonnegative estimate without
+consuming state; each programmed estimate MUST be at least the checked sum of its byte units, and a
+missing or duplicate key fails deterministically.</p>
+<p>The Stage 15 provider contract tests MUST be reusable through <code>ModelProvider</code> plus a narrow fixture
+factory, without reading a concrete provider&#39;s fields, stream type, program queue, or captures. The
+suite covers identity/correlation, ordered text and multiple complete tool lifecycles, exactly one
+usage result and terminal, refusal, structured data, reasoning summary, opaque continuation,
+unknown-item fail-closed behavior, limits, cancellation, overall and idle deadlines, certainty
+mapping, semantic-output observation, and terminal response validation. Scripted-provider-specific
+tests remain additional coverage.</p>
+<p>The Stage 15 structural checker MUST resolve bounded simple local type aliases and traverse
+reachable helpers with a visited set and a finite conservative depth bound. It MUST reject runtime
+target-catalog mutation across aliases and helpers, selector paths whose explicit/default target
+provenance changes, non-append provider-output mutations or split/recombine transformations, and
+normalization paths where an unknown item can disappear without normalized output or explicit
+error. Permanent Stage 15 semantic checker mutations MUST first pass a deterministic Rust
+compilation gate and only then prove checker rejection; a noncompiling mutation is a failed probe.
+Its retained compilation-gated controls MUST also prove that constructor-local mutable target
+builders, target-ID projection and diagnostic iteration, deterministic target-inventory sorting,
+canonical JSON key sorting, and unrelated fixture filtering remain allowed.
+<code>ScriptedProvider</code> does not persist, journal, execute tools, access a Workstation, use HTTP, or know
+provider wire structs.</p>
 <h2>Explicit agent loop</h2>
 <aside class="explain-card level-2" data-source-heading="Explicit agent loop">
   <div class="explain-card-label">Major-section guide · plain-English companion</div>
@@ -8536,7 +8667,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-30T18:02:04.867Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>f8c06b464c8d4b921bf73ff6f2e957b22648c2ca3fdaa05916733d5ec06224ae</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-31T04:26:08.482Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>2d3e94e34c0ec76d349dcd7f92092101624be0ae5485dd850c74901aa56f382c</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

@@ -4,8 +4,8 @@
 
 **Status:** Authoritative implementation source of truth  
 **Architecture version:** V0.0.01  
-**Document revision:** 4\
-**Last updated:** 2026-08-28\
+**Document revision:** 5\
+**Last updated:** 2026-08-31\
 **Audience:** Craxii engineering, Codex, ChatGPT, reviewers, and future contributors  
 **Supersedes for V0.0.01:** `CRAXII_V0.0.01_DEEP_ARCHITECTURE_SOURCE_OF_TRUTH.md` and the V0 recommendations in `docs/temp/craxii-v0.0.01-architecture-review.md`
 
@@ -3217,7 +3217,8 @@ The selection result records:
 - required capabilities;
 - selection reason `explicit` or `configured_default`;
 - target configuration version;
-- timestamp.
+- no wall-clock timestamp in the pure in-memory Stage 15 result; Stage 17 persistence records
+  observed invocation lifecycle timestamps.
 
 No cost optimization, learned routing, fallback ladder, or task classifier is implemented.
 
@@ -3426,6 +3427,150 @@ V0 defaults, configurable within hard bounds:
 - maximum work-item wall time: 30 minutes, excluding time queued.
 
 Exceeding a loop/content limit creates a definite normalized failure; it never silently drops calls or continues infinitely.
+
+### Stage 15 canonical contract freeze
+
+Stage 15 is the provider-neutral contract layer, not a model runtime. It introduces no migration,
+provider call persistence, Context Assembler, Model Gateway, agent loop, production WorkRunner,
+real provider HTTP, public model endpoint, or client draft stream. Production remains
+`live_unready`.
+
+Configured targets are loaded once from validated startup configuration into an immutable snapshot
+ordered by ascending `ModelTargetId`. The published snapshot stores targets as the private immutable
+`Box<[ModelTarget]>` produced at the end of construction. Mutable vectors or validation maps are
+permitted only as constructor-local builders; the published snapshot exposes no mutable receiver,
+mutable target-storage reference, replacement collection, setter, lock/cell wrapper, or helper path
+that can mutate or replace its catalog. Target identity reuses `ModelTargetId`, `ProviderId`,
+`ProviderModelId`, and positive target-configuration version. Each target preserves enabled state,
+safe endpoint/account configuration references, the complete canonical capability/limit snapshot,
+requested output tokens, estimator ID/version, and validated typed native options. There is no
+dynamic registration, alias, discovery, availability state, fallback ladder, or second catalog
+fingerprint; the global runtime configuration fingerprint binds catalog semantics.
+
+The deterministic selector either validates and selects the explicit target or validates and
+selects the configured default. It never substitutes another target or silently removes a
+requirement. Each branch calls the same exact-ID lookup/validation path with either the explicit
+`ModelTargetId` or configured default `ModelTargetId`; the selected target can have no collection,
+index, iteration, candidate, or fallback provenance. Missing, disabled, or incapable lookup results
+propagate as their branch-specific errors. The result preserves the selected target snapshot,
+`explicit|configured_default` reason, all considered target IDs in snapshot order, required
+capabilities, and target configuration version.
+
+Canonical request and response values use compact recursively key-ordered JSON and SHA-256 for
+stable semantic hashing. Vector order is semantic. Stage 15 request hashes are reusable fixture
+identity only; Stage 16 owns the authoritative hash after final context rendering. Requests always
+freeze `parallel_tool_calls=false`. Responses preserve the seven ordered output variants defined
+above, exact raw and parsed tool arguments, provider IDs, usage, optional provider continuation,
+and bounded typed metadata. The hard normalized boundaries are 64 output items, 65,536 actual
+UTF-8 bytes per complete raw tool-argument string, and 262,144 actual compact serialized bytes per
+normalized response. Canonical response construction validates the observed-order input vector by
+immutable iteration and moves that same vector unchanged into the response. Provider normalization
+MUST normalize each observed semantic item through a one-input to one-output-or-error function and
+append each result in observed order; it MUST NOT expose the canonical vector mutably, reorder it,
+or use filtering, folding, partitioning, or subset helpers to decide whether an item survives.
+Unknown items therefore become retained canonical evidence or an explicit error, never absence.
+Overflow rejects the response without truncating or dropping an item.
+
+Usage is nonnegative and signed-64-bit-compatible, with cached input no greater than input,
+reasoning no greater than output, and total exactly input plus output under checked arithmetic.
+The response constructor MUST enforce this terminal-consistency matrix without discarding an item:
+
+- `completed` requires text or structured data, forbids a tool call, refusal, or unknown item, and
+  permits reasoning summary or provider-opaque evidence only alongside normal answer content;
+- `tool_continuation` requires at least one complete tool call, forbids refusal, structured data,
+  and unknown items, and may retain accompanying text, reasoning summary, or provider-opaque
+  evidence in provider order;
+- `refusal` requires refusal content and forbids normal text, structured data, tool calls, reasoning
+  summary, and unknown items; provider-opaque evidence may accompany it;
+- `incomplete_provider_limit` may retain non-executable text, structured data, reasoning summary,
+  or provider-opaque evidence, but forbids tool calls, refusal, and unknown items;
+- `cancelled` has no exposed semantic output and may retain only provider-opaque evidence; and
+- `provider_failure` has no usable answer, executable tool call, structured data, refusal, or
+  reasoning summary. It may retain bounded provider-opaque or unknown diagnostic evidence, but an
+  unknown item still fails supported-semantics validation.
+
+Permanent response validation MUST use an independently declared stop-reason × semantic-class
+matrix covering all six stop reasons and all seven canonical semantic classes (42 single-semantic
+cells), plus explicit meaningful mixed-item cases. Expected validity MUST NOT be derived from the
+response constructor or a production semantic classifier, allowed-mask helper, or compatibility
+function.
+
+Unknown provider items and events retain bounded hashed evidence and fail closed when semantics are
+required. Reasoning output is limited to provider-exposed summary; no hidden/private chain-of-
+thought type exists.
+
+The internal stream contract records started identity, text/reasoning/refusal deltas, tool start and
+bounded argument deltas, tool completion, structured data, usage, explicit `usage_unavailable`,
+completion, provider error, and unknown event evidence. One small state machine preserves item
+ordinal/call identity and enforces one initial started event, no event before it, unique call IDs,
+exact start/delta/completion identity, the aggregate argument bound, no open call at successful
+completion, exactly one usage result immediately before exactly one terminal event, and no event
+after usage or terminality. A successful normalized response MUST use exactly one `usage` event,
+whose value equals the terminal response usage. A provider-error terminal MUST use exactly one of
+`usage` or `usage_unavailable`; zero usage is never synthesized. The terminal response target MUST
+equal the started target. No validator may reorder events to repair an invalid stream.
+
+Provider-error terminal mapping preserves certainty: authentication, authorization, invalid
+request, unknown model, context, safety/refusal, and internal failures are definite provider
+failure; rate limit, temporary unavailable, and transport-before-response are definite transient
+failure; cancellation is cancellation; transport-after-possible-processing and provider-outcome-
+unknown are outcome ambiguity; timeout-before-output and timeout-after-output remain distinct; and
+malformed, oversized, or unsupported responses are protocol failure. A timeout-before-output or
+transient-before-output terminal after semantic output, and a timeout-after-output terminal before
+semantic output, are contradictory and MUST fail validation. No such terminal is `completed`. The
+contract is not an HTTP/SSE contract.
+
+The object-safe provider and token-estimator ports receive already-selected provider-neutral
+values. Retry classification is pure and permits at most initial plus two retries. Only definite
+transient failure before semantic output is eligible. Authentication/authorization/request/model/
+schema/context/refusal/malformed/unsupported/cancellation/ambiguous/deadline-exhausted and every
+post-output failure are nonretryable. Backoff is pure full jitter with 250 ms base, 5-second local
+cap, and Retry-After capped at 30 seconds; it never sleeps in Stage 15 tests.
+
+One attempt freezes the minimum of absolute Work, shutdown, provider-invocation, and retry-budget
+deadlines. The default provider limit is five minutes and stream idle ceiling is 60 seconds. A
+known absolute deadline is passed unchanged rather than reconstructed from a fresh relative
+timeout. Cancellation is provider-neutral and awaitable. `ScriptedProvider` retains the injected
+monotonic clock, absolute deadline, idle timeout, last valid activity, cancellation token, and the
+same semantic-output predicate used by retry classification. Before each event and after each
+release barrier it checks cancellation, then overall and idle expiry. Cancellation wins a same-
+observation race; `now >= threshold` is expired. Timeout before semantic output is the definite
+pre-output classification, while timeout after text, tool, refusal, structured data, reasoning
+summary, or unknown semantic evidence is the nonretryable post-output classification.
+
+The deterministic `ScriptedProvider` is Stage 15's only concrete provider adapter and is never
+composed as a live provider. It matches target/request hash or fixture key/prior tool result/
+invocation ordinal/attempt, emits ordered provider-neutral events or classified errors, and uses
+injected release barriers rather than sleeps. It records redacted IDs, hashes, counts, ordering,
+cancellation, and terminal classification while retaining exact requests only through explicit
+test-safe capture access. A program with any step after its first emitted terminal event or terminal
+failure is rejected before the first event; capture distinguishes completion, provider failure,
+cancellation, outcome unknown, timeout, script mismatch, and invalid program. Its canonical
+scripted estimator uses immutable estimator identity plus target identity and exact normalized unit
+sequence as the lookup key. Repeated equivalent input returns the same nonnegative estimate without
+consuming state; each programmed estimate MUST be at least the checked sum of its byte units, and a
+missing or duplicate key fails deterministically.
+
+The Stage 15 provider contract tests MUST be reusable through `ModelProvider` plus a narrow fixture
+factory, without reading a concrete provider's fields, stream type, program queue, or captures. The
+suite covers identity/correlation, ordered text and multiple complete tool lifecycles, exactly one
+usage result and terminal, refusal, structured data, reasoning summary, opaque continuation,
+unknown-item fail-closed behavior, limits, cancellation, overall and idle deadlines, certainty
+mapping, semantic-output observation, and terminal response validation. Scripted-provider-specific
+tests remain additional coverage.
+
+The Stage 15 structural checker MUST resolve bounded simple local type aliases and traverse
+reachable helpers with a visited set and a finite conservative depth bound. It MUST reject runtime
+target-catalog mutation across aliases and helpers, selector paths whose explicit/default target
+provenance changes, non-append provider-output mutations or split/recombine transformations, and
+normalization paths where an unknown item can disappear without normalized output or explicit
+error. Permanent Stage 15 semantic checker mutations MUST first pass a deterministic Rust
+compilation gate and only then prove checker rejection; a noncompiling mutation is a failed probe.
+Its retained compilation-gated controls MUST also prove that constructor-local mutable target
+builders, target-ID projection and diagnostic iteration, deterministic target-inventory sorting,
+canonical JSON key sorting, and unrelated fixture filtering remain allowed.
+`ScriptedProvider` does not persist, journal, execute tools, access a Workstation, use HTTP, or know
+provider wire structs.
 
 ## Explicit agent loop
 

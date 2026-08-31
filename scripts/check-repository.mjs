@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -361,9 +370,9 @@ function verifyBootstrapSnapshotStructure(source) {
   return snapshotSource;
 }
 
-function stage15ImplementationLeaks(productionFiles) {
+function stage16PlusImplementationLeaks(productionFiles) {
   const leaks = [];
-  const generalImplementation = /reqwest|hyper::client|\b(?:OpenAI|Anthropic)(?:Client|Adapter)\b|\b(?:struct|trait|impl)\s+ModelGateway\b|(?:async\s+)?fn\s+(?:invoke|stream|execute)_model\s*\(|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(|\b(?:struct|impl)\s+RemoteWorkstation\b|\b(?:struct|impl)\s+Mcp(?:Client|Server|Transport)\b|\bfn\s+(?:register|load)_(?:plugin|dynamic_tool)s?\s*\(/;
+  const generalImplementation = /reqwest|hyper::client|\b(?:OpenAI|Anthropic)(?:Client|Adapter)\b|\b(?:struct|trait|impl)\s+ModelGateway\b|struct\s+ContextAssembler\b|struct\s+(?:Real)?WorkRunner\b|impl\s+WorkRunner\s+for|(?:async\s+)?fn\s+run_agent_loop\s*\(|(?:async\s+)?fn\s+generate_assistant_completion\s*\(|(?:async\s+)?fn\s+stream_draft\s*\(|\b(?:struct|impl)\s+RemoteWorkstation\b|\b(?:struct|impl)\s+Mcp(?:Client|Server|Transport)\b|\bfn\s+(?:register|load)_(?:plugin|dynamic_tool)s?\s*\(/;
   for (const file of productionFiles) {
     const source = stripRustComments(withoutRustTestModules(file.source));
     if (generalImplementation.test(source)) {
@@ -903,17 +912,17 @@ function verifyStage14CheckerNegativeProbes(handlerSource, registrySource, servi
   expectStructuralRejection('public tool endpoint', () => verifyStage11RouteInventory(executeRouter));
   probeCount += 1;
   assert(
-    stage15ImplementationLeaks([{ path: 'application/provider.rs', source: 'async fn invoke_model() {}' }]).length === 1,
-    'checker negative probe was not rejected: provider import or model invocation',
+    stage16PlusImplementationLeaks([{ path: 'application/model_gateway.rs', source: 'struct ModelGateway;' }]).length === 1,
+    'checker negative probe was not rejected: ModelGateway',
   );
   probeCount += 1;
   assert(
-    stage15ImplementationLeaks([{ path: 'application/context_assembler.rs', source: 'struct ContextAssembler;' }]).length === 1,
+    stage16PlusImplementationLeaks([{ path: 'application/context_assembler.rs', source: 'struct ContextAssembler;' }]).length === 1,
     'checker negative probe was not rejected: context assembler',
   );
   probeCount += 1;
   assert(
-    stage15ImplementationLeaks([{ path: 'application/agent_loop.rs', source: 'async fn run_agent_loop() {}' }]).length === 1,
+    stage16PlusImplementationLeaks([{ path: 'application/agent_loop.rs', source: 'async fn run_agent_loop() {}' }]).length === 1,
     'checker negative probe was not rejected: agent loop',
   );
   probeCount += 1;
@@ -924,7 +933,7 @@ function verifyStage14CheckerNegativeProbes(handlerSource, registrySource, servi
     ['RemoteWorkstation', 'adapters/remote.rs', 'struct RemoteWorkstation;'],
     ['dynamic plugin registration', 'application/plugins.rs', 'fn register_plugins() {}'],
   ]) {
-    assert(stage15ImplementationLeaks([{ path, source }]).length === 1, `checker negative probe was not rejected: ${label}`);
+    assert(stage16PlusImplementationLeaks([{ path, source }]).length === 1, `checker negative probe was not rejected: ${label}`);
     probeCount += 1;
   }
   const failpointIsGated = (source) =>
@@ -1063,11 +1072,6 @@ function verifyStage14ToolStructure(rustRoot, productionFiles) {
   ]) {
     assert(new RegExp(`(?:async\\s+)?fn\\s+${testName}\\s*\\(`).test(`${registry}\n${service}\n${stage8Tests}`), `Stage 14 permanent test inventory is missing ${testName}`);
   }
-  const stage15Modules = productionFiles
-    .map((file) => file.path)
-    .filter((path) => /(?:^|\/)(?:provider-client|provider_client|context-assembler|context_assembler|agent-loop|agent_loop|assistant-completion|assistant_completion|draft-stream|draft_stream)\.rs$/.test(path));
-  const stage15Leaks = stage15ImplementationLeaks(productionFiles);
-  assert(stage15Modules.length === 0 && stage15Leaks.length === 0, `Stage 15+ implementation is forbidden in Stage 14: ${[...stage15Modules, ...stage15Leaks].join(', ')}`);
   return verifyStage14CheckerNegativeProbes(handlers, registry, service);
 }
 
@@ -1876,10 +1880,10 @@ function verifyStage13CheckerNegativeProbes() {
     stage13ProcessBoundaryLeaks(processEscape).length === 1,
     'checker negative probe was not rejected: process API outside LocalWorkstation',
   );
-  const stage15 = [{ path: 'application/provider.rs', source: 'async fn invoke_model() {}' }];
+  const stage15 = [{ path: 'application/model_gateway.rs', source: 'struct ModelGateway;' }];
   assert(
-    stage15ImplementationLeaks(stage15).length === 1,
-    'checker negative probe was not rejected: Stage 15 provider implementation',
+    stage16PlusImplementationLeaks(stage15).length === 1,
+    'checker negative probe was not rejected: Stage 16 ModelGateway implementation',
   );
   const missingStage10Deadline = stage13DeadlinePropagationViolations(
     'self.local_workstation.begin_execution_shutdown(); self.local_workstation.shutdown_executions_before(deadline);',
@@ -2096,6 +2100,1655 @@ ${helpers}`;
     'checker false-positive probe rejected cooperative helper depth, unrelated recursion, loops, or waitid references',
   );
   return 19;
+}
+
+function stage15ProductionViolations(file) {
+  const source = stripRustComments(withoutRustTestModules(file.source));
+  const violations = [];
+  if (stage16PlusImplementationLeaks([{ path: file.path, source }]).length > 0) {
+    violations.push('Stage 16+ implementation');
+  }
+  const providerBoundary = file.path === 'ports/model_provider.rs' ||
+    file.path === 'adapters/scripted_provider.rs';
+  if (providerBoundary) {
+    for (const [label, pattern] of [
+      ['StateStore or SQLx access', /\b(?:StateStore|SqliteStateStore|sqlx)\b/],
+      ['journal access', /\bJournal[A-Za-z0-9_]*\b|\bjournal_(?:event|write|append)|\b(?:append|write)_journal/],
+      ['ToolExecutionService call', /\bToolExecutionService\b|\.execute_call\s*\(/],
+      ['Workstation access', /\bWorkstation\b|\.read_file\s*\(|\.execute\s*\(/],
+      ['provider HTTP or SSE', /\b(?:reqwest|hyper|Sse|EventSource)\b|authorization_header|https?:\/\//i],
+      ['provider credential handling', /\b(?:api_key|authorization_header|bearer_token|CredentialRef)\b/i],
+      ['filesystem or process access', /\b(?:std|tokio)::(?:fs|process)\b|\bCommand::new\s*\(/],
+      ['wall-clock sleep', /tokio::time::sleep\s*\(|std::thread::sleep\s*\(/],
+    ]) {
+      if (pattern.test(source)) violations.push(label);
+    }
+  }
+  if (file.path === 'application/model_selection.rs') {
+    if (stage15DynamicRegistryMutation(source)) {
+      violations.push('dynamic target/provider mutation');
+    }
+    if (stage15FallbackSelection(source)) {
+      violations.push('silent model fallback');
+    }
+    violations.push(...stage15ModelSelectionContractViolations(source));
+  }
+  if (file.path === 'domain/model.rs' || /^adapters\/.*provider.*\.rs$/.test(file.path)) {
+    if (stage15OutputReordering(source)) {
+      violations.push('provider output sorting');
+    }
+    if (stage15UnknownItemDropping(source)) {
+      violations.push('unknown provider item dropping');
+    }
+  }
+  if (file.path === 'domain/model.rs') {
+    violations.push(...stage15ModelResponseContractViolations(source));
+    if (/parallel_tool_calls[\s\S]{0,40}(?:true|=\s*true)/.test(source)) {
+      violations.push('parallel tool calls enabled');
+    }
+    if (/MAX_MODEL_OUTPUT_ITEMS\s*:\s*usize\s*=/.test(source) &&
+        !/MAX_MODEL_OUTPUT_ITEMS\s*:\s*usize\s*=\s*64\s*;/.test(source)) {
+      violations.push('output-item limit differs');
+    }
+    if (/MAX_MODEL_TOOL_ARGUMENT_BYTES\s*:\s*usize\s*=/.test(source) &&
+        !/MAX_MODEL_TOOL_ARGUMENT_BYTES\s*:\s*usize\s*=\s*65_536\s*;/.test(source)) {
+      violations.push('raw tool-argument limit differs');
+    }
+  }
+  return violations;
+}
+
+const STAGE15_CALL_GRAPH_MAX_DEPTH = 16;
+const STAGE15_TYPE_ALIAS_MAX_DEPTH = 16;
+
+function stage15SimpleTypeAliases(source) {
+  const aliases = new Map();
+  for (const match of source.matchAll(
+    /\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^;={}]*)?=\s*([^;]+);/g,
+  )) {
+    aliases.set(match[1], match[2].trim());
+  }
+  return aliases;
+}
+
+function stage15ResolveTypeAliases(typeSource, aliases) {
+  let resolved = typeSource;
+  let depth = 0;
+  for (; depth < STAGE15_TYPE_ALIAS_MAX_DEPTH; depth += 1) {
+    let changed = false;
+    for (const [name, value] of aliases) {
+      const pattern = new RegExp(`\\b${name}\\b`, 'g');
+      const next = resolved.replace(pattern, `(${value})`);
+      if (next !== resolved) {
+        resolved = next;
+        changed = true;
+      }
+    }
+    if (!changed) return { resolved, depthExceeded: false };
+  }
+  const depthExceeded = [...aliases.keys()].some((name) =>
+    new RegExp(`\\b${name}\\b`).test(resolved),
+  );
+  return { resolved, depthExceeded };
+}
+
+function stage15TargetType(typeSource) {
+  return /\b(?:ModelTarget(?:Snapshot|Collection|Catalog|Registry|Map|List|Set)?|ModelTargets|TargetCollection|TargetSnapshot|TargetCatalog|TargetRegistry)\b/.test(
+    typeSource,
+  );
+}
+
+function stage15TargetCollectionType(typeSource) {
+  return stage15TargetType(typeSource) &&
+    /\b(?:Vec|HashMap|BTreeMap|Map|HashSet|BTreeSet|Box|Arc|ModelTargetSnapshot|ModelTargets|TargetCollection|TargetSnapshot|Catalog|Registry)\b|\[\s*ModelTarget/.test(
+      typeSource,
+    );
+}
+
+function stage15CompactRust(source) {
+  return source.replace(/\s+/g, '');
+}
+
+function stage15NamedBlockOrNull(source, pattern) {
+  const match = pattern.exec(source);
+  if (!match) return null;
+  const opening = source.indexOf('{', match.index);
+  if (opening === -1) return null;
+  const closing = findMatchingDelimiter(source, opening, '{', '}');
+  if (closing === -1) return null;
+  return source.slice(match.index, closing + 1);
+}
+
+function stage15ModelSelectionContractViolations(source) {
+  if (!/pub\s+struct\s+ModelTargetSnapshot\b/.test(source) ||
+      !/pub\s+struct\s+ModelSelectionPolicy\b/.test(source)) return [];
+
+  const violations = [];
+  const aliases = stage15SimpleTypeAliases(source);
+  const snapshot = stage15NamedBlockOrNull(source, /pub\s+struct\s+ModelTargetSnapshot\b/);
+  const snapshotImpl = stage15NamedBlockOrNull(source, /impl\s+ModelTargetSnapshot\b/);
+  const policyImpl = stage15NamedBlockOrNull(source, /impl\s+ModelSelectionPolicy\b/);
+  if (stage15CompactRust(snapshot ?? '') !==
+      'pubstructModelTargetSnapshot{default_target:ModelTargetId,targets:Box<[ModelTarget]>,}') {
+    violations.push('published model-target storage is not the exact immutable Box<[ModelTarget]> shape');
+  }
+  if (!snapshotImpl || !policyImpl) {
+    violations.push('model-target snapshot or selector implementation is absent');
+    return violations;
+  }
+
+  const snapshotMethods = rustMethodNames(snapshotImpl);
+  if (!equalStringArrays(snapshotMethods, [
+    'try_new',
+    'from_validated_config',
+    'default_target',
+    'targets',
+    'target',
+    'ordered_target_ids',
+  ])) {
+    violations.push('published model-target snapshot API differs from the read-only constructor contract');
+  }
+  if (/&\s*mut\s+self\b/.test(snapshotImpl) || /&\s*mut\s+ModelTargetSnapshot\b/.test(source)) {
+    violations.push('published model-target snapshot exposes mutable access after construction');
+  }
+  const tryNew = rustFunctionBlocks(snapshotImpl).find((block) => block.name === 'try_new');
+  if (!tryNew || !/mut\s+targets\s*:\s*Vec<ModelTarget>/.test(tryNew.parameters) ||
+      !/targets\s*\.\s*sort_by\s*\(/.test(tryNew.body) ||
+      !/targets\s*:\s*targets\s*\.\s*into_boxed_slice\s*\(\s*\)/.test(tryNew.body)) {
+    violations.push('model-target constructor does not end mutable building at immutable publication');
+  }
+
+  for (const match of source.matchAll(/\bstruct\s+[A-Za-z_][A-Za-z0-9_]*[^;{]*\{/g)) {
+    const opening = match.index + match[0].lastIndexOf('{');
+    const closing = findMatchingDelimiter(source, opening, '{', '}');
+    if (closing === -1) continue;
+    const structure = source.slice(match.index, closing + 1);
+    for (const field of structure.matchAll(/\b[A-Za-z_][A-Za-z0-9_]*\s*:\s*([^,\n}]+)/g)) {
+      const resolved = stage15ResolveTypeAliases(field[1], aliases);
+      if (resolved.depthExceeded) {
+        violations.push('model-target storage alias exceeds the finite analysis bound');
+        continue;
+      }
+      if (stage15TargetType(resolved.resolved) &&
+          /\b(?:Vec|HashMap|BTreeMap|HashSet|BTreeSet|Mutex|RwLock|RefCell|UnsafeCell|Cell)\b/.test(
+            resolved.resolved,
+          )) {
+        violations.push('mutable model-target collection is stored after construction');
+      }
+    }
+  }
+  for (const block of rustFunctionBlocks(source)) {
+    const resolved = stage15ResolveTypeAliases(block.signature, aliases);
+    if (resolved.depthExceeded && stage15TargetType(resolved.resolved)) {
+      violations.push('model-target function signature exceeds the finite alias bound');
+      continue;
+    }
+    const mutableTargetReference = /&\s*mut\s+[^,)]*(?:ModelTarget|\[\s*ModelTarget)/.test(
+      resolved.resolved,
+    );
+    const ownedMutableBuilder = /mut\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*[^,)]*(?:Vec|BTreeMap|HashMap)[^,)]*ModelTarget/.test(
+      resolved.resolved,
+    );
+    if (mutableTargetReference) {
+      violations.push('mutable model-target storage escapes a constructor');
+    }
+    if (ownedMutableBuilder &&
+        !/^(?:try_new|from_validated_config|build[A-Za-z0-9_]*|construct[A-Za-z0-9_]*)$/.test(block.name)) {
+      violations.push('mutable model-target builder exists outside an approved constructor boundary');
+    }
+    if (/&\s*mut\s+[A-Za-z_][A-Za-z0-9_\s.]*\.\s*targets\b/.test(block.body) ||
+        /\b[A-Za-z_][A-Za-z0-9_\s.]*\.\s*targets\s*=/.test(block.body)) {
+      violations.push('published model-target storage has a mutable alias or whole-field assignment');
+    }
+  }
+
+  const policyMethods = rustMethodNames(policyImpl);
+  if (!equalStringArrays(policyMethods, ['new', 'snapshot', 'select', 'select_exact'])) {
+    violations.push('selector API/topology differs from the exact-ID branch contract');
+  }
+  const policyFunctions = rustFunctionBlocks(policyImpl);
+  const select = policyFunctions.find((block) => block.name === 'select');
+  const selectExact = policyFunctions.find((block) => block.name === 'select_exact');
+  const expectedSelectBody = `
+    match explicit {
+      Some(explicit_id) => self.select_exact(
+        explicit_id,
+        required,
+        ModelSelectionReason::Explicit,
+        ModelSelectionErrorKind::ExplicitTargetMissing,
+        ModelSelectionErrorKind::ExplicitTargetDisabled,
+        ModelSelectionErrorKind::ExplicitTargetIncapable,
+      ),
+      None => self.select_exact(
+        self.snapshot.default_target(),
+        required,
+        ModelSelectionReason::ConfiguredDefault,
+        ModelSelectionErrorKind::DefaultTargetMissing,
+        ModelSelectionErrorKind::DefaultTargetDisabled,
+        ModelSelectionErrorKind::DefaultTargetIncapable,
+      ),
+    }`;
+  const expectedSelectExactBody = `
+    let target = self
+      .snapshot
+      .target(target_id)
+      .ok_or(ModelSelectionError(missing))?;
+    if !target.enabled() {
+      return Err(ModelSelectionError(disabled));
+    }
+    if !required.satisfied_by(target.reference().capabilities()) {
+      return Err(ModelSelectionError(incapable));
+    }
+    Ok(ModelSelectionResult {
+      selected_target: target.clone(),
+      reason,
+      considered_target_ids: self.snapshot.ordered_target_ids(),
+      required_capabilities: required,
+      target_configuration_version: target.reference().target_configuration_version(),
+    })`;
+  if (!select || stage15CompactRust(select.body) !== stage15CompactRust(expectedSelectBody)) {
+    violations.push('selector explicit/default branches are not the frozen exact-ID topology');
+  }
+  if (!selectExact ||
+      stage15CompactRust(selectExact.body) !== stage15CompactRust(expectedSelectExactBody) ||
+      !/target_id\s*:\s*&\s*ModelTargetId/.test(selectExact.parameters)) {
+    violations.push('selected-target success provenance is not the exact requested/default ID lookup');
+  }
+  return [...new Set(violations)];
+}
+
+function stage15ModelResponseContractViolations(source) {
+  if (!/pub\s+struct\s+ModelResponseInput\b/.test(source) ||
+      !/pub\s+struct\s+ModelResponse\b/.test(source)) return [];
+
+  const violations = [];
+  const input = stage15NamedBlockOrNull(source, /pub\s+struct\s+ModelResponseInput\b/);
+  const response = stage15NamedBlockOrNull(source, /pub\s+struct\s+ModelResponse\b/);
+  const responseImpl = stage15NamedBlockOrNull(source, /impl\s+ModelResponse\b/);
+  if (!/pub\s+output_items\s*:\s*Vec<ModelOutputItem>/.test(input ?? '') ||
+      !/(?:^|\n)\s*output_items\s*:\s*Vec<ModelOutputItem>/.test(response ?? '') ||
+      /pub\s+output_items\s*:/.test(response ?? '')) {
+    violations.push('canonical response output storage shape differs');
+  }
+  if (!responseImpl) {
+    violations.push('canonical response implementation is absent');
+    return violations;
+  }
+  const functions = rustFunctionBlocks(responseImpl);
+  const tryNew = functions.find((block) => block.name === 'try_new');
+  const supported = functions.find((block) => block.name === 'require_supported_semantics');
+  if (!tryNew ||
+      stage15CompactRust(tryNew.signature) !==
+        'fntry_new(input:ModelResponseInput)->Result<Self,ModelContractError>') {
+    violations.push('canonical response constructor signature differs from immutable input ownership');
+  } else {
+    const uses = [...tryNew.body.matchAll(/input\s*\.\s*output_items/g)].length;
+    if (uses !== 3 ||
+        !/input\s*\.\s*output_items\s*\.\s*len\s*\(\s*\)/.test(tryNew.body) ||
+        !/for\s+item\s+in\s+&\s*input\s*\.\s*output_items/.test(tryNew.body) ||
+        !/output_items\s*:\s*input\s*\.\s*output_items\s*,/.test(tryNew.body)) {
+      violations.push('canonical output is not validated immutably and moved unchanged into ModelResponse');
+    }
+    if (/\blet\s+(?:mut\s+)?(?:\([^;=]*\)|[A-Za-z_][A-Za-z0-9_]*)[^;=]*\boutput_items\b[^;=]*=/.test(
+      tryNew.body,
+    ) || /&\s*mut[^;\n]*output_items|output_items[^;\n]*\.\s*iter_mut\s*\(/.test(tryNew.body)) {
+      violations.push('canonical output construction is not append-free immutable pass-through');
+    }
+  }
+  if (/&\s*mut\s+self\b/.test(responseImpl) ||
+      /&\s*mut\s+(?:Vec\s*<\s*ModelOutputItem|\[\s*ModelOutputItem\s*\])/.test(source)) {
+    violations.push('canonical output storage exposes a mutable alias');
+  }
+  if (!tryNew ||
+      !/ModelOutputItem::UnknownProviderItem\s*\(_\)\s*=>\s*semantics\.unknown\s*=\s*true/.test(
+        tryNew.body,
+      )) {
+    violations.push('one-input item conservation does not classify unknown output exhaustively');
+  }
+  if (!supported ||
+      !/\.\s*any\s*\(\s*\|item\|\s*matches!\(item,\s*ModelOutputItem::UnknownProviderItem\(_\)\)\s*\)/s.test(
+        supported.body,
+      ) || !/ModelContractErrorKind::UnknownSemanticItem/.test(supported.body)) {
+    violations.push('unknown canonical output does not fail supported-semantics validation');
+  }
+  return [...new Set(violations)];
+}
+
+function stage15DynamicRegistryMutation(source) {
+  const aliases = stage15SimpleTypeAliases(source);
+  const resolvedAliases = [...aliases.values()].map((value) =>
+    stage15ResolveTypeAliases(value, aliases),
+  );
+  if (resolvedAliases.some(({ resolved, depthExceeded }) =>
+    depthExceeded && stage15TargetType(resolved))) return true;
+  if (resolvedAliases.some(({ resolved }) =>
+    stage15TargetCollectionType(resolved) && /\b(?:Mutex|RwLock)\b/.test(resolved))) return true;
+
+  const expandedSource = stage15ResolveTypeAliases(source, aliases);
+  if (expandedSource.depthExceeded && stage15TargetType(expandedSource.resolved)) return true;
+  if (
+    /\b(?:Mutex|RwLock)\s*<[\s\S]{0,360}\b(?:ModelTarget|ModelTargets|TargetCollection|TargetSnapshot|TargetCatalog|TargetRegistry)\b/.test(
+      expandedSource.resolved,
+    )
+  ) return true;
+
+  const functions = rustFunctionBlocks(source);
+  const inventory = stage14FunctionInventory(functions);
+  const typedRoots = functions.filter((block) => {
+    const signature = stage15ResolveTypeAliases(block.signature, aliases);
+    return signature.depthExceeded || stage15TargetType(signature.resolved) ||
+      /(?:target|catalog|snapshot|registry)/i.test(block.name) && /&mut\s+self/.test(block.parameters);
+  });
+  const reachable = stage15ReachableRustBlocks(typedRoots, inventory);
+  if (reachable.depthExceeded) return true;
+
+  return reachable.some((block) => {
+    const expanded = stage15ResolveTypeAliases(block.source, aliases);
+    if (expanded.depthExceeded) return true;
+    const targetSignature = stage15TargetType(
+      stage15ResolveTypeAliases(block.signature, aliases).resolved,
+    );
+    const mutableTargetParameters = [];
+    for (const match of expanded.resolved.matchAll(
+      /\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*&\s*mut\s+([^,){]+)/g,
+    )) {
+      if (stage15TargetCollectionType(match[2])) mutableTargetParameters.push(match[1]);
+    }
+    for (const receiver of mutableTargetParameters) {
+      if (new RegExp(
+        `\\b${receiver}\\s*\\.\\s*(?:insert|remove|replace|clear|append|extend|push|retain|swap|swap_remove)\\s*\\(`,
+      ).test(expanded.resolved)) return true;
+    }
+    if (
+      targetSignature && /&mut\s+self/.test(block.parameters) &&
+      /\bself\s*\.\s*[A-Za-z_][A-Za-z0-9_]*\s*(?:=|\.\s*(?:insert|remove|replace|clear|append|extend|push|retain|swap|swap_remove)\s*\()/.test(
+        block.body,
+      )
+    ) return true;
+    if (
+      targetSignature &&
+      /\b(?:register|replace|remove|insert|update|set|swap|mutate)[A-Za-z0-9_]*\s*\(/i.test(
+        block.signature,
+      ) && /&mut\s+self|&\s*mut\s+/.test(block.parameters)
+    ) return true;
+    return /\.\s*write\s*\(\s*\)[\s\S]{0,220}\.\s*(?:insert|remove|replace|clear|extend|push)\s*\(/.test(
+      expanded.resolved,
+    );
+  });
+}
+
+function stage15FallbackSelection(source) {
+  if (/pub\s+struct\s+ModelSelectionPolicy\b/.test(source)) {
+    return stage15ModelSelectionContractViolations(source).some((violation) =>
+      /selector|selected-target/.test(violation),
+    );
+  }
+  const functions = rustFunctionBlocks(source);
+  const inventory = stage14FunctionInventory(functions);
+  const selectRoots = functions.filter((block) => block.name === 'select');
+  const reachable = stage15ReachableRustBlocks(selectRoots, inventory);
+  if (reachable.depthExceeded) return true;
+  return reachable.some((block) => stage15SelectorProvenanceViolation(block));
+}
+
+function stage15SelectorProvenanceViolation(block) {
+  const body = block.body;
+  if (/\.(?:or|or_else|unwrap_or|unwrap_or_else|map_or|map_or_else)\s*\(/.test(body)) {
+    return true;
+  }
+  if (
+    /\bmatch\s+[^\{;]*(?:lookup|resolve|selected|explicit|target)[^\{;]*\{[\s\S]{0,700}\b(?:Err\s*\([^)]*\)|None)\s*=>[\s\S]{0,240}(?:default|target|candidate|\.find\s*\(|\.first\s*\(|\.next\s*\(|Ok\s*\(|Some\s*\()/i.test(
+      body,
+    )
+  ) return true;
+  if (
+    /if\s+let\s+(?:Err\s*\([^)]*\)|None)\s*=[\s\S]{0,500}(?:default_target|\.targets?\s*\(|\.find\s*\(|return\s+(?:Ok|Some)\s*\()/i.test(
+      body,
+    )
+  ) return true;
+  if (
+    /if\s+[^\{]{0,220}(?:!\s*[^\{]*(?:enabled|capable|satisfied_by)|(?:disabled|incapable))[^\{]*\{[\s\S]{0,420}(?:default_target|[A-Za-z_][A-Za-z0-9_]*target\s*\(|\.targets?\s*\(|\.find\s*\(|return\s+(?:Ok|Some)\s*\()/i.test(
+      body,
+    )
+  ) return true;
+  if (
+    /(?:for\s+\w+\s+in|while\s+[^\{]+)[\s\S]{0,600}(?:enabled|capable|satisfied_by)[\s\S]{0,260}(?:return\s+(?:Ok|Some)|break\s+\w+)/.test(
+      body,
+    )
+  ) return true;
+
+  for (const match of body.matchAll(/\.(?:find|find_map|first|next)\s*\(([^;]*)/g)) {
+    const expression = match[0];
+    const exactIdentityLookup = /(?:==|\.eq\s*\()[\s\S]{0,160}(?:requested|explicit|target_id|\bid\b)/.test(
+      expression,
+    ) && !/(?:enabled|capable|satisfied_by)/.test(expression);
+    const diagnosticOnly = /(?:considered|diagnostic|inventory|ordered_target_ids)/i.test(block.name) &&
+      !/Result\s*<[^>]*ModelTarget|Option\s*<[^>]*ModelTarget/.test(block.signature);
+    if (!exactIdentityLookup && !diagnosticOnly) return true;
+  }
+  return false;
+}
+
+function stage15OutputReordering(source) {
+  const functions = rustFunctionBlocks(source);
+  const inventory = stage14FunctionInventory(functions);
+  const reachable = stage15ReachableRustBlocks(stage15ProviderOutputRoots(functions), inventory);
+  if (reachable.depthExceeded) return true;
+  return reachable.some((block) => {
+    if (block.name === 'canonicalize_json' || /\bserde_json::Value\b|\bValue::Object\b/.test(block.source)) {
+      return false;
+    }
+    const anyReceiverOrderMutation = /\b[A-Za-z_][A-Za-z0-9_]*\s*\.\s*(?:sort|sort_by|sort_by_key|sort_unstable|sort_unstable_by|sort_unstable_by_key|reverse|rotate_left|rotate_right|swap|swap_remove|dedup|dedup_by|dedup_by_key|splice|split_off)\s*\(/;
+    const outputReceiverDestructiveMutation = /\b(?:output_items|response_items|normalized_items|provider_items|outputs|items|values)\s*\.\s*(?:insert|remove|drain|truncate|clear)\s*\(/;
+    const iteratorReorder = /\.\s*(?:rev|sorted|sorted_by|sorted_by_key)\s*\(\s*\)/;
+    const splitOrRecombine = /\.\s*partition\s*\(|\b(?:texts?|tools?|known|unknown|recognized|discarded)[A-Za-z0-9_]*\s*\.\s*(?:extend|append)\s*\(|\.\s*chain\s*\(/;
+    return [
+      anyReceiverOrderMutation,
+      outputReceiverDestructiveMutation,
+      iteratorReorder,
+      splitOrRecombine,
+    ].some((pattern) => pattern.test(block.body));
+  });
+}
+
+function stage15ProviderOutputRoots(functions) {
+  return functions.filter((block) =>
+    /\bModelOutputItem\b|\b(?:output_items|response_items|provider_items|normalized_items|outputs)\b/.test(
+      `${block.signature}\n${block.body}`,
+    ) || /(?:normalize|response|output)/i.test(block.name) && /\bitems?\b/.test(block.parameters),
+  );
+}
+
+function stage15LocalCallCounts(body, inventory) {
+  const calls = new Map();
+  for (const name of inventory.keys()) {
+    const pattern = new RegExp(`(?:\\.|::|(?<![A-Za-z0-9_]))${name}\\s*\\(`, 'g');
+    const count = [...body.matchAll(pattern)].length;
+    if (count > 0) calls.set(name, count);
+  }
+  return calls;
+}
+
+function stage15ReachableRustBlocks(roots, inventory) {
+  const reachable = [];
+  reachable.depthExceeded = false;
+  const pending = roots.map((block) => ({ block, depth: 0 }));
+  const seen = new Set();
+  while (pending.length > 0) {
+    const { block, depth } = pending.pop();
+    if (seen.has(block)) continue;
+    seen.add(block);
+    reachable.push(block);
+    const localCalls = stage15LocalCallCounts(block.body, inventory);
+    if (depth >= STAGE15_CALL_GRAPH_MAX_DEPTH && localCalls.size > 0) {
+      reachable.depthExceeded = true;
+      continue;
+    }
+    for (const name of localCalls.keys()) {
+      pending.push(...(inventory.get(name) ?? []).map((callee) => ({
+        block: callee,
+        depth: depth + 1,
+      })));
+    }
+  }
+  return reachable;
+}
+
+function stage15UnknownItemDropping(source) {
+  const functions = rustFunctionBlocks(source);
+  const inventory = stage14FunctionInventory(functions);
+  const reachable = stage15ReachableRustBlocks(stage15ProviderOutputRoots(functions), inventory);
+  if (reachable.depthExceeded) return true;
+  return reachable.some((block) => {
+    if (block.name === 'canonicalize_json' || /\bserde_json::Value\b|\bValue::Object\b/.test(block.source)) {
+      return false;
+    }
+    const silentLossOperation = /\.\s*(?:filter|filter_map|retain|partition|flat_map|take_while|skip_while|drain)\s*\(/;
+    const unknownDiscardArm = /(?:UnknownProviderItem|UnknownProviderEvent)[\s\S]{0,220}=>\s*(?:continue\b|None\b|Ok\s*\(\s*None\s*\)|Vec::new\s*\(\s*\)|\[\s*\]|\{\s*\})/;
+    const swallowedUnknownError = /(?:UnknownProviderItem|UnknownProviderEvent)[\s\S]{0,240}\.\s*ok\s*\(\s*\)|\.\s*ok\s*\(\s*\)[\s\S]{0,240}(?:UnknownProviderItem|UnknownProviderEvent)/;
+    const guardedPushWithoutConservation = /if\s+[^\{]{0,180}(?:known|recognized|supported|UnknownProvider)[^\{]*\{[^{}]{0,360}\.\s*push\s*\([^{}]*\)\s*;?\s*\}(?!\s*else)/i;
+    return [
+      silentLossOperation,
+      unknownDiscardArm,
+      swallowedUnknownError,
+      guardedPushWithoutConservation,
+    ].some((pattern) => pattern.test(block.body));
+  });
+}
+
+function verifyStage15CheckerNegativeProbes() {
+  let probeCount = 0;
+  const cases = [
+    ['ContextAssembler introduction', 'application/context_assembler.rs', 'struct ContextAssembler;'],
+    ['ModelGateway introduction', 'application/model_gateway.rs', 'struct ModelGateway;'],
+    ['AgentLoop introduction', 'application/agent_loop.rs', 'async fn run_agent_loop() {}'],
+    ['production WorkRunner', 'application/work_runner.rs', 'struct WorkRunner;'],
+    ['OpenAI adapter', 'adapters/openai.rs', 'struct OpenAIAdapter;'],
+    ['Reqwest use', 'adapters/provider.rs', 'fn send(client: reqwest::Client) {}'],
+    ['provider StateStore access', 'ports/model_provider.rs', 'fn persist(store: &dyn StateStore) {}'],
+    ['provider journal write', 'adapters/scripted_provider.rs', 'fn write() { append_journal_event(); }'],
+    ['provider ToolExecutionService call', 'adapters/scripted_provider.rs', 'fn call(service: &ToolExecutionService) { service.execute_call(); }'],
+    ['provider Workstation call', 'adapters/scripted_provider.rs', 'fn call(machine: &dyn Workstation) { machine.execute(); }'],
+    ['snapshot insert mutation', 'application/model_selection.rs', 'fn mutate(snapshot: &mut ModelTargets, target: ModelTarget) { snapshot.insert(target); }'],
+    ['replace target mutation', 'application/model_selection.rs', 'fn replace_target(snapshot: &mut ModelTargets, target: ModelTarget) { snapshot.replace(target); }'],
+    ['runtime model registration', 'application/model_selection.rs', 'pub fn register_model_target(&mut self, target: ModelTarget) { self.targets.push(target); }'],
+    ['mutex model catalog', 'application/model_selection.rs', 'struct MutableCatalog { targets: Arc<Mutex<ModelTargets>> }'],
+    ['helper-mediated registry mutation', 'application/model_selection.rs', `
+      fn update(snapshot: &mut ModelTargets, target: ModelTarget) { change(snapshot, target); }
+      fn change(collection: &mut ModelTargets, target: ModelTarget) { collection.insert(target); }`],
+    ['alias-hidden mutex target vector', 'application/model_selection.rs', `
+      type RuntimeTargetCollection = Vec<ModelTarget>;
+      type SharedRuntimeTargets = Arc<Mutex<RuntimeTargetCollection>>;
+      struct RuntimeRegistry { targets: SharedRuntimeTargets }`],
+    ['alias-chain rwlock target map', 'application/model_selection.rs', `
+      type TargetRows = BTreeMap<ModelTargetId, ModelTarget>;
+      type TargetGuard = RwLock<TargetRows>;
+      type SharedRuntimeTargets = Arc<TargetGuard>;
+      struct RuntimeRegistry { targets: SharedRuntimeTargets }`],
+    ['helper mutates alias-hidden map after startup', 'application/model_selection.rs', `
+      type TargetRows = BTreeMap<ModelTargetId, ModelTarget>;
+      type SharedRuntimeTargets = Arc<Mutex<TargetRows>>;
+      fn update_after_startup(targets: &SharedRuntimeTargets, id: ModelTargetId, target: ModelTarget) {
+        mutate_targets(targets, id, target);
+      }
+      fn mutate_targets(targets: &SharedRuntimeTargets, id: ModelTargetId, target: ModelTarget) {
+        targets.lock().unwrap().insert(id, target);
+      }`],
+    ['setter replaces whole target collection', 'application/model_selection.rs', `
+      type RuntimeTargetCollection = Vec<ModelTarget>;
+      struct RuntimeRegistry { targets: RuntimeTargetCollection }
+      impl RuntimeRegistry {
+        pub fn set_targets(&mut self, replacement: RuntimeTargetCollection) {
+          self.targets = replacement;
+        }
+      }`],
+    ['helper write-lock inserts target', 'application/model_selection.rs', `
+      type RuntimeTargetCollection = BTreeMap<ModelTargetId, ModelTarget>;
+      type SharedRuntimeTargets = Arc<RwLock<RuntimeTargetCollection>>;
+      fn install(targets: &SharedRuntimeTargets, id: ModelTargetId, target: ModelTarget) {
+        write_target(targets, id, target);
+      }
+      fn write_target(targets: &SharedRuntimeTargets, id: ModelTargetId, target: ModelTarget) {
+        targets.write().unwrap().insert(id, target);
+      }`],
+    ['or-else capable fallback', 'application/model_selection.rs', 'pub fn select(&self) { self.selected().or_else(|| first_capable_target()); }'],
+    ['loop fallback after default failure', 'application/model_selection.rs', 'pub fn select(&self) { for target in self.snapshot.targets() { if target.capable() { return Ok(target); } } }'],
+    ['helper-mediated alternate selection', 'application/model_selection.rs', `
+      pub fn select(&self) { pick(self.snapshot.targets()); }
+      fn pick(candidates: &[ModelTarget]) -> Option<&ModelTarget> {
+        candidates.iter().find(|candidate| candidate.capable())
+      }`],
+    ['unwrap-or secondary target', 'application/model_selection.rs', 'pub fn select(&self) { selected.unwrap_or(secondary_target); }'],
+    ['explicit failure falls back to default', 'application/model_selection.rs', 'pub fn select(&self) { explicit_target.or_else(|| self.snapshot.default_target()); }'],
+    ['incapable default falls back to enabled target', 'application/model_selection.rs', 'pub fn select(&self) { if default_incapable { first_capable_target() } }'],
+    ['match explicit lookup failure chooses default', 'application/model_selection.rs', `
+      pub fn select(&self) {
+        let selected = match resolve_explicit() {
+          Ok(target) => target,
+          Err(_) => resolve_configured_default(),
+        };
+        Ok(selected)
+      }`],
+    ['unwrap-or configured default', 'application/model_selection.rs', `
+      pub fn select(&self) {
+        let selected = resolve_explicit().unwrap_or(resolve_configured_default());
+        Ok(selected)
+      }`],
+    ['unwrap-or-else first capable', 'application/model_selection.rs', `
+      pub fn select(&self) {
+        let selected = resolve_explicit().unwrap_or_else(|| targets.iter().find(|target| target.capable()).unwrap());
+        Ok(selected)
+      }`],
+    ['helper match fallback', 'application/model_selection.rs', `
+      pub fn select(&self) { resolve_requested(explicit_target, configured_default) }
+      fn resolve_requested(explicit_target: Option<ModelTarget>, configured_default: ModelTarget) -> ModelTarget {
+        match explicit_target { Some(target) => target, None => configured_default }
+      }`],
+    ['iterator alternate target search', 'application/model_selection.rs', `
+      pub fn select(&self) -> Option<&ModelTarget> {
+        self.snapshot.targets().iter().find(|candidate| candidate.enabled() && candidate.capable())
+      }`],
+    ['default capability failure chooses another enabled target', 'application/model_selection.rs', `
+      pub fn select(&self) -> Option<&ModelTarget> {
+        let selected = self.snapshot.target(self.snapshot.default_target())?;
+        if !selected.capable() {
+          return self.snapshot.targets().iter().find(|candidate| candidate.enabled());
+        }
+        Some(selected)
+      }`],
+    ['explicit disabled chooses default target', 'application/model_selection.rs', `
+      pub fn select(&self) -> Option<&ModelTarget> {
+        let selected = self.snapshot.target(explicit_target)?;
+        if !selected.enabled() { return self.snapshot.target(self.snapshot.default_target()); }
+        Some(selected)
+      }`],
+    ['direct provider output sort', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.sort(); }'],
+    ['helper-mediated provider output sort', 'domain/model.rs', `
+      fn normalize(mut output_items: Vec<Item>) { scramble(&mut output_items); }
+      fn scramble<T: Ord>(values: &mut [T]) { values.sort(); }`],
+    ['provider output reverse', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.reverse(); }'],
+    ['split and reconstruct provider output', 'domain/model.rs', 'fn normalize(output_items: Vec<Item>) { let (mut texts, mut tools) = output_items.partition(is_text); texts.extend(tools); }'],
+    ['stable sort by output variant', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.sort_by_key(Item::variant); }'],
+    ['deduplicate provider output', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.dedup(); }'],
+    ['rotate provider output left', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.rotate_left(1); }'],
+    ['rotate provider output right', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.rotate_right(1); }'],
+    ['swap provider output items', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.swap(0, 1); }'],
+    ['swap-remove provider output item', 'domain/model.rs', 'fn normalize(mut output_items: Vec<Item>) { output_items.swap_remove(0); }'],
+    ['remove and reinsert provider output item', 'domain/model.rs', `
+      fn normalize(mut output_items: Vec<Item>) {
+        let first = output_items.remove(0);
+        output_items.insert(1, first);
+      }`],
+    ['partition text and tools then concatenate', 'domain/model.rs', `
+      fn normalize(output_items: Vec<Item>) -> Vec<Item> {
+        let (texts, tools): (Vec<_>, Vec<_>) = output_items.into_iter().partition(Item::is_text);
+        texts.into_iter().chain(tools).collect()
+      }`],
+    ['helper returns reversed clone', 'domain/model.rs', `
+      fn normalize(output_items: Vec<Item>) -> Vec<Item> { reversed_copy(output_items) }
+      fn reversed_copy(mut values: Vec<Item>) -> Vec<Item> { values.reverse(); values }
+    `],
+    ['sort provider output by variant', 'domain/model.rs', `
+      fn normalize(mut output_items: Vec<Item>) { output_items.sort_by(|left, right| left.variant().cmp(&right.variant())); }
+    `],
+    ['filter unknown provider item', 'domain/model.rs', 'fn normalize(items: Vec<ModelOutputItem>) { items.filter(|item| !matches!(item, UnknownProviderItem(_))); }'],
+    ['filter-map unknown provider item', 'domain/model.rs', 'fn normalize(items: Vec<ModelOutputItem>) { items.filter_map(|item| match item { UnknownProviderItem(_) => None, known => Some(known) }); }'],
+    ['continue on unknown provider item', 'domain/model.rs', 'fn normalize(items: Vec<ModelOutputItem>) { for item in items { match item { UnknownProviderItem(_) => continue, _ => emit(item) } } }'],
+    ['retain known provider items', 'domain/model.rs', 'fn normalize(mut items: Vec<ModelOutputItem>) { items.retain(|item| !matches!(item, UnknownProviderItem(_))); }'],
+    ['helper-mediated unknown drop', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) { items.filter_map(project); }
+      fn project(item: ModelOutputItem) -> Option<ModelOutputItem> {
+        match item { UnknownProviderItem(_) => None, known => Some(known) }
+      }`],
+    ['partition and discard unknown half', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        let (known, discarded): (Vec<_>, Vec<_>) = items.into_iter().partition(is_known);
+        known
+      }`],
+    ['flat-map unknown to empty', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        items.into_iter().flat_map(|item| match item {
+          UnknownProviderItem(_) => Vec::new(),
+          known => vec![known],
+        }).collect()
+      }`],
+    ['match unknown continues', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        let mut output = Vec::new();
+        for item in items {
+          match item { UnknownProviderItem(_) => continue, known => output.push(known) }
+        }
+        output
+      }`],
+    ['helper returns only known provider items', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> { only_known(items) }
+      fn only_known(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        items.into_iter().filter(|item| is_known(item)).collect()
+      }`],
+    ['guarded known push has no unknown branch', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        let mut output = Vec::new();
+        for item in items { if is_known(&item) { output.push(item); } }
+        output
+      }`],
+    ['filter-map recognized provider items', 'domain/model.rs', `
+      fn normalize(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        items.into_iter().filter_map(recognize).collect()
+      }`],
+    ['retain recognized provider items', 'domain/model.rs', `
+      fn normalize(mut items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+        items.retain(is_known);
+        items
+      }`],
+    ['more than 64 output items', 'domain/model.rs', 'const MAX_MODEL_OUTPUT_ITEMS: usize = 65;'],
+    ['more than 64 KiB arguments', 'domain/model.rs', 'const MAX_MODEL_TOOL_ARGUMENT_BYTES: usize = 65_537;'],
+    ['parallel tool calls true', 'domain/model.rs', 'fn request() { parallel_tool_calls = true; }'],
+  ];
+  for (const [label, path, source] of cases) {
+    assert(
+      stage15ProductionViolations({ path, source }).length > 0,
+      `checker negative probe was not rejected: ${label}`,
+    );
+    probeCount += 1;
+  }
+
+  const modelRoute = `
+    Router::new()
+      .route("/health/live", get(liveness))
+      .route("/health/ready", get(readiness))
+      .route("/bootstrap", get(bootstrap))
+      .route("/conversations/{conversation_id}/messages", post(message))
+      .route("/work-items/{work_id}/cancel", post(cancel))
+      .route("/events", get(events))
+      .route("/models/invoke", post(invoke));`;
+  expectStructuralRejection('public model endpoint', () => verifyStage11RouteInventory(modelRoute));
+  probeCount += 1;
+
+  assert(
+    stage15MigrationViolations(['0001_core.sql', '0002_journal.sql', '0003_model.sql', '0004_stage15.sql']).length === 1,
+    'checker negative probe was not rejected: migration 0004',
+  );
+  probeCount += 1;
+
+  const readinessProbe = 'fn compose(health: Health) { health.mark_ready(); start_scheduler(); }';
+  assert(
+    stage15ReadinessViolations(readinessProbe).length === 2,
+    'checker negative probe was not rejected: readiness promotion',
+  );
+  probeCount += 1;
+
+  const falsePositiveCases = [
+    ['constructor-local mutable builder', 'application/model_selection.rs', `
+      struct ModelTargetSnapshot { targets: Box<[ModelTarget]> }
+      fn build(config: Config) -> ModelTargetSnapshot {
+        let mut targets = Vec::new();
+        for item in config.targets() { targets.push(make_target(item)); }
+        targets.sort_by(target_id_order);
+        ModelTargetSnapshot { targets: targets.into_boxed_slice() }
+      }`],
+    ['considered target ID projection', 'application/model_selection.rs', `
+      fn ordered_target_ids(&self) -> Vec<ModelTargetId> {
+        self.targets.iter().map(|target| target.id().clone()).collect()
+      }`],
+    ['deterministic model target inventory sort', 'application/model_selection.rs', `
+      fn build(mut targets: Vec<ModelTarget>) -> Box<[ModelTarget]> {
+        targets.sort_by(|left, right| left.id().cmp(right.id()));
+        targets.into_boxed_slice()
+      }`],
+    ['constructor-local target validation map', 'application/model_selection.rs', `
+      fn validate(targets: &[ModelTarget]) -> Result<(), Error> {
+        let mut by_id = BTreeMap::new();
+        for target in targets { by_id.insert(target.id(), target); }
+        Ok(())
+      }`],
+    ['immutable arc target slice', 'application/model_selection.rs', `
+      type ImmutableTargets = Arc<[ModelTarget]>;
+      struct ModelTargetSnapshot { targets: ImmutableTargets }
+      fn publish(targets: Vec<ModelTarget>) -> ModelTargetSnapshot {
+        ModelTargetSnapshot { targets: Arc::from(targets) }
+      }`],
+    ['diagnostic target inventory iteration', 'application/model_selection.rs', `
+      pub fn select(&self) -> Result<&ModelTarget, Error> {
+        record_diagnostic_ids(self.snapshot.targets());
+        exact_target(self.snapshot.targets(), requested).ok_or(Error)
+      }
+      fn record_diagnostic_ids(targets: &[ModelTarget]) {
+        for target in targets { record(target.id()); }
+      }
+      fn exact_target<'a>(targets: &'a [ModelTarget], requested: &ModelTargetId) -> Option<&'a ModelTarget> {
+        targets.iter().find(|target| target.id() == requested)
+      }`],
+    ['exact target lookup helper', 'application/model_selection.rs', `
+      pub fn select(&self) -> Result<&ModelTarget, Error> {
+        exact_target(self.snapshot.targets(), requested).ok_or(Error)
+      }
+      fn exact_target<'a>(targets: &'a [ModelTarget], requested: &ModelTargetId) -> Option<&'a ModelTarget> {
+        targets.iter().find(|target| target.id() == requested)
+      }`],
+    ['harmless immutable helper alias', 'application/model_selection.rs', `
+      type ImmutableTargetSlice = Arc<[ModelTarget]>;
+      fn target_count(targets: &ImmutableTargetSlice) -> usize { targets.len() }`],
+    ['canonical JSON key sorting', 'domain/model.rs', `
+      fn canonicalize_json_object(mut keys: Vec<(String, Value)>) -> Value {
+        keys.sort_by(|left, right| left.0.cmp(&right.0));
+        Value::Object(keys.into_iter().collect())
+      }`],
+    ['unrelated output fixture sorting', 'domain/model.rs', `
+      fn sort_fixture_rows(mut rows: Vec<FixtureRow>) -> Vec<FixtureRow> {
+        rows.sort_by_key(FixtureRow::ordinal);
+        rows
+      }`],
+    ['model target inventory filtering', 'application/model_selection.rs', `
+      fn enabled_target_ids(targets: &[ModelTarget]) -> Vec<ModelTargetId> {
+        targets.iter().filter(|target| target.enabled()).map(|target| target.id().clone()).collect()
+      }`],
+    ['test-only output diagnostics', 'domain/model.rs', `
+      #[cfg(test)]
+      mod diagnostics {
+        fn unknown_rows(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+          items.into_iter().filter(|item| matches!(item, UnknownProviderItem(_))).collect()
+        }
+      }`],
+    ['unrelated fixture filtering', 'domain/model.rs', `
+      fn select_fixture_rows(rows: Vec<FixtureRow>) -> Vec<FixtureRow> {
+        rows.into_iter().filter(|row| row.enabled()).collect()
+      }`],
+  ];
+  for (const [label, path, source] of falsePositiveCases) {
+    assert(
+      stage15ProductionViolations({ path, source }).length === 0,
+      `checker false-positive probe was rejected: ${label}`,
+    );
+  }
+  const compiled = verifyStage15CompilationGatedProbes();
+  return {
+    negativeProbeCount: probeCount + compiled.negativeProbeCount,
+    retainedStructuralProbeCount: probeCount,
+    compilationGatedNegativeProbeCount: compiled.negativeProbeCount,
+    compilationGatedCaseCount: compiled.negativeProbeCount + compiled.controlCount,
+    builtInCompilationGatedProbeCount: compiled.builtInCount,
+    novelChallengeMutationCount: compiled.novelCount,
+    falsePositiveCompilationGatedControlCount: compiled.controlCount,
+  };
+}
+
+function stage15ReplaceOnce(source, before, after, label) {
+  const parts = source.split(before);
+  assert(parts.length === 2, `Stage 15 probe mutation anchor differs: ${label}`);
+  return `${parts[0]}${after}${parts[1]}`;
+}
+
+function stage15AppendProductionHelper(source, helper) {
+  return `${source.trimEnd()}\n\n${helper.trim()}\n`;
+}
+
+const STAGE15_EXACT_LOOKUP = `        let target = self
+            .snapshot
+            .target(target_id)
+            .ok_or(ModelSelectionError(missing))?;`;
+
+const STAGE15_EXPLICIT_SELECTOR_ARM = `            Some(explicit_id) => self.select_exact(
+                explicit_id,
+                required,
+                ModelSelectionReason::Explicit,
+                ModelSelectionErrorKind::ExplicitTargetMissing,
+                ModelSelectionErrorKind::ExplicitTargetDisabled,
+                ModelSelectionErrorKind::ExplicitTargetIncapable,
+            ),`;
+
+function stage15MutateExactLookup(source, replacement, label) {
+  return stage15ReplaceOnce(source, STAGE15_EXACT_LOOKUP, replacement, label);
+}
+
+function stage15MutateResponseBeforeConstruction(source, statement, outputExpression = null) {
+  let mutated = stage15ReplaceOnce(
+    source,
+    '        let response = Self {',
+    `${statement.trimEnd()}\n        let response = Self {`,
+    'ModelResponse construction',
+  );
+  if (outputExpression !== null) {
+    mutated = stage15ReplaceOnce(
+      mutated,
+      '            output_items: input.output_items,',
+      `            output_items: ${outputExpression},`,
+      'ModelResponse output move',
+    );
+  }
+  return mutated;
+}
+
+function stage15MutableResponseInput(source) {
+  return stage15ReplaceOnce(
+    source,
+    'pub fn try_new(input: ModelResponseInput) -> Result<Self, ModelContractError> {',
+    'pub fn try_new(mut input: ModelResponseInput) -> Result<Self, ModelContractError> {',
+    'mutable ModelResponse input',
+  );
+}
+
+function stage15DynamicProbeDefinitions() {
+  return [
+    {
+      label: 'neutral helper whole-catalog assignment',
+      mutate(source) {
+        let mutated = stage15ReplaceOnce(
+          source,
+          '    targets: Box<[ModelTarget]>,',
+          '    targets: Vec<ModelTarget>,',
+          this.label,
+        );
+        mutated = stage15ReplaceOnce(
+          mutated,
+          '            targets: targets.into_boxed_slice(),',
+          '            targets,',
+          this.label,
+        );
+        return stage15AppendProductionHelper(mutated, `
+          impl ModelTargetSnapshot {
+              fn publish_catalog_epoch(&mut self, replacement: Vec<ModelTarget>) {
+                  transfer_entire_catalog(&mut self.targets, replacement);
+              }
+          }
+          fn transfer_entire_catalog(targets: &mut Vec<ModelTarget>, replacement: Vec<ModelTarget>) {
+              *targets = replacement;
+          }`);
+      },
+    },
+    {
+      label: 'mem::replace catalog storage',
+      mutate(source) {
+        return stage15AppendProductionHelper(source, `
+          impl ModelTargetSnapshot {
+              fn publish_replacement(&mut self, replacement: Vec<ModelTarget>) {
+                  let _old = std::mem::replace(&mut self.targets, replacement.into_boxed_slice());
+              }
+          }`);
+      },
+    },
+    {
+      label: 'alias-hidden wrapper setter',
+      mutate(source) {
+        let mutated = stage15ReplaceOnce(
+          source,
+          '#[derive(Debug)]\npub struct ModelTargetSnapshot {',
+          'type PublishedCatalog = Vec<ModelTarget>;\n\n#[derive(Debug)]\npub struct ModelTargetSnapshot {',
+          this.label,
+        );
+        mutated = stage15ReplaceOnce(
+          mutated,
+          '    targets: Box<[ModelTarget]>,',
+          '    targets: PublishedCatalog,',
+          this.label,
+        );
+        mutated = stage15ReplaceOnce(
+          mutated,
+          '            targets: targets.into_boxed_slice(),',
+          '            targets,',
+          this.label,
+        );
+        return stage15AppendProductionHelper(mutated, `
+          impl ModelTargetSnapshot {
+              fn publish_epoch(&mut self, replacement: PublishedCatalog) {
+                  self.targets = replacement;
+              }
+          }`);
+      },
+    },
+    {
+      label: 'mutable published storage type',
+      mutate(source) {
+        return stage15ReplaceOnce(
+          stage15ReplaceOnce(
+            source,
+            '    targets: Box<[ModelTarget]>,',
+            '    targets: Vec<ModelTarget>,',
+            this.label,
+          ),
+          '            targets: targets.into_boxed_slice(),',
+          '            targets,',
+          this.label,
+        );
+      },
+    },
+  ];
+}
+
+function stage15SelectorProbeDefinitions() {
+  return [
+    {
+      label: 'Option plus get-zero fallback',
+      mutate: (source) => stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| self.snapshot.targets().get(0))
+            .ok_or(ModelSelectionError(missing))?;`, 'get-zero fallback'),
+    },
+    {
+      label: 'first-target fallback',
+      mutate: (source) => stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| self.snapshot.targets().first())
+            .ok_or(ModelSelectionError(missing))?;`, 'first fallback'),
+    },
+    {
+      label: 'map values-next fallback',
+      mutate: (source) => stage15MutateExactLookup(source, `        let inventory: std::collections::BTreeMap<&ModelTargetId, &ModelTarget> = self
+            .snapshot
+            .targets()
+            .iter()
+            .map(|target| (target.reference().model_target_id(), target))
+            .collect();
+        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| inventory.values().next().copied())
+            .ok_or(ModelSelectionError(missing))?;`, 'values-next fallback'),
+    },
+    {
+      label: 'neutral helper returns last target',
+      mutate(source) {
+        return stage15AppendProductionHelper(
+          stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| candidate(self.snapshot.targets()))
+            .ok_or(ModelSelectionError(missing))?;`, this.label),
+          `fn candidate(targets: &[ModelTarget]) -> Option<&ModelTarget> { targets.last() }`,
+        );
+      },
+    },
+    {
+      label: 'explicit failure selects configured default',
+      mutate(source) {
+        return stage15ReplaceOnce(source, STAGE15_EXPLICIT_SELECTOR_ARM, `            Some(explicit_id) => self
+                .select_exact(
+                    explicit_id,
+                    required,
+                    ModelSelectionReason::Explicit,
+                    ModelSelectionErrorKind::ExplicitTargetMissing,
+                    ModelSelectionErrorKind::ExplicitTargetDisabled,
+                    ModelSelectionErrorKind::ExplicitTargetIncapable,
+                )
+                .or_else(|_| {
+                    self.select_exact(
+                        self.snapshot.default_target(),
+                        required,
+                        ModelSelectionReason::ConfiguredDefault,
+                        ModelSelectionErrorKind::DefaultTargetMissing,
+                        ModelSelectionErrorKind::DefaultTargetDisabled,
+                        ModelSelectionErrorKind::DefaultTargetIncapable,
+                    )
+                }),`, this.label);
+      },
+    },
+    {
+      label: 'default failure selects arbitrary capable target',
+      mutate: (source) => stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| {
+                (reason == ModelSelectionReason::ConfiguredDefault)
+                    .then(|| self.snapshot.targets().iter().find(|target| {
+                        target.enabled() && required.satisfied_by(target.reference().capabilities())
+                    }))
+                    .flatten()
+            })
+            .ok_or(ModelSelectionError(missing))?;`, 'default arbitrary fallback'),
+    },
+  ];
+}
+
+function stage15OutputProbeDefinitions() {
+  const mutableInput = (source, statement) => stage15MutateResponseBeforeConstruction(
+    stage15MutableResponseInput(source),
+    statement,
+  );
+  return [
+    {
+      label: 'as_mut_slice swap',
+      mutate: (source) => mutableInput(source, `        if input.output_items.len() > 1 {
+            input.output_items.as_mut_slice().swap(0, 1);
+        }`),
+    },
+    {
+      label: 'mutable slice rotate',
+      mutate: (source) => mutableInput(source, `        if input.output_items.len() > 1 {
+            let slice = &mut input.output_items[..];
+            slice.rotate_left(1);
+        }`),
+    },
+    {
+      label: 'arbitrary helper receives mutable output Vec',
+      mutate(source) {
+        return stage15AppendProductionHelper(
+          mutableInput(source, '        mutate_canonical_output(&mut input.output_items);'),
+          `fn mutate_canonical_output(items: &mut Vec<ModelOutputItem>) {
+              if items.len() > 1 { items.reverse(); }
+          }`,
+        );
+      },
+    },
+    {
+      label: 'remove and reinsert output item',
+      mutate: (source) => mutableInput(source, `        if input.output_items.len() > 1 {
+            let first = input.output_items.remove(0);
+            input.output_items.insert(1, first);
+        }`),
+    },
+    {
+      label: 'reverse iterator reconstruction',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(
+        source,
+        `        let output_items = input.output_items.into_iter().rev().collect();`,
+        'output_items',
+      ),
+    },
+  ];
+}
+
+function stage15UnknownProbeDefinitions() {
+  return [
+    {
+      label: 'fold drops unknown provider item',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let output_items = input.output_items.into_iter().fold(
+            Vec::new(),
+            |mut acc, item| {
+                if !matches!(item, ModelOutputItem::UnknownProviderItem(_)) {
+                    acc.push(item);
+                }
+                acc
+            },
+        );`, 'output_items'),
+    },
+    {
+      label: 'partition discards unknown half',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let (output_items, _discarded): (Vec<_>, Vec<_>) = input
+            .output_items
+            .into_iter()
+            .partition(|item| !matches!(item, ModelOutputItem::UnknownProviderItem(_)));`, 'output_items'),
+    },
+    {
+      label: 'filter_map drops unknown item',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let output_items = input
+            .output_items
+            .into_iter()
+            .filter_map(|item| match item {
+                ModelOutputItem::UnknownProviderItem(_) => None,
+                known => Some(known),
+            })
+            .collect();`, 'output_items'),
+    },
+    {
+      label: 'helper returns recognized subset',
+      mutate(source) {
+        return stage15AppendProductionHelper(
+          stage15MutateResponseBeforeConstruction(
+            source,
+            '        let output_items = only_supported_items(input.output_items);',
+            'output_items',
+          ),
+          `fn only_supported_items(items: Vec<ModelOutputItem>) -> Vec<ModelOutputItem> {
+              items
+                  .into_iter()
+                  .filter(|item| !matches!(item, ModelOutputItem::UnknownProviderItem(_)))
+                  .collect()
+          }`,
+        );
+      },
+    },
+    {
+      label: 'unknown match arm continues',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let mut output_items = Vec::new();
+        for item in input.output_items {
+            if matches!(item, ModelOutputItem::UnknownProviderItem(_)) {
+                continue;
+            }
+            output_items.push(item);
+        }`, 'output_items'),
+    },
+  ];
+}
+
+function stage15NovelProbeDefinitions() {
+  return [
+    {
+      className: 'dynamic registry',
+      label: 'mem::swap immutable catalog field',
+      path: 'backend/src/application/model_selection.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        impl ModelTargetSnapshot {
+            fn exchange_epoch(&mut self, replacement: Vec<ModelTarget>) {
+                let mut replacement = replacement.into_boxed_slice();
+                std::mem::swap(&mut self.targets, &mut replacement);
+            }
+        }`),
+    },
+    {
+      className: 'dynamic registry',
+      label: 'mem::take immutable catalog field',
+      path: 'backend/src/application/model_selection.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        impl ModelTargetSnapshot {
+            fn empty_epoch(&mut self) {
+                let _old = std::mem::take(&mut self.targets);
+            }
+        }`),
+    },
+    {
+      className: 'selector provenance',
+      label: 'slice index one fallback',
+      path: 'backend/src/application/model_selection.rs',
+      mutate: (source) => stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| self.snapshot.targets().get(1))
+            .ok_or(ModelSelectionError(missing))?;`, 'slice index fallback'),
+    },
+    {
+      className: 'selector provenance',
+      label: 'neutral nth helper fallback',
+      path: 'backend/src/application/model_selection.rs',
+      mutate(source) {
+        return stage15AppendProductionHelper(
+          stage15MutateExactLookup(source, `        let target = self
+            .snapshot
+            .target(target_id)
+            .or_else(|| later_candidate(self.snapshot.targets()))
+            .ok_or(ModelSelectionError(missing))?;`, this.label),
+          `fn later_candidate(targets: &[ModelTarget]) -> Option<&ModelTarget> {
+              targets.iter().nth(1)
+          }`,
+        );
+      },
+    },
+    {
+      className: 'output order',
+      label: 'subslice rotate-right',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let mut output_items = input.output_items;
+        if output_items.len() > 1 {
+            output_items[0..2].rotate_right(1);
+        }`, 'output_items'),
+    },
+    {
+      className: 'output order',
+      label: 'pop last and insert first',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let mut output_items = input.output_items;
+        if output_items.len() > 1 {
+            let last = output_items.pop().expect("length checked");
+            output_items.insert(0, last);
+        }`, 'output_items'),
+    },
+    {
+      className: 'unknown conservation',
+      label: 'scan terminates at unknown item',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let output_items = input
+            .output_items
+            .into_iter()
+            .scan((), |(), item| match item {
+                ModelOutputItem::UnknownProviderItem(_) => None,
+                known => Some(known),
+            })
+            .collect();`, 'output_items'),
+    },
+    {
+      className: 'unknown conservation',
+      label: 'take_while truncates at unknown item',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15MutateResponseBeforeConstruction(source, `        let output_items = input
+            .output_items
+            .into_iter()
+            .take_while(|item| !matches!(item, ModelOutputItem::UnknownProviderItem(_)))
+            .collect();`, 'output_items'),
+    },
+  ];
+}
+
+function stage15ControlDefinitions() {
+  return [
+    {
+      label: 'mutable constructor builder',
+      path: 'backend/src/application/model_selection.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        fn build_control_catalog(mut targets: Vec<ModelTarget>) -> Box<[ModelTarget]> {
+            targets.sort_by(|left, right| left.reference().model_target_id().cmp(
+                right.reference().model_target_id(),
+            ));
+            targets.into_boxed_slice()
+        }`),
+    },
+    {
+      label: 'considered target ID iteration',
+      path: 'backend/src/application/model_selection.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        fn diagnostic_control_ids(snapshot: &ModelTargetSnapshot) -> Vec<ModelTargetId> {
+            snapshot
+                .targets()
+                .iter()
+                .map(|target| target.reference().model_target_id().clone())
+                .collect()
+        }`),
+    },
+    {
+      label: 'model-target sorting',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        fn sort_model_target_control(mut targets: Vec<ModelTarget>) -> Vec<ModelTarget> {
+            targets.sort_by(|left, right| {
+                left.reference().model_target_id().cmp(right.reference().model_target_id())
+            });
+            targets
+        }`),
+    },
+    {
+      label: 'canonical JSON key sorting',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        fn canonicalize_json_control(mut keys: Vec<String>) -> Vec<String> {
+            keys.sort();
+            keys
+        }`),
+    },
+    {
+      label: 'unrelated fixture filtering',
+      path: 'backend/src/domain/model.rs',
+      mutate: (source) => stage15AppendProductionHelper(source, `
+        fn select_fixture_control(rows: Vec<u64>) -> Vec<u64> {
+            rows.into_iter().filter(|row| *row > 0).collect()
+        }`),
+    },
+  ];
+}
+
+function stage15CompilationProbeDefinitions() {
+  const selectionPath = 'backend/src/application/model_selection.rs';
+  const modelPath = 'backend/src/domain/model.rs';
+  const builtIn = [
+    ...stage15DynamicProbeDefinitions().map((probe) => ({
+      ...probe,
+      className: 'dynamic registry',
+      path: selectionPath,
+    })),
+    ...stage15SelectorProbeDefinitions().map((probe) => ({
+      ...probe,
+      className: 'selector provenance',
+      path: selectionPath,
+    })),
+    ...stage15OutputProbeDefinitions().map((probe) => ({
+      ...probe,
+      className: 'output order',
+      path: modelPath,
+    })),
+    ...stage15UnknownProbeDefinitions().map((probe) => ({
+      ...probe,
+      className: 'unknown conservation',
+      path: modelPath,
+    })),
+  ];
+  return { builtIn, novel: stage15NovelProbeDefinitions(), controls: stage15ControlDefinitions() };
+}
+
+function stage15CopyProbeRepository(destination) {
+  cpSync(repositoryRoot, destination, {
+    recursive: true,
+    filter(source) {
+      const path = relative(repositoryRoot, source);
+      return path === '' || !/^(?:\.git|target)(?:\/|$)/.test(path);
+    },
+  });
+}
+
+function stage15RunCompilationCase(probeRepository, targetDirectory, probe, expectRejection) {
+  const path = join(probeRepository, probe.path);
+  const original = readFileSync(path, 'utf8');
+  const mutated = probe.mutate(original);
+  assert(mutated !== original, `Stage 15 compilation probe did not mutate source: ${probe.label}`);
+  writeFileSync(path, mutated);
+  try {
+    const compile = spawnSync(
+      'cargo',
+      ['check', '--locked', '--workspace', '--all-targets'],
+      {
+        cwd: probeRepository,
+        encoding: 'utf8',
+        env: { ...process.env, CARGO_TARGET_DIR: targetDirectory },
+        maxBuffer: 16 * 1024 * 1024,
+      },
+    );
+    assert(
+      compile.status === 0,
+      `Stage 15 compilation-gated probe did not compile: ${probe.label}: ${
+        compile.stderr.trim() || compile.stdout.trim() || `exit status ${compile.status}`
+      }`,
+    );
+    const checker = spawnSync(
+      process.execPath,
+      ['scripts/check-repository.mjs', '--stage15-probe-only'],
+      { cwd: probeRepository, encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 },
+    );
+    if (expectRejection) {
+      assert(
+        checker.status !== 0 && /Repository invariant failed:/.test(checker.stderr),
+        `compiling forbidden mutation was not rejected by the Stage 15 checker: ${probe.label}`,
+      );
+    } else {
+      assert(
+        checker.status === 0,
+        `compiling legitimate control was rejected by the Stage 15 checker: ${probe.label}: ${
+          checker.stderr.trim() || checker.stdout.trim() || `exit status ${checker.status}`
+        }`,
+      );
+    }
+  } finally {
+    writeFileSync(path, original);
+  }
+}
+
+function verifyStage15CompilationGatedProbes() {
+  const definitions = stage15CompilationProbeDefinitions();
+  assert(definitions.builtIn.length === 20, 'Stage 15 built-in compilation probe inventory differs');
+  assert(definitions.novel.length === 8, 'Stage 15 novel mutation inventory differs');
+  assert(definitions.controls.length === 5, 'Stage 15 compilation-gated control inventory differs');
+  const temporaryRoot = mkdtempSync(join(tmpdir(), 'craxii-stage15-probes-'));
+  const probeRepository = join(temporaryRoot, 'repository');
+  const targetDirectory = join(temporaryRoot, 'target');
+  try {
+    stage15CopyProbeRepository(probeRepository);
+    for (const probe of [...definitions.builtIn, ...definitions.novel]) {
+      stage15RunCompilationCase(probeRepository, targetDirectory, probe, true);
+    }
+    for (const control of definitions.controls) {
+      stage15RunCompilationCase(probeRepository, targetDirectory, control, false);
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+  return {
+    negativeProbeCount: definitions.builtIn.length + definitions.novel.length,
+    builtInCount: definitions.builtIn.length,
+    novelCount: definitions.novel.length,
+    controlCount: definitions.controls.length,
+  };
+}
+
+function verifyStage15ProbeRepository() {
+  const files = [
+    ['application/model_selection.rs', 'backend/src/application/model_selection.rs'],
+    ['domain/model.rs', 'backend/src/domain/model.rs'],
+  ];
+  const violations = files.flatMap(([checkerPath, repositoryPath]) =>
+    stage15ProductionViolations({
+      path: checkerPath,
+      source: readFileSync(join(repositoryRoot, repositoryPath), 'utf8'),
+    }).map((violation) => `${checkerPath}: ${violation}`),
+  );
+  assert(violations.length === 0, `Stage 15 probe boundary differs: ${violations.join(', ')}`);
+}
+
+function stage15MigrationViolations(names) {
+  return names.filter((name) => /^000(?:[4-9]|[1-9][0-9]+)_.*\.sql$/.test(name));
+}
+
+function stage15ReadinessViolations(source) {
+  const violations = [];
+  if (/mark_ready\s*\(/.test(source)) violations.push('readiness promotion');
+  if (/start_scheduler\s*\(/.test(source)) violations.push('scheduler activation');
+  return violations;
+}
+
+function verifyStage15CanonicalModelStructure(rustRoot, productionFiles) {
+  const expectedModules = [
+    'adapters/scripted_provider.rs',
+    'application/model_selection.rs',
+    'domain/model.rs',
+    'ports/model_provider.rs',
+  ];
+  const actualModules = productionFiles
+    .map((file) => file.path)
+    .filter((path) => /(?:^|\/)(?:model|model_selection|model_provider|scripted_provider)\.rs$/.test(path));
+  assert(
+    equalStringArrays(sortedStrings(actualModules), expectedModules),
+    `Stage 15 production module allowlist differs: ${actualModules.join(', ')}`,
+  );
+  for (const file of productionFiles) {
+    const violations = stage15ProductionViolations(file);
+    assert(
+      violations.length === 0,
+      `Stage 15 boundary differs in ${file.path}: ${violations.join(', ')}`,
+    );
+  }
+  const stage16Leaks = stage16PlusImplementationLeaks(productionFiles);
+  assert(stage16Leaks.length === 0, `Stage 16+ implementation is forbidden: ${stage16Leaks.join(', ')}`);
+
+  const model = readFileSync(join(rustRoot, 'domain', 'model.rs'), 'utf8');
+  const selection = readFileSync(join(rustRoot, 'application', 'model_selection.rs'), 'utf8');
+  const provider = readFileSync(join(rustRoot, 'ports', 'model_provider.rs'), 'utf8');
+  const providerContract = readFileSync(
+    join(rustRoot, 'ports', 'model_provider', 'provider_contract.rs'),
+    'utf8',
+  );
+  const scripted = readFileSync(join(rustRoot, 'adapters', 'scripted_provider.rs'), 'utf8');
+  const bootstrap = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
+  const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
+
+  assert(
+    /MAX_MODEL_OUTPUT_ITEMS:\s*usize\s*=\s*64;/.test(model) &&
+      /MAX_MODEL_TOOL_ARGUMENT_BYTES:\s*usize\s*=\s*65_536;/.test(model) &&
+      /MAX_NORMALIZED_MODEL_RESPONSE_BYTES:\s*usize\s*=\s*262_144;/.test(model),
+    'Stage 15 canonical output limits differ',
+  );
+  for (const variant of [
+    'Text', 'ToolCall', 'StructuredData', 'Refusal', 'ReasoningSummary',
+    'ProviderOpaque', 'UnknownProviderItem',
+  ]) {
+    assert(new RegExp(`\\b${variant}\\b`).test(extractRustNamedBlock(model, /pub\s+enum\s+ModelOutputItem\b/, 'ModelOutputItem')), `Stage 15 output variant is absent: ${variant}`);
+  }
+  assert(
+    /pub\s+const\s+fn\s+parallel_tool_calls\([^)]*\)\s*->\s*bool\s*\{\s*false\s*\}/s.test(model) &&
+      /"parallel_tool_calls":\s*false/.test(model),
+    'Stage 15 request must freeze parallel_tool_calls=false',
+  );
+  assert(
+    /pub\s+struct\s+ModelUsage\b/.test(model) &&
+      /cached_input_tokens\s*>\s*input_tokens/.test(model) &&
+      /reasoning_tokens\s*>\s*output_tokens/.test(model) &&
+      /total_tokens\s*!=\s*calculated/.test(model),
+    'Stage 15 usage validation is incomplete',
+  );
+  assert(
+    /UnknownProviderItem/.test(model) && /require_supported_semantics/.test(model) &&
+      /UnknownSemanticItem/.test(model),
+    'Stage 15 unknown semantic item is not retained and rejected',
+  );
+  assert(
+    /canonical_json_bytes/.test(model) && /Sha256Digest::hash_bytes/.test(model) &&
+      /keys\.sort_by/.test(model),
+    'Stage 15 canonical JSON/SHA-256 contract is incomplete',
+  );
+  assert(
+    !/chain_of_thought|hidden_reasoning|private_reasoning/i.test(model) &&
+      !/\b(?:OpenAI|ResponsesApi|SseEvent)\b/.test(model),
+    'Stage 15 canonical model module contains hidden reasoning or provider wire types',
+  );
+
+  assert(
+    /targets\.sort_by/.test(selection) && /targets:\s*Box<\[ModelTarget\]>/.test(selection) &&
+      !/pub\s+fn\s+(?:insert|register|remove|update)/.test(selection),
+    'Stage 15 target snapshot is not immutable and deterministically ordered',
+  );
+  assert(
+    /match\s+explicit\s*\{[\s\S]*Some\(explicit_id\)\s*=>\s*self\.select_exact\s*\(/.test(selection) &&
+      /None\s*=>\s*self\.select_exact\s*\([\s\S]*self\.snapshot\.default_target\(\)/.test(selection) &&
+      /ExplicitTargetMissing/.test(selection) && /DefaultTargetMissing/.test(selection) &&
+      !/fallback/i.test(stripRustComments(withoutRustTestModules(selection))),
+    'Stage 15 exact explicit/default no-fallback selection differs',
+  );
+  assert(
+    /ConfigFingerprint/.test(readFileSync(join(rustRoot, 'bootstrap', 'config', 'fingerprint.rs'), 'utf8')) &&
+      /semantic_target_changes_alter_the_single_global_config_fingerprint/.test(selection),
+    'Stage 15 does not prove the existing global config fingerprint binds target semantics',
+  );
+
+  assert(
+    /pub\s+trait\s+ModelProvider:\s*Send\s*\+\s*Sync/.test(provider) &&
+      /pub\s+trait\s+ModelProviderStream:\s*Send/.test(provider) &&
+      /pub\s+trait\s+TokenEstimator:\s*Send\s*\+\s*Sync/.test(provider),
+    'Stage 15 provider/stream/estimator ports are absent or not object-safe',
+  );
+  for (const category of [
+    'Authentication', 'Authorization', 'InvalidRequest', 'UnknownModel', 'RateLimited',
+    'TemporarilyUnavailable', 'TransportBeforeResponse', 'TransportAfterPossibleProcessing',
+    'TimeoutBeforeOutput', 'TimeoutAfterOutput', 'MalformedResponse',
+    'MalformedCompletedToolArguments', 'OutputTooLarge', 'UnsupportedResponseItem',
+    'ContextError', 'SafetyRefusal', 'Cancelled', 'ProviderOutcomeUnknown',
+    'InternalProviderError',
+  ]) {
+    assert(new RegExp(`\\b${category}\\b`).test(provider), `Stage 15 provider error category is absent: ${category}`);
+  }
+  assert(
+    /MAX_PROVIDER_ATTEMPTS:\s*u32\s*=\s*3/.test(provider) &&
+      /Duration::from_millis\(250\)/.test(provider) &&
+      /Duration::from_secs\(5\)/.test(provider) &&
+      /Duration::from_secs\(30\)/.test(provider) &&
+      /Duration::from_secs\(5\s*\*\s*60\)/.test(provider) &&
+      /Duration::from_secs\(60\)/.test(provider),
+    'Stage 15 retry/backoff/deadline constants differ',
+  );
+
+  assert(
+    /impl\s+ModelProvider\s+for\s+ScriptedProvider/.test(scripted) &&
+      /ScriptedStep::AwaitRelease/.test(scripted) && /ScriptMismatch/.test(scripted) &&
+      /impl\s+TokenEstimator\s+for\s+ScriptedTokenEstimator/.test(scripted) &&
+      /clock:\s*Arc<dyn Clock>/.test(scripted) &&
+      /expected:\s*Box<\[ScriptedEstimate\]>/.test(scripted) &&
+      !/expected:\s*Mutex<VecDeque<ScriptedEstimate>>/.test(scripted),
+    'Stage 15 deterministic scripted provider/estimator is incomplete',
+  );
+  assert(
+    /trait\s+ModelProviderContractFixture/.test(providerContract) &&
+      /assert_model_provider_contract/.test(providerContract) &&
+      /Arc<dyn ModelProvider>/.test(providerContract) &&
+      !/ScriptedProvider|ScriptedStream|ScriptedProgram|captures\s*\(/.test(providerContract),
+    'Stage 15 provider contract suite is not reusable through the public provider port',
+  );
+  for (const testName of [
+    'scripted_text_only_completion_is_ordered_and_captured_once',
+    'scripted_one_tool_call_preserves_identity_name_and_arguments',
+    'scripted_text_then_tool_call_preserves_provider_order',
+    'scripted_multiple_tool_calls_preserve_exact_ordinals',
+    'scripted_refusal_is_semantic_output_not_transport_failure',
+    'scripted_structured_data_preserves_canonical_json',
+    'scripted_reasoning_summary_exposes_only_summary_delta',
+    'scripted_opaque_continuation_retains_provider_hash_and_type',
+    'scripted_transient_pre_output_failure_is_retry_eligible',
+    'scripted_failure_after_semantic_output_is_never_retryable',
+    'scripted_malformed_tool_arguments_are_retained_then_fail_closed',
+    'scripted_oversized_tool_arguments_are_rejected_before_emission',
+    'scripted_duplicate_provider_tool_ids_fail_closed_without_item_drop',
+    'scripted_timeout_before_output_is_retry_eligible',
+    'scripted_timeout_after_output_is_not_retryable',
+    'scripted_cancellation_uses_barrier_and_records_observation_without_sleep',
+    'scripted_unknown_provider_item_is_retained_and_rejected_semantically',
+    'scripted_request_hash_mismatch_fails_deterministically_before_stream',
+    'scripted_machine_inspection_answer_fixture_is_deterministic',
+    'scripted_stream_preserves_all_events_and_rejects_post_terminal_ordering',
+    'response_terminal_consistency_matrix_fails_closed',
+    'response_terminal_mixed_combinations_make_contradictions_explicit',
+    'scripted_complete_multi_tool_lifecycle_preserves_order_without_execution',
+    'scripted_program_rejects_every_post_terminal_residue_before_emission',
+    'scripted_emitted_provider_error_capture_preserves_terminal_certainty',
+    'scripted_overall_deadline_expires_before_first_event_without_sleep',
+    'scripted_idle_timeout_classification_uses_shared_semantic_predicate',
+    'scripted_timeout_threshold_completion_and_cancellation_precedence_are_frozen',
+    'scripted_token_estimator_is_immutable_by_canonical_input_identity',
+    'reusable_model_provider_contract_suite_passes_via_public_port_only',
+  ]) {
+    assert(
+      new RegExp(`(?:async\\s+)?fn\\s+${testName}\\s*\\(`).test(`${model}\n${scripted}`),
+      `Stage 15 permanent provider test is absent: ${testName}`,
+    );
+  }
+
+  assert(
+    /ModelTargetSnapshot::from_validated_config\(config\.models\(\)\)/.test(bootstrap) &&
+      /ModelSelectionPolicy::new\(model_targets\)/.test(bootstrap) &&
+      !/ScriptedProvider/.test(bootstrap),
+    'Stage 15 bootstrap must compose only the immutable target snapshot and selector',
+  );
+  assert(!/^reqwest\s*=/m.test(cargoManifest), 'Reqwest must remain absent through Stage 15');
+  assert(
+    !/ContextManifestId::generate|ContextManifest::(?:new|try_new)/.test(`${model}\n${selection}\n${provider}\n${scripted}`),
+    'Stage 16 context manifest construction is forbidden in Stage 15',
+  );
+  assert(
+    stage15ReadinessViolations(bootstrap).length === 0,
+    'Stage 15 must not activate Scheduler/WorkRunner or promote readiness',
+  );
+  return verifyStage15CheckerNegativeProbes();
 }
 
 function verifyDirectDependencies(metadata, workspacePackages) {
@@ -2952,8 +4605,14 @@ function verifyStage13Boundaries() {
     rustRoot,
     productionImplementationFiles,
   );
+  const stage15Checker = verifyStage15CanonicalModelStructure(
+    rustRoot,
+    productionImplementationFiles,
+  );
+  const stage15CheckerNegativeProbeCount = stage15Checker.negativeProbeCount;
   const checkerNegativeProbeCount =
-    stage13CheckerNegativeProbeCount + stage14CheckerNegativeProbeCount;
+    stage13CheckerNegativeProbeCount + stage14CheckerNegativeProbeCount +
+    stage15CheckerNegativeProbeCount;
 
   assert(
     /^tokio\s*=\s*\{[^\n]*features\s*=\s*\["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"\][^\n]*\}$/m.test(cargoManifest) &&
@@ -2977,10 +4636,24 @@ function verifyStage13Boundaries() {
     checkerNegativeProbeCount,
     stage13CheckerNegativeProbeCount,
     stage14CheckerNegativeProbeCount,
+    stage15CheckerNegativeProbeCount,
+    stage15RetainedStructuralProbeCount: stage15Checker.retainedStructuralProbeCount,
+    stage15CompilationGatedNegativeProbeCount:
+      stage15Checker.compilationGatedNegativeProbeCount,
+    stage15CompilationGatedCaseCount: stage15Checker.compilationGatedCaseCount,
+    stage15BuiltInCompilationGatedProbeCount:
+      stage15Checker.builtInCompilationGatedProbeCount,
+    stage15NovelChallengeMutationCount: stage15Checker.novelChallengeMutationCount,
+    stage15FalsePositiveCompilationGatedControlCount:
+      stage15Checker.falsePositiveCompilationGatedControlCount,
   };
 }
 
 try {
+  if (process.argv[2] === '--stage15-probe-only') {
+    verifyStage15ProbeRepository();
+    console.log('Stage 15 structural invariants passed.');
+  } else {
   const metadata = cargoMetadata();
   assert(
     Array.isArray(metadata.workspace_members) && metadata.workspace_members.length === 1,
@@ -3035,16 +4708,30 @@ try {
     'craxii-v0.0.01-implementation-plan.md',
     'craxii-v0.0.01-implementation-plan.html',
   );
-  const stage14 = verifyStage13Boundaries();
+  const stage15 = verifyStage13Boundaries();
 
   assert(
     directDependencyCount > 0 &&
-      stage14.stage13CheckerNegativeProbeCount === 19 &&
-      stage14.stage14CheckerNegativeProbeCount === 30 &&
-      stage14.checkerNegativeProbeCount === 49,
+      stage15.stage13CheckerNegativeProbeCount === 19 &&
+      stage15.stage14CheckerNegativeProbeCount === 30 &&
+      stage15.stage15RetainedStructuralProbeCount === 65 &&
+      stage15.stage15BuiltInCompilationGatedProbeCount === 20 &&
+      stage15.stage15CompilationGatedNegativeProbeCount === 28 &&
+      stage15.stage15CompilationGatedCaseCount === 33 &&
+      stage15.stage15NovelChallengeMutationCount === 8 &&
+      stage15.stage15FalsePositiveCompilationGatedControlCount === 5 &&
+      stage15.stage15CheckerNegativeProbeCount === 93 &&
+      stage15.checkerNegativeProbeCount === 142,
     'checker summary evidence is incomplete',
   );
-  console.log('Stage 14 structural invariants passed.');
+  console.log('Stage 13 retained checker probes: 19.');
+  console.log('Stage 14 retained checker probes: 30.');
+  console.log('Stage 15 retained structural probes: 65.');
+  console.log('Stage 15 compilation-gated negative probes: 28 (20 built-in, 8 novel).');
+  console.log('Stage 15 false-positive compilation-gated controls: 5.');
+  console.log('Stage 15 checker negative probes passed: 93 (142 total retained).');
+  console.log('Stage 15 structural invariants passed.');
+  }
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);
   process.exitCode = 1;

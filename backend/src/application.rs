@@ -11,6 +11,7 @@ pub mod authority;
 pub mod command_gateway;
 pub mod command_service;
 pub mod device_provisioning;
+pub mod model_selection;
 pub mod projector;
 pub mod publication;
 pub mod runtime;

@@ -16,6 +16,7 @@ use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
 use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
+use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
 use crate::application::runtime::{
     HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
 };
@@ -63,6 +64,11 @@ pub async fn run(
 ) -> Result<RunningBootstrap, StartupError> {
     let cli = Cli::parse(arguments)?;
     let config = config::load(&cli.config_path).map_err(|_| StartupError::Configuration)?;
+    let model_targets = Arc::new(
+        ModelTargetSnapshot::from_validated_config(config.models())
+            .map_err(|_| StartupError::Configuration)?,
+    );
+    let model_selection_policy = ModelSelectionPolicy::new(model_targets);
     let clock = Arc::new(SystemClock::new());
     let build = BuildMetadata::embedded().map_err(|_| StartupError::BuildMetadata)?;
     let process = ProcessMetadata::capture(build, config.fingerprint(), clock.as_ref())
@@ -303,6 +309,7 @@ pub async fn run(
         workstation,
         local_workstation,
         tool_execution_service,
+        model_selection_policy,
         shutdown,
         mutation_admission,
         server,
@@ -386,6 +393,7 @@ pub struct RunningBootstrap {
     workstation: Arc<dyn Workstation>,
     local_workstation: Arc<LocalWorkstation>,
     tool_execution_service: Arc<ToolExecutionService>,
+    model_selection_policy: ModelSelectionPolicy,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
     server: ServerHandle,
@@ -426,6 +434,16 @@ impl RunningBootstrap {
     #[must_use]
     pub fn tool_execution_service(&self) -> &Arc<ToolExecutionService> {
         &self.tool_execution_service
+    }
+
+    #[must_use]
+    pub const fn model_selection_policy(&self) -> &ModelSelectionPolicy {
+        &self.model_selection_policy
+    }
+
+    #[must_use]
+    pub fn model_target_snapshot(&self) -> &ModelTargetSnapshot {
+        self.model_selection_policy.snapshot().as_ref()
     }
 
     pub async fn wait_for_shutdown_request(&mut self) -> Result<(), StartupError> {
