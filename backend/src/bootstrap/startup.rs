@@ -10,12 +10,20 @@ use crate::adapters::http::{ConnectionRegistry, HttpState, ServerHandle};
 use crate::adapters::local_workstation::{
     LocalWorkstation, LocalWorkstationOptions, observe_execution_support,
 };
+use crate::adapters::openai::{OpenAiConservativeEstimator, OpenAiProvider};
 use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
 use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
 use crate::adapters::system_clock::SystemClock;
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
-use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
+use crate::application::agent_loop::{AgentLoop, AgentLoopLimits, AgentLoopRuntimeContext};
+use crate::application::authority::{
+    AuthorityEvaluator, V0AuthorityConstraints, V0AuthorityEvaluator,
+};
+use crate::application::context_assembler::{
+    ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
+};
+use crate::application::model_gateway::{ModelGateway, ModelGatewayLimits, NoopDraftSink};
 use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
 use crate::application::runtime::{
     HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
@@ -24,6 +32,7 @@ use crate::application::tool_execution_service::{ToolExecutionService, ToolRunti
 use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::application::transport::{CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::config;
+use crate::bootstrap::credential::load_credentials;
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
 use crate::domain::{
@@ -31,12 +40,15 @@ use crate::domain::{
     RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput, SchemaVersion,
     UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
 };
+use crate::domain::model::RequiredModelCapabilities;
 use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
 use crate::ports::clock::Clock;
+use crate::ports::context_source_store::ContextSourceStore;
+use crate::ports::model_provider::{FullJitterSource, ModelProvider, TokenEstimator};
 use crate::ports::runtime_observation::RuntimeProcessObserver;
 use crate::ports::state_store::{
-    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, RuntimeStateStore,
-    StateStoreErrorKind, ToolStateStore, V0IdentityReference,
+    BootstrapObservation, BootstrapStateStore, LoadOrBootstrapIdentityRequest, ModelStateStore,
+    RuntimeStateStore, StateStoreErrorKind, ToolStateStore, V0IdentityReference,
 };
 use crate::ports::workstation::Workstation;
 use crate::ports::workstation_preparation::WorkstationPreparation;
@@ -68,8 +80,23 @@ pub async fn run(
         ModelTargetSnapshot::from_validated_config(config.models())
             .map_err(|_| StartupError::Configuration)?,
     );
-    let model_selection_policy = ModelSelectionPolicy::new(model_targets);
+    let model_selection_policy = Arc::new(ModelSelectionPolicy::new(Arc::clone(&model_targets)));
+    let credentials = load_credentials(
+        config.credentials().source(),
+        config
+            .models()
+            .targets()
+            .iter()
+            .filter(|target| target.enabled())
+            .map(|target| target.credential()),
+    )
+    .map_err(|_| StartupError::ProviderCredential)?;
     let clock = Arc::new(SystemClock::new());
+    let provider_clock: Arc<dyn Clock> = clock.clone();
+    let model_provider: Arc<dyn ModelProvider> = Arc::new(
+        OpenAiProvider::try_new(credentials, provider_clock)
+            .map_err(|_| StartupError::ProviderComposition)?,
+    );
     let build = BuildMetadata::embedded().map_err(|_| StartupError::BuildMetadata)?;
     let process = ProcessMetadata::capture(build, config.fingerprint(), clock.as_ref())
         .map_err(|_| StartupError::Clock)?;
@@ -263,7 +290,7 @@ pub async fn run(
     let tool_clock: Arc<dyn Clock> = clock.clone();
     let tool_execution_service = Arc::new(
         ToolExecutionService::new(
-            tool_registry,
+            Arc::clone(&tool_registry),
             authority,
             tool_state_store,
             tool_workstation,
@@ -287,6 +314,90 @@ pub async fn run(
         )
         .map_err(|_| StartupError::WorkstationLifecycle)?,
     );
+    let default_target = model_targets
+        .target(model_targets.default_target())
+        .ok_or(StartupError::ProviderComposition)?;
+    let estimator: Arc<dyn TokenEstimator> = Arc::new(OpenAiConservativeEstimator::new(
+        default_target.estimator().clone(),
+    ));
+    let source_store: Arc<dyn ContextSourceStore> = state_store.clone();
+    let context_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let context_clock: Arc<dyn Clock> = clock.clone();
+    let context_assembler = Arc::new(ContextAssembler::new(
+        source_store,
+        Some(context_artifacts),
+        estimator,
+        Arc::clone(&tool_registry),
+        VersionedInstructionSnapshot::v0(),
+        context_clock,
+    ));
+    let model_store: Arc<dyn ModelStateStore> = state_store.clone();
+    let model_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let model_clock: Arc<dyn Clock> = clock.clone();
+    let model_gateway = Arc::new(
+        ModelGateway::new(
+            model_store,
+            model_artifacts,
+            model_provider,
+            Arc::new(NoopDraftSink),
+            model_clock,
+            Box::new(SystemJitter),
+            ModelGatewayLimits::default(),
+        )
+        .map_err(|_| StartupError::ProviderComposition)?,
+    );
+    let loop_store: Arc<dyn crate::application::agent_loop::AgentLoopStateStore> =
+        state_store.clone();
+    let loop_clock: Arc<dyn Clock> = clock.clone();
+    let required_capabilities = RequiredModelCapabilities {
+        text_input: true,
+        text_output: true,
+        custom_tool_calling: true,
+        streaming: true,
+        ordered_output_items: true,
+        structured_output: true,
+        reasoning_continuation: default_target
+            .provider_native_options()
+            .reasoning_continuation(),
+        required_output_tokens: default_target.requested_output_tokens(),
+    };
+    let runner = Arc::new(
+        AgentLoop::new(
+            Arc::clone(&model_selection_policy),
+            context_assembler,
+            ContextAssemblyVersions::v0(),
+            model_gateway,
+            Arc::clone(&tool_execution_service),
+            loop_store,
+            loop_clock,
+            required_capabilities,
+            AgentLoopRuntimeContext {
+                workstation: snapshot.workstation.clone(),
+                workspace: snapshot.workspace.clone(),
+                authority_constraints: V0AuthorityConstraints::default(),
+            },
+            AgentLoopLimits::default(),
+        )
+        .map_err(|_| StartupError::ProviderComposition)?,
+    );
+    let scheduler = crate::application::scheduler::start_scheduler(
+        Arc::clone(&state_store),
+        runner,
+        Arc::clone(&clock),
+        health.clone(),
+        fatal.clone(),
+        crate::application::scheduler::SchedulerStart {
+            runtime_instance_id: runtime.runtime_instance_id,
+            conversation_id: snapshot.identity.conversation_id,
+            readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
+        },
+    )
+    .map_err(|_| StartupError::RuntimeLifecycle)?;
+    let scheduler_notifier = scheduler.notifier();
+    shutdown
+        .install_scheduler(scheduler)
+        .await
+        .map_err(|_| StartupError::RuntimeLifecycle)?;
     let http_state = HttpState::new(
         Arc::clone(&state_store),
         Arc::clone(&clock),
@@ -298,6 +409,7 @@ pub async fn run(
         connections,
         allowed_hosts(&config)?,
         Some(controlled_shutdown),
+        Some(scheduler_notifier),
     );
     let server = ServerHandle::start(listener, http_state);
     Ok(RunningBootstrap {
@@ -380,6 +492,22 @@ fn bootstrap_observation(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SystemJitter;
+
+impl FullJitterSource for SystemJitter {
+    fn sample_inclusive(&mut self, upper_bound: u64) -> u64 {
+        if upper_bound == 0 {
+            return 0;
+        }
+        let mut bytes = [0_u8; 8];
+        if getrandom::fill(&mut bytes).is_err() {
+            return 0;
+        }
+        u64::from_le_bytes(bytes) % upper_bound.saturating_add(1)
+    }
+}
+
 /// Successful Stage 7 bootstrap ownership.
 ///
 /// This guard keeps the database pool and process lock alive without making the application layer
@@ -393,7 +521,7 @@ pub struct RunningBootstrap {
     workstation: Arc<dyn Workstation>,
     local_workstation: Arc<LocalWorkstation>,
     tool_execution_service: Arc<ToolExecutionService>,
-    model_selection_policy: ModelSelectionPolicy,
+    model_selection_policy: Arc<ModelSelectionPolicy>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
     server: ServerHandle,
@@ -437,8 +565,8 @@ impl RunningBootstrap {
     }
 
     #[must_use]
-    pub const fn model_selection_policy(&self) -> &ModelSelectionPolicy {
-        &self.model_selection_policy
+    pub fn model_selection_policy(&self) -> &ModelSelectionPolicy {
+        self.model_selection_policy.as_ref()
     }
 
     #[must_use]
@@ -485,11 +613,11 @@ impl RunningBootstrap {
             | crate::bootstrap::health::HealthState::Fatal => {}
         }
         self.server.stop_accepting();
-        self.local_workstation.begin_execution_shutdown(deadline);
         self.mutation_admission.close_and_wait().await;
         if self.shutdown.request().await.is_err() {
             runtime_cleanup_failed = true;
         }
+        self.local_workstation.begin_execution_shutdown(deadline);
         if self
             .local_workstation
             .shutdown_executions_before(deadline)
@@ -551,6 +679,8 @@ pub enum StartupError {
     DatabaseIntegrity,
     RuntimeLifecycle,
     WorkstationLifecycle,
+    ProviderCredential,
+    ProviderComposition,
     Telemetry(TelemetryError),
     ServerBind,
     ServerLifecycle(crate::adapters::http::ServerError),
@@ -616,6 +746,8 @@ impl StartupError {
             Self::DatabaseIntegrity => "database_integrity_failure",
             Self::RuntimeLifecycle => "runtime_lifecycle_failure",
             Self::WorkstationLifecycle => "workstation_lifecycle_failure",
+            Self::ProviderCredential => "provider_credential_unavailable",
+            Self::ProviderComposition => "provider_composition_failure",
             Self::Telemetry(TelemetryError::GlobalSubscriberConflict) => {
                 "telemetry_subscriber_conflict"
             }

@@ -959,7 +959,7 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
             value.display_name == "Craxii"
                 && value.owner_label == "local-owner"
                 && value.architecture_revision == "V0.0.01"
-                && matches!(value.schema_revision.get(), 2 | 3)
+                && matches!(value.schema_revision.get(), 2..=4)
                 && crate::domain::LogicalPathReference::absolute(
                     value.workspace_logical_root.clone(),
                 )
@@ -1935,11 +1935,11 @@ mod tests {
             ),
             (
                 JournalEventKind::RuntimeStarted,
-                "124ce4a11d3df09669a2db9bd55fff9ce018a4101f3a8c26a2118c6b1105e6b7",
+                "4709740d4b529e3215b21877ee64c30c9d6191166e53274a503835db5b18fd8e",
             ),
             (
                 JournalEventKind::RuntimeRecoveryPerformed,
-                "1f8c7167e46c5d82b33b1afdd183118becb3ffe636673aab1ec52ba926704454",
+                "b6030f6b240a9b26b8340fc8830c81e5a8491b8598aaaf051d1e8be532822fbd",
             ),
             (
                 JournalEventKind::RuntimeStopping,

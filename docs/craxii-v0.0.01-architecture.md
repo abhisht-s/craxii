@@ -2507,7 +2507,12 @@ context_manifest_sources (
 
 Exactly one source identity family must be present. `transform_json` records normalization, inline
 projection, or synthetic status rendering. Source positions start at one, are contiguous at load,
-and reconcile exactly with the immutable parent `source_count`.
+and reconcile exactly with the immutable parent `source_count`. A `model_invocation` record source
+uses either the bare canonical invocation ID for an attempt-level fact,
+`<model_invocation_id>:item:<positive-canonical-decimal>` for one ordered normalized output item,
+or `<model_invocation_id>:continuation` for provider-native continuation evidence. These suffixes
+are typed manifest locators, not alternate invocation identities; zero, leading-zero, malformed,
+or extended suffixes fail closed.
 
 ### `model_invocations`
 
@@ -2550,6 +2555,15 @@ model_invocations (
   tool_call_count           INTEGER,
   draft_exposed             INTEGER NOT NULL DEFAULT 0,
   normalized_error_json     TEXT,
+  usage_status              TEXT NOT NULL,
+  provider_reported_usage_json TEXT,
+  provider_error_kind       TEXT,
+  provider_outcome_certainty TEXT,
+  retry_reason              TEXT,
+  retry_delay_ms            INTEGER,
+  provider_retry_after_ms   INTEGER,
+  billing_ambiguity         INTEGER NOT NULL DEFAULT 0,
+  attempt_evidence_version  INTEGER NOT NULL DEFAULT 1,
   UNIQUE (logical_invocation_id, attempt_no),
   UNIQUE (work_id, agent_step_no, attempt_no)
 )
@@ -3452,29 +3466,31 @@ Each retry is a new `model_invocations` row with the same `logical_invocation_id
 
 V0 permits at most three provider attempts for one logical invocation: initial plus two retries.
 
-Automatic retry is allowed only for a classified transient condition before any semantic draft has been exposed:
+Automatic retry is allowed only for `RateLimited`, `TemporarilyUnavailable`,
+`TransportBeforeResponse`, or `TimeoutBeforeOutput`; certainty MUST be `DefinitelyNotSent` or
+`DefiniteProviderFailure`; and no semantic output or draft may have been exposed. Cancellation,
+shutdown, the absolute Work deadline, and logical/Work attempt budgets MUST still permit the retry.
 
-- connect failure before response bytes;
-- connection reset with no output item/delta observed;
-- provider 429 with bounded retry guidance;
-- provider 5xx;
-- provider-declared temporary unavailable;
-- response-idle timeout before output.
+Authentication, authorization, invalid request, unknown model, transport after possible
+processing, timeout after output, malformed response or completed tool arguments, oversized or
+unsupported output, context error, safety refusal, cancellation, provider-outcome ambiguity,
+internal provider error, script mismatch, and invalid scripted program are never automatically
+retried.
 
-Do not automatically retry:
-
-- authentication or permission errors;
-- invalid requests or unsupported model/tool schema;
-- context-limit errors;
-- safety refusal;
-- malformed completed tool arguments;
-- any attempt after a text/refusal/tool delta was exposed to the client;
-- cancellation;
-- an unknown provider protocol event affecting semantics.
+Semantic output begins on a text or reasoning-summary delta, tool-call start, tool-argument delta,
+completed tool call, refusal delta/completion, structured-data item, or unknown
+correctness-bearing event. Provider response-start metadata, request/response identifiers,
+usage-only or usage-unavailable evidence, the terminal marker itself, and transport bytes without
+a semantic event do not cross the cutoff. Once the cutoff is crossed, automatic retry is
+permanently disabled for that logical chain.
 
 Backoff uses full jitter, a 250 ms initial base, a 5-second local cap, and provider `Retry-After` guidance capped at 30 seconds. Cancellation interrupts backoff.
 
-Provider retries may duplicate provider billing; the invocation records ambiguity. They cannot duplicate workstation side effects because no tool is dispatched until one complete successful response is persisted.
+Provider request hashes and provider IDs are evidence only; V0 has no provider request-idempotency
+guarantee. A possibly processed request, lost in-flight stream, or terminal provider result not yet
+durably committed becomes `provider_outcome_unknown`, interrupts Work, abandons drafts, and is not
+retried. Provider retries cannot duplicate workstation side effects because no tool is dispatched
+until one complete successful response is persisted.
 
 ### Model limits
 
@@ -3490,6 +3506,76 @@ V0 defaults, configurable within hard bounds:
 - maximum work-item wall time: 30 minutes, excluding time queued.
 
 Exceeding a loop/content limit creates a definite normalized failure; it never silently drops calls or continues infinitely.
+
+### Stage 17 model-attempt, loop, and readiness contract freeze
+
+Stage 17 adds migration V4 and raises the maximum supported schema version to `4`. V4 preserves
+all V3 model-attempt facts and adds explicit `usage_status`, optional provider-reported usage for
+non-completed terminal attempts, `provider_error_kind`, `provider_outcome_certainty`,
+`retry_reason`, `retry_delay_ms`, `provider_retry_after_ms`, `billing_ambiguity`, and a versioned
+attempt-evidence marker. Cross-field constraints require attempt one to have no retry metadata,
+retry attempts to name a predecessor and carry bounded nonnegative evidence, terminal state to
+agree with error/certainty/billing truth, and normalized output to exist only for completed
+attempts. Reported token usage is valid on `completed`, `failed`, `cancelled_locally`, and
+`provider_outcome_unknown`; unavailable usage remains explicit and is never fabricated.
+
+One row is one physical provider attempt. `logical_invocation_id` groups the initial attempt and
+its retries. The exact Stage 16 manifest and first requesting intent commit before provider I/O;
+retries reuse the exact logical request/manifest and add linked attempt evidence. The bounded
+canonical accumulator validates identity/order, at most 64 ordered items, at most 64 KiB raw tool
+arguments per call, unknown correctness-bearing events, and exactly one terminal result before
+producing the authoritative `ModelResponse`. Reasoning summary means only provider-exposed summary,
+never hidden chain of thought; provider-opaque evidence remains opaque.
+
+The explicit loop reloads the owned Work at every checkpoint, performs new target selection and
+fresh Stage 16 assembly on every model step, validates a complete tool batch before dispatch, and
+executes tools sequentially through Tool Execution Service only. If the remaining Work tool budget
+cannot contain the whole batch, none of that batch runs. An ordinary observed tool failure remains
+model-visible evidence; `tool_outcome_unknown` interrupts immediately and prevents later calls or
+a new model invocation. Stage 17 never automatically resumes an old in-flight loop after startup.
+
+Deterministic Stage 17 integration composition may become ready only after bootstrap, completed
+recovery, dependency construction, real `AgentLoop` installation, scheduler startup, and one
+successful initial scheduler scan. `ScriptedProvider` remains test-only. Because Stage 17 contains
+no live provider, the production binary MUST remain `live_unready`; Stage 19 live-provider
+composition is the first production path that may become `live_ready`. Once ready, a critical
+owned-task or storage invariant becomes fatal rather than reverting to `live_unready`.
+
+### Stage 18 deterministic end-to-end and crash/recovery contract freeze
+
+Stage 18 adds no migration or dependency and leaves the schema ceiling at V4. Its reusable
+deterministic composition crosses the authenticated HTTP command boundary, real file-backed SQLite
+WAL and artifact/workspace directories, scheduler ownership, `AgentLoop`, fresh target selection,
+Stage 16 context assembly, `ModelGateway`, test-only `ScriptedProvider`, `ToolExecutionService`,
+`LocalWorkstation`, atomic assistant completion, bootstrap, and durable replay. Production remains
+`live_unready`; Stage 18 adds no live provider, client draft protocol, parallel tools, or alternate
+command path.
+
+Crash evidence uses a true child process stopped at a feature-gated physical boundary and killed by
+its parent. Recovery always creates a new runtime over the same durable files. No scheduler,
+provider program, cancellation state, health state, runtime identity, or task state crosses the
+restart in memory. Startup classifies stale Work before readiness and never automatically resumes
+the old loop, reissues an ambiguous provider request, or repeats an uncertain tool effect.
+
+A synced redacted provider ledger records Work identity, logical invocation identity, physical
+attempt, and request hash before test-provider delegation. A disposable-workspace marker is the
+independent authority for workstation effects. Together they prove zero-call, one-call, bounded
+safe retry, no-reissue, and no-blind-tool-retry behavior without inferring effects from database
+rows alone.
+
+The versioned normalized evidence contract removes UUID values that have no semantic identity,
+timestamps, runtime IDs, process IDs, latency, temporary roots, and machine-specific paths that are
+not material. It preserves ordering, state transitions, request hashes, semantic output,
+attempt/tool counts, causal relationships, artifact hashes, and failure classifications. Two
+empty-state executions and a cold reopen must reproduce the frozen durable meaning. Behavioral
+runtime tests and direct evidence are authoritative; structural checks enforce only simple
+feature-gating and composition boundaries.
+
+The Ubuntu 24.04 x86-64 acceptance command is `scripts/verify-stage18-deterministic`. On that target
+it additionally verifies machine facts, cgroup v2 visibility, process cleanup, filesystem/artifact
+behavior, and deterministic benchmark evidence. On another host the target-independent suite runs
+without claiming Ubuntu evidence and reports target execution as deferred by the user to Stage 27
+or earlier.
 
 ### Stage 15 canonical contract freeze
 

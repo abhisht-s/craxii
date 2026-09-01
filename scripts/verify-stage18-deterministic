@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '%s\n' 'cargo is required to run the Stage 18 deterministic gate' >&2
+  exit 1
+fi
+
+ubuntu_target=false
+if [[ -r /etc/os-release ]]; then
+  os_id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"
+  os_version="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"
+  if [[ "${os_id}" == "ubuntu" && "${os_version}" == "24.04" && "$(uname -m)" == "x86_64" ]]; then
+    ubuntu_target=true
+  fi
+fi
+
+cd "${repository_root}"
+if [[ "${ubuntu_target}" == true ]]; then
+  export CRAXII_STAGE18_REQUIRE_UBUNTU=1
+fi
+
+cargo test --locked -p craxii-server --features test-failpoints --test stage18 -- --test-threads=1
+
+if [[ "${ubuntu_target}" == true ]]; then
+  test -r /sys/fs/cgroup/cgroup.controllers
+  if pgrep -f 'craxii-stage18-.*(sleep 30|stage18-effect)' >/dev/null 2>&1; then
+    printf '%s\n' 'Stage 18 process/cgroup residue remains after the deterministic suite' >&2
+    exit 1
+  fi
+  printf '%s\n' 'STAGE_18_UBUNTU_TARGET_EXECUTION: PASSED'
+else
+  printf '%s\n' 'STAGE_18_UBUNTU_TARGET_EXECUTION: DEFERRED_BY_USER_TO_STAGE_27_OR_EARLIER'
+fi

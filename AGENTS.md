@@ -1,41 +1,25 @@
 # Repository Guidelines
 
-## Architecture and source-of-truth order
-
-Implement Craxii V0.0.01 from `docs/craxii-v0.0.01-architecture.md`; its MUST/MUST NOT requirements are normative. Follow `docs/craxii-v0.0.01-implementation-plan.md` for dependency-ordered stages and acceptance gates. Use `docs/craxii-identity-credential-architecture.md` only for long-term seams not superseded by V0. Treat the deep draft, `docs/temp/` review, annotated HTML, and empty `docs/craxii2.md` as non-normative history or placeholders. Change a durable contract in the architecture before changing its implementation.
-
-## Project structure and module organization
-
-The repository is documentation-led and contains the minimal Rust backend foundation. Keep design records in `docs/` and rendering utilities in `docs/scripts/`. Generated HTML files are companions; edit their Markdown sources and regenerate them rather than hand-editing HTML.
-
-As implementation stages begin, use these ownership boundaries:
-
-- `backend/`: one Rust package with `bootstrap`, `domain`, `application`, `ports`, and `adapters`; keep `main` composition-only.
-- `backend/migrations/`: immutable, versioned SQLx SQLite migrations.
-- `clients/macos/`: native SwiftUI app plus unit and UI tests.
-- `ops/`: Ubuntu/AWS deployment, systemd, Caddy, backup, and restore assets.
-- `scripts/`: repository-wide verification commands.
-
-Create directories only with their first real file. Do not add speculative empty layers.
-
-## Build, test, and development commands
-
-For normal repository changes, run the authoritative baseline local gate:
-
-```sh
-scripts/verify
-```
-
-The gate supplies `/opt/homebrew/bin` and `/opt/homebrew/sbin`, then falls back to the configured Cargo home when needed. It includes the current locked Cargo format, check, Clippy, test, and dependency-tree commands plus structured repository and documentation checks. Run the implementation-plan renderer separately only when intentionally regenerating its timestamped HTML companion. Run macOS and Ubuntu-specific suites only on environments whose semantics they claim.
-
-Before manually invoking Node or npm tooling, run `export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$PATH"`. Do not treat a shell PATH miss as a project failure.
-
-## Coding and testing conventions
-
-Use sentence-case Markdown headings, one H1, fenced blocks with language tags, relative links, and kebab-case filenames. In Rust, preserve inward dependencies: domain code must not import Axum, SQLx, provider, or operating-system types. Test every durable transition against both current-state rows and journal events; test side effects for intent-before-action and honest unknown outcomes. Live-provider tests are opt-in and must report “not configured,” never silently pass.
-
-## Commits, pull requests, and security
-
-Use short imperative subjects such as `docs: clarify replay contract`. Preserve real repository history and do not manufacture revision metadata. Keep commits stage-focused. Pull requests must identify the implementation-plan stage, architecture consequences, validation performed, unresolved questions, and primary-source links; include screenshots for layout-sensitive UI or generated documents.
-
 Never commit credentials, local databases/WAL files, artifacts, test evidence containing secrets, Terraform state, or build output. Redact tokens, content, commands, outputs, and headers from logs and review artifacts by default.
+
+## Validation efficiency
+
+Optimize for meaningful verification, not repetitive ceremony.
+
+During implementation, run only focused checks that can catch regressions in the subsystem being changed. Do not repeatedly run repository-wide checks, schema inventories, Git-state audits, documentation scans, checker probe suites, or unchanged-stage regressions after each small edit.
+
+At the end of a stage, use at most three validation layers:
+
+1. Focused tests while implementing.
+2. One consolidated repository-wide gate after the stage is complete.
+3. One independent verification pass against the stage contract.
+
+Do not verify the verifier. Do not rerun a passing full gate unless subsequent code changes could invalidate it. Do not repeat old-stage validation unless the current change touches those invariants.
+
+Treat `scripts/check-repository.mjs`, `scripts/verify`, full Cargo test matrices, cargo-deny, schema/fingerprint audits, and similar expensive checks as end-of-stage gates unless the current task specifically changes those systems.
+
+Avoid long polling loops and repetitive progress narration for quiet commands. Wait in bounded intervals and report only meaningful state changes, failures, or final results.
+
+Behavioral tests are authoritative for runtime behavior. Repository checkers should enforce straightforward structural policy only; do not build mutation-test or static-analysis machinery to prove arbitrary malicious source rewrites unless that is explicitly the purpose of the stage.
+
+When a focused check already proves a fact, reuse that result rather than proving the same fact through another equivalent command.

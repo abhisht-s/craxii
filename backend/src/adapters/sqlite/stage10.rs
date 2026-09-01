@@ -1064,7 +1064,10 @@ async fn recover_work_unit(
                     )?;
                     let changed = sqlx::query(
                         "UPDATE model_invocations SET state = 'provider_outcome_unknown', completed_at = ?, \
-                         normalized_error_json = ? WHERE model_invocation_id = ? AND state IN ('requesting','streaming')",
+                         normalized_error_json = ?, usage_status = 'unavailable', \
+                         provider_error_kind = 'provider_outcome_unknown', \
+                         provider_outcome_certainty = 'outcome_unknown', billing_ambiguity = 1 \
+                         WHERE model_invocation_id = ? AND state IN ('requesting','streaming')",
                     )
                     .bind(request.recovered_at.to_string())
                     .bind(error)

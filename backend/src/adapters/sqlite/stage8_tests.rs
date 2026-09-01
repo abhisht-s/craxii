@@ -2305,6 +2305,112 @@ async fn model_begin_stream_and_terminal_are_atomic_ordered_and_clear_work_link(
 }
 
 #[tokio::test]
+async fn assistant_completion_is_one_atomic_authoritative_message_and_work_commit() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let terminal_model_event: JournalEventId = {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        sqlx::query_scalar::<_, String>(
+            "SELECT event_id FROM journal_events WHERE work_id = ? \
+             AND event_type = 'model.invocation_completed'",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap()
+    };
+    let running = resumed(&fixture, 4);
+    let completed = decide_work_transition(
+        &running,
+        WorkTransitionGuard::for_snapshot(&running),
+        WorkTransitionRequest::Complete {
+            reason: WorkCompletionReason::Answered,
+            evidence: WorkCompletionEvidence::SATISFIED,
+        },
+    )
+    .unwrap()
+    .into_next();
+    let message = Message::try_new(MessageInput {
+        message_id: MessageId::generate(),
+        craxii_id: fixture.identity.craxii_id,
+        conversation_id: fixture.identity.conversation_id,
+        role: MessageRole::Assistant,
+        content: MessageContent::try_new(vec![ContentBlock::text("done").unwrap()]).unwrap(),
+        produced_by_work_id: Some(fixture.work_id),
+        device_id: None,
+        client_message_id: None,
+        committed_at: T4.parse().unwrap(),
+    })
+    .unwrap();
+    let message_id = message.message_id();
+    let assistant_event = JournalEventId::generate();
+    fixture
+        .store
+        .commit_assistant_completion(CommitAssistantCompletionRequest {
+            expected_work: WorkExpectation::for_snapshot(&running),
+            expected_model: ModelExpectation {
+                model_invocation_id: model.invocation_id,
+                state: ModelInvocationState::Completed,
+            },
+            assistant_message: message,
+            assistant_event: EventIntent {
+                event_id: assistant_event,
+                correlation_id: fixture.correlation_id,
+                causation_event_id: Some(terminal_model_event),
+            },
+            completion_event: EventIntent {
+                event_id: JournalEventId::generate(),
+                correlation_id: fixture.correlation_id,
+                causation_event_id: Some(assistant_event),
+            },
+            work_next: completed,
+        })
+        .await
+        .unwrap();
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let message_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages WHERE message_id = ? AND role = 'assistant'",
+    )
+    .bind(message_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let work_state: String = sqlx::query_scalar(
+        "SELECT state FROM work_items WHERE work_id = ? AND runtime_instance_id IS NULL",
+    )
+    .bind(fixture.work_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let terminal_events: Vec<String> = sqlx::query_scalar(
+        "SELECT event_type FROM journal_events WHERE work_id = ? \
+         AND event_type IN ('assistant.message_committed','work.completed') ORDER BY journal_offset",
+    )
+    .bind(fixture.work_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(message_count, 1);
+    assert_eq!(work_state, "completed");
+    assert_eq!(
+        terminal_events,
+        ["assistant.message_committed", "work.completed"]
+    );
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
 async fn model_begin_failure_at_final_event_boundary_rolls_back_every_detail_row() {
     let fixture = fixture().await;
     make_fixture_journal_consistent(&fixture).await;
@@ -2482,6 +2588,7 @@ async fn model_begin_failure_at_final_event_boundary_rolls_back_every_detail_row
 #[tokio::test]
 async fn model_retry_is_contiguous_terminal_and_uses_distinct_semantic_artifact_metadata() {
     let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
     let model = begin_and_stream_model(&fixture).await;
     complete_model(&fixture, &model).await;
 
@@ -2503,7 +2610,8 @@ async fn model_retry_is_contiguous_terminal_and_uses_distinct_semantic_artifact_
     let mut connection = fixture.guard.runtime().acquire().await.unwrap();
     let rows = sqlx::query(
         "SELECT model_invocation_id, attempt_no, retry_of_invocation_id, context_manifest_id, \
-         request_artifact_id FROM model_invocations ORDER BY attempt_no",
+         request_artifact_id, retry_reason, retry_delay_ms, provider_retry_after_ms \
+         FROM model_invocations ORDER BY attempt_no",
     )
     .fetch_all(&mut *connection)
     .await
@@ -2522,6 +2630,15 @@ async fn model_retry_is_contiguous_terminal_and_uses_distinct_semantic_artifact_
     assert_ne!(
         rows[0].get::<Option<String>, _>("request_artifact_id"),
         rows[1].get::<Option<String>, _>("request_artifact_id")
+    );
+    assert_eq!(
+        rows[1].get::<Option<String>, _>("retry_reason").as_deref(),
+        Some("classified_transient_before_output")
+    );
+    assert_eq!(rows[1].get::<Option<i64>, _>("retry_delay_ms"), Some(0));
+    assert_eq!(
+        rows[1].get::<Option<i64>, _>("provider_retry_after_ms"),
+        None
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
@@ -2543,6 +2660,11 @@ async fn model_retry_is_contiguous_terminal_and_uses_distinct_semantic_artifact_
         1
     );
     drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
     fixture.guard.shutdown().await;
 }
 

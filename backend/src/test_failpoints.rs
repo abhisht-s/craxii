@@ -1,8 +1,7 @@
 //! Test-only deterministic crash-boundary foundation.
 //!
 //! This module is absent unless the non-default `test-failpoints` feature is
-//! explicitly enabled. Architecture failpoints remain reserved until their owning
-//! stage installs a reviewed hook; Stage 14 activates the complete tool boundary set.
+//! explicitly enabled. Stage 18 activates the complete deterministic V0 crash boundary set.
 
 use std::fmt::{Debug, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -374,6 +373,7 @@ pub enum OwningStage {
     Stage13,
     Stage14,
     Stage17,
+    Stage18,
     Stage19,
 }
 
@@ -583,25 +583,25 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &WORK_CLAIM,
         OwningStage::Stage10,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterContextManifestCommit,
         &CONTEXT_MANIFEST,
-        OwningStage::Stage17,
+        OwningStage::Stage18,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterModelIntentCommit,
         &MODEL_INTENT,
-        OwningStage::Stage17,
+        OwningStage::Stage18,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterFirstProviderDelta,
         &PROVIDER_DELTA,
-        OwningStage::Stage19,
+        OwningStage::Stage18,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterModelResponseCommit,
         &MODEL_RESPONSE,
-        OwningStage::Stage17,
+        OwningStage::Stage18,
     ),
     active_spec(
         FailpointName::AfterToolRequestedCommit,
@@ -628,10 +628,10 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         &ARTIFACT_RENAME,
         OwningStage::Stage8,
     ),
-    spec(
+    active_spec(
         FailpointName::AfterAssistantMessageCommit,
         &FINAL_ANSWER,
-        OwningStage::Stage17,
+        OwningStage::Stage18,
     ),
     active_spec(
         FailpointName::AfterCancelRequestedCommit,
@@ -644,19 +644,6 @@ pub static REGISTRY: [FailpointSpec; 14] = [
         OwningStage::Stage10,
     ),
 ];
-
-const fn spec(
-    architecture_name: FailpointName,
-    physical_boundaries: &'static [PhysicalBoundarySpec],
-    owning_stage: OwningStage,
-) -> FailpointSpec {
-    FailpointSpec {
-        architecture_name,
-        physical_boundaries,
-        owning_stage,
-        status: HookStatus::Reserved,
-    }
-}
 
 const fn active_spec(
     architecture_name: FailpointName,
@@ -1021,6 +1008,26 @@ pub fn foundation_directory(run_id: &str) -> Result<PathBuf, ControlError> {
 
 #[cfg(unix)]
 pub fn run_controlled_startup() -> Result<(), ControlError> {
+    let record = initialize_controlled_record()?;
+    if record.selection.architecture_name.is_some() {
+        reach(record.selection.physical_hook);
+        Err(ControlError::ProbeIo)
+    } else {
+        run_foundation_probe(&record.run_id)
+    }
+}
+
+/// Initializes one subprocess failpoint selection without reaching it immediately.
+///
+/// Stage 18 child harnesses use this to compose the real runtime first, allowing the
+/// production hook itself to emit the marker at the selected durable boundary.
+#[cfg(unix)]
+pub fn initialize_controlled_process() -> Result<ControlSelection, ControlError> {
+    initialize_controlled_record().map(|record| record.selection)
+}
+
+#[cfg(unix)]
+fn initialize_controlled_record() -> Result<ActivationRecord, ControlError> {
     let mut input = Vec::new();
     std::io::stdin()
         .take((MAX_CONTROL_BYTES + 1) as u64)
@@ -1031,12 +1038,7 @@ pub fn run_controlled_startup() -> Result<(), ControlError> {
     record.startup_ready = health.snapshot().is_ready();
     let marker = duplicate_marker_file(MARKER_FILE_DESCRIPTOR)?;
     PROCESS_ACTIVATION.initialize(record.clone(), marker)?;
-    if record.selection.architecture_name.is_some() {
-        reach(record.selection.physical_hook);
-        Err(ControlError::ProbeIo)
-    } else {
-        run_foundation_probe(&record.run_id)
-    }
+    Ok(record)
 }
 
 fn run_foundation_probe(run_id: &str) -> Result<(), ControlError> {
@@ -1134,28 +1136,9 @@ mod tests {
     }
 
     #[test]
-    fn registry_metadata_is_complete_typed_and_has_exact_stage14_activation() {
+    fn registry_metadata_is_complete_typed_and_all_stage18_boundaries_are_active() {
         for spec in REGISTRY {
-            let active = matches!(
-                spec.architecture_name,
-                FailpointName::AfterMessageTransactionCommit
-                    | FailpointName::AfterWorkClaimCommit
-                    | FailpointName::AfterToolRequestedCommit
-                    | FailpointName::AfterToolDispatchIntentCommit
-                    | FailpointName::AfterToolProcessSpawn
-                    | FailpointName::AfterToolProcessExitBeforeOutcomeCommit
-                    | FailpointName::AfterArtifactRenameBeforeDbCommit
-                    | FailpointName::AfterCancelRequestedCommit
-                    | FailpointName::DuringGracefulShutdown
-            );
-            assert_eq!(
-                spec.status,
-                if active {
-                    HookStatus::Active
-                } else {
-                    HookStatus::Reserved
-                }
-            );
+            assert_eq!(spec.status, HookStatus::Active);
             assert!(!spec.physical_boundaries.is_empty());
             for physical in spec.physical_boundaries {
                 assert!(!physical.physical_hook.as_str().is_empty());
@@ -1250,20 +1233,17 @@ mod tests {
     }
 
     #[test]
-    fn active_and_reserved_selections_are_distinct_from_unknown_and_ambiguous() {
+    fn active_selections_are_distinct_from_unknown_and_ambiguous() {
         let direct = format!(
             "{CONTROL_PROTOCOL}\trun_id=run-unit-3\tarchitecture_name={}\tphysical_hook=none\n",
             FailpointName::AfterWorkClaimCommit.as_str()
         );
         assert!(parse_control(direct.as_bytes()).is_ok());
-        let reserved = format!(
+        let provider_delta = format!(
             "{CONTROL_PROTOCOL}\trun_id=run-unit-3\tarchitecture_name={}\tphysical_hook=none\n",
             FailpointName::AfterFirstProviderDelta.as_str()
         );
-        assert_eq!(
-            parse_control(reserved.as_bytes()),
-            Err(ControlError::ReservedArchitectureFailpoint)
-        );
+        assert!(parse_control(provider_delta.as_bytes()).is_ok());
         let ambiguous = format!(
             "{CONTROL_PROTOCOL}\trun_id=run-unit-3\tarchitecture_name={}\tphysical_hook=none\n",
             FailpointName::AfterModelIntentCommit.as_str()

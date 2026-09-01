@@ -30,7 +30,7 @@ use super::transaction::WriteTransaction;
 const DISPLAY_NAME: &str = "Craxii";
 const OWNER_LABEL: &str = "local-owner";
 const ARCHITECTURE_REVISION: &str = "V0.0.01";
-const SCHEMA_REVISION: i64 = 3;
+const SCHEMA_REVISION: i64 = 4;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -711,7 +711,7 @@ async fn load_root_snapshot(
         || principal.primary_conversation_id() != primary_conversation.conversation_id()
         || principal.default_workspace_id() != workspace.workspace_id()
         || workstation.workstation_id() != workspace.workstation_id()
-        || !matches!(principal.schema_revision().get(), 2 | SCHEMA_REVISION)
+        || !matches!(principal.schema_revision().get(), 2 | 3 | SCHEMA_REVISION)
     {
         return Err(inconsistent());
     }

@@ -62,6 +62,20 @@
       "decision_record_path": "docs/dependencies/nix.md"
     },
     {
+      "package": "reqwest",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "dependency_kind": "normal",
+      "approved_compatible_requirement": "^0.13.4",
+      "enabled_features": ["json", "rustls"],
+      "default_features": false,
+      "optional": false,
+      "target_restriction": null,
+      "approval_status": "approved",
+      "approver_role": "repository/project owner",
+      "approval_date": "2026-09-01",
+      "decision_record_path": "docs/dependencies/reqwest.md"
+    },
+    {
       "package": "serde",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
       "dependency_kind": "normal",

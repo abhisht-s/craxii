@@ -1218,10 +1218,7 @@ mod tests {
     }
 
     impl ModelStateStore for FakeStateStore {
-        fn load_owned_work(
-            &self,
-            _: LoadOwnedWorkRequest,
-        ) -> StateStoreFuture<'_, OwnedWorkState> {
+        fn load_owned_work(&self, _: LoadOwnedWorkRequest) -> StateStoreFuture<'_, OwnedWorkState> {
             self.fail(Intent::BeginModel)
         }
         fn begin_model_invocation(

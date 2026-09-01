@@ -215,6 +215,7 @@ impl Harness {
             connections.clone(),
             vec![authority.clone()],
             Some(Arc::clone(&shutdown_authority)),
+            None,
         );
         if let Some(stall) = ws_send_stall {
             state = state.with_test_ws_send_stall(stall);

@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod http;
 pub mod local_workstation;
+pub mod openai;
 pub mod runtime_observation;
 pub mod scripted_provider;
 pub mod sqlite;

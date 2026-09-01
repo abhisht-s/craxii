@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+cd "${repository_root}"
+
+if [[ "${CRAXII_OPENAI_LIVE:-}" != "1" || -z "${OPENAI_API_KEY:-}" || -z "${CRAXII_OPENAI_MODEL:-}" ]]; then
+  echo "STAGE_19_LIVE_SMOKE: NOT_CONFIGURED"
+  if [[ "${CRAXII_OPENAI_LIVE_REQUIRED:-}" == "1" ]]; then
+    exit 2
+  fi
+  exit 0
+fi
+
+cargo test --locked -p craxii-server --test openai_live live_stateless_custom_tool_round_trip -- --ignored --nocapture

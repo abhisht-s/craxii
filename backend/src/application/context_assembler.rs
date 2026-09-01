@@ -701,6 +701,76 @@ impl ContextAssemblyResult {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    pub(crate) fn from_exact_parts(
+        selection: ModelSelectionResult,
+        request: ModelRequest,
+        prepared_manifest: PreparedContextManifest,
+    ) -> Result<ContextAssemblyResult, ContextAssemblyError> {
+        if request.target() != selection.selected_target()
+            || request.context_manifest_id() != prepared_manifest.context_manifest_id
+            || request.logical_invocation_id() != prepared_manifest.logical_invocation_id
+            || request.canonical_sha256() != prepared_manifest.rendered_request_sha256
+        {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ContractViolation,
+            ));
+        }
+        let canonical_bytes = request.canonical_bytes();
+        let serialized_byte_count = u64::try_from(canonical_bytes.len())
+            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
+        let selected_output_limit = SelectedOutputLimit(request.requested_output_limit());
+        let toolset_fingerprint = model_toolset_fingerprint(request.tool_definitions());
+        let final_request = FinalModelRequest {
+            request: request.clone(),
+            canonical_bytes: canonical_bytes.into_boxed_slice(),
+            request_sha256: request.canonical_sha256(),
+            estimation_units: Vec::new().into_boxed_slice(),
+            serialized_byte_count,
+            selected_output_limit,
+            toolset_fingerprint,
+        };
+        let prepared_sources = prepared_manifest.sources.clone().into_boxed_slice();
+        let package = ContextPackage {
+            context_manifest_id: request.context_manifest_id(),
+            logical_invocation_id: request.logical_invocation_id(),
+            selected_target: selection,
+            ordered_sources: prepared_sources.clone(),
+            ordered_input_items: request.ordered_input_items().to_vec().into_boxed_slice(),
+            instructions: request.instructions().to_vec().into_boxed_slice(),
+            tool_definitions: request.tool_definitions().to_vec().into_boxed_slice(),
+            tool_choice: request.tool_choice_policy(),
+            requested_output_tokens: request.requested_output_limit().get() as u64,
+            estimator_id: request.target().estimator().id().to_owned(),
+            estimator_version: request.target().estimator().version(),
+            prompt_fingerprint: prepared_manifest.system_prompt_fingerprint,
+            toolset_fingerprint,
+        };
+        Ok(ContextAssemblyResult {
+            package,
+            final_request,
+            prepared_manifest,
+            prepared_sources,
+            budget: ContextBudgetEvidence {
+                estimated_input_tokens: 1,
+                requested_output_tokens: request.requested_output_limit().get() as u64,
+                context_window_tokens: request
+                    .target()
+                    .reference()
+                    .capabilities()
+                    .context_window_tokens()
+                    .get() as u64,
+                request_serialized_bytes: serialized_byte_count,
+                request_byte_limit: MAX_CANONICAL_MODEL_REQUEST_BYTES,
+                contributions: Vec::new().into_boxed_slice(),
+            },
+        })
+    }
+}
+
 pub struct ContextAssembler {
     source_store: Arc<dyn ContextSourceStore>,
     artifact_store: Option<Arc<dyn ArtifactStore>>,

@@ -105,9 +105,7 @@ async fn terminalize_owned_work(
     if !crate::domain::is_legal_work_pair(expected.state(), request.work_next.state()) {
         return Err(invalid());
     }
-    let runtime_id = request.expected_work.runtime_owner.ok_or_else(invalid)?;
-    let mut transaction =
-        WriteTransaction::begin(&store.runtime, "terminalize_owned_work").await?;
+    let mut transaction = WriteTransaction::begin(&store.runtime, "terminalize_owned_work").await?;
     let context = load_work_context(&mut transaction, request.expected_work).await?;
     let latest: Option<String> = sqlx::query_scalar(
         "SELECT event_id FROM journal_events WHERE stream_id = ? ORDER BY stream_seq DESC LIMIT 1",
@@ -134,7 +132,7 @@ async fn terminalize_owned_work(
     let position = append_work_event(
         &mut transaction,
         &context,
-        Some(runtime_id),
+        request.work_next.runtime_owner(),
         request.event,
         work_payload(&expected, &request.work_next, request.terminal_at)?,
         request.terminal_at,
@@ -161,11 +159,9 @@ async fn commit_assistant_completion(
         || request.work_next.state() != WorkState::Completed
         || request.work_next.work_id() != request.expected_work.work_id
         || request.assistant_message.role() != MessageRole::Assistant
-        || request.assistant_message.produced_by_work_id()
-            != Some(request.expected_work.work_id)
+        || request.assistant_message.produced_by_work_id() != Some(request.expected_work.work_id)
         || request.assistant_event.causation_event_id.is_none()
-        || request.completion_event.causation_event_id
-            != Some(request.assistant_event.event_id)
+        || request.completion_event.causation_event_id != Some(request.assistant_event.event_id)
     {
         return Err(invalid());
     }
@@ -241,7 +237,7 @@ async fn commit_assistant_completion(
             work_id: Some(request.expected_work.work_id),
             causation_event_id: request.assistant_event.causation_event_id,
             correlation_id: context.correlation_id,
-            actor: JournalActor::Runtime(runtime_id),
+            actor: JournalActor::Craxii(context.craxii_id),
             runtime_instance_id: Some(runtime_id),
             payload: JournalEventPayload::AssistantMessageCommitted(MessageCommittedV1 {
                 message_id: request.assistant_message.message_id(),
@@ -275,7 +271,7 @@ async fn commit_assistant_completion(
     let completion_position = append_work_event(
         &mut transaction,
         &context,
-        Some(runtime_id),
+        request.work_next.runtime_owner(),
         request.completion_event,
         work_payload(
             &expected,
@@ -285,6 +281,10 @@ async fn commit_assistant_completion(
         request.assistant_message.committed_at(),
     )
     .await?;
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::reach(
+        crate::test_failpoints::PhysicalHook::FinalAnswerAfterAllRowsBeforeCommit,
+    );
     transaction.commit().await?;
     Ok(CommitReceipt {
         committed_version: Some(request.work_next.projection_version()),
@@ -734,11 +734,33 @@ fn valid_source_record_identifier(kind: &str, value: &str) -> bool {
         "workstation" => value.parse::<crate::domain::WorkstationId>().is_ok(),
         "workspace" => value.parse::<crate::domain::WorkspaceId>().is_ok(),
         "message" => value.parse::<crate::domain::MessageId>().is_ok(),
-        "model_invocation" => value.parse::<crate::domain::ModelInvocationId>().is_ok(),
+        "model_invocation" => valid_model_invocation_source_record_identifier(value),
         "tool_execution" => value.parse::<crate::domain::ToolExecutionId>().is_ok(),
         "work" => value.parse::<crate::domain::WorkId>().is_ok(),
         _ => false,
     }
+}
+
+fn valid_model_invocation_source_record_identifier(value: &str) -> bool {
+    if value.parse::<crate::domain::ModelInvocationId>().is_ok() {
+        return true;
+    }
+    if let Some(invocation_id) = value.strip_suffix(":continuation") {
+        return invocation_id
+            .parse::<crate::domain::ModelInvocationId>()
+            .is_ok();
+    }
+    let Some((invocation_id, ordinal_literal)) = value.rsplit_once(":item:") else {
+        return false;
+    };
+    let Ok(ordinal) = ordinal_literal.parse::<u64>() else {
+        return false;
+    };
+    ordinal > 0
+        && ordinal.to_string() == ordinal_literal
+        && invocation_id
+            .parse::<crate::domain::ModelInvocationId>()
+            .is_ok()
 }
 
 fn model_role(value: ContextModelRole) -> &'static str {
@@ -869,7 +891,9 @@ async fn insert_context_manifest(
                     Some(id.clone()),
                 )
             }
-            ContextSourceIdentity::Record { .. } => return Err(invalid()),
+            ContextSourceIdentity::Record { .. } => {
+                return Err(invalid());
+            }
         };
         if (source.kind == ContextSourceKind::ArtifactContent && artifact_id.is_none())
             || (source.kind == ContextSourceKind::ProviderNativeContinuation
@@ -1142,6 +1166,10 @@ async fn begin_model(
         insert_artifact_metadata(&mut transaction, artifact, attempt.work_id()).await?;
     }
     validate_retry_or_insert_manifest(&mut transaction, &request.manifest, attempt).await?;
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::reach(
+        crate::test_failpoints::PhysicalHook::ModelAttemptAfterManifestRowsBeforeIntent,
+    );
     let capabilities = encode_model_capabilities(attempt.provider_model())?;
     let selection_reason = match request.invocation.selection_reason {
         ModelSelectionReason::Explicit => "explicit",
@@ -1250,6 +1278,10 @@ async fn begin_model(
         request.invocation.started_at,
     )
     .await?;
+    #[cfg(feature = "test-failpoints")]
+    crate::test_failpoints::reach(
+        crate::test_failpoints::PhysicalHook::ModelAttemptAfterAllRowsBeforeCommit,
+    );
     transaction.commit().await?;
     Ok(CommitReceipt {
         committed_version: Some(request.work_next.projection_version()),
@@ -1265,7 +1297,10 @@ async fn mark_model_streaming(
     request: MarkModelStreamingRequest,
 ) -> Result<CommitReceipt, SqliteAdapterError> {
     if request.expected_model.state != ModelInvocationState::Requesting
-        || request.expected_work.state != WorkState::WaitingOnModel
+        || !matches!(
+            request.expected_work.state,
+            WorkState::WaitingOnModel | WorkState::CancelRequested
+        )
         || request.expected_work.current_attempt
             != CurrentWorkAttempt::Model(request.expected_model.model_invocation_id)
         || request
@@ -1368,17 +1403,27 @@ async fn mark_model_streaming(
     })
 }
 
+type ValidatedModelTerminal = (Option<String>, Option<[i64; 5]>, Option<String>);
+
 fn validate_model_terminal(
     request: &FinishModelInvocationRequest,
-) -> Result<(Option<String>, Option<[i64; 5]>, Option<String>), SqliteAdapterError> {
+) -> Result<ValidatedModelTerminal, SqliteAdapterError> {
     let outcome = &request.outcome;
     if !outcome.state.is_terminal()
         || !is_legal_model_pair(request.expected_model.state, outcome.state)
-        || request.expected_work.state != WorkState::WaitingOnModel
+        || !matches!(
+            request.expected_work.state,
+            WorkState::WaitingOnModel | WorkState::CancelRequested
+        )
         || request.expected_work.current_attempt
             != CurrentWorkAttempt::Model(request.expected_model.model_invocation_id)
         || request.work_next.current_attempt() != CurrentWorkAttempt::None
         || request.work_event.causation_event_id != Some(request.model_event.event_id)
+        || (request.expected_work.state == WorkState::CancelRequested
+            && !matches!(
+                request.work_next.state(),
+                WorkState::Cancelled | WorkState::Interrupted
+            ))
     {
         return Err(invalid());
     }
@@ -1560,11 +1605,31 @@ async fn finish_model(
         request.expected_work.work_id,
         ArtifactProducer::Model(request.expected_model.model_invocation_id),
     )?;
-    let referenced = request
+    let mut referenced = request
         .outcome
         .response_artifact_id
         .into_iter()
         .collect::<HashSet<_>>();
+    let opaque_references = request
+        .outcome
+        .normalized_output
+        .as_ref()
+        .into_iter()
+        .flat_map(|output| output.items.iter())
+        .filter_map(|item| match item {
+            crate::ports::state_store::NormalizedModelOutputItem::ProviderOpaque {
+                artifact_id,
+                sha256,
+                ..
+            } => Some((*artifact_id, *sha256)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    referenced.extend(
+        opaque_references
+            .iter()
+            .map(|(artifact_id, _)| *artifact_id),
+    );
     require_exact_artifact_set(&indexed, &referenced, &referenced)?;
     if let Some(id) = request.outcome.response_artifact_id {
         require_supplied_artifact_facts(
@@ -1575,6 +1640,15 @@ async fn finish_model(
             None,
             None,
         )?;
+    }
+    for (artifact_id, sha256) in opaque_references {
+        require_supplied_artifact_facts(&indexed, artifact_id, sha256, None, None, None)?;
+        let artifact = indexed.get(&artifact_id).ok_or_else(invalid)?;
+        if artifact.metadata.mime_type().as_str() != "application/octet-stream"
+            || artifact.metadata.retention() != ArtifactRetention::CanonicalEvidence
+        {
+            return Err(invalid());
+        }
     }
     let mut transaction =
         WriteTransaction::begin(&store.runtime, "finish_model_invocation").await?;
@@ -1726,7 +1800,7 @@ async fn finish_model(
     let work_position = append_work_event(
         &mut transaction,
         &context,
-        Some(runtime_id),
+        request.work_next.runtime_owner(),
         request.work_event,
         work_payload(&expected, &request.work_next, request.outcome.completed_at)?,
         request.outcome.completed_at,
@@ -2461,7 +2535,7 @@ async fn finish_tool(
     let work_position = append_work_event(
         &mut transaction,
         &context,
-        Some(runtime_id),
+        request.work_next.runtime_owner(),
         request.work_event,
         work_payload(&expected, &request.work_next, outcome.completed_at)?,
         outcome.completed_at,
@@ -2712,7 +2786,6 @@ pub(super) async fn verify_stage8_consistency(
             validate_transform(&source.try_get::<String, _>("transform_json")?)?;
         }
     }
-
     let artifact_rows = sqlx::query("SELECT * FROM artifacts")
         .fetch_all(&mut *connection)
         .await
@@ -2847,7 +2920,6 @@ pub(super) async fn verify_stage8_consistency(
             return Err(corrupt());
         }
     }
-
     let model_rows = sqlx::query("SELECT * FROM model_invocations")
         .fetch_all(&mut *connection)
         .await
@@ -3032,7 +3104,6 @@ pub(super) async fn verify_stage8_consistency(
             }
         }
     }
-
     let tool_rows = sqlx::query("SELECT * FROM tool_executions")
         .fetch_all(&mut *connection)
         .await
@@ -3324,7 +3395,6 @@ pub(super) async fn verify_stage8_consistency(
             return Err(corrupt());
         }
     }
-
     let bad_work_links: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM work_items w \
          LEFT JOIN model_invocations m ON m.model_invocation_id = w.current_model_invocation_id \
@@ -3371,7 +3441,7 @@ pub(super) async fn verify_stage8_consistency(
 
 impl SqliteStateStore {
     /// Loads logical descriptors only; no physical path escapes the artifact adapter.
-    pub(crate) async fn load_referenced_artifacts(
+    pub async fn load_referenced_artifacts(
         &self,
     ) -> Result<Vec<crate::ports::artifact_store::ArtifactObjectReference>, SqliteAdapterError>
     {
@@ -3424,7 +3494,11 @@ impl ModelStateStore for SqliteStateStore {
         &self,
         request: LoadOwnedWorkRequest,
     ) -> StateStoreFuture<'_, OwnedWorkState> {
-        Box::pin(async move { load_owned_work_state(self, request).await.map_err(map_port_error) })
+        Box::pin(async move {
+            load_owned_work_state(self, request)
+                .await
+                .map_err(map_port_error)
+        })
     }
     fn begin_model_invocation(
         &self,
@@ -3455,7 +3529,24 @@ impl ModelStateStore for SqliteStateStore {
         &self,
         request: TerminalizeOwnedWorkRequest,
     ) -> StateStoreFuture<'_, CommitReceipt> {
-        Box::pin(async move { terminalize_owned_work(self, request).await.map_err(map_port_error) })
+        Box::pin(async move {
+            terminalize_owned_work(self, request)
+                .await
+                .map_err(map_port_error)
+        })
+    }
+}
+
+impl CompletionStateStore for SqliteStateStore {
+    fn commit_assistant_completion(
+        &self,
+        request: CommitAssistantCompletionRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt> {
+        Box::pin(async move {
+            commit_assistant_completion(self, request)
+                .await
+                .map_err(map_port_error)
+        })
     }
 }
 
@@ -3479,5 +3570,31 @@ impl ToolStateStore for SqliteStateStore {
         request: FinishToolExecutionRequest,
     ) -> StateStoreFuture<'_, CommitReceipt> {
         Box::pin(async move { finish_tool(self, request).await.map_err(map_port_error) })
+    }
+}
+
+#[cfg(test)]
+mod source_record_tests {
+    use super::valid_model_invocation_source_record_identifier;
+    use crate::domain::ModelInvocationId;
+
+    #[test]
+    fn model_manifest_record_ids_accept_only_invocation_and_frozen_item_locators() {
+        let invocation = ModelInvocationId::generate().to_string();
+        assert!(valid_model_invocation_source_record_identifier(&invocation));
+        assert!(valid_model_invocation_source_record_identifier(&format!(
+            "{invocation}:item:1"
+        )));
+        assert!(valid_model_invocation_source_record_identifier(&format!(
+            "{invocation}:continuation"
+        )));
+        for invalid in [
+            format!("{invocation}:item:0"),
+            format!("{invocation}:item:01"),
+            format!("{invocation}:item:not-a-number"),
+            format!("{invocation}:continuation:extra"),
+        ] {
+            assert!(!valid_model_invocation_source_record_identifier(&invalid));
+        }
     }
 }

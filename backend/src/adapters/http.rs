@@ -39,6 +39,7 @@ use crate::application::publication::{
     PublicStateService, PublicationError, PublicationErrorKind, encode_public_event_frame,
 };
 use crate::application::runtime::ControlledShutdown;
+use crate::application::scheduler::SchedulerNotifier;
 use crate::application::transport::{CommandCommitEffects, CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::health::{FatalReasonCode, Health, HealthState};
 use crate::domain::{AuthenticatedDevice, ConversationId, IdempotencyKey, UtcTimestamp, WorkId};
@@ -93,8 +94,9 @@ impl HttpState {
         connections: ConnectionRegistry,
         allowed_hosts: Vec<String>,
         controlled_shutdown: Option<Arc<dyn ControlledShutdown>>,
+        scheduler_notifier: Option<SchedulerNotifier>,
     ) -> Self {
-        let effects = CommandCommitEffects::new(cursors.clone(), None);
+        let effects = CommandCommitEffects::new(cursors.clone(), scheduler_notifier);
         let command_gateway = Arc::new(CommandGateway::new(
             Arc::clone(&store),
             Arc::clone(&clock),

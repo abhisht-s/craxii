@@ -381,7 +381,13 @@ pub fn classify_provider_retry(
         RetryReasonCode::ProviderOutcomeAmbiguous
     } else if current_attempt >= MAX_PROVIDER_ATTEMPTS {
         RetryReasonCode::AttemptCapReached
-    } else if error.kind.transient_before_output() {
+    } else if error.kind.transient_before_output()
+        && matches!(
+            error.certainty,
+            ProviderOutcomeCertainty::DefinitelyNotSent
+                | ProviderOutcomeCertainty::DefiniteProviderFailure
+        )
+    {
         RetryReasonCode::ClassifiedTransientBeforeOutput
     } else {
         RetryReasonCode::NonretryableCategory
@@ -800,6 +806,20 @@ mod tests {
             classify_provider_retry(&ambiguous, false, 1, false, false).reason(),
             RetryReasonCode::ProviderOutcomeAmbiguous
         );
+        for certainty in [
+            ProviderOutcomeCertainty::DefinitelyCompleted,
+            ProviderOutcomeCertainty::SemanticOutputObserved,
+        ] {
+            let inconsistent = ProviderError::new(ProviderErrorKind::RateLimited, certainty);
+            assert_eq!(
+                classify_provider_retry(&inconsistent, false, 1, false, false).reason(),
+                if certainty == ProviderOutcomeCertainty::SemanticOutputObserved {
+                    RetryReasonCode::SemanticOutputObserved
+                } else {
+                    RetryReasonCode::NonretryableCategory
+                }
+            );
+        }
     }
 
     #[test]

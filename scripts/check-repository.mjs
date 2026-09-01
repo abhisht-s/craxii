@@ -3735,18 +3735,13 @@ function verifyStage15CanonicalModelStructure(rustRoot, productionFiles) {
 
   assert(
     /ModelTargetSnapshot::from_validated_config\(config\.models\(\)\)/.test(bootstrap) &&
-      /ModelSelectionPolicy::new\(model_targets\)/.test(bootstrap) &&
+      /ModelSelectionPolicy::new\(Arc::clone\(&model_targets\)\)/.test(bootstrap) &&
       !/ScriptedProvider/.test(bootstrap),
     'Stage 15 bootstrap must compose only the immutable target snapshot and selector',
   );
-  assert(!/^reqwest\s*=/m.test(cargoManifest), 'Reqwest must remain absent through Stage 15');
   assert(
     !/ContextManifestId::generate|ContextManifest::(?:new|try_new)/.test(`${model}\n${selection}\n${provider}\n${scripted}`),
     'Stage 16 context manifest construction is forbidden in Stage 15',
-  );
-  assert(
-    stage15ReadinessViolations(bootstrap).length === 0,
-    'Stage 15 must not activate Scheduler/WorkRunner or promote readiness',
   );
   return verifyStage15CheckerNegativeProbes();
 }
@@ -4296,6 +4291,194 @@ function verifyStage16ContextStructure(rustRoot, productionFiles) {
     compilationGatedFalsePositiveControlCount: compilation.controlCount,
     typeSealedChallengeCount: compilation.typeSealedChallengeCount,
   };
+}
+
+function verifyStage17Boundaries(rustRoot, productionFiles, migration4) {
+  const gatewayPath = join(rustRoot, 'application', 'model_gateway.rs');
+  const loopPath = join(rustRoot, 'application', 'agent_loop.rs');
+  assert(existsSync(gatewayPath), 'Stage 17 ModelGateway module is absent');
+  assert(existsSync(loopPath), 'Stage 17 AgentLoop module is absent');
+  const gateway = stripRustComments(withoutRustTestModules(readFileSync(gatewayPath, 'utf8')));
+  const loop = stripRustComments(withoutRustTestModules(readFileSync(loopPath, 'utf8')));
+  const bootstrap = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8'),
+  ));
+  assert(!/\b(?:reqwest|OpenAI|ResponsesApi|SseEvent)\b/.test(`${gateway}\n${loop}`),
+    'Stage 17 application services must remain provider-wire and HTTP neutral');
+  assert(!/\b(?:sqlx|SqliteStateStore|ToolRegistry|LocalWorkstation)\b/.test(loop),
+    'AgentLoop must use application services and ports instead of direct adapters or registry dispatch');
+  assert(/impl\s+WorkRunner\s+for\s+AgentLoop\b/.test(loop),
+    'AgentLoop is not the real WorkRunner implementation');
+  const toolBatch = extractRustFunction(loop, 'execute_tool_batch');
+  assert(!/join_all|FuturesUnordered|tokio::spawn|JoinSet/.test(toolBatch),
+    'AgentLoop tool dispatch must remain sequential');
+  assert(!/ScriptedProvider/.test(bootstrap),
+    'production startup must not compose ScriptedProvider as a live provider');
+  assert(/start_scheduler\s*\(/.test(bootstrap) && /OpenAiProvider::try_new\s*\(/.test(bootstrap),
+    'Stage 19 production startup must install the Stage 17 runner only with the live provider');
+  const sqliteState = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'state_store.rs'), 'utf8');
+  const sqliteJournal = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'journal.rs'), 'utf8');
+  assert(/const\s+SCHEMA_REVISION:\s*i64\s*=\s*4;/.test(sqliteState) &&
+      /matches!\(principal\.schema_revision\(\)\.get\(\),\s*2\s*\|\s*3\s*\|\s*SCHEMA_REVISION\)/.test(sqliteState) &&
+      /matches!\(value\.schema_revision\.get\(\),\s*(?:2\s*\|\s*3\s*\|\s*4|2\s*\.\.\s*=\s*4)\)/.test(sqliteJournal),
+    'Stage 17 runtime schema evidence must emit V4 while accepting frozen V2/V3 history');
+  for (const column of [
+    'usage_status', 'provider_error_kind', 'provider_outcome_certainty', 'retry_reason',
+    'retry_delay_ms', 'provider_retry_after_ms', 'billing_ambiguity',
+  ]) {
+    assert(new RegExp(`\\b${column}\\b`).test(migration4),
+      `Stage 17 migration evidence column is absent: ${column}`);
+  }
+  const plan = readFileSync(
+    join(repositoryRoot, 'docs', 'craxii-v0.0.01-implementation-plan.md'),
+    'utf8',
+  );
+  assert(
+    createHash('sha256').update(plan).digest('hex') ===
+      '27b88665e9686df1d2856d552c859ba5379359ea479fbe13ad8b14a5c22af0f6',
+    'the authoritative implementation plan changed during Stage 17',
+  );
+  assert(productionFiles.some((file) => file.path === 'application/model_gateway.rs') &&
+      productionFiles.some((file) => file.path === 'application/agent_loop.rs'),
+    'Stage 17 production module inventory is incomplete');
+}
+
+function verifyStage18Boundaries(rustRoot) {
+  const requiredPaths = [
+    'backend/tests/stage18.rs',
+    'backend/tests/support/stage18_harness.rs',
+    'backend/tests/fixtures/stage18-v1/evidence-contract.json',
+    'docs/decisions/2026-09-01-stage-18-deterministic-end-to-end-and-crash-recovery-proof.md',
+    'scripts/verify-stage18-deterministic',
+  ];
+  for (const path of requiredPaths) {
+    assert(existsSync(join(repositoryRoot, path)), `Stage 18 required path is absent: ${path}`);
+  }
+
+  const script = readFileSync(
+    join(repositoryRoot, 'scripts', 'verify-stage18-deterministic'),
+    'utf8',
+  );
+  assert(
+    /cargo test --locked -p craxii-server --features test-failpoints --test stage18 -- --test-threads=1/.test(
+      script,
+    ),
+    'Stage 18 runner does not execute the authoritative deterministic suite serially',
+  );
+  assert(
+    script.includes(
+      'STAGE_18_UBUNTU_TARGET_EXECUTION: DEFERRED_BY_USER_TO_STAGE_27_OR_EARLIER',
+    ),
+    'Stage 18 runner does not preserve the exact Ubuntu defer status',
+  );
+
+  const hooks = [
+    ['adapters/sqlite/stage8.rs', 'ModelAttemptAfterManifestRowsBeforeIntent'],
+    ['adapters/sqlite/stage8.rs', 'ModelAttemptAfterAllRowsBeforeCommit'],
+    ['application/model_gateway.rs', 'ModelAttemptAfterCommitBeforeProviderIo'],
+    ['application/model_gateway.rs', 'AfterFirstProviderDelta'],
+    ['application/model_gateway.rs', 'AfterModelResponseCommit'],
+    ['adapters/sqlite/stage8.rs', 'FinalAnswerAfterAllRowsBeforeCommit'],
+    ['application/agent_loop.rs', 'FinalAnswerAfterCommitBeforeNotification'],
+  ];
+  for (const [path, hook] of hooks) {
+    const source = stripRustComments(withoutRustTestModules(
+      readFileSync(join(rustRoot, path), 'utf8'),
+    ));
+    assert(
+      new RegExp(
+        `#\\s*\\[\\s*cfg\\s*\\(\\s*feature\\s*=\\s*"test-failpoints"\\s*\\)\\s*\\][\\s\\S]{0,320}PhysicalHook::${hook}`,
+      ).test(source),
+      `Stage 18 physical hook is absent or not feature-gated: ${hook}`,
+    );
+  }
+
+  const failpoints = readFileSync(join(rustRoot, 'test_failpoints.rs'), 'utf8');
+  for (const alias of [
+    'model_attempt_after_manifest_rows_before_intent',
+    'model_attempt_after_all_rows_before_commit',
+    'model_attempt_after_commit_before_provider_io',
+    'after_first_provider_delta',
+    'after_model_response_commit',
+    'final_answer_after_all_rows_before_commit',
+    'final_answer_after_commit_before_notification',
+  ]) {
+    assert(failpoints.includes(`"${alias}"`), `Stage 18 failpoint alias is inactive: ${alias}`);
+  }
+
+  const bootstrap = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8'),
+  ));
+  assert(!/ScriptedProvider/.test(bootstrap),
+    'Stage 18 test provider crossed into production composition');
+}
+
+function verifyStage19Boundaries(rustRoot, productionFiles, cargoManifest) {
+  const requiredPaths = [
+    'backend/src/adapters/openai/mod.rs',
+    'backend/src/adapters/openai/tests.rs',
+    'backend/tests/fixtures/openai/responses-text.sse',
+    'backend/tests/fixtures/openai/responses-tool-call.sse',
+    'backend/tests/fixtures/openai/responses-reasoning.sse',
+    'backend/tests/openai_live.rs',
+    'docs/dependencies/reqwest.md',
+    'scripts/verify-stage19-openai-live',
+  ];
+  for (const path of requiredPaths) {
+    assert(existsSync(join(repositoryRoot, path)), `Stage 19 required path is absent: ${path}`);
+  }
+  assert(
+    /^reqwest\s*=\s*\{[^\n]*version\s*=\s*"0\.13\.4"[^\n]*default-features\s*=\s*false[^\n]*features\s*=\s*\["json", "rustls"\][^\n]*\}$/m.test(cargoManifest),
+    'Stage 19 Reqwest declaration differs from the reviewed feature set',
+  );
+  const openai = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'adapters', 'openai', 'mod.rs'), 'utf8'),
+  ));
+  for (const required of [
+    /impl\s+ModelProvider\s+for\s+OpenAiProvider/,
+    /"store"\.to_owned\(\),\s*false\.into\(\)/,
+    /"parallel_tool_calls"\.to_owned\(\),\s*false\.into\(\)/,
+    /"truncation"\.to_owned\(\),\s*"disabled"\.into\(\)/,
+    /"reasoning\.encrypted_content"/,
+    /MAX_STREAM_BYTES:\s*usize\s*=\s*8\s*\*\s*1024\s*\*\s*1024/,
+    /UnknownProviderEvent/,
+  ]) {
+    assert(required.test(openai), `Stage 19 OpenAI adapter contract is incomplete: ${required}`);
+  }
+  assert(
+    !/\b(?:StateStore|SqliteStateStore|ToolExecutionService|Workstation|sqlx)\b/.test(openai),
+    'Stage 19 OpenAI adapter crossed persistence/tool/workstation boundaries',
+  );
+  const reqwestLocations = productionFiles
+    .filter((file) => /\breqwest\b/.test(stripRustComments(withoutRustTestModules(file.source))))
+    .map((file) => file.path);
+  assert(
+    equalStringArrays(reqwestLocations, ['adapters/openai/mod.rs']),
+    `Reqwest escaped the OpenAI adapter: ${reqwestLocations.join(', ')}`,
+  );
+  const bootstrap = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8'),
+  ));
+  assert(
+    /load_credentials\s*\(/.test(bootstrap) &&
+      /OpenAiProvider::try_new\s*\(/.test(bootstrap) &&
+      /ModelGateway::new\s*\(/.test(bootstrap) &&
+      /AgentLoop::new\s*\(/.test(bootstrap) &&
+      /start_scheduler\s*\(/.test(bootstrap) &&
+      /ReadyAfterInitialScan/.test(bootstrap) &&
+      /Some\(scheduler_notifier\)/.test(bootstrap) &&
+      !/ScriptedProvider/.test(bootstrap),
+    'Stage 19 production provider/runner/readiness composition is incomplete',
+  );
+  const liveScript = readFileSync(
+    join(repositoryRoot, 'scripts', 'verify-stage19-openai-live'),
+    'utf8',
+  );
+  assert(
+    liveScript.includes('STAGE_19_LIVE_SMOKE: NOT_CONFIGURED') &&
+      liveScript.includes('--ignored --nocapture'),
+    'Stage 19 live gate lacks explicit prerequisite/deferred behavior',
+  );
 }
 
 function verifyStage16ProbeRepository() {
@@ -4981,14 +5164,16 @@ function verifyStage13Boundaries() {
       '0001_core_durable_schema.sql',
       '0002_journal_and_work_inputs.sql',
       '0003_context_model_tool_artifacts.sql',
+      '0004_model_attempt_outcome_evidence.sql',
     ]),
-    `Stage 10 must contain exactly migrations 0001, 0002, and 0003; found ${migrationFiles.join(', ') || 'nothing'}`,
+    `Stage 17 must contain exactly migrations 0001 through 0004; found ${migrationFiles.join(', ') || 'nothing'}`,
   );
   const migration1 = readFileSync(join(migrationRoot, migrationFiles[0]), 'utf8');
   const migration2 = readFileSync(join(migrationRoot, migrationFiles[1]), 'utf8');
   const migration3 = readFileSync(join(migrationRoot, migrationFiles[2]), 'utf8');
-  const migrations = `${migration1}\n${migration2}\n${migration3}`;
-  const migrationChecksums = [migration1, migration2, migration3].map((migration) =>
+  const migration4 = readFileSync(join(migrationRoot, migrationFiles[3]), 'utf8');
+  const migrations = `${migration1}\n${migration2}\n${migration3}\n${migration4}`;
+  const migrationChecksums = [migration1, migration2, migration3, migration4].map((migration) =>
     createHash('sha384').update(migration).digest('hex'),
   );
   assert(
@@ -4996,6 +5181,7 @@ function verifyStage13Boundaries() {
       '717c44a33c94ccaadbdb6fd7a2cc3b4d99eb269216de241f379af7cce2c3557eb78e5a0ba98b1fe280d2b8449675dd8d',
       '677379cfb19c61d45c6a61bdeb978539490adcee97f57e51cab8794e63038b70950d715a90e7e524397007a97f875ebf',
       'e2f5cab2ac0921ce54e6ae8a741eb23c11766e847a5d17f21f7381ae4aa1d729287542c1ebaa12d25431f3b277cd5c39',
+      '5b0f569b08c578f6a86afbdf6610b5b83a26f6348380b8ce8b09eff673adab2854a5f161990cce6d73a45ca9f51c0010',
     ]),
     `migration checksum inventory differs: ${migrationChecksums.join(', ')}`,
   );
@@ -5275,12 +5461,12 @@ function verifyStage13Boundaries() {
   const compatibility = readFileSync(join(rustRoot, 'bootstrap', 'compatibility.rs'), 'utf8');
   const schema = readFileSync(join(sqliteRoot, 'schema.rs'), 'utf8');
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*3;/.test(compatibility),
-    'bootstrap schema compatibility ceiling must be 3',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*u64\s*=\s*4;/.test(compatibility),
+    'bootstrap schema compatibility ceiling must be 4',
   );
   assert(
-    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*3;/.test(schema),
-    'SQLite schema compatibility ceiling must be 3',
+    /MAX_SUPPORTED_SCHEMA_VERSION:\s*i64\s*=\s*4;/.test(schema),
+    'SQLite schema compatibility ceiling must be 4',
   );
 
   const journalDomain = readFileSync(join(rustRoot, 'domain', 'journal.rs'), 'utf8');
@@ -5325,8 +5511,8 @@ function verifyStage13Boundaries() {
     'Stage 8 persistence port requested_cwd must be concrete and nonoptional',
   );
   assert(
-    !/impl\s+CompletionStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
-    'Stage 17 completion behavior must remain unimplemented',
+    /impl\s+CompletionStateStore\s+for\s+SqliteStateStore/.test(productionSqliteSource),
+    'Stage 17 SQLite assistant-completion transaction is absent',
   );
   const canonicalPersistence = [stateStore, artifactPort, journalDomain].join('\n');
   assert(
@@ -5630,6 +5816,14 @@ function verifyStage13Boundaries() {
       path: relative(rustRoot, path),
       source: readFileSync(path, 'utf8'),
     }));
+  const preStage17ProductionFiles = productionImplementationFiles.filter(
+    (file) => ![
+      'application/model_gateway.rs',
+      'application/agent_loop.rs',
+      'adapters/openai/mod.rs',
+      'bootstrap/startup.rs',
+    ].includes(file.path),
+  );
   verifyStage13WorkstationStructure(rustRoot, productionImplementationFiles);
   const stage13CheckerNegativeProbeCount = verifyStage13CheckerNegativeProbes();
   const stage14CheckerNegativeProbeCount = verifyStage14ToolStructure(
@@ -5638,12 +5832,15 @@ function verifyStage13Boundaries() {
   );
   const stage15Checker = verifyStage15CanonicalModelStructure(
     rustRoot,
-    productionImplementationFiles,
+    preStage17ProductionFiles,
   );
   const stage16Checker = verifyStage16ContextStructure(
     rustRoot,
-    productionImplementationFiles,
+    preStage17ProductionFiles,
   );
+  verifyStage17Boundaries(rustRoot, productionImplementationFiles, migration4);
+  verifyStage18Boundaries(rustRoot);
+  verifyStage19Boundaries(rustRoot, productionImplementationFiles, cargoManifest);
   const stage15CheckerNegativeProbeCount = stage15Checker.negativeProbeCount;
   const checkerNegativeProbeCount =
     stage13CheckerNegativeProbeCount + stage14CheckerNegativeProbeCount +
@@ -5797,6 +5994,7 @@ try {
   console.log('Stage 16 type-sealed compile-prevented challenges passed: 16.');
   console.log('Stage 16 compilation-gated positive controls passed: 14.');
   console.log('Stage 16 structural invariants passed.');
+  console.log('Stage 17 narrow boundaries and V4 evidence inventory passed.');
   }
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

@@ -608,7 +608,7 @@ pub enum ModelInputRole {
 }
 
 impl ModelInputRole {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::System => "system",
             Self::Developer => "developer",
@@ -830,6 +830,16 @@ impl ModelToolDefinition {
         &self.name
     }
 
+    #[must_use]
+    pub const fn description(&self) -> &ModelTextPart {
+        &self.description
+    }
+
+    #[must_use]
+    pub const fn input_schema(&self) -> &Value {
+        &self.input_schema
+    }
+
     /// Exact compact canonical model-visible definition bytes.
     #[must_use]
     pub fn canonical_bytes(&self) -> Vec<u8> {
@@ -867,7 +877,7 @@ pub enum ModelToolChoicePolicy {
 }
 
 impl ModelToolChoicePolicy {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Automatic => "automatic",
             Self::None => "none",
@@ -992,6 +1002,11 @@ impl ModelRequest {
     }
 
     #[must_use]
+    pub const fn provider_native_options(&self) -> ProviderNativeOptions {
+        self.provider_native_options
+    }
+
+    #[must_use]
     pub const fn parallel_tool_calls(&self) -> bool {
         false
     }
@@ -1101,6 +1116,35 @@ impl ModelOutputItem {
         true
     }
 
+    /// Ordered text parts for answer, refusal, or provider-exposed reasoning-summary items.
+    #[must_use]
+    pub fn content_parts(&self) -> Option<&[ModelTextPart]> {
+        match self {
+            Self::Text { content_parts }
+            | Self::Refusal { content_parts }
+            | Self::ReasoningSummary { content_parts } => Some(content_parts),
+            _ => None,
+        }
+    }
+
+    /// Canonicalized structured data, when this is a structured-data item.
+    #[must_use]
+    pub const fn structured_data_value(&self) -> Option<&Value> {
+        match self {
+            Self::StructuredData { data } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Complete validated tool call, when this item requests one.
+    #[must_use]
+    pub const fn tool_call(&self) -> Option<&CanonicalModelToolCall> {
+        match self {
+            Self::ToolCall(call) => Some(call),
+            _ => None,
+        }
+    }
+
     fn semantic_value(&self) -> Value {
         match self {
             Self::Text { content_parts } => {
@@ -1142,7 +1186,7 @@ pub enum ModelStopReason {
 }
 
 impl ModelStopReason {
-    const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Completed => "completed",
             Self::ToolContinuation => "tool_continuation",

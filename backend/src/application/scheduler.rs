@@ -34,10 +34,12 @@ pub struct WorkRunnerStartError;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkRunnerExit {
+    TerminalCommitted,
     CancellationConfirmed,
     Abnormal,
 }
 
+#[derive(Clone)]
 pub struct WorkCancellation {
     receiver: tokio::sync::watch::Receiver<bool>,
 }
@@ -54,6 +56,11 @@ impl WorkCancellation {
                 return;
             }
         }
+    }
+
+    #[must_use]
+    pub fn receiver(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.receiver.clone()
     }
 }
 
@@ -124,10 +131,16 @@ enum SchedulerCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchedulerReadiness {
+    RemainLiveUnready,
+    ReadyAfterInitialScan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulerStart {
     pub runtime_instance_id: RuntimeInstanceId,
     pub conversation_id: ConversationId,
-    pub allow_test_ready: bool,
+    pub readiness: SchedulerReadiness,
 }
 
 impl SchedulerHandle {
@@ -224,9 +237,6 @@ where
     let claiming = Arc::new(AtomicBool::new(true));
     let claim_gate = Arc::new(tokio::sync::Mutex::new(()));
     let loop_registry = registry.clone();
-    if start.allow_test_ready {
-        health.mark_ready().map_err(|_| SchedulerError::Health)?;
-    }
     let join = tokio::spawn(run_scheduler(
         store,
         runner,
@@ -240,6 +250,7 @@ where
         loop_registry,
         Arc::clone(&claiming),
         Arc::clone(&claim_gate),
+        start.readiness,
     ));
     notifier.wake();
     Ok(SchedulerHandle {
@@ -266,6 +277,7 @@ async fn run_scheduler<S, R, C>(
     registry_view: TaskRegistryView,
     claiming: Arc<AtomicBool>,
     claim_gate: Arc<tokio::sync::Mutex<()>>,
+    readiness: SchedulerReadiness,
 ) -> Result<(), SchedulerError>
 where
     S: SchedulerStateStore + 'static,
@@ -281,6 +293,7 @@ where
     let mut fatal_error = None;
     let mut deadline_frozen = false;
     let mut control_open = true;
+    let mut initial_scan_completed = false;
 
     loop {
         if shutting_down && tasks.is_empty() {
@@ -326,6 +339,11 @@ where
                         control_open = false;
                         claiming.store(false, Ordering::Release);
                         fatal_error.get_or_insert(SchedulerError::TaskJoin);
+                        shutting_down = true;
+                        for entry in registry.values() {
+                            let _ = entry.cancellation.send(true);
+                        }
+                        update_view(&registry, &registry_view);
                     }
                 }
             }
@@ -365,6 +383,16 @@ where
                     let _ = health.mark_fatal(FatalReasonCode::Internal);
                     let _ = fatal.send(true);
                     fatal_error = Some(error);
+                } else if !initial_scan_completed {
+                    initial_scan_completed = true;
+                    if readiness == SchedulerReadiness::ReadyAfterInitialScan
+                        && health.mark_ready().is_err()
+                    {
+                        claiming.store(false, Ordering::Release);
+                        let _ = health.mark_fatal(FatalReasonCode::Internal);
+                        let _ = fatal.send(true);
+                        fatal_error = Some(SchedulerError::Health);
+                    }
                 }
             }
             _ = scan.tick(), if !deadline_frozen && fatal_error.is_none() => {
@@ -385,6 +413,16 @@ where
                     let _ = health.mark_fatal(FatalReasonCode::Internal);
                     let _ = fatal.send(true);
                     fatal_error = Some(error);
+                } else if !initial_scan_completed {
+                    initial_scan_completed = true;
+                    if readiness == SchedulerReadiness::ReadyAfterInitialScan
+                        && health.mark_ready().is_err()
+                    {
+                        claiming.store(false, Ordering::Release);
+                        let _ = health.mark_fatal(FatalReasonCode::Internal);
+                        let _ = fatal.send(true);
+                        fatal_error = Some(SchedulerError::Health);
+                    }
                 }
             }
         }
@@ -531,6 +569,7 @@ where
         return Ok(());
     }
     match exit {
+        Some(WorkRunnerExit::TerminalCommitted) => {}
         Some(WorkRunnerExit::CancellationConfirmed) => {
             store
                 .finish_cancellation(FinishCancellationRequest {
@@ -797,6 +836,18 @@ mod tests {
         }
     }
 
+    struct TerminalRunner;
+
+    impl WorkRunner for TerminalRunner {
+        fn start(
+            &self,
+            _: ClaimedWork,
+            _: WorkCancellation,
+        ) -> Result<WorkRunnerFuture, WorkRunnerStartError> {
+            Ok(Box::pin(async { WorkRunnerExit::TerminalCommitted }))
+        }
+    }
+
     struct PanicRunner;
 
     impl WorkRunner for PanicRunner {
@@ -989,7 +1040,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_handle_joins_every_runner_and_may_enable_only_test_readiness() {
+    async fn scheduler_readiness_waits_for_the_initial_successful_scan() {
         let runtime_id = RuntimeInstanceId::generate();
         let claimed = claimed(runtime_id);
         let work_id = claimed.work.work_id();
@@ -1009,7 +1060,7 @@ mod tests {
             SchedulerStart {
                 runtime_instance_id: runtime_id,
                 conversation_id: ConversationId::generate(),
-                allow_test_ready: true,
+                readiness: SchedulerReadiness::ReadyAfterInitialScan,
             },
         )
         .unwrap();
@@ -1018,6 +1069,84 @@ mod tests {
         assert_eq!(handle.registry().snapshot()[0].work_id, work_id);
         handle.stop_and_join().await.unwrap();
         assert_eq!(*lock(&store.finished), vec![work_id]);
+    }
+
+    #[tokio::test]
+    async fn terminal_committed_exit_is_observed_without_mutation_then_follower_is_claimed() {
+        let runtime_id = RuntimeInstanceId::generate();
+        let first = claimed(runtime_id);
+        let first_id = first.work.work_id();
+        let second = claimed(runtime_id);
+        let second_id = second.work.work_id();
+        let store = FakeSchedulerStore {
+            claims: Mutex::new(VecDeque::from([first, second])),
+            ..FakeSchedulerStore::default()
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut registry = HashMap::new();
+        let mut task_to_work = HashMap::new();
+        let view = TaskRegistryView::default();
+        let claiming = AtomicBool::new(true);
+        let claim_gate = tokio::sync::Mutex::new(());
+        let clock = test_clock();
+        scan_once(
+            &store,
+            &TerminalRunner,
+            clock.as_ref(),
+            runtime_id,
+            ConversationId::generate(),
+            &mut tasks,
+            &mut registry,
+            &mut task_to_work,
+            &view,
+            &claiming,
+            &claim_gate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.snapshot()[0].work_id, first_id);
+        observe_join(
+            tasks.join_next_with_id().await,
+            &store,
+            clock.as_ref(),
+            runtime_id,
+            &mut registry,
+            &mut task_to_work,
+            &view,
+            JoinDisposition::ReconcileDurably,
+        )
+        .await
+        .unwrap();
+        assert!(lock(&store.finished).is_empty());
+        assert!(lock(&store.interrupted).is_empty());
+        scan_once(
+            &store,
+            &TerminalRunner,
+            clock.as_ref(),
+            runtime_id,
+            ConversationId::generate(),
+            &mut tasks,
+            &mut registry,
+            &mut task_to_work,
+            &view,
+            &claiming,
+            &claim_gate,
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.snapshot()[0].work_id, second_id);
+        observe_join(
+            tasks.join_next_with_id().await,
+            &store,
+            clock.as_ref(),
+            runtime_id,
+            &mut registry,
+            &mut task_to_work,
+            &view,
+            JoinDisposition::ReconcileDurably,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1048,7 +1177,7 @@ mod tests {
             SchedulerStart {
                 runtime_instance_id: runtime_id,
                 conversation_id: ConversationId::generate(),
-                allow_test_ready: false,
+                readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )
         .unwrap();
@@ -1089,7 +1218,7 @@ mod tests {
             SchedulerStart {
                 runtime_instance_id: runtime_id,
                 conversation_id: ConversationId::generate(),
-                allow_test_ready: false,
+                readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )
         .unwrap();
@@ -1123,7 +1252,7 @@ mod tests {
             SchedulerStart {
                 runtime_instance_id: RuntimeInstanceId::generate(),
                 conversation_id: ConversationId::generate(),
-                allow_test_ready: false,
+                readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )
         .unwrap();

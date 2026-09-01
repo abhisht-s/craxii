@@ -591,7 +591,7 @@ async fn work_input_constraints_and_private_causal_validation_fail_closed() {
 }
 
 #[tokio::test]
-async fn valid_version_one_database_migrates_to_version_three_and_reopens() {
+async fn valid_version_one_database_migrates_to_version_four_and_reopens() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -628,7 +628,7 @@ async fn valid_version_one_database_migrates_to_version_three_and_reopens() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        3
+        4
     );
     drop(connection);
     guard.shutdown().await;

@@ -1,26 +1,48 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use sqlx::Row;
 
+use crate::adapters::artifacts::LocalArtifactStore;
+use crate::adapters::local_workstation::{LocalWorkstation, LocalWorkstationOptions};
+use crate::application::agent_loop::{AgentLoop, AgentLoopLimits, AgentLoopRuntimeContext};
+use crate::application::authority::{
+    AuthorityEvaluator, V0AuthorityConstraints, V0AuthorityEvaluator,
+};
 use crate::application::command_service::{
     AcceptMessageCommand, CancelWorkCommand, CommandService,
 };
+use crate::application::context_assembler::{
+    ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
+};
 use crate::application::device_provisioning::DeviceProvisioningService;
+use crate::application::model_gateway::{ModelGateway, ModelGatewayLimits, NoopDraftSink};
+use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
 use crate::application::runtime::{HeartbeatTask, RuntimeControlError, ShutdownController};
 use crate::application::runtime::{RuntimeBootstrapReceipt, bootstrap_runtime};
 use crate::application::scheduler::{
-    SchedulerStart, WorkCancellation, WorkRunner, WorkRunnerFuture, WorkRunnerStartError,
-    start_scheduler,
+    SchedulerReadiness, SchedulerStart, WorkCancellation, WorkRunner, WorkRunnerFuture,
+    WorkRunnerStartError, start_scheduler,
 };
+use crate::application::tool_execution_service::{ToolExecutionService, ToolRuntimeLimits};
+use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::bootstrap::health::{FatalReasonCode, Health, HealthState};
 use crate::domain::*;
-use crate::ports::clock::TestClock;
+use crate::ports::artifact_store::ArtifactStore;
+use crate::ports::clock::{Clock, TestClock};
+use crate::ports::model_provider::{
+    ConservativeTokenEstimate, FullJitterSource, ModelProvider, ModelProviderFuture,
+    ModelProviderInvocation, ModelProviderStream, ProviderError, ProviderErrorKind,
+    ProviderOutcomeCertainty, TokenEstimateUnit, TokenEstimator,
+};
 use crate::ports::state_store::*;
+use crate::ports::workstation::{HARD_FILE_READ_MAX_BYTES, Workstation};
+use crate::ports::workstation_preparation::WorkstationPreparation;
 
 use super::{SqliteRuntimeGuard, SqliteStateStore};
 
@@ -83,7 +105,14 @@ fn observation() -> BootstrapObservation {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_observation(|_| observation()).await
+}
+
+async fn fixture_with_observation(
+    build_observation: impl FnOnce(&TestRoot) -> BootstrapObservation,
+) -> Fixture {
     let root = TestRoot::new();
+    let bootstrap_observation = build_observation(&root);
     let guard = SqliteRuntimeGuard::start(root.path(), 4).await.unwrap();
     let store = SqliteStateStore::new(guard.runtime().clone());
     let identity = store
@@ -98,7 +127,7 @@ async fn fixture() -> Fixture {
             conversation_created_event_id: JournalEventId::generate(),
             correlation_id: CorrelationId::generate(),
             created_at: at(T0),
-            observation: observation(),
+            observation: bootstrap_observation,
         })
         .await
         .unwrap()
@@ -916,7 +945,7 @@ async fn shutdown_latches_deadline_stops_claims_and_classifies_before_timeout_ab
         SchedulerStart {
             runtime_instance_id: runtime_id,
             conversation_id: fixture.identity.conversation_id,
-            allow_test_ready: true,
+            readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
         },
     )
     .unwrap();
@@ -1046,7 +1075,7 @@ async fn fatal_health_remains_terminal_while_controlled_shutdown_completes() {
         SchedulerStart {
             runtime_instance_id: runtime_id,
             conversation_id: fixture.identity.conversation_id,
-            allow_test_ready: false,
+            readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
     .unwrap();
@@ -1107,7 +1136,7 @@ async fn heartbeat_fatal_error_still_runs_shutdown_and_preserves_original_failur
         SchedulerStart {
             runtime_instance_id: runtime_id,
             conversation_id: fixture.identity.conversation_id,
-            allow_test_ready: true,
+            readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
         },
     )
     .unwrap();
@@ -1207,7 +1236,7 @@ async fn scheduler_fatal_error_retains_ownership_until_controlled_shutdown() {
         SchedulerStart {
             runtime_instance_id: runtime_id,
             conversation_id: fixture.identity.conversation_id,
-            allow_test_ready: false,
+            readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
     .unwrap();
@@ -1420,7 +1449,7 @@ async fn stage10_failpoint_crash_child() {
                 SchedulerStart {
                     runtime_instance_id: runtime.runtime_instance_id,
                     conversation_id: fixture.identity.conversation_id,
-                    allow_test_ready: false,
+                    readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
                 },
             )
             .unwrap();
@@ -1598,7 +1627,7 @@ async fn after_message_commit_process_loss_replays_once_and_scheduler_scan_claim
         SchedulerStart {
             runtime_instance_id: current.runtime_instance_id,
             conversation_id: fixture.identity.conversation_id,
-            allow_test_ready: false,
+            readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
     .unwrap();
@@ -1780,5 +1809,691 @@ async fn process_loss_between_recovery_units_is_idempotent_on_the_next_startup()
         .verify_application_consistency()
         .await
         .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+struct Stage17FixedEstimator {
+    identity: TokenEstimatorIdentity,
+}
+
+impl TokenEstimator for Stage17FixedEstimator {
+    fn identity(&self) -> &TokenEstimatorIdentity {
+        &self.identity
+    }
+
+    fn estimate(
+        &self,
+        _: &ModelTarget,
+        _: &[TokenEstimateUnit],
+    ) -> Result<ConservativeTokenEstimate, ProviderError> {
+        ConservativeTokenEstimate::try_new(self.identity.clone(), 1_024)
+    }
+}
+
+struct Stage17MinimumJitter;
+
+impl FullJitterSource for Stage17MinimumJitter {
+    fn sample_inclusive(&mut self, _: u64) -> u64 {
+        0
+    }
+}
+
+enum Stage17ProviderPlan {
+    ReadFile,
+    ReadFiles,
+    FinalText(&'static str),
+    Structured,
+    Refusal(&'static str),
+}
+
+struct Stage17Provider {
+    provider_id: ProviderId,
+    plans: Mutex<VecDeque<Stage17ProviderPlan>>,
+    requests: Mutex<Vec<ModelRequest>>,
+    first_started: tokio::sync::Notify,
+    release_first: tokio::sync::Notify,
+    invocation_count: AtomicUsize,
+}
+
+impl Stage17Provider {
+    fn new(plans: Vec<Stage17ProviderPlan>) -> Self {
+        Self {
+            provider_id: ProviderId::try_new("stage17-fixture").unwrap(),
+            plans: Mutex::new(plans.into()),
+            requests: Mutex::new(Vec::new()),
+            first_started: tokio::sync::Notify::new(),
+            release_first: tokio::sync::Notify::new(),
+            invocation_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn requests(&self) -> Vec<ModelRequest> {
+        self.requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+struct Stage17ProviderStream {
+    events: VecDeque<ModelStreamEvent>,
+}
+
+impl ModelProviderStream for Stage17ProviderStream {
+    fn next_event(&mut self) -> ModelProviderFuture<'_, Option<ModelStreamEvent>> {
+        Box::pin(async move { Ok(self.events.pop_front()) })
+    }
+}
+
+impl ModelProvider for Stage17Provider {
+    fn provider_id(&self) -> &ProviderId {
+        &self.provider_id
+    }
+
+    fn capabilities(&self, target: &ModelTarget) -> Result<ModelCapabilitySnapshot, ProviderError> {
+        if target.reference().provider_id() != &self.provider_id {
+            return Err(ProviderError::new(
+                ProviderErrorKind::UnknownModel,
+                ProviderOutcomeCertainty::DefinitelyNotSent,
+            ));
+        }
+        Ok(target.reference().capabilities().clone())
+    }
+
+    fn invoke_stream(
+        &self,
+        invocation: ModelProviderInvocation,
+    ) -> ModelProviderFuture<'_, Box<dyn ModelProviderStream>> {
+        Box::pin(async move {
+            let ordinal = self.invocation_count.fetch_add(1, Ordering::SeqCst) + 1;
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(invocation.request.clone());
+            let plan = self
+                .plans
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::ScriptMismatch,
+                        ProviderOutcomeCertainty::DefinitelyNotSent,
+                    )
+                })?;
+            if ordinal == 1 {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            let request_id = ProviderEvidenceId::try_new(format!("req-{ordinal}")).unwrap();
+            let response_id = ProviderEvidenceId::try_new(format!("resp-{ordinal}")).unwrap();
+            let usage = crate::domain::model::ModelUsage::try_new(10, 0, 5, 0, 15).unwrap();
+            let target = invocation.request.target().identity();
+            let (items, stop_reason, semantic_events) = match plan {
+                Stage17ProviderPlan::ReadFile => {
+                    let call = CanonicalModelToolCall::try_new(
+                        ModelToolCallId::try_new("read-note").unwrap(),
+                        "read_file",
+                        "{\"path\":\"note.txt\"}",
+                    )
+                    .unwrap();
+                    (
+                        vec![ModelOutputItem::ToolCall(call.clone())],
+                        ModelStopReason::ToolContinuation,
+                        vec![
+                            ModelStreamEvent::ToolCallStarted {
+                                item_ordinal: 0,
+                                call_id: call.call_id().clone(),
+                                name: call.name().clone(),
+                            },
+                            ModelStreamEvent::ToolArgumentDelta {
+                                item_ordinal: 0,
+                                call_id: call.call_id().clone(),
+                                delta: call.raw_arguments().to_owned(),
+                            },
+                            ModelStreamEvent::ToolCallCompleted {
+                                item_ordinal: 0,
+                                call,
+                            },
+                        ],
+                    )
+                }
+                Stage17ProviderPlan::ReadFiles => {
+                    let first = CanonicalModelToolCall::try_new(
+                        ModelToolCallId::try_new("read-first-note").unwrap(),
+                        "read_file",
+                        "{\"path\":\"note.txt\"}",
+                    )
+                    .unwrap();
+                    let second = CanonicalModelToolCall::try_new(
+                        ModelToolCallId::try_new("read-second-note").unwrap(),
+                        "read_file",
+                        "{\"path\":\"note-two.txt\"}",
+                    )
+                    .unwrap();
+                    let missing = CanonicalModelToolCall::try_new(
+                        ModelToolCallId::try_new("read-missing-note").unwrap(),
+                        "read_file",
+                        "{\"path\":\"missing-note.txt\"}",
+                    )
+                    .unwrap();
+                    let mut semantic_events = Vec::new();
+                    for (item_ordinal, call) in [
+                        (0, first.clone()),
+                        (1, second.clone()),
+                        (2, missing.clone()),
+                    ] {
+                        semantic_events.extend([
+                            ModelStreamEvent::ToolCallStarted {
+                                item_ordinal,
+                                call_id: call.call_id().clone(),
+                                name: call.name().clone(),
+                            },
+                            ModelStreamEvent::ToolArgumentDelta {
+                                item_ordinal,
+                                call_id: call.call_id().clone(),
+                                delta: call.raw_arguments().to_owned(),
+                            },
+                            ModelStreamEvent::ToolCallCompleted { item_ordinal, call },
+                        ]);
+                    }
+                    (
+                        vec![
+                            ModelOutputItem::ToolCall(first),
+                            ModelOutputItem::ToolCall(second),
+                            ModelOutputItem::ToolCall(missing),
+                        ],
+                        ModelStopReason::ToolContinuation,
+                        semantic_events,
+                    )
+                }
+                Stage17ProviderPlan::FinalText(text) => {
+                    let part = ModelTextPart::try_new(text).unwrap();
+                    (
+                        vec![ModelOutputItem::text(vec![part.clone()]).unwrap()],
+                        ModelStopReason::Completed,
+                        vec![ModelStreamEvent::TextDelta {
+                            item_ordinal: 0,
+                            delta: part,
+                        }],
+                    )
+                }
+                Stage17ProviderPlan::Structured => {
+                    let data = serde_json::json!({"z": 2, "a": 1});
+                    (
+                        vec![ModelOutputItem::structured_data(data.clone()).unwrap()],
+                        ModelStopReason::Completed,
+                        vec![ModelStreamEvent::StructuredData {
+                            item_ordinal: 0,
+                            data,
+                        }],
+                    )
+                }
+                Stage17ProviderPlan::Refusal(text) => {
+                    let part = ModelTextPart::try_new(text).unwrap();
+                    (
+                        vec![ModelOutputItem::refusal(vec![part.clone()]).unwrap()],
+                        ModelStopReason::Refusal,
+                        vec![
+                            ModelStreamEvent::RefusalDelta {
+                                item_ordinal: 0,
+                                delta: part,
+                            },
+                            ModelStreamEvent::RefusalCompleted { item_ordinal: 0 },
+                        ],
+                    )
+                }
+            };
+            let response = ModelResponse::try_new(ModelResponseInput {
+                selected_target: target.clone(),
+                output_items: items,
+                stop_reason,
+                usage,
+                provider_request_id: Some(request_id.clone()),
+                provider_response_id: Some(response_id.clone()),
+                provider_continuation: None,
+                provider_metadata: ProviderMetadata::default(),
+            })
+            .unwrap();
+            let mut events = VecDeque::from([ModelStreamEvent::ResponseStarted {
+                target,
+                provider_request_id: Some(request_id),
+                provider_response_id: Some(response_id),
+            }]);
+            events.extend(semantic_events);
+            events.push_back(ModelStreamEvent::Usage(usage));
+            events.push_back(ModelStreamEvent::Completed(response));
+            Ok(Box::new(Stage17ProviderStream { events }) as Box<dyn ModelProviderStream>)
+        })
+    }
+}
+
+fn stage17_target() -> ModelTarget {
+    let capabilities = ModelCapabilitySnapshot::new(ModelCapabilitySnapshotInput {
+        text_input: true,
+        text_output: true,
+        custom_tool_calling: true,
+        streaming: true,
+        ordered_output_items: true,
+        structured_output: true,
+        reasoning_continuation: false,
+        context_window_tokens: TokenCount::try_new(128_000).unwrap(),
+        max_output_tokens: TokenCount::try_new(4_096).unwrap(),
+    });
+    ModelTarget::try_new(ModelTargetInput {
+        reference: ProviderModelReference::new(
+            ModelTargetId::try_new("stage17-primary").unwrap(),
+            ProviderId::try_new("stage17-fixture").unwrap(),
+            ProviderModelId::try_new("fixture-model").unwrap(),
+            TargetConfigurationVersion::try_new(1).unwrap(),
+            capabilities,
+        ),
+        enabled: true,
+        endpoint_reference: ModelConfigReference::endpoint("https://fixture.invalid/v1").unwrap(),
+        account_reference: ModelConfigReference::named("fixture-account").unwrap(),
+        requested_output_tokens: TokenCount::try_new(512).unwrap(),
+        estimator: TokenEstimatorIdentity::try_new("stage17_fixed", 1).unwrap(),
+        provider_native_options: ProviderNativeOptions::new(false),
+    })
+    .unwrap()
+}
+
+struct Stage17ObservedRunner {
+    inner: Arc<AgentLoop>,
+    abnormal: Arc<tokio::sync::Notify>,
+    release_abnormal: Arc<tokio::sync::Notify>,
+}
+
+impl WorkRunner for Stage17ObservedRunner {
+    fn start(
+        &self,
+        work: ClaimedWork,
+        cancellation: WorkCancellation,
+    ) -> Result<WorkRunnerFuture, WorkRunnerStartError> {
+        let future = self.inner.start(work, cancellation)?;
+        let abnormal = Arc::clone(&self.abnormal);
+        let release = Arc::clone(&self.release_abnormal);
+        Ok(Box::pin(async move {
+            let exit = future.await;
+            if exit == crate::application::scheduler::WorkRunnerExit::Abnormal {
+                abnormal.notify_one();
+                release.notified().await;
+            }
+            exit
+        }))
+    }
+}
+
+#[tokio::test]
+async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic_messages() {
+    let fixture = fixture_with_observation(|root| {
+        let workspace_root = root.path().join("stage17-workspace");
+        let mut value = observation();
+        value.default_shell = "/bin/bash".into();
+        value.workspace_logical_root = workspace_root.to_string_lossy().into_owned();
+        value.workspace_resolved_root = value.workspace_logical_root.clone();
+        value.execution_capabilities = ExecutionCapabilityObservation {
+            foreground_execute: true,
+            privilege_administrative: false,
+            process_group_cleanup: true,
+            cgroup_cleanup: false,
+        };
+        value
+    })
+    .await;
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    let first = accept(&fixture, "read the note", at(T1)).await;
+    let second = accept(&fixture, "read both notes in order", at(T1)).await;
+    let third = accept(&fixture, "return structured data", at(T1)).await;
+    let fourth = accept(&fixture, "decline this one", at(T1)).await;
+
+    let workspace_root = fixture._root.path().join("stage17-workspace");
+    fs::create_dir(&workspace_root).unwrap();
+    fs::write(workspace_root.join("note.txt"), "durable tool evidence\n").unwrap();
+    fs::write(
+        workspace_root.join("note-two.txt"),
+        "ordered second tool evidence\n",
+    )
+    .unwrap();
+    let artifact_store = Arc::new(
+        LocalArtifactStore::initialize(&fixture._root.path().join("stage17-artifacts")).unwrap(),
+    );
+    let clock = Arc::new(TestClock::new(
+        at(T2).to_offset_datetime(),
+        Duration::from_secs(10),
+    ));
+    let snapshot = fixture.store.load_bootstrap_snapshot().await.unwrap();
+    let workstation_clock: Arc<dyn Clock> = clock.clone();
+    let workstation_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let local_workstation = Arc::new(
+        LocalWorkstation::new(
+            &snapshot.workstation,
+            &snapshot.workspace,
+            LocalWorkstationOptions {
+                default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+                configured_workspace_root: workspace_root,
+                read_hard_limit: HARD_FILE_READ_MAX_BYTES,
+                artifact_store: workstation_artifacts,
+                administrative_enabled: false,
+                delegated_cgroup_root: None,
+                clock: workstation_clock,
+            },
+        )
+        .unwrap(),
+    );
+    let policy = ToolSemanticPolicy {
+        read_file_default_bytes: 4_096,
+        read_file_max_bytes: 65_536,
+        run_shell_command_max_bytes: 65_536,
+        run_shell_default_timeout_ms: 60_000,
+        run_shell_max_timeout_ms: 900_000,
+    };
+    let registry = Arc::new(ToolRegistry::v0(policy).unwrap());
+    let tool_store: Arc<dyn ToolStateStore> = Arc::new(fixture.store.clone());
+    let workstation: Arc<dyn Workstation> = local_workstation.clone();
+    let preparation: Arc<dyn WorkstationPreparation> = local_workstation;
+    let tool_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let tool_clock: Arc<dyn Clock> = clock.clone();
+    let tool_execution = Arc::new(
+        ToolExecutionService::new(
+            Arc::clone(&registry),
+            Arc::new(V0AuthorityEvaluator) as Arc<dyn AuthorityEvaluator>,
+            tool_store,
+            workstation,
+            preparation,
+            tool_artifacts,
+            tool_clock,
+            ToolRuntimeLimits {
+                read_file_default_bytes: policy.read_file_default_bytes,
+                read_file_max_bytes: policy.read_file_max_bytes,
+                run_shell_command_max_bytes: policy.run_shell_command_max_bytes,
+                run_shell_default_timeout_ms: policy.run_shell_default_timeout_ms,
+                run_shell_max_timeout_ms: policy.run_shell_max_timeout_ms,
+                stdout_capture_bytes: 32_768,
+                stderr_capture_bytes: 32_768,
+                inline_model_result_bytes: 65_536,
+                per_stream_projection_bytes: 32_768,
+            },
+        )
+        .unwrap(),
+    );
+
+    let target = stage17_target();
+    let required_capabilities = crate::domain::model::RequiredModelCapabilities {
+        text_input: true,
+        text_output: true,
+        custom_tool_calling: true,
+        streaming: true,
+        ordered_output_items: true,
+        structured_output: true,
+        reasoning_continuation: false,
+        required_output_tokens: TokenCount::try_new(512).unwrap(),
+    };
+    let selection = Arc::new(ModelSelectionPolicy::new(Arc::new(
+        ModelTargetSnapshot::try_new(target.reference().model_target_id().clone(), vec![target])
+            .unwrap(),
+    )));
+    let source_store: Arc<dyn crate::ports::context_source_store::ContextSourceStore> =
+        Arc::new(fixture.store.clone());
+    let context_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+    let estimator: Arc<dyn TokenEstimator> = Arc::new(Stage17FixedEstimator {
+        identity: TokenEstimatorIdentity::try_new("stage17_fixed", 1).unwrap(),
+    });
+    let context_clock: Arc<dyn Clock> = clock.clone();
+    let assembler = Arc::new(ContextAssembler::new(
+        source_store,
+        Some(context_artifacts),
+        estimator,
+        Arc::clone(&registry),
+        VersionedInstructionSnapshot::v0(),
+        context_clock,
+    ));
+    let provider = Arc::new(Stage17Provider::new(vec![
+        Stage17ProviderPlan::ReadFile,
+        Stage17ProviderPlan::FinalText("the note was read once"),
+        Stage17ProviderPlan::ReadFiles,
+        Stage17ProviderPlan::FinalText("both notes were read in order"),
+        Stage17ProviderPlan::Structured,
+        Stage17ProviderPlan::Refusal("request refused"),
+    ]));
+    let gateway_store: Arc<dyn ModelStateStore> = Arc::new(fixture.store.clone());
+    let gateway_artifacts: Arc<dyn ArtifactStore> = artifact_store;
+    let gateway_provider: Arc<dyn ModelProvider> = provider.clone();
+    let gateway_clock: Arc<dyn Clock> = clock.clone();
+    let gateway = Arc::new(
+        ModelGateway::new(
+            gateway_store,
+            gateway_artifacts,
+            gateway_provider,
+            Arc::new(NoopDraftSink),
+            gateway_clock,
+            Box::new(Stage17MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap(),
+    );
+    let loop_store: Arc<dyn crate::application::agent_loop::AgentLoopStateStore> =
+        Arc::new(fixture.store.clone());
+    let loop_clock: Arc<dyn Clock> = clock.clone();
+    let agent_loop = Arc::new(
+        AgentLoop::new(
+            selection,
+            assembler,
+            ContextAssemblyVersions::v0(),
+            gateway,
+            tool_execution,
+            loop_store,
+            loop_clock,
+            required_capabilities,
+            AgentLoopRuntimeContext {
+                workstation: snapshot.workstation,
+                workspace: snapshot.workspace,
+                authority_constraints: V0AuthorityConstraints::default(),
+            },
+            AgentLoopLimits::default(),
+        )
+        .unwrap(),
+    );
+    let abnormal = Arc::new(tokio::sync::Notify::new());
+    let runner = Arc::new(Stage17ObservedRunner {
+        inner: agent_loop,
+        abnormal: Arc::clone(&abnormal),
+        release_abnormal: Arc::new(tokio::sync::Notify::new()),
+    });
+    let store = Arc::new(fixture.store.clone());
+    let health = Health::new();
+    let (fatal, _) = tokio::sync::watch::channel(false);
+    let scheduler = start_scheduler(
+        Arc::clone(&store),
+        runner,
+        Arc::clone(&clock),
+        health.clone(),
+        fatal,
+        SchedulerStart {
+            runtime_instance_id: runtime_id,
+            conversation_id: fixture.identity.conversation_id,
+            readiness: SchedulerReadiness::ReadyAfterInitialScan,
+        },
+    )
+    .unwrap();
+
+    provider.first_started.notified().await;
+    let mut connection = fixture.store.runtime.acquire().await.unwrap();
+    let queued_followers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?) AND state = 'queued'",
+    )
+    .bind(second.work_id.to_string())
+    .bind(third.work_id.to_string())
+    .bind(fourth.work_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    let leaked_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_sources \
+         WHERE source_record_kind = 'message' AND source_record_id IN (?, ?, ?)",
+    )
+    .bind(second.message_id.to_string())
+    .bind(third.message_id.to_string())
+    .bind(fourth.message_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    assert_eq!(queued_followers, 3);
+    assert_eq!(leaked_sources, 0);
+    provider.release_first.notify_one();
+
+    let terminal = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut connection = fixture.store.runtime.acquire().await.unwrap();
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?, ?) AND state = 'completed'",
+            )
+            .bind(first.work_id.to_string())
+            .bind(second.work_id.to_string())
+            .bind(third.work_id.to_string())
+            .bind(fourth.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+            drop(connection);
+            if count == 4 {
+                break true;
+            }
+            tokio::select! {
+                () = abnormal.notified() => break false,
+                () = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+        }
+    })
+    .await;
+    if terminal != Ok(true) {
+        let mut connection = fixture.store.runtime.acquire().await.unwrap();
+        let states: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT work_id, state, COALESCE(terminal_reason_code, '') FROM work_items \
+             WHERE work_id IN (?, ?, ?, ?) ORDER BY conversation_work_ordinal",
+        )
+        .bind(first.work_id.to_string())
+        .bind(second.work_id.to_string())
+        .bind(third.work_id.to_string())
+        .bind(fourth.work_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        let models: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT work_id, state, COALESCE(provider_error_kind, '') FROM model_invocations \
+             ORDER BY started_at, model_invocation_id",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        let tools: Vec<(String, String)> = sqlx::query_as(
+            "SELECT work_id, state FROM tool_executions ORDER BY requested_at, tool_execution_id",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM journal_events WHERE work_id = ? ORDER BY journal_offset",
+        )
+        .bind(first.work_id.to_string())
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        panic!(
+            "Stage 17 loop did not terminalize: states={states:?}, models={models:?}, \
+             tools={tools:?}, events={events:?}, provider_calls={}, health={:?}",
+            provider.invocation_count.load(Ordering::SeqCst),
+            health.snapshot()
+        );
+    }
+    assert!(health.snapshot().is_ready());
+    assert_eq!(provider.invocation_count.load(Ordering::SeqCst), 6);
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 6);
+    assert!(
+        requests[1]
+            .ordered_input_items()
+            .iter()
+            .any(|item| matches!(item, ModelInputItem::ToolResult { .. }))
+    );
+    let prior_assistant_parts: Vec<&str> = requests[2]
+        .ordered_input_items()
+        .iter()
+        .filter_map(|item| match item {
+            ModelInputItem::PriorAssistant { content_parts } => Some(content_parts.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .map(ModelTextPart::as_str)
+        .collect();
+    assert_eq!(prior_assistant_parts, ["the note was read once"]);
+    assert_eq!(
+        requests[3]
+            .ordered_input_items()
+            .iter()
+            .filter(|item| matches!(item, ModelInputItem::ToolResult { .. }))
+            .count(),
+        4
+    );
+    let mut connection = fixture.store.runtime.acquire().await.unwrap();
+    let evidence: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT COUNT(*) FROM model_invocations WHERE work_id = ?), \
+         (SELECT COUNT(*) FROM tool_executions WHERE work_id = ?), \
+         (SELECT COUNT(*) FROM model_invocations WHERE work_id = ?), \
+         (SELECT COUNT(*) FROM tool_executions WHERE work_id = ?), \
+         (SELECT COUNT(*) FROM messages WHERE produced_by_work_id IN (?, ?, ?, ?) AND role = 'assistant'), \
+         (SELECT COUNT(*) FROM journal_events WHERE work_id IN (?, ?, ?, ?) AND event_type = 'assistant.message_committed')",
+    )
+    .bind(first.work_id.to_string())
+    .bind(first.work_id.to_string())
+    .bind(second.work_id.to_string())
+    .bind(second.work_id.to_string())
+    .bind(first.work_id.to_string())
+    .bind(second.work_id.to_string())
+    .bind(third.work_id.to_string())
+    .bind(fourth.work_id.to_string())
+    .bind(first.work_id.to_string())
+    .bind(second.work_id.to_string())
+    .bind(third.work_id.to_string())
+    .bind(fourth.work_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(evidence, (2, 1, 2, 3, 4, 4));
+    let ordered_tool_ordinals: Vec<i64> = sqlx::query_scalar(
+        "SELECT tool_ordinal FROM tool_executions WHERE work_id = ? ORDER BY tool_ordinal",
+    )
+    .bind(second.work_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(ordered_tool_ordinals, [1, 2, 3]);
+    let result_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT json_extract(result_json, '$.result_kind') FROM tool_executions \
+         WHERE work_id = ? ORDER BY tool_ordinal",
+    )
+    .bind(second.work_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(result_kinds, ["success", "success", "file_error"]);
+    let structured: String = sqlx::query_scalar(
+        "SELECT content_json FROM messages WHERE produced_by_work_id = ? AND role = 'assistant'",
+    )
+    .bind(third.work_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert!(structured.contains("{\\\"a\\\":1,\\\"z\\\":2}"));
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    scheduler.stop_and_join().await.unwrap();
     fixture.guard.shutdown().await;
 }

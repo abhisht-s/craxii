@@ -1,0 +1,32 @@
+{
+  "protocol": "craxii.stage18.evidence.v1",
+  "schema_version": 4,
+  "protocol_version": 1,
+  "required_fields": [
+    "protocol",
+    "request_hashes",
+    "tool_result_classes",
+    "assistant_semantics",
+    "provider_calls",
+    "work_states"
+  ],
+  "normalization": {
+    "removed": [
+      "uuidv7_values",
+      "timestamps",
+      "runtime_ids",
+      "temporary_roots",
+      "process_ids",
+      "latency"
+    ],
+    "preserved": [
+      "ordering",
+      "normalized_request_hashes",
+      "semantic_output",
+      "attempt_and_tool_counts",
+      "causal_relationships",
+      "artifact_hashes",
+      "failure_classifications"
+    ]
+  }
+}

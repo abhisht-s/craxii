@@ -6,12 +6,14 @@ use crate::domain::{
 };
 use crate::ports::state_store::BootstrapSnapshot;
 
+pub mod agent_loop;
 pub mod authentication;
 pub mod authority;
 pub mod command_gateway;
 pub mod command_service;
 pub mod context_assembler;
 pub mod device_provisioning;
+pub mod model_gateway;
 pub mod model_selection;
 pub mod projector;
 pub mod publication;

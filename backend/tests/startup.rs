@@ -15,7 +15,7 @@ const SECRET_SENTINEL: &str = "startup-secret-sentinel-XYZ";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
-fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
+fn valid_local_config_emits_pretty_initial_live_unready_evidence() {
     let config = TempConfig::new(LOCAL);
     let output = run(&["--config", config.path().to_str().unwrap()]);
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
@@ -33,7 +33,7 @@ fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
         "architecture_version=\"V0.0.01\"",
         "protocol_version=1",
         "configuration_version=1",
-        "max_supported_schema_version=3",
+        "max_supported_schema_version=4",
         "configuration_fingerprint=\"sha256:",
         "health_state=\"live_unready\"",
         "live=true",
@@ -143,7 +143,7 @@ fn bind_failure_precedes_database_and_runtime_creation() {
 }
 
 #[test]
-fn startup_does_not_read_declared_credential_files() {
+fn unreadable_provider_credential_fails_with_a_fixed_redacted_code() {
     let root = temporary_root();
     fs::create_dir_all(&root).unwrap();
     let state_root = root.join("state");
@@ -191,9 +191,14 @@ fn startup_does_not_read_declared_credential_files() {
     fs::set_permissions(&credential_file, fs::Permissions::from_mode(0o600)).unwrap();
     fs::remove_dir_all(&root).unwrap();
 
-    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        text(&output.stderr),
+        "craxii fatal: provider_credential_unavailable\n"
+    );
     assert!(!text(&output.stdout).contains(SECRET_SENTINEL));
-    assert!(output.stderr.is_empty());
+    assert!(!text(&output.stderr).contains(SECRET_SENTINEL));
 }
 
 #[test]
@@ -208,6 +213,48 @@ fn no_valid_startup_format_reports_ready() {
         assert!(!stdout.contains("health_state=ready"));
         assert!(!stdout.contains("\"health_state\":\"ready\""));
     }
+}
+
+#[test]
+fn live_provider_composition_becomes_ready_after_scheduler_initial_scan() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpStream;
+
+    let config = TempConfig::new(LOCAL);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_craxii-server"))
+        .args(["--config", config.path().to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("craxii-server binary should execute");
+    let mut ready = false;
+    for _ in 0..300 {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if let Ok(mut stream) = TcpStream::connect(&config.authority) {
+            stream
+                .write_all(
+                    format!(
+                        "GET /health/ready HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                        config.authority
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            if response.starts_with("HTTP/1.1 200") {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    terminate(&mut child);
+    let output = child.wait_with_output().unwrap();
+    assert!(ready, "composition did not become ready: {}", text(&output.stderr));
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
 }
 
 fn run(arguments: &[&str]) -> Output {
@@ -226,13 +273,16 @@ fn run(arguments: &[&str]) -> Output {
     // Successful Stage 10 startup is a long-lived process. Exercise the real
     // composition-edge SIGTERM path so these startup assertions also wait for
     // a graceful RuntimeInstance close instead of leaving stale test state.
+    terminate(&mut child);
+    child.wait_with_output().unwrap()
+}
+
+fn terminate(child: &mut std::process::Child) {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
-    // SAFETY: `child.id()` is the live child we own and signal 15 is SIGTERM on
-    // every Unix target supported by this repository.
+    // SAFETY: `child.id()` is the live child we own and signal 15 is SIGTERM on every Unix target.
     assert_eq!(unsafe { kill(child.id() as i32, 15) }, 0);
-    child.wait_with_output().unwrap()
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -250,6 +300,7 @@ fn temporary_root() -> PathBuf {
 struct TempConfig {
     root: PathBuf,
     path: PathBuf,
+    authority: String,
 }
 
 impl TempConfig {
@@ -265,6 +316,13 @@ impl TempConfig {
         fs::set_permissions(&state_root, fs::Permissions::from_mode(0o700)).unwrap();
         let workspace_root = root.join("workspace");
         fs::create_dir(&workspace_root).unwrap();
+        let credential_root = root.join("credentials");
+        fs::create_dir(&credential_root).unwrap();
+        for name in ["openai_primary", "openai_secondary", "openai_provider"] {
+            let credential = credential_root.join(name);
+            fs::write(&credential, "stage19-startup-fixture-key").unwrap();
+            fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        }
         let contents = contents
             .replace(
                 "bind_address = \"127.0.0.1:8080\"",
@@ -274,6 +332,20 @@ impl TempConfig {
                 "public_base_url = \"http://127.0.0.1:8080\"",
                 &format!("public_base_url = \"http://{authority}\""),
             );
+        let contents = if contents.contains("source = \"systemd\"") {
+            contents.replace(
+                "source = \"systemd\"",
+                &format!(
+                    "source = \"local_directory\"\ndirectory = \"{}\"",
+                    credential_root.to_str().unwrap()
+                ),
+            )
+        } else {
+            contents.replace(
+                "directory = \"/tmp/craxii-dev/credentials\"",
+                &format!("directory = \"{}\"", credential_root.to_str().unwrap()),
+            )
+        };
         let contents = match contents
             .lines()
             .find(|line| line.starts_with("state_root = "))
@@ -312,7 +384,11 @@ impl TempConfig {
         };
         let path = root.join("config.toml");
         fs::write(&path, contents).unwrap();
-        Self { root, path }
+        Self {
+            root,
+            path,
+            authority: authority.to_owned(),
+        }
     }
 
     fn path(&self) -> &Path {
