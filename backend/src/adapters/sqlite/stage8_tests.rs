@@ -137,7 +137,7 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(3).unwrap(),
+                schema_version: SchemaVersion::try_new(4).unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -679,6 +679,7 @@ fn running_expectation(fixture: &Fixture, version: i64) -> WorkExpectation {
         version: ProjectionVersion::try_new(version).unwrap(),
         runtime_owner: Some(fixture.runtime_id),
         current_attempt: CurrentWorkAttempt::None,
+        cancellation_reason: None,
     }
 }
 
@@ -804,6 +805,7 @@ async fn begin_model(fixture: &Fixture, stream: bool) -> BegunModel {
                 }],
                 request_sha256: request_sha,
                 request_artifact_id: Some(artifact_id),
+                retry_evidence: None,
                 started_at: T1.parse().unwrap(),
             },
             artifacts: vec![PreparedArtifact {
@@ -857,6 +859,7 @@ async fn begin_model(fixture: &Fixture, stream: bool) -> BegunModel {
                     version: ProjectionVersion::try_new(3).unwrap(),
                     runtime_owner: Some(fixture.runtime_id),
                     current_attempt: CurrentWorkAttempt::Model(invocation_id),
+                    cancellation_reason: None,
                 },
                 expected_model: ModelExpectation {
                     model_invocation_id: invocation_id,
@@ -904,6 +907,7 @@ fn model_completion_request(
             version: ProjectionVersion::try_new(3).unwrap(),
             runtime_owner: Some(fixture.runtime_id),
             current_attempt: CurrentWorkAttempt::Model(model.invocation_id),
+            cancellation_reason: None,
         },
         expected_model: ModelExpectation {
             model_invocation_id: model.invocation_id,
@@ -930,6 +934,11 @@ fn model_completion_request(
                 reasoning_tokens: 0,
                 total_tokens: 15,
             }),
+            usage_status: crate::ports::model_provider::ModelUsageStatus::Reported,
+            provider_error_kind: None,
+            provider_outcome_certainty:
+                crate::ports::model_provider::ProviderOutcomeCertainty::DefinitelyCompleted,
+            billing_ambiguity: false,
             stop_reason: Some("stop".to_owned()),
             tool_call_count: Some(0),
             draft_exposed: false,
@@ -1038,6 +1047,11 @@ fn retry_model_request(
                 }],
                 request_sha256: request_sha,
                 request_artifact_id: Some(artifact_id),
+                retry_evidence: Some(crate::ports::model_provider::ProviderRetryEvidence {
+                    reason: crate::ports::model_provider::RetryReasonCode::ClassifiedTransientBeforeOutput,
+                    delay: std::time::Duration::ZERO,
+                    provider_retry_after: None,
+                }),
                 started_at: T4.parse().unwrap(),
             },
             artifacts: vec![PreparedArtifact {
@@ -1176,6 +1190,7 @@ async fn request_named_tool(
             version: ProjectionVersion::try_new(waiting_version).unwrap(),
             runtime_owner: Some(fixture.runtime_id),
             current_attempt: CurrentWorkAttempt::Tool(tool_id),
+            cancellation_reason: None,
         },
     )
 }
@@ -2374,6 +2389,7 @@ async fn model_begin_failure_at_final_event_boundary_rolls_back_every_detail_row
                 provider_options: Vec::new(),
                 request_sha256: request_sha,
                 request_artifact_id: Some(artifact_id),
+                retry_evidence: None,
                 started_at: T1.parse().unwrap(),
             },
             artifacts: vec![PreparedArtifact {
@@ -2601,6 +2617,7 @@ async fn tool_request_dispatch_and_unknown_outcome_preserve_intent_before_action
         version: ProjectionVersion::try_new(5).unwrap(),
         runtime_owner: Some(fixture.runtime_id),
         current_attempt: CurrentWorkAttempt::Tool(tool_id),
+        cancellation_reason: None,
     };
     let dispatch_event = JournalEventId::generate();
     let prepared_cwd = fixture_prepared_cwd(&fixture);
@@ -3034,7 +3051,7 @@ async fn durable_publish_before_database_commit_reopens_as_nonfatal_orphan_witho
 }
 
 #[tokio::test]
-async fn populated_v2_migrates_to_v3_without_changing_stage7_identity_or_old_fingerprints() {
+async fn populated_v2_migrates_through_v4_without_changing_stage7_identity_or_old_fingerprints() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
     let state_store = SqliteStateStore::new(guard.runtime().clone());
@@ -3078,7 +3095,7 @@ async fn populated_v2_migrates_to_v3_without_changing_stage7_identity_or_old_fin
             .await
             .unwrap();
     }
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 3")
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 3")
         .execute(&mut *connection)
         .await
         .unwrap();
@@ -3109,7 +3126,7 @@ async fn populated_v2_migrates_to_v3_without_changing_stage7_identity_or_old_fin
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3"
+        "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2"
     );
     migrated.shutdown().await;
 
@@ -3248,7 +3265,7 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(3).unwrap(),
+                schema_version: SchemaVersion::try_new(4).unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -3288,7 +3305,7 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(3).unwrap(),
+                schema_version: SchemaVersion::try_new(4).unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),

@@ -214,7 +214,7 @@ mod tests {
             diagnostic_pid: Some(DiagnosticPid::try_new(7).unwrap()),
             package_version: PackageVersion::try_new("0.0.1").unwrap(),
             git_revision: GitRevision::try_new("test").unwrap(),
-            schema_version: SchemaVersion::try_new(3).unwrap(),
+            schema_version: SchemaVersion::try_new(4).unwrap(),
             started_at: at(1),
         })
     }

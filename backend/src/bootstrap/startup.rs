@@ -184,7 +184,7 @@ pub async fn run(
             .map_err(|_| StartupError::BuildMetadata)?,
         git_revision: GitRevision::try_new(process.build().git_revision())
             .map_err(|_| StartupError::BuildMetadata)?,
-        schema_version: SchemaVersion::try_new(3).map_err(|_| StartupError::BuildMetadata)?,
+        schema_version: SchemaVersion::try_new(4).map_err(|_| StartupError::BuildMetadata)?,
         started_at: runtime_started_at,
     });
     let state_store = Arc::new(state_store);

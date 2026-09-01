@@ -1140,7 +1140,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 3);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 4);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();

@@ -3779,7 +3779,6 @@ function stage16ContextMutationViolations(path, source) {
     ]) {
       if (pattern.test(production)) violations.push(label);
     }
-    violations.push(...stage16AssemblerReachabilityViolations(production));
     violations.push(...stage16FinalRequestTopologyViolations(production));
     violations.push(...stage16OutcomeUnknownTopologyViolations(production));
   }
@@ -3852,202 +3851,233 @@ function stage16PriorQueryShapeViolations(source) {
   return violations;
 }
 
-function stage16AssemblerReachabilityViolations(source) {
-  if (!/\bstruct\s+ContextAssembler\b/.test(source)) return [];
-  const functions = rustFunctionBlocks(source);
-  const inventory = stage14FunctionInventory(functions);
-  const roots = functions.filter((block) =>
-    ['assemble', 'assemble_snapshot', 'verify_reconstruction', 'verify_exact_reconstruction',
-      'render_model_and_tool_trace', 'render_model_output', 'render_exact_source',
-      'render_tool_result'].includes(block.name));
-  const reachable = stage15ReachableRustBlocks(roots, inventory);
-  const violations = [];
-  if (reachable.depthExceeded) {
-    violations.push('ContextAssembler helper call graph exceeds the finite analysis bound');
-  }
-  const aliases = stage15SimpleTypeAliases(source);
-  for (const block of reachable) {
-    const expanded = stage15ResolveTypeAliases(block.source, aliases);
-    if (expanded.depthExceeded) {
-      violations.push('ContextAssembler helper type alias exceeds the finite analysis bound');
-      continue;
-    }
-    const value = expanded.resolved;
-    if (/\bModelSelectionPolicy\b|\bModelTargetSnapshot\b/.test(value) ||
-        /\b(?:selector|selection_policy|target_catalog|target_registry|target_snapshot)\b[\s\S]{0,180}\.\s*(?:select|target|default_target|targets)\s*\(/i.test(value) ||
-        /considered_target_ids\s*\(\s*\)[\s\S]{0,100}\.\s*(?:first|last|get|find|next)\s*\(/.test(value) ||
-        /\b(?:fallback|alternate|default)[A-Za-z0-9_]*target\b/i.test(value)) {
-      violations.push('selector, catalog lookup, default, or alternate target is reachable from ContextAssembler');
-    }
-
-    const shortening = /\.\s*(?:truncate|split_off|drain|remove|pop|retain|take|take_while|skip|skip_while)\s*\(|\.\s*split_at\s*\(|\b(?:bytes|items|request|sources|history|tool_definitions|ordered_input_items)\s*\[[^\]\n]*\.\.[^\]\n]*\]/;
-    const outputReduction = /requested_output[^;\n]{0,180}(?:saturating_sub|checked_sub|-=|\/=|=\s*[^;\n]*-)|reserved_output[^;\n]{0,180}(?:saturating_sub|checked_sub|-=|\/=)/;
-    const budgetFiltering = /(?:budget|limit|fit|token|byte)[\s\S]{0,220}\.(?:filter|filter_map|retain)\s*\(|\.(?:filter|filter_map|retain)\s*\([^;]{0,220}(?:budget|limit|fit|token|byte)/i;
-    if (shortening.test(block.body) || outputReduction.test(block.body) || budgetFiltering.test(block.body)) {
-      violations.push('semantic request truncation is reachable from ContextAssembler');
-    }
-  }
-  return violations;
+function stage16NamedBraceBlock(source, keyword, name) {
+  const marker = new RegExp(`\\b${keyword}\\s+${name}\\b[^;{]*\\{`).exec(source);
+  if (!marker) return null;
+  const opening = source.indexOf('{', marker.index);
+  const closing = findMatchingDelimiter(source, opening, '{', '}');
+  if (closing === -1) return null;
+  return source.slice(marker.index, closing + 1);
 }
 
-function stage16SemanticValueEscapeViolations(block, valueName, allowedCalls) {
-  const violations = [];
-  if (new RegExp(`\\blet\\s+mut\\s+${valueName}\\b|&\\s*mut\\s+${valueName}\\b`).test(block)) {
-    violations.push(`${valueName} has a mutable alias`);
-  }
-  if (new RegExp(`\\b${valueName}\\s*\\[[^\\]]*\\.\\.[^\\]]*\\]`).test(block)) {
-    violations.push(`${valueName} is sliced or indexed`);
-  }
-  for (const match of block.matchAll(
-    new RegExp(`(?<![A-Za-z0-9_.:])([A-Za-z_][A-Za-z0-9_]*)\\s*(?:::\\s*<[^;(){}>]+>)?\\s*\\([^(){};]*\\b${valueName}\\b[^(){};]*\\)`, 'g'),
-  )) {
-    if (!allowedCalls.has(match[1])) {
-      violations.push(`${valueName} escapes to ${match[1]}`);
-    }
-  }
-  return violations;
+function stage16ImplBlock(source, name) {
+  return stage16NamedBraceBlock(source, 'impl', name);
+}
+
+function stage16MethodNames(block) {
+  return rustFunctionBlocks(block ?? '').map((method) => method.name).sort();
+}
+
+function stage16SameNames(actual, expected) {
+  return actual.length === expected.length && actual.every((value, index) => value === [...expected].sort()[index]);
 }
 
 function stage16FinalRequestTopologyViolations(source) {
   if (!/\bstruct\s+ContextAssembler\b/.test(source)) return [];
   const violations = [];
   const functions = rustFunctionBlocks(source);
-  const constructors = functions.filter((block) => block.name === 'construct_final_model_request');
-  const modelRequestConstructors = source.match(/\bModelRequest::try_new\s*\(/g) ?? [];
-  if (constructors.length !== 1 || modelRequestConstructors.length !== 1) {
-    return ['final ModelRequest must have one exclusive construction function'];
+  const inputImpl = stage16ImplBlock(source, 'FrozenModelInputs');
+  const toolImpl = stage16ImplBlock(source, 'FrozenModelTools');
+  const outputImpl = stage16ImplBlock(source, 'SelectedOutputLimit');
+  const finalImpl = stage16ImplBlock(source, 'FinalModelRequest');
+
+  if (!/\bstruct\s+FrozenModelInputs\s*\(\s*Box\s*<\s*\[\s*ModelInputItem\s*\]\s*>\s*\)\s*;/.test(source) ||
+      /\bpub(?:\([^)]*\))?\s+struct\s+FrozenModelInputs\b/.test(source)) {
+    violations.push('FrozenModelInputs must have one private boxed-slice field');
   }
-  const constructor = constructors[0];
-  const constructorAliases = stage15ResolveTypeAliases(
-    constructor.source,
-    stage15SimpleTypeAliases(source),
-  );
-  if (constructorAliases.depthExceeded) {
-    violations.push('final ModelRequest constructor type aliases exceed the finite analysis bound');
+  if (!inputImpl || !stage16SameNames(stage16MethodNames(inputImpl), ['as_slice', 'iter', 'len']) ||
+      /\bpub(?:\([^)]*\))?\s+(?:const\s+)?fn\b|&\s*mut|\b(?:as_mut|into_inner|replace|set|swap|take|truncate|remove|retain|drain|split_off)\b|\bFn(?:Mut|Once)?\b/.test(inputImpl) ||
+      /impl[^\n{]*\b(?:AsMut|DerefMut|IndexMut)\b[^\n{]*\bFrozenModelInputs\b/.test(source)) {
+    violations.push('FrozenModelInputs immutable API differs');
   }
-  const constructed = constructorAliases.resolved.replace(/\(\s*(Model(?:InputItem|ToolDefinition|TextPart))\s*\)/g, '$1');
+  const canonicalBuilder = stage16NamedBraceBlock(source, 'struct', 'CanonicalInputBuilder');
+  const canonicalBuilderImpl = stage16ImplBlock(source, 'CanonicalInputBuilder');
+  if (!canonicalBuilder || !/items:\s*Vec<ModelInputItem>/.test(canonicalBuilder) ||
+      !canonicalBuilderImpl || !stage16SameNames(stage16MethodNames(canonicalBuilderImpl), ['finish', 'push']) ||
+      !/fn\s+push\s*\(\s*&mut\s+self\s*,\s*item:\s*ModelInputItem/.test(canonicalBuilderImpl) ||
+      !/fn\s+finish\s*\(\s*self\s*\)\s*->\s*Result<FrozenModelInputs/.test(canonicalBuilderImpl) ||
+      !/FrozenModelInputs\s*\(\s*self\.items\.into_boxed_slice\s*\(\s*\)\s*\)/.test(canonicalBuilderImpl)) {
+    violations.push('CanonicalInputBuilder mutable-to-frozen boundary differs');
+  }
+  if (!/\bstruct\s+FrozenModelTools\s*\(\s*Box\s*<\s*\[\s*ModelToolDefinition\s*\]\s*>\s*\)\s*;/.test(source) ||
+      /\bpub(?:\([^)]*\))?\s+struct\s+FrozenModelTools\b/.test(source)) {
+    violations.push('FrozenModelTools must have one private boxed-slice field');
+  }
+  if (!toolImpl || !stage16SameNames(stage16MethodNames(toolImpl), ['as_slice', 'fingerprint', 'from_registry', 'iter', 'len']) ||
+      /\bpub(?:\([^)]*\))?\s+(?:const\s+)?fn\b|&\s*mut|\b(?:as_mut|into_inner|replace|set|swap|take|truncate|remove|retain|drain|split_off)\b|\bFn(?:Mut|Once)?\b/.test(toolImpl) ||
+      !/fn\s+from_registry\s*\(\s*registry:\s*&ToolRegistry\s*\)/.test(toolImpl) ||
+      !/project_model_tool_definitions\s*\(\s*registry\s*\)/.test(toolImpl) ||
+      !/model_toolset_fingerprint\s*\(\s*self\.as_slice\s*\(\s*\)\s*\)/.test(toolImpl) ||
+      /impl[^\n{]*\b(?:AsMut|DerefMut|IndexMut)\b[^\n{]*\bFrozenModelTools\b/.test(source)) {
+    violations.push('FrozenModelTools complete immutable registry projection differs');
+  }
+  if ((source.match(/project_model_tool_definitions\s*\(/g) ?? []).length !== 1) {
+    violations.push('Stage 14 model-tool projection has an alternate construction path');
+  }
+
+  if (!/\bstruct\s+SelectedOutputLimit\s*\(\s*TokenCount\s*\)\s*;/.test(source) ||
+      !outputImpl || !stage16SameNames(stage16MethodNames(outputImpl), ['as_u64', 'from_selection', 'get']) ||
+      (source.match(/\bSelectedOutputLimit\s*\(/g) ?? []).length !== 1 ||
+      !/Self\s*\(\s*selection\.selected_target\s*\(\s*\)\.requested_output_tokens\s*\(\s*\)\s*\)/.test(outputImpl) ||
+      /(?:saturating_|checked_|\.min\s*\(|\.max\s*\(|clamp|\+|\-|\/|\*)/.test(
+        rustFunctionBlocks(outputImpl).find((block) => block.name === 'from_selection')?.body ?? '',
+      )) {
+    violations.push('SelectedOutputLimit exact selected-target source differs');
+  }
+
+  const finalStruct = stage16NamedBraceBlock(source, 'struct', 'FinalModelRequest');
   for (const [label, pattern] of [
-    ['input items are not copied from the complete frozen canonical input', /ordered_input_items:\s*input\.canonical_input_items\.to_vec\s*\(\s*\)/],
-    ['instructions are not copied from the complete canonical instruction snapshot', /instructions:\s*input\.canonical_instructions\.to_vec\s*\(\s*\)/],
-    ['tools are not copied from the complete Stage 14 projection', /tool_definitions:\s*input\.canonical_tool_definitions\.to_vec\s*\(\s*\)/],
-    ['requested output does not come directly from the selected target', /requested_output_limit:\s*input\.target\.requested_output_tokens\s*\(\s*\)/],
-    ['provider options do not come directly from the selected target', /provider_native_options:\s*input\.target\.provider_native_options\s*\(\s*\)/],
-    ['final input equality guard is absent', /final_request\.ordered_input_items\s*\(\s*\)\s*!=\s*input\.canonical_input_items/],
-    ['final tool equality guard is absent', /final_request\.tool_definitions\s*\(\s*\)\s*!=\s*input\.canonical_tool_definitions/],
-    ['final requested-output equality guard is absent', /final_request\.requested_output_limit\s*\(\s*\)\s*!=\s*input\.target\.requested_output_tokens\s*\(\s*\)/],
-    ['final tool fingerprint guard is absent', /model_toolset_fingerprint\s*\(\s*final_request\.tool_definitions\s*\(\s*\)\s*\)\s*!=\s*input\.expected_toolset_fingerprint/],
+    ['request', /request:\s*ModelRequest/],
+    ['canonical bytes', /canonical_bytes:\s*Box<\[u8\]>/],
+    ['request hash', /request_sha256:\s*Sha256Digest/],
+    ['estimation units', /estimation_units:\s*Box<\[TokenEstimateUnit\]>/],
+    ['serialized byte count', /serialized_byte_count:\s*u64/],
+    ['selected output limit', /selected_output_limit:\s*SelectedOutputLimit/],
+    ['toolset fingerprint', /toolset_fingerprint:\s*Sha256Digest/],
   ]) {
-    if (!pattern.test(constructed)) violations.push(label);
+    if (!finalStruct || !pattern.test(finalStruct)) violations.push(`FinalModelRequest ${label} field differs`);
   }
-  if (/\b(?:mut\s+)?(?:ordered_input_items|tool_definitions|requested_output_limit)\b\s*=/.test(constructor.body) ||
-      /&\s*mut\s+input\.(?:canonical_input_items|canonical_tool_definitions)/.test(constructor.body)) {
-    violations.push('final ModelRequest semantic fields are reconstructed or mutably escaped');
+  if (/\bpub(?:\([^)]*\))?\s+struct\s+FinalModelRequest\b/.test(source) ||
+      !finalImpl || !stage16SameNames(stage16MethodNames(finalImpl), [
+        'canonical_bytes', 'construct', 'estimation_units', 'request', 'request_sha256',
+        'selected_output_limit', 'serialized_byte_count', 'toolset_fingerprint',
+      ]) || /\bpub(?:\([^)]*\))?\s+(?:const\s+)?fn\b|&\s*mut/.test(finalImpl)) {
+    violations.push('FinalModelRequest private immutable API differs');
+  }
+
+  const constructors = functions.filter((block) => block.name === 'construct');
+  const constructor = constructors.find((block) => /FinalModelRequest/.test(finalImpl ?? '') && finalImpl.includes(block.source));
+  if (!constructor || (source.match(/\bModelRequest::try_new\s*\(/g) ?? []).length !== 1) {
+    return [...new Set([...violations, 'FinalModelRequest must own the only ModelRequest constructor'])];
+  }
+  for (const [label, pattern] of [
+    ['frozen input parameter', /canonical_inputs:\s*FrozenModelInputs/],
+    ['frozen tool parameter', /canonical_tools:\s*FrozenModelTools/],
+    ['selected output parameter', /selected_output_limit:\s*SelectedOutputLimit/],
+    ['complete input move', /ordered_input_items:\s*canonical_inputs\.0\.into_vec\s*\(\s*\)/],
+    ['complete tool move', /tool_definitions:\s*canonical_tools\.0\.into_vec\s*\(\s*\)/],
+    ['versioned instruction source', /instructions:\s*instructions\.request_instructions\s*\(\s*\)/],
+    ['exact output use', /requested_output_limit:\s*selected_output_limit\.get\s*\(\s*\)/],
+    ['selected provider options', /provider_native_options:\s*selected\.provider_native_options\s*\(\s*\)/],
+    ['canonical serialization', /let\s+canonical_bytes\s*=\s*request\.canonical_bytes\s*\(\s*\)\.into_boxed_slice\s*\(\s*\)/],
+    ['byte count derivation', /let\s+serialized_byte_count\s*=\s*u64::try_from\s*\(\s*canonical_bytes\.len\s*\(\s*\)\s*\)/],
+    ['request hash derivation', /let\s+request_sha256\s*=\s*Sha256Digest::hash_bytes\s*\(\s*&canonical_bytes\s*\)/],
+    ['instruction estimation', /for\s+instruction\s+in\s+request\.instructions\s*\(\s*\)/],
+    ['input estimation', /for\s+item\s+in\s+request\.ordered_input_items\s*\(\s*\)/],
+    ['tool estimation', /for\s+tool\s+in\s+request\.tool_definitions\s*\(\s*\)/],
+  ]) {
+    if (!pattern.test(constructor.source)) violations.push(`FinalModelRequest ${label} differs`);
+  }
+  const outsideConstructor = source.replace(constructor.source, '');
+  if (/TokenEstimateUnit::(?:TextBytes|StructuredBytes|ToolDefinitionBytes|ProviderOpaqueBytes)\s*\(/.test(outsideConstructor) ||
+      /fn\s+(?:complete_request_units|estimate_units_from_slice)\b/.test(source)) {
+    violations.push('estimation units can be independently constructed outside FinalModelRequest');
+  }
+  if (/\.canonical_sha256\s*\(/.test(outsideConstructor) ||
+      /Sha256Digest::hash_bytes\s*\(\s*final_request\.canonical_bytes\s*\(\s*\)\s*\)/.test(outsideConstructor)) {
+    violations.push('request hash is independently recomputed outside FinalModelRequest');
   }
 
   const assembly = functions.find((block) => block.name === 'assemble_snapshot');
   const reconstruction = functions.find((block) => block.name === 'verify_exact_reconstruction');
-  if (!assembly || !reconstruction) return [...violations, 'final request construction roots are absent'];
+  if (!assembly || !reconstruction) return [...new Set([...violations, 'final request roots are absent'])];
   for (const [label, block, patterns] of [
     ['assembly', assembly.source, [
-      /let\s+canonical_input_items\s*=\s*builder\.freeze_canonical_input_items\s*\(\s*\)\s*\?\s*;/,
-      /let\s+requested_output\s*=\s*selected\.requested_output_tokens\s*\(\s*\)\s*;/,
-      /let\s+final_request\s*=\s*construct_final_model_request\s*\(\s*FinalModelRequestInput\s*\{[\s\S]*?target:\s*selected\s*,[\s\S]*?canonical_input_items:\s*canonical_input_items\.as_ref\s*\(\s*\)\s*,[\s\S]*?canonical_tool_definitions:\s*&tool_definitions\s*,[\s\S]*?expected_toolset_fingerprint:\s*self\.tool_registry\.model_projection_fingerprint\s*\(\s*\)/,
-      /let\s+canonical_request_bytes\s*=\s*final_request\.canonical_bytes\s*\(\s*\)\s*;/,
-      /let\s+request_byte_count\s*=\s*u64::try_from\s*\(\s*canonical_request_bytes\.len\s*\(\s*\)\s*\)/,
+      /let\s+canonical_tools\s*=\s*FrozenModelTools::from_registry\s*\(\s*&self\.tool_registry\s*\)\s*\?\s*;/,
+      /let\s+finished\s*=\s*builder\.finish\s*\(\s*\)\s*\?\s*;/,
+      /let\s+selected_output_limit\s*=\s*SelectedOutputLimit::from_selection\s*\(\s*selection\s*\)\s*;/,
+      /FinalModelRequest::construct\s*\(\s*selection\s*,\s*finished\.canonical_inputs\s*,\s*canonical_tools\s*,\s*&self\.instructions\s*,\s*selected_output_limit\s*,/,
+      /let\s+request_byte_count\s*=\s*final_request\.serialized_byte_count\s*\(\s*\)\s*;/,
       /validate_request_byte_limit\s*\(\s*request_byte_count\s*,\s*MAX_CANONICAL_MODEL_REQUEST_BYTES\s*\)/,
-      /complete_request_units\s*\(\s*&final_request\s*,\s*request_byte_count\s*\)/,
-      /let\s+rendered_request_sha256\s*=\s*final_request\.canonical_sha256\s*\(\s*\)\s*;/,
-      /ordered_input_items:\s*canonical_input_items\.clone\s*\(\s*\)\s*,/,
-      /tool_definitions:\s*tool_definitions\.clone\s*\(\s*\)\.into_boxed_slice\s*\(\s*\)\s*,/,
-      /reserved_output_tokens:\s*requested_output_tokens\s*,/,
-      /request:\s*final_request\s*,/,
+      /\.estimate\s*\(\s*selected\s*,\s*final_request\.estimation_units\s*\(\s*\)\s*\)/,
+      /let\s+requested_output_tokens\s*=\s*final_request\.selected_output_limit\s*\(\s*\)\.as_u64\s*\(\s*\)\s*;/,
+      /let\s+rendered_request_sha256\s*=\s*final_request\.request_sha256\s*\(\s*\)\s*;/,
+      /toolset_fingerprint:\s*final_request\.toolset_fingerprint\s*\(\s*\)/,
+      /reserved_output_tokens:\s*requested_output_tokens/,
+      /ContextPackage::from_final_request\s*\([\s\S]*?&final_request/,
+      /final_request\s*,\s*prepared_manifest/,
     ]],
     ['reconstruction', reconstruction.source, [
-      /let\s+canonical_input_items\s*=\s*builder\.freeze_canonical_input_items\s*\(\s*\)\s*\?\s*;/,
-      /let\s+final_request\s*=\s*construct_final_model_request\s*\(\s*FinalModelRequestInput\s*\{[\s\S]*?target\s*,[\s\S]*?canonical_input_items:\s*canonical_input_items\.as_ref\s*\(\s*\)\s*,[\s\S]*?canonical_tool_definitions:\s*&tool_definitions\s*,[\s\S]*?expected_toolset_fingerprint:\s*manifest\.toolset_fingerprint/,
-      /let\s+canonical_request_bytes\s*=\s*final_request\.canonical_bytes\s*\(\s*\)\s*;/,
-      /canonical_request_bytes\s*!=\s*prepared\.request\.canonical_bytes\s*\(\s*\)/,
-      /final_request\.canonical_sha256\s*\(\s*\)\s*!=\s*manifest\.rendered_request_sha256/,
+      /let\s+canonical_tools\s*=\s*FrozenModelTools::from_registry\s*\(\s*&self\.tool_registry\s*\)\s*\?\s*;/,
+      /let\s+finished\s*=\s*builder\.finish\s*\(\s*\)\s*\?\s*;/,
+      /let\s+selected_output_limit\s*=\s*SelectedOutputLimit::from_selection\s*\(\s*selected\s*\)\s*;/,
+      /FinalModelRequest::construct\s*\(\s*selected\s*,\s*finished\.canonical_inputs\s*,\s*canonical_tools\s*,\s*&self\.instructions\s*,\s*selected_output_limit\s*,/,
+      /final_request\.canonical_bytes\s*\(\s*\)\s*!=\s*prepared\.final_request\.canonical_bytes\s*\(\s*\)/,
+      /final_request\.request_sha256\s*\(\s*\)\s*!=\s*prepared\.final_request\.request_sha256\s*\(\s*\)/,
+      /final_request\.request\s*\(\s*\)\s*!=\s*prepared\.final_request\.request\s*\(\s*\)/,
+      /final_request\.estimation_units\s*\(\s*\)\s*!=\s*prepared\.final_request\.estimation_units\s*\(\s*\)/,
     ]],
   ]) {
     for (const pattern of patterns) {
-      if (!pattern.test(block)) violations.push(`${label} final request conservation topology differs`);
+      if (!pattern.test(block)) violations.push(`${label} sealed final-request topology differs`);
     }
   }
-
-  const assemblyFrozen = assembly.source.slice(assembly.source.indexOf('let canonical_input_items'));
-  const reconstructionFrozen = reconstruction.source.slice(
-    reconstruction.source.indexOf('let canonical_input_items'),
-  );
-  violations.push(...stage16SemanticValueEscapeViolations(
-    assemblyFrozen,
-    'canonical_input_items',
-    new Set(['construct_final_model_request']),
-  ));
-  violations.push(...stage16SemanticValueEscapeViolations(
-    reconstructionFrozen,
-    'canonical_input_items',
-    new Set(['construct_final_model_request']),
-  ));
-  violations.push(...stage16SemanticValueEscapeViolations(
-    assembly.source,
-    'tool_definitions',
-    new Set(['model_toolset_fingerprint', 'render_tool_sources', 'construct_final_model_request']),
-  ));
-  violations.push(...stage16SemanticValueEscapeViolations(
-    reconstruction.source,
-    'tool_definitions',
-    new Set(['project_model_tool_definitions', 'render_exact_source', 'construct_final_model_request']),
-  ));
-  if ((source.match(/\bconstruct_final_model_request\s*\(/g) ?? []).length !== 3) {
-    violations.push('final ModelRequest constructor call inventory differs');
+  if (!/struct\s+ContextAssemblyResult\s*\{[\s\S]*?final_request:\s*FinalModelRequest/.test(source) ||
+      /struct\s+ContextAssemblyResult\s*\{[\s\S]*?\n\s*request:\s*ModelRequest/.test(source) ||
+      !/fn\s+from_final_request\s*\([\s\S]*?final_request:\s*&FinalModelRequest/.test(source)) {
+    violations.push('ContextPackage or ContextAssemblyResult bypasses FinalModelRequest provenance');
   }
   return [...new Set(violations)];
 }
 
 function stage16OutcomeUnknownTopologyViolations(source) {
   if (!/\bfn\s+render_tool_result\b/.test(source)) return [];
-  const render = rustFunctionBlocks(source).find((block) => block.name === 'render_tool_result');
-  if (!render) return ['tool-result renderer topology is absent'];
-  const marker = /ToolExecutionState::OutcomeUnknown\s*=>\s*\{/.exec(render.body);
-  if (!marker) return ['outcome_unknown mapping arm is absent'];
-  const opening = render.body.indexOf('{', marker.index);
-  const closing = findMatchingDelimiter(render.body, opening, '{', '}');
-  if (closing === -1) return ['outcome_unknown mapping arm is unbalanced'];
-  const arm = render.body.slice(opening + 1, closing);
-  const returned = /\(\s*ContextSourceKind::SyntheticOutcomeUnknown\s*,\s*"synthetic_tool_outcome_unknown"\s*,([\s\S]+)\)\s*$/.exec(
-    arm.trim(),
-  );
-  const functions = rustFunctionBlocks(source);
-  const inventory = stage14FunctionInventory(functions);
-  const called = [];
-  const returnedExpression = returned?.[1] ?? '';
-  for (const name of stage15LocalCallCounts(returnedExpression, inventory).keys()) {
-    called.push(...(inventory.get(name) ?? []));
-  }
-  const reachable = stage15ReachableRustBlocks(called, inventory);
-  const topology = [returnedExpression, ...reachable.map((block) => block.source)].join('\n');
-  const aliases = stage15ResolveTypeAliases(topology, stage15SimpleTypeAliases(source));
-  const expandedTopology = aliases.resolved
-    .replace(/\(\s*(ModelInputItem)\s*\)/g, '$1')
-    .replace(/\(\s*(Result\s*<[^;{}]+>)\s*\)/g, '$1');
   const violations = [];
-  if (reachable.depthExceeded) violations.push('outcome_unknown helper call graph exceeds the finite analysis bound');
-  if (aliases.depthExceeded) violations.push('outcome_unknown helper type aliases exceed the finite analysis bound');
-  if (!returned || !/ModelInputItem::synthetic_runtime_status\s*\(/.test(expandedTopology)) {
-    violations.push('outcome_unknown is not mapped through the synthetic uncertainty representation');
+  const evidence = stage16NamedBraceBlock(source, 'enum', 'RenderedToolEvidence');
+  const definite = stage16NamedBraceBlock(source, 'struct', 'DefiniteObservedToolResult');
+  const unknown = stage16NamedBraceBlock(source, 'struct', 'UnknownToolOutcome');
+  if (!evidence || !/^enum\s+RenderedToolEvidence\s*\{\s*Definite\(DefiniteObservedToolResult\),\s*OutcomeUnknown\(UnknownToolOutcome\),\s*\}$/s.test(evidence)) {
+    violations.push('RenderedToolEvidence must have only definite and outcome-unknown variants');
   }
-  const safeSemanticMacros = new Set(['json', 'format', 'vec', 'matches']);
-  for (const match of expandedTopology.matchAll(/\b([A-Za-z_][A-Za-z0-9_]*)\s*!\s*[({[]/g)) {
-    const locallyDefined = new RegExp(`\\bmacro_rules\\s*!\\s*${match[1]}\\b`).test(source);
-    if (!safeSemanticMacros.has(match[1]) || locallyDefined) {
-      violations.push('outcome_unknown reaches an unresolved semantic macro expansion');
-    }
+  if (!definite || !/call_id:\s*ModelToolCallId/.test(definite) || !/projection:\s*Value/.test(definite) ||
+      /ModelInputItem|\bToolResult\b|UnknownToolOutcome/.test(definite)) {
+    violations.push('DefiniteObservedToolResult representation differs');
   }
-  if (/ModelInputItem\s*::\s*(?:ToolResult|tool_result)\b|\bToolResult\s*::|\btool_result\s*\(|result_success|result_failure/.test(expandedTopology)) {
-    violations.push('outcome_unknown reaches an ordinary tool result');
+  if (!unknown || (unknown.match(/:\s*String/g) ?? []).length !== 4 ||
+      /ModelInputItem|\bToolResult\b|DefiniteObservedToolResult|RenderedToolEvidence/.test(unknown)) {
+    violations.push('UnknownToolOutcome must carry only safe primitive evidence');
   }
-  return violations;
+  if (/impl(?:<[^>]+>)?\s+(?:From|Into|AsRef|AsMut)[^\n{]*RenderedToolEvidence|impl[^\n{]*for\s+(?:RenderedToolEvidence|UnknownToolOutcome)/.test(source)) {
+    violations.push('tool evidence generic conversion seam is forbidden');
+  }
+
+  const functions = rustFunctionBlocks(source);
+  const classifier = functions.find((block) => block.name === 'classify_rendered_tool_evidence');
+  const render = functions.find((block) => block.name === 'render_tool_result');
+  if (!classifier || !render) return [...violations, 'tool evidence classifier or renderer is absent'];
+  if (!/->\s*Result<RenderedToolEvidence,\s*ContextAssemblyError>/.test(classifier.signature) ||
+      !/^\s*tool:\s*&ContextToolResultSource\s*,\s*call_id:\s*ModelToolCallId\s*,?\s*$/s.test(classifier.parameters) ||
+      /\b(?:ModelInputItem|ToolResult|Fn|fn\s*\(|callback|mapper)\b/.test(classifier.source)) {
+    violations.push('tool lifecycle classifier exposes a semantic injection point');
+  }
+  if (!/ToolExecutionState::Completed\s*=>\s*\{[\s\S]*?RenderedToolEvidence::Definite\s*\(\s*DefiniteObservedToolResult\s*\{/.test(classifier.body) ||
+      !/ToolExecutionState::OutcomeUnknown\s*=>\s*\{\s*Ok\s*\(\s*RenderedToolEvidence::OutcomeUnknown\s*\(\s*UnknownToolOutcome\s*\{/.test(classifier.body)) {
+    violations.push('durable definite/unknown classification topology differs');
+  }
+  const unknownClassifierStart = classifier.body.indexOf('ToolExecutionState::OutcomeUnknown');
+  const unknownClassifierEnd = classifier.body.indexOf('_ =>', unknownClassifierStart);
+  const unknownClassifier = classifier.body.slice(unknownClassifierStart, unknownClassifierEnd);
+  if (/ModelInputItem|ToolResult|RenderedToolEvidence::Definite|\b(?:identity|map|convert)\s*\(/.test(unknownClassifier)) {
+    violations.push('OutcomeUnknown classification reaches definite or generic semantic construction');
+  }
+
+  const matchMarker = /match\s+evidence\s*\{/.exec(render.body);
+  if (!matchMarker) return [...violations, 'exhaustive rendered-tool conversion is absent'];
+  const opening = render.body.indexOf('{', matchMarker.index);
+  const closing = findMatchingDelimiter(render.body, opening, '{', '}');
+  if (closing === -1) return [...violations, 'rendered-tool conversion is unbalanced'];
+  const conversion = render.body.slice(opening + 1, closing);
+  if (!/RenderedToolEvidence::Definite\s*\(\s*result\s*\)\s*=>[\s\S]*?ModelInputItem::tool_result\s*\(/.test(conversion) ||
+      !/RenderedToolEvidence::OutcomeUnknown\s*\(\s*status\s*\)\s*=>\s*\{[\s\S]*?ModelInputItem::synthetic_runtime_status\s*\(\s*"tool_outcome_unknown"/.test(conversion) ||
+      /(?:^|[,{}]\s*)_\s*=>/.test(conversion)) {
+    violations.push('exhaustive definite-vs-unknown conversion topology differs');
+  }
+  const unknownConversionStart = conversion.indexOf('RenderedToolEvidence::OutcomeUnknown');
+  const unknownConversion = conversion.slice(unknownConversionStart);
+  if (/ModelInputItem::(?:tool_result|ToolResult)|\bToolResult\b|RenderedToolEvidence::Definite|\b(?:callback|mapper)\b/.test(unknownConversion)) {
+    violations.push('OutcomeUnknown final conversion reaches ordinary ToolResult');
+  }
+  return [...new Set(violations)];
 }
 
 function verifyStage16CheckerProbes() {
@@ -4090,6 +4120,96 @@ function verifyStage16CheckerProbes() {
       `Stage 16 checker negative probe was not rejected: ${label}`,
     );
   }
+  const contextPath = join(repositoryRoot, 'backend', 'src', 'application', 'context_assembler.rs');
+  const context = readFileSync(contextPath, 'utf8');
+  const topologyCases = [
+    ['public FrozenModelInputs', (value) => value.replace('struct FrozenModelInputs(', 'pub struct FrozenModelInputs(')],
+    ['FrozenModelInputs mutable accessor', (value) => value.replace(
+      'impl FrozenModelInputs {',
+      'impl FrozenModelInputs {\n    fn as_mut(&mut self) -> &mut [ModelInputItem] { &mut self.0 }',
+    )],
+    ['FrozenModelInputs DerefMut', (value) => stage15AppendProductionHelper(value, `
+      impl std::ops::Deref for FrozenModelInputs {
+          type Target = [ModelInputItem];
+          fn deref(&self) -> &Self::Target { &self.0 }
+      }
+      impl std::ops::DerefMut for FrozenModelInputs {
+          fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+      }`)],
+    ['CanonicalInputBuilder nonconsuming finish', (value) => value.replace(
+      'fn finish(self) -> Result<FrozenModelInputs, ContextAssemblyError>',
+      'fn finish(&self) -> Result<FrozenModelInputs, ContextAssemblyError>',
+    )],
+    ['public FrozenModelTools', (value) => value.replace('struct FrozenModelTools(', 'pub struct FrozenModelTools(')],
+    ['alternate tool projection path', (value) => stage15AppendProductionHelper(value, `
+      fn stage16_alternate_projection(registry: &ToolRegistry) -> Vec<ModelToolDefinition> {
+          project_model_tool_definitions(registry).expect("projection")
+      }`)],
+    ['constant tool fingerprint', (value) => value.replace(
+      'model_toolset_fingerprint(self.as_slice())',
+      'Sha256Digest::hash_bytes(b"constant")',
+    )],
+    ['SelectedOutputLimit helper source', (value) => value.replace(
+      'Self(selection.selected_target().requested_output_tokens())',
+      'Self(stage16_adjust_output(selection.selected_target().requested_output_tokens()))',
+    )],
+    ['FinalModelRequest raw Vec input', (value) => value.replace(
+      'canonical_inputs: FrozenModelInputs,',
+      'canonical_inputs: Vec<ModelInputItem>,',
+    )],
+    ['alternate ModelRequest construction', (value) => stage15AppendProductionHelper(value, `
+      fn stage16_alternate_request(input: ModelRequestInput) {
+          let _ = ModelRequest::try_new(input);
+      }`)],
+    ['external estimation-unit constructor', (value) => stage15AppendProductionHelper(value, `
+      fn stage16_external_units() -> Vec<TokenEstimateUnit> {
+          vec![TokenEstimateUnit::StructuredBytes(1)]
+      }`)],
+    ['external request hash recomputation', (value) => stage15AppendProductionHelper(value, `
+      fn stage16_external_hash(request: &ModelRequest) -> Sha256Digest {
+          request.canonical_sha256()
+      }`)],
+    ['byte gate detached from final request', (value) => value.replace(
+      'let request_byte_count = final_request.serialized_byte_count();',
+      'let request_byte_count = 1_u64;',
+    )],
+    ['estimator detached from final units', (value) => value.replace(
+      '.estimate(selected, final_request.estimation_units())',
+      '.estimate(selected, &[])',
+    )],
+    ['ContextAssemblyResult raw request field', (value) => value.replace(
+      'final_request: FinalModelRequest,',
+      'request: ModelRequest,',
+    )],
+    ['RenderedToolEvidence unknown variant removed', (value) => value.replace(
+      'OutcomeUnknown(UnknownToolOutcome),',
+      'OutcomeUnknown(DefiniteObservedToolResult),',
+    )],
+    ['OutcomeUnknown classified definite', (value) => value.replace(
+      'ToolExecutionState::OutcomeUnknown => {\n            Ok(RenderedToolEvidence::OutcomeUnknown(UnknownToolOutcome {',
+      'ToolExecutionState::OutcomeUnknown => {\n            Ok(RenderedToolEvidence::Definite(DefiniteObservedToolResult {',
+    )],
+    ['classifier callback parameter', (value) => value.replace(
+      'call_id: ModelToolCallId,\n) -> Result<RenderedToolEvidence',
+      'call_id: ModelToolCallId,\n    callback: fn(UnknownToolOutcome) -> RenderedToolEvidence,\n) -> Result<RenderedToolEvidence',
+    )],
+    ['wildcard evidence conversion', (value) => value.replace(
+      'RenderedToolEvidence::OutcomeUnknown(status) => {',
+      '_ => {',
+    )],
+    ['unknown evidence converts to ToolResult', (value) => value.replace(
+      'ModelInputItem::synthetic_runtime_status("tool_outcome_unknown", details)',
+      'ModelInputItem::tool_result(ModelToolCallId::try_new("unknown").unwrap(), details)',
+    )],
+  ];
+  for (const [label, mutate] of topologyCases) {
+    const mutated = mutate(context);
+    assert(mutated !== context, `Stage 16 topology probe did not mutate source: ${label}`);
+    assert(
+      stage16ContextMutationViolations('application/context_assembler.rs', mutated).length > 0,
+      `Stage 16 topology checker negative probe was not rejected: ${label}`,
+    );
+  }
   const controls = [
     ['single unique lookup', 'adapters/sqlite/context_source_store.rs', 'fn load_one() { sql!("SELECT * FROM work_items WHERE work_id = ?"); }'],
     ['diagnostic sorting', 'application/diagnostics.rs', 'fn diagnostic(mut rows: Vec<Row>) { rows.sort_by_key(Row::created_at); }'],
@@ -4104,7 +4224,10 @@ function verifyStage16CheckerProbes() {
       `Stage 16 checker false-positive control was rejected: ${label}`,
     );
   }
-  return { negativeProbeCount: cases.length, falsePositiveControlCount: controls.length };
+  return {
+    negativeProbeCount: cases.length + topologyCases.length,
+    falsePositiveControlCount: controls.length,
+  };
 }
 
 function verifyStage16ContextStructure(rustRoot, productionFiles) {
@@ -4154,7 +4277,7 @@ function verifyStage16ContextStructure(rustRoot, productionFiles) {
   assert(byteCeiling !== -1 && estimatorIdentity !== -1 && estimatorCall !== -1 &&
       byteCeiling < estimatorIdentity && byteCeiling < estimatorCall,
     'request byte ceiling must be enforced before estimator identity/call work');
-  assert(/let\s+rendered_request_sha256\s*=\s*final_request\.canonical_sha256\s*\(\s*\)/.test(productionContext), 'authoritative request hash is not derived from complete ModelRequest');
+  assert(/let\s+rendered_request_sha256\s*=\s*final_request\.request_sha256\s*\(\s*\)/.test(productionContext), 'authoritative request hash is not read from FinalModelRequest');
   const manifestHash = extractRustFunction(productionContext, 'semantic_manifest_hash');
   assert(!/created_at|utc_now/.test(manifestHash), 'created_at leaked into semantic manifest hash');
   assert(!/persist_context_manifest|insert_context_manifest/.test(productionContext), 'Stage 16 independently persists successful manifests');
@@ -4171,6 +4294,7 @@ function verifyStage16ContextStructure(rustRoot, productionFiles) {
     falsePositiveControlCount: probes.falsePositiveControlCount + compilation.controlCount,
     compilationGatedNegativeProbeCount: compilation.negativeProbeCount,
     compilationGatedFalsePositiveControlCount: compilation.controlCount,
+    typeSealedChallengeCount: compilation.typeSealedChallengeCount,
   };
 }
 
@@ -4205,28 +4329,45 @@ function stage16AppendReachableHelper(source, helper, call) {
   return stage15AppendProductionHelper(stage16InjectAssembleStatement(source, call), helper);
 }
 
-function stage16ReplaceOutcomeUnknownArm(source, replacement) {
-  return stage16MutateFunction(source, 'render_tool_result', (block) => {
+function stage16ReplaceClassifierUnknownArm(source, replacement) {
+  return stage16MutateFunction(source, 'classify_rendered_tool_evidence', (block) => {
     const marker = /ToolExecutionState::OutcomeUnknown\s*=>\s*\{/.exec(block);
-    assert(marker, 'Stage 16 outcome_unknown mutation anchor differs');
+    assert(marker, 'Stage 16 classifier outcome-unknown mutation anchor differs');
     const opening = block.indexOf('{', marker.index);
     const closing = findMatchingDelimiter(block, opening, '{', '}');
-    assert(closing !== -1, 'Stage 16 outcome_unknown mutation arm is unbalanced');
+    assert(closing !== -1, 'Stage 16 classifier outcome-unknown arm is unbalanced');
     return `${block.slice(0, opening)}{${replacement}}${block.slice(closing + 1)}`;
   });
 }
 
-function stage16CompilationProbeDefinitions() {
+function stage16ReplaceEvidenceUnknownArm(source, replacement) {
+  return stage16MutateFunction(source, 'render_tool_result', (block) => {
+    const marker = /RenderedToolEvidence::OutcomeUnknown\s*\(\s*status\s*\)\s*=>\s*\{/.exec(block);
+    assert(marker, 'Stage 16 rendered-evidence outcome-unknown mutation anchor differs');
+    const opening = block.indexOf('{', marker.index);
+    const closing = findMatchingDelimiter(block, opening, '{', '}');
+    assert(closing !== -1, 'Stage 16 rendered-evidence outcome-unknown arm is unbalanced');
+    return `${block.slice(0, marker.index)}${replacement}${block.slice(closing + 1)}`;
+  });
+}
+
+function stage16SealedProbeDefinitions() {
   const applicationPath = 'backend/src/application/context_assembler.rs';
   const sqlitePath = 'backend/src/adapters/sqlite/context_source_store.rs';
-  const directUnknownResult = `
-        let projection = json!({"result_kind": "failure", "outcome": "unknown"});
-        (
-            ContextSourceKind::ObservedToolResult,
-            "observed_tool_result",
-            ModelInputItem::tool_result(call_id, projection).map_err(contract_error)?,
-        )
-      `;
+  const ordinaryUnknownArm = (rendered) => `RenderedToolEvidence::OutcomeUnknown(status) => {
+            let call_id = ModelToolCallId::try_new(status.provider_tool_call_id.clone())
+                .map_err(contract_error)?;
+            let ordinary = ModelInputItem::tool_result(
+                call_id,
+                json!({"outcome": "unknown", "result_kind": "failure"}),
+            ).map_err(contract_error)?;
+            (
+                ContextSourceKind::ObservedToolResult,
+                "observed_tool_result",
+                ContextTransformKind::InlineProjection,
+                ${rendered},
+            )
+        }`;
   return {
     negatives: [
       {
@@ -4247,8 +4388,7 @@ function stage16CompilationProbeDefinitions() {
         label: 'future cutoff predicate removed',
         path: sqlitePath,
         mutate: (source) => stage16MutateFunction(source, 'load_prior_works', (block) =>
-          block
-            .replace(' AND w.conversation_work_ordinal < ?', '')
+          block.replace(' AND w.conversation_work_ordinal < ?', '')
             .replace('\n    .bind(active_ordinal.get())', '')),
       },
       {
@@ -4258,23 +4398,7 @@ function stage16CompilationProbeDefinitions() {
           block.replace('.bind(active_ordinal.get())', '.bind(active_ordinal.get() + 1)')),
       },
       {
-        label: 'broad same-conversation query followed by application filtering',
-        path: sqlitePath,
-        mutate: (source) => stage16MutateFunction(source, 'load_prior_works', (block) =>
-          block
-            .replace(' AND w.conversation_work_ordinal < ?', '')
-            .replace('\n    .bind(active_ordinal.get())', '')
-            .replace(
-              'rows.iter().map(decode_work_source).collect()',
-              `let decoded = rows.iter().map(decode_work_source).collect::<Result<Vec<_>, _>>()?;
-    Ok(decoded
-        .into_iter()
-        .filter(|work| work.ordinal < active_ordinal)
-        .collect())`,
-            )),
-      },
-      {
-        label: 'direct selector call reachable from assembler',
+        label: 'selector call becomes reachable from assembler',
         path: applicationPath,
         mutate: (source) => stage16InjectAssembleStatement(source, `
           if let Some(policy) = Option::<&crate::application::model_selection::ModelSelectionPolicy>::None {
@@ -4282,501 +4406,286 @@ function stage16CompilationProbeDefinitions() {
           }`),
       },
       {
-        label: 'neutral helper wraps selector',
+        label: 'selected output lowered through two helper layers',
         path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_route(
-              policy: &crate::application::model_selection::ModelSelectionPolicy,
-              selection: &ModelSelectionResult,
-          ) {
-              let _ = policy.select(None, selection.required_capabilities());
-          }`, `
-          if let Some(policy) = Option::<&crate::application::model_selection::ModelSelectionPolicy>::None {
-              stage16_route(policy, selection);
+        mutate: (source) => stage15AppendProductionHelper(source.replace(
+          'let selected_output_limit = SelectedOutputLimit::from_selection(selection);',
+          `let selected_output_limit = SelectedOutputLimit::from_selection(selection);
+        let selected_output_limit = stage16_lower_output_one(selected_output_limit);`,
+        ), `
+          fn stage16_lower_output_one(value: SelectedOutputLimit) -> SelectedOutputLimit {
+              stage16_lower_output_two(value)
+          }
+          fn stage16_lower_output_two(value: SelectedOutputLimit) -> SelectedOutputLimit {
+              SelectedOutputLimit(TokenCount::try_new(value.get().get() - 1).expect("positive"))
           }`),
       },
       {
-        label: 'type alias hides selection policy',
+        label: 'estimator receives only even-indexed units',
         path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          type Stage16RouteEngine = crate::application::model_selection::ModelSelectionPolicy;
-          fn stage16_route_alias(policy: &Stage16RouteEngine, selection: &ModelSelectionResult) {
-              let _ = policy.select(None, selection.required_capabilities());
-          }`, `
-          if let Some(policy) = Option::<&Stage16RouteEngine>::None {
-              stage16_route_alias(policy, selection);
-          }`),
+        mutate: (source) => source.replace(
+          'let estimate = self\n            .estimator\n            .estimate(selected, final_request.estimation_units())',
+          `let reduced_units = final_request.estimation_units().iter().copied()
+            .enumerate().filter_map(|(index, unit)| (index % 2 == 0).then_some(unit))
+            .collect::<Vec<_>>();
+        let estimate = self
+            .estimator
+            .estimate(selected, &reduced_units)`,
+        ),
       },
       {
-        label: 'helper chooses alternate considered target',
+        label: 'estimator omits input index zero',
         path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_alternate(selection: &ModelSelectionResult) -> Option<&crate::domain::ModelTargetId> {
-              selection.considered_target_ids().last()
-          }`, 'let _ = stage16_alternate(selection);'),
+        mutate: (source) => source.replace(
+          'let estimate = self\n            .estimator\n            .estimate(selected, final_request.estimation_units())',
+          `let reduced_units = final_request.estimation_units()[1..].to_vec();
+        let estimate = self
+            .estimator
+            .estimate(selected, &reduced_units)`,
+        ),
       },
       {
-        label: 'neutral helper returns first N canonical inputs',
+        label: 'final constructor reverses frozen inputs',
         path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_first_n<T>(values: Vec<T>, count: usize) -> Vec<T> {
-              values.into_iter().take(count).collect()
-          }`, 'let _ = stage16_first_n(Vec::<ModelInputItem>::new(), 1);'),
-      },
-      {
-        label: 'request byte iterator take',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_byte_take(bytes: &[u8], byte_budget: usize) -> Vec<u8> {
-              bytes.iter().copied().take(byte_budget).collect()
-          }`, 'let _ = stage16_byte_take(&[], 0);'),
-      },
-      {
-        label: 'string or byte prefix slicing helper',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_byte_prefix(bytes: &[u8], byte_budget: usize) -> &[u8] {
-              &bytes[..byte_budget.min(bytes.len())]
-          }`, 'let _ = stage16_byte_prefix(&[], 0);'),
-      },
-      {
-        label: 'helper removes last input item',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_remove_last(mut items: Vec<ModelInputItem>) -> Vec<ModelInputItem> {
-              items.pop();
-              items
-          }`, 'let _ = stage16_remove_last(Vec::new());'),
-      },
-      {
-        label: 'helper removes tool definition',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_remove_tool(mut tool_definitions: Vec<ModelToolDefinition>) -> Vec<ModelToolDefinition> {
-              if !tool_definitions.is_empty() { tool_definitions.remove(0); }
-              tool_definitions
-          }`, 'let _ = stage16_remove_tool(Vec::new());'),
-      },
-      {
-        label: 'helper lowers requested output reserve',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_lower_output(requested_output: u64) -> u64 {
-              requested_output.saturating_sub(1)
-          }`, 'let _ = stage16_lower_output(1);'),
-      },
-      {
-        label: 'direct outcome_unknown to ordinary ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage16ReplaceOutcomeUnknownArm(source, directUnknownResult),
-      },
-      {
-        label: 'neutral helper maps outcome_unknown to ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_unknown_item(call_id)?,
-            )`), `
-          fn stage16_unknown_item(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-              ModelInputItem::tool_result(call_id, json!({"outcome": "unknown"})).map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'outcome_unknown becomes fake failed result',
-        path: applicationPath,
-        mutate: (source) => stage16ReplaceOutcomeUnknownArm(source, directUnknownResult.replace(
-          '"outcome": "unknown"', '"error": "unknown", "result_kind": "failure"')),
-      },
-      {
-        label: 'alias helper maps outcome_unknown to ordinary result',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_alias_unknown(call_id)?,
-            )`), `
-          type Stage16UnknownRendered = ModelInputItem;
-          fn stage16_alias_unknown(call_id: ModelToolCallId) -> Result<Stage16UnknownRendered, ContextAssemblyError> {
-              ModelInputItem::tool_result(call_id, json!({"result_kind": "failure"})).map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'previous bypass A uses a neutral helper to remove the final canonical input',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let canonical_input_items = builder.freeze_canonical_input_items()?;',
-            `let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let canonical_input_items = stage16_shape_a(canonical_input_items);`,
-          )), `
-          fn stage16_shape_a(values: Box<[ModelInputItem]>) -> Box<[ModelInputItem]> {
-              let mut owned = values.into_vec();
-              let final_index = owned.len() - 1;
-              owned.swap_remove(final_index);
-              owned.into_boxed_slice()
-          }`),
-      },
-      {
-        label: 'previous bypass B checks a neutral byte prefix instead of the final request',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let request_byte_count = u64::try_from(canonical_request_bytes.len())',
-            'let request_byte_count = u64::try_from(stage16_shape_b(&canonical_request_bytes).len())',
-          )), `
-          fn stage16_shape_b(bytes: &[u8]) -> &[u8] {
-              &bytes[..bytes.len().saturating_sub(1)]
-          }`),
-      },
-      {
-        label: 'previous bypass C removes one real tool with swap_remove',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);',
-            `let tool_definitions = stage16_shape_c(tool_definitions);
-        let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);`,
-          )), `
-          fn stage16_shape_c(mut values: Vec<ModelToolDefinition>) -> Vec<ModelToolDefinition> {
-              values.swap_remove(0);
+        mutate: (source) => stage15AppendProductionHelper(source.replace(
+          'ordered_input_items: canonical_inputs.0.into_vec(),',
+          'ordered_input_items: stage16_reverse_inputs(canonical_inputs),',
+        ), `
+          fn stage16_reverse_inputs(inputs: FrozenModelInputs) -> Vec<ModelInputItem> {
+              let mut values = inputs.0.into_vec();
+              values.reverse();
               values
           }`),
       },
       {
-        label: 'previous bypass D lowers the selected requested output by one',
+        label: 'final constructor replaces one frozen tool',
         path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'construct_final_model_request', (block) => block.replace(
-            'requested_output_limit: input.target.requested_output_tokens(),',
-            'requested_output_limit: stage16_shape_d(input.target.requested_output_tokens()),',
-          )), `
-          fn stage16_shape_d(limit: crate::domain::TokenCount) -> crate::domain::TokenCount {
-              crate::domain::TokenCount::try_new(limit.get() - 1).expect("positive configured limit")
+        mutate: (source) => stage15AppendProductionHelper(source.replace(
+          'tool_definitions: canonical_tools.0.into_vec(),',
+          'tool_definitions: stage16_replace_tool(canonical_tools),',
+        ), `
+          fn stage16_replace_tool(tools: FrozenModelTools) -> Vec<ModelToolDefinition> {
+              let mut values = tools.0.into_vec();
+              values.swap(0, 1);
+              values
           }`),
       },
       {
-        label: 'novel input slice copies all but the final canonical item',
+        label: 'byte gate uses shortened count',
         path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let canonical_input_items = builder.freeze_canonical_input_items()?;',
-            `let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let canonical_input_items = stage16_shape_e(canonical_input_items);`,
-          )), `
-          fn stage16_shape_e(values: Box<[ModelInputItem]>) -> Box<[ModelInputItem]> {
-              values[..values.len() - 1].to_vec().into_boxed_slice()
+        mutate: (source) => source.replace(
+          'let request_byte_count = final_request.serialized_byte_count();',
+          'let request_byte_count = final_request.serialized_byte_count().saturating_sub(1);',
+        ),
+      },
+      {
+        label: 'request hash recomputed outside sealed request',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(source, `
+          fn stage16_rehash(request: &ModelRequest) -> Sha256Digest {
+              request.canonical_sha256()
           }`),
       },
       {
-        label: 'novel neutral manual loop stops before the final canonical item',
+        label: 'OutcomeUnknown classification fabricates definite evidence',
         path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let canonical_input_items = builder.freeze_canonical_input_items()?;',
-            `let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let canonical_input_items = stage16_shape_f(canonical_input_items);`,
-          )), `
-          fn stage16_shape_f(values: Box<[ModelInputItem]>) -> Box<[ModelInputItem]> {
-              let mut copied = Vec::new();
-              let stopping_point = values.len().saturating_sub(1);
-              let mut position = 0;
-              while position < stopping_point {
-                  copied.push(values[position].clone());
-                  position += 1;
-              }
-              copied.into_boxed_slice()
-          }`),
-      },
-      {
-        label: 'novel manual tool projection skips one known definition',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);',
-            `let tool_definitions = stage16_shape_g(tool_definitions);
-        let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);`,
-          )), `
-          fn stage16_shape_g(values: Vec<ModelToolDefinition>) -> Vec<ModelToolDefinition> {
-              let mut copied = Vec::new();
-              for value in values {
-                  if value.name().as_str() != "read_file" {
-                      copied.push(value);
-                  }
-              }
-              copied
-          }`),
-      },
-      {
-        label: 'novel output helper uses saturating arithmetic on a neutral parameter',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'construct_final_model_request', (block) => block.replace(
-            'requested_output_limit: input.target.requested_output_tokens(),',
-            'requested_output_limit: stage16_shape_h(input.target.requested_output_tokens()),',
-          )), `
-          fn stage16_shape_h(value: crate::domain::TokenCount) -> crate::domain::TokenCount {
-              crate::domain::TokenCount::try_new(value.get().saturating_sub(1))
-                  .expect("positive configured limit")
-          }`),
-      },
-      {
-        label: 'novel byte helper copies a shorter vector before the actual gate',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-            'let request_byte_count = u64::try_from(canonical_request_bytes.len())',
-            `let gate_material = stage16_shape_i(&canonical_request_bytes);
-        let request_byte_count = u64::try_from(gate_material.len())`,
-          )), `
-          fn stage16_shape_i(bytes: &[u8]) -> Vec<u8> {
-              let mut copied = Vec::new();
-              let stopping_point = bytes.len().saturating_sub(1);
-              let mut position = 0;
-              while position < stopping_point {
-                  copied.push(bytes[position]);
-                  position += 1;
-              }
-              copied
-          }`),
-      },
-      {
-        label: 'previous outcome_unknown alias helper returns a failed ToolResult while synthetic is unused',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            let unused = ModelInputItem::synthetic_runtime_status(
-                "tool_outcome_unknown",
-                json!({"outcome": "unknown"}),
-            ).map_err(contract_error)?;
-            drop(unused);
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_shape_j(call_id)?,
-            )`), `
-          type Stage16ShapeJ = ModelInputItem;
-          fn stage16_shape_j(call_id: ModelToolCallId) -> Result<Stage16ShapeJ, ContextAssemblyError> {
-              Stage16ShapeJ::tool_result(call_id, json!({"result_kind": "failure"}))
-                  .map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'novel outcome_unknown helper returns a successful ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_shape_k(call_id)?,
-            )`), `
-          fn stage16_shape_k(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-              ModelInputItem::tool_result(call_id, json!({"result_kind": "success", "value": true}))
-                  .map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'novel outcome_unknown wrapper contains an ordinary ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_shape_l(call_id)?.value,
-            )`), `
-          struct Stage16ShapeL { value: ModelInputItem }
-          fn stage16_shape_l(call_id: ModelToolCallId) -> Result<Stage16ShapeL, ContextAssemblyError> {
-              Ok(Stage16ShapeL {
-                  value: ModelInputItem::tool_result(call_id, json!({"result_kind": "failure"}))
-                      .map_err(contract_error)?,
-              })
-          }`),
-      },
-      {
-        label: 'novel outcome_unknown reaches ToolResult through two neutral helper layers',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16ReplaceOutcomeUnknownArm(source, `
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                stage16_shape_m1(call_id)?,
-            )`), `
-          fn stage16_shape_m1(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-              stage16_shape_m2(call_id)
-          }
-          fn stage16_shape_m2(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-              ModelInputItem::tool_result(call_id, json!({"result_kind": "success"}))
-                  .map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'novel outcome_unknown constructs ToolResult then drops a separate synthetic marker',
-        path: applicationPath,
-        mutate: (source) => stage16ReplaceOutcomeUnknownArm(source, `
-            let ordinary = ModelInputItem::tool_result(
+        mutate: (source) => stage16ReplaceClassifierUnknownArm(source, `
+            Ok(RenderedToolEvidence::Definite(DefiniteObservedToolResult {
                 call_id,
-                json!({"result_kind": "failure"}),
-            ).map_err(contract_error)?;
-            let synthetic = ModelInputItem::synthetic_runtime_status(
-                "tool_outcome_unknown",
-                json!({"outcome": "unknown"}),
-            ).map_err(contract_error)?;
-            drop(synthetic);
+                projection: json!({"outcome": "unknown", "result_kind": "failure"}),
+            }))
+        `),
+      },
+      {
+        label: 'generic identity carries prebuilt unknown ToolResult',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(
+          stage16ReplaceEvidenceUnknownArm(source, ordinaryUnknownArm('stage16_unknown_identity(ordinary)')),
+          `
+          fn stage16_unknown_identity<T>(value: T) -> T { value }`,
+        ),
+      },
+      {
+        label: 'wrapper carries unknown ToolResult',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(
+          stage16ReplaceEvidenceUnknownArm(source, ordinaryUnknownArm('stage16_unknown_wrapper(ordinary).0')),
+          `
+          struct Stage16UnknownWrapper(ModelInputItem);
+          fn stage16_unknown_wrapper(value: ModelInputItem) -> Stage16UnknownWrapper {
+              Stage16UnknownWrapper(value)
+          }`,
+        ),
+      },
+      {
+        label: 'trait conversion maps unknown evidence to ToolResult',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(
+          stage16ReplaceEvidenceUnknownArm(source, `RenderedToolEvidence::OutcomeUnknown(status) => {
+            let rendered = ModelInputItem::try_from(status)?;
             (
                 ContextSourceKind::ObservedToolResult,
                 "observed_tool_result",
-                ordinary,
-            )`),
+                ContextTransformKind::InlineProjection,
+                rendered,
+            )
+        }`), `
+          impl TryFrom<UnknownToolOutcome> for ModelInputItem {
+              type Error = ContextAssemblyError;
+              fn try_from(value: UnknownToolOutcome) -> Result<Self, Self::Error> {
+                  let call_id = ModelToolCallId::try_new(value.provider_tool_call_id)
+                      .map_err(contract_error)?;
+                  ModelInputItem::tool_result(call_id, json!({"outcome": "unknown"}))
+                      .map_err(contract_error)
+              }
+          }`),
+      },
+      {
+        label: 'function-pointer unknown semantic injection seam',
+        path: applicationPath,
+        mutate: (source) => {
+          let changedSignature = source.replace(
+            'call_id: ModelToolCallId,\n) -> Result<RenderedToolEvidence, ContextAssemblyError>',
+            'call_id: ModelToolCallId,\n    unknown_mapper: fn(UnknownToolOutcome) -> RenderedToolEvidence,\n) -> Result<RenderedToolEvidence, ContextAssemblyError>',
+          ).replace(
+            'let evidence = classify_rendered_tool_evidence(tool, call_id)?;',
+            'let evidence = classify_rendered_tool_evidence(tool, call_id, stage16_unknown_pointer)?;',
+          );
+          return stage15AppendProductionHelper(
+            stage16ReplaceClassifierUnknownArm(changedSignature, `
+              let unknown = UnknownToolOutcome {
+                  provider_tool_call_id: tool.provider_tool_call_id.clone(),
+                  tool_execution_id: tool.tool_execution_id.to_string(),
+                  tool_name: tool.tool_name.as_str().to_owned(),
+                  work_id: tool.work_id.to_string(),
+              };
+              Ok(unknown_mapper(unknown))
+            `), `
+              fn stage16_unknown_pointer(value: UnknownToolOutcome) -> RenderedToolEvidence {
+                  let call_id = ModelToolCallId::try_new(value.provider_tool_call_id).expect("durable call id");
+                  RenderedToolEvidence::Definite(DefiniteObservedToolResult {
+                      call_id,
+                      projection: json!({"outcome": "unknown"}),
+                  })
+              }`);
+        },
+      },
+      {
+        label: 'closure unknown semantic injection seam',
+        path: applicationPath,
+        mutate: (source) => {
+          let changedSignature = source.replace(
+            `fn classify_rendered_tool_evidence(
+    tool: &ContextToolResultSource,
+    call_id: ModelToolCallId,
+) -> Result<RenderedToolEvidence, ContextAssemblyError> {`,
+            `fn classify_rendered_tool_evidence<F>(
+    tool: &ContextToolResultSource,
+    call_id: ModelToolCallId,
+    unknown_mapper: F,
+) -> Result<RenderedToolEvidence, ContextAssemblyError>
+where
+    F: FnOnce(UnknownToolOutcome) -> RenderedToolEvidence,
+{`,
+          ).replace(
+            'let evidence = classify_rendered_tool_evidence(tool, call_id)?;',
+            `let evidence = classify_rendered_tool_evidence(tool, call_id, |value| {
+        let call_id = ModelToolCallId::try_new(value.provider_tool_call_id).expect("durable call id");
+        RenderedToolEvidence::Definite(DefiniteObservedToolResult {
+            call_id,
+            projection: json!({"outcome": "unknown"}),
+        })
+    })?;`,
+          );
+          return stage16ReplaceClassifierUnknownArm(changedSignature, `
+              let unknown = UnknownToolOutcome {
+                  provider_tool_call_id: tool.provider_tool_call_id.clone(),
+                  tool_execution_id: tool.tool_execution_id.to_string(),
+                  tool_name: tool.tool_name.as_str().to_owned(),
+                  work_id: tool.work_id.to_string(),
+              };
+              Ok(unknown_mapper(unknown))
+            `);
+        },
+      },
+      {
+        label: 'wildcard replaces exhaustive unknown conversion',
+        path: applicationPath,
+        mutate: (source) => stage16ReplaceEvidenceUnknownArm(source, `_ => {
+            let details = json!({"outcome": "unknown"});
+            (
+                ContextSourceKind::SyntheticOutcomeUnknown,
+                "synthetic_tool_outcome_unknown",
+                ContextTransformKind::SyntheticStatus,
+                ModelInputItem::synthetic_runtime_status("tool_outcome_unknown", details)
+                    .map_err(contract_error)?,
+            )
+        }`),
+      },
+      {
+        label: 'unknown conversion directly emits ToolResult',
+        path: applicationPath,
+        mutate: (source) => stage16ReplaceEvidenceUnknownArm(source, ordinaryUnknownArm('ordinary')),
+      },
+      {
+        label: 'alternate ModelRequest constructor',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(source, `
+          fn stage16_alternate_request(input: ModelRequestInput) {
+              let _ = ModelRequest::try_new(input);
+          }`),
+      },
+      {
+        label: 'alternate Stage 14 tool projection',
+        path: applicationPath,
+        mutate: (source) => stage15AppendProductionHelper(source, `
+          fn stage16_alternate_tools(registry: &ToolRegistry) {
+              let _ = project_model_tool_definitions(registry);
+          }`),
       },
     ],
+    typeSealed: [
+      ['mutable canonical-input alias escape', `fn stage16_attack(mut value: FrozenModelInputs) { let _ = value.as_mut(); }`],
+      ['post-freeze input removal', `fn stage16_attack(mut value: FrozenModelInputs) { value.remove(0); }`],
+      ['middle input replacement', `fn stage16_attack(mut value: FrozenModelInputs, item: ModelInputItem) { value[1] = item; }`],
+      ['frozen input into mutable Vec', `fn stage16_attack(value: FrozenModelInputs) { let _ = value.into_vec(); }`],
+      ['mutable frozen-tool alias', `fn stage16_attack(mut value: FrozenModelTools) { let _ = value.as_mut(); }`],
+      ['post-freeze tool removal', `fn stage16_attack(mut value: FrozenModelTools) { value.remove(0); }`],
+      ['post-freeze tool replacement', `fn stage16_attack(mut value: FrozenModelTools, tool: ModelToolDefinition) { value[0] = tool; }`],
+      ['SelectedOutputLimit arithmetic', `fn stage16_attack(value: SelectedOutputLimit) { let _ = value.saturating_sub(1); }`],
+      ['mutable final request access', `fn stage16_attack(value: &mut FinalModelRequest) { let _ = value.request_mut(); }`],
+      ['mutable estimator-unit access', `fn stage16_attack(value: &mut FinalModelRequest) { let _ = value.estimation_units_mut(); }`],
+      ['mutable canonical byte access', `fn stage16_attack(value: &mut FinalModelRequest) { let _ = value.canonical_bytes_mut(); }`],
+      ['generic unknown helper argument', `fn stage16_attack<T>(tool: &ContextToolResultSource, call_id: ModelToolCallId, helper: T) { let _ = classify_rendered_tool_evidence(tool, call_id, helper); }`],
+      ['function-pointer unknown alias argument', `fn stage16_attack(tool: &ContextToolResultSource, call_id: ModelToolCallId, helper: fn(UnknownToolOutcome) -> RenderedToolEvidence) { let _ = classify_rendered_tool_evidence(tool, call_id, helper); }`],
+      ['closure unknown alias argument', `fn stage16_attack(tool: &ContextToolResultSource, call_id: ModelToolCallId) { let _ = classify_rendered_tool_evidence(tool, call_id, |_| unreachable!()); }`],
+      ['wrapper unknown alias argument', `fn stage16_attack(tool: &ContextToolResultSource, call_id: ModelToolCallId, wrapper: DefiniteObservedToolResult) { let _ = classify_rendered_tool_evidence(tool, call_id, wrapper); }`],
+      ['trait conversion from unknown evidence', `fn stage16_attack(value: UnknownToolOutcome) { let _: ModelInputItem = value.into(); }`],
+    ].map(([label, helper]) => ({
+      label,
+      path: applicationPath,
+      mutate: (source) => stage15AppendProductionHelper(source, `\n${helper}`),
+    })),
     controls: [
-      {
-        label: 'constructor-local mutable source builder',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(source, `
-          fn stage16_control_source_builder(mut values: Vec<String>) -> Box<[String]> {
-              values.push(String::from("source"));
-              values.into_boxed_slice()
-          }`),
-      },
-      {
-        label: 'created-at metadata value',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(source, `
-          fn stage16_control_created_at_metadata(created_at: UtcTimestamp) -> UtcTimestamp {
-              created_at
-          }`),
-      },
-      {
-        label: 'immutable selected target inspection',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_control_selected(selection: &ModelSelectionResult) -> &crate::domain::ModelTarget {
-              selection.selected_target()
-          }`, 'let _ = stage16_control_selected(selection);'),
-      },
-      {
-        label: 'request byte inspection without truncation',
-        path: applicationPath,
-        mutate: (source) => stage16AppendReachableHelper(source, `
-          fn stage16_control_request_bytes(bytes: &[u8]) -> usize { bytes.len() }`,
-          'let _ = stage16_control_request_bytes(&[]);'),
-      },
-      {
-        label: 'ordinary definite failed result remains ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(source, `
-          fn stage16_control_definite_failure(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-              ModelInputItem::tool_result(call_id, json!({"result_kind": "failure"})).map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'diagnostics-only take outside semantic assembly',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(source, `
-          fn stage16_control_diagnostic_sample(values: Vec<u64>) -> Vec<u64> {
-              values.into_iter().take(2).collect()
-          }`),
-      },
-      {
-        label: 'immutable iteration over the frozen final input',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-          'let canonical_input_items = builder.freeze_canonical_input_items()?;',
-          `let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let _canonical_item_count = canonical_input_items.iter().count();`,
-        )),
-      },
-      {
-        label: 'exact immutable move of the complete frozen input',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-          'let canonical_input_items = builder.freeze_canonical_input_items()?;',
-          `let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let canonical_input_items = canonical_input_items;`,
-        )),
-      },
-      {
-        label: 'immutable inspection of the complete Stage 14 tool projection',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-          'let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);',
-          `let _projected_tool_count = tool_definitions.iter().count();
-        let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);`,
-        )),
-      },
-      {
-        label: 'exact configured requested output is immutably copied',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-          'let requested_output = selected.requested_output_tokens();',
-          `let requested_output = selected.requested_output_tokens();
-        let _configured_requested_output = requested_output;`,
-        )),
-      },
-      {
-        label: 'immutable complete final request byte inspection',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'assemble_snapshot', (block) => block.replace(
-          'let canonical_request_bytes = final_request.canonical_bytes();',
-          `let canonical_request_bytes = final_request.canonical_bytes();
-        let _diagnostic_request_byte_count = canonical_request_bytes.len();`,
-        )),
-      },
-      {
-        label: 'definite completed tool evidence remains an ordinary ToolResult',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'render_tool_result', (block) => block.replace(
-          'ToolExecutionState::Completed => {',
-          `ToolExecutionState::Completed => {
-            let _definite_observed_state = ToolExecutionState::Completed;`,
-        )),
-      },
-      {
-        label: 'outcome_unknown direct synthetic uncertainty remains accepted',
-        path: applicationPath,
-        mutate: (source) => stage16MutateFunction(source, 'render_tool_result', (block) => block.replace(
-          'ToolExecutionState::OutcomeUnknown => {',
-          `ToolExecutionState::OutcomeUnknown => {
-            let _durable_unknown_state = ToolExecutionState::OutcomeUnknown;`,
-        )),
-      },
-      {
-        label: 'outcome_unknown synthetic uncertainty helper chain remains accepted',
-        path: applicationPath,
-        mutate: (source) => stage15AppendProductionHelper(
-          stage16MutateFunction(source, 'render_tool_result', (block) => block.replace(
-            `ModelInputItem::synthetic_runtime_status("tool_outcome_unknown", details)
-                    .map_err(contract_error)?`,
-            'stage16_control_synthetic(details)?',
-          )), `
-          fn stage16_control_synthetic(details: Value) -> Result<ModelInputItem, ContextAssemblyError> {
-              stage16_control_synthetic_inner(details)
-          }
-          fn stage16_control_synthetic_inner(details: Value) -> Result<ModelInputItem, ContextAssemblyError> {
-              ModelInputItem::synthetic_runtime_status("tool_outcome_unknown", details)
-                  .map_err(contract_error)
-          }`),
-      },
-      {
-        label: 'unrelated ToolResult fixture outside Stage 16 outcome mapping',
-        path: applicationPath,
-        mutate: (source) => `${source.trimEnd()}
-
-#[cfg(test)]
-fn stage16_control_fixture(call_id: ModelToolCallId) -> Result<ModelInputItem, ContextAssemblyError> {
-    ModelInputItem::tool_result(call_id, json!({"fixture": true})).map_err(contract_error)
-}
-`,
-      },
-    ],
+      ['mutable builder push before freeze', `fn stage16_control(mut builder: CanonicalInputBuilder, item: ModelInputItem) { let _ = builder.push(item); }`],
+      ['immutable FrozenModelInputs iteration', `fn stage16_control(value: &FrozenModelInputs) -> usize { value.iter().count() }`],
+      ['immutable FrozenModelInputs slice', `fn stage16_control(value: &FrozenModelInputs) -> &[ModelInputItem] { value.as_slice() }`],
+      ['complete FrozenModelInputs consumption', `fn stage16_control(builder: CanonicalInputBuilder) -> Result<FrozenModelInputs, ContextAssemblyError> { builder.finish() }`],
+      ['immutable FrozenModelTools iteration', `fn stage16_control(value: &FrozenModelTools) -> usize { value.iter().count() }`],
+      ['complete FrozenModelTools fingerprint', `fn stage16_control(value: &FrozenModelTools) -> Sha256Digest { value.fingerprint() }`],
+      ['exact SelectedOutputLimit read', `fn stage16_control(value: SelectedOutputLimit) -> TokenCount { value.get() }`],
+      ['final request canonical bytes', `fn stage16_control(value: &FinalModelRequest) -> &[u8] { value.canonical_bytes() }`],
+      ['final request estimator units', `fn stage16_control(value: &FinalModelRequest) -> &[TokenEstimateUnit] { value.estimation_units() }`],
+      ['definite success ToolResult', `fn stage16_control(call_id: ModelToolCallId) { let _ = ModelInputItem::tool_result(call_id, json!({"result_kind": "success"})); }`],
+      ['definite failure ToolResult', `fn stage16_control(call_id: ModelToolCallId) { let _ = ModelInputItem::tool_result(call_id, json!({"result_kind": "failure"})); }`],
+      ['primitive synthetic status text helper', `fn stage16_control(tool_name: &str) -> String { format!("unknown outcome for {tool_name}") }`],
+      ['diagnostics-only sampling', `fn stage16_control(values: Vec<u64>) -> Vec<u64> { values.into_iter().take(2).collect() }`],
+      ['created-at metadata copy', `fn stage16_control(value: UtcTimestamp) -> UtcTimestamp { value }`],
+    ].map(([label, helper]) => ({
+      label,
+      path: applicationPath,
+      mutate: (source) => stage15AppendProductionHelper(source, `\n${helper}`),
+    })),
   };
 }
 
@@ -4822,10 +4731,33 @@ function stage16RunCompilationCase(probeRepository, targetDirectory, probe, expe
   }
 }
 
+function stage16RunTypeSealedCase(probeRepository, targetDirectory, probe) {
+  const path = join(probeRepository, probe.path);
+  const original = readFileSync(path, 'utf8');
+  const mutated = probe.mutate(original);
+  assert(mutated !== original, `Stage 16 type-sealed probe did not mutate source: ${probe.label}`);
+  writeFileSync(path, mutated);
+  try {
+    const compile = spawnSync('cargo', ['check', '--locked', '--workspace', '--all-targets'], {
+      cwd: probeRepository,
+      encoding: 'utf8',
+      env: { ...process.env, CARGO_TARGET_DIR: targetDirectory },
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    assert(
+      compile.status !== 0,
+      `type-sealed adversarial mutation unexpectedly compiled: ${probe.label}`,
+    );
+  } finally {
+    writeFileSync(path, original);
+  }
+}
+
 function verifyStage16CompilationGatedProbes() {
-  const definitions = stage16CompilationProbeDefinitions();
-  assert(definitions.negatives.length === 33, 'Stage 16 compilation-gated negative inventory differs');
-  assert(definitions.controls.length === 15, 'Stage 16 compilation-gated control inventory differs');
+  const definitions = stage16SealedProbeDefinitions();
+  assert(definitions.negatives.length === 22, 'Stage 16 compilation-gated negative inventory differs');
+  assert(definitions.typeSealed.length === 16, 'Stage 16 type-sealed challenge inventory differs');
+  assert(definitions.controls.length === 14, 'Stage 16 compilation-gated control inventory differs');
   const temporaryRoot = mkdtempSync(join(tmpdir(), 'craxii-stage16-probes-'));
   const probeRepository = join(temporaryRoot, 'repository');
   const targetDirectory = join(temporaryRoot, 'target');
@@ -4834,13 +4766,20 @@ function verifyStage16CompilationGatedProbes() {
     for (const probe of definitions.negatives) {
       stage16RunCompilationCase(probeRepository, targetDirectory, probe, true);
     }
+    for (const probe of definitions.typeSealed) {
+      stage16RunTypeSealedCase(probeRepository, targetDirectory, probe);
+    }
     for (const control of definitions.controls) {
       stage16RunCompilationCase(probeRepository, targetDirectory, control, false);
     }
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
-  return { negativeProbeCount: definitions.negatives.length, controlCount: definitions.controls.length };
+  return {
+    negativeProbeCount: definitions.negatives.length,
+    typeSealedChallengeCount: definitions.typeSealed.length,
+    controlCount: definitions.controls.length,
+  };
 }
 
 function verifyDirectDependencies(metadata, workspacePackages) {
@@ -5748,6 +5687,7 @@ function verifyStage13Boundaries() {
       stage16Checker.compilationGatedNegativeProbeCount,
     stage16CompilationGatedFalsePositiveControlCount:
       stage16Checker.compilationGatedFalsePositiveControlCount,
+    stage16TypeSealedChallengeCount: stage16Checker.typeSealedChallengeCount,
   };
 }
 
@@ -5760,14 +5700,15 @@ try {
     console.log('Stage 16 structural invariants passed.');
   } else if (process.argv[2] === '--stage16-static-probes-only') {
     const probes = verifyStage16CheckerProbes();
-    assert(probes.negativeProbeCount === 31 && probes.falsePositiveControlCount === 6,
+    assert(probes.negativeProbeCount === 51 && probes.falsePositiveControlCount === 6,
       'Stage 16 static probe summary differs');
     console.log('Stage 16 static checker probes passed.');
   } else if (process.argv[2] === '--stage16-compilation-probes-only') {
     const probes = verifyStage16CompilationGatedProbes();
-    assert(probes.negativeProbeCount === 33 && probes.controlCount === 15,
+    assert(probes.negativeProbeCount === 22 && probes.typeSealedChallengeCount === 16 &&
+      probes.controlCount === 14,
       'Stage 16 compilation-gated probe summary differs');
-    console.log('Stage 16 compilation-gated checker probes passed: 33 negative, 15 controls.');
+    console.log('Stage 16 checker probes passed: 22 compilation-gated negative, 16 type-sealed, 14 controls.');
   } else {
   const metadata = cargoMetadata();
   assert(
@@ -5836,11 +5777,12 @@ try {
       stage15.stage15NovelChallengeMutationCount === 8 &&
       stage15.stage15FalsePositiveCompilationGatedControlCount === 5 &&
       stage15.stage15CheckerNegativeProbeCount === 93 &&
-      stage15.stage16CheckerNegativeProbeCount === 64 &&
-      stage15.stage16CheckerFalsePositiveControlCount === 21 &&
-      stage15.stage16CompilationGatedNegativeProbeCount === 33 &&
-      stage15.stage16CompilationGatedFalsePositiveControlCount === 15 &&
-      stage15.checkerNegativeProbeCount === 206,
+      stage15.stage16CheckerNegativeProbeCount === 73 &&
+      stage15.stage16CheckerFalsePositiveControlCount === 20 &&
+      stage15.stage16CompilationGatedNegativeProbeCount === 22 &&
+      stage15.stage16CompilationGatedFalsePositiveControlCount === 14 &&
+      stage15.stage16TypeSealedChallengeCount === 16 &&
+      stage15.checkerNegativeProbeCount === 215,
     'checker summary evidence is incomplete',
   );
   console.log('Stage 13 retained checker probes: 19.');
@@ -5849,10 +5791,11 @@ try {
   console.log('Stage 15 compilation-gated negative probes: 28 (20 built-in, 8 novel).');
   console.log('Stage 15 false-positive compilation-gated controls: 5.');
   console.log('Stage 15 checker negative probes passed: 93 (142 total retained).');
-  console.log('Stage 16 checker negative probes passed: 64 (31 structural, 33 compilation-gated).');
-  console.log('Stage 16 checker positive controls passed: 21 (6 structural, 15 compilation-gated).');
-  console.log('Stage 16 compilation-gated negative probes passed: 33.');
-  console.log('Stage 16 compilation-gated positive controls passed: 15.');
+  console.log('Stage 16 checker negative probes passed: 73 (51 structural, 22 compilation-gated).');
+  console.log('Stage 16 checker positive controls passed: 20 (6 structural, 14 compilation-gated).');
+  console.log('Stage 16 compilation-gated negative probes passed: 22.');
+  console.log('Stage 16 type-sealed compile-prevented challenges passed: 16.');
+  console.log('Stage 16 compilation-gated positive controls passed: 14.');
   console.log('Stage 16 structural invariants passed.');
   }
 } catch (error) {

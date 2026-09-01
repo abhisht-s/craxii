@@ -1036,13 +1036,13 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         }
         JournalEventPayload::ArtifactRecorded(value) => value.canonical_length <= i64::MAX as u64,
         JournalEventPayload::RuntimeStarted(value) => {
-            value.schema_version.get() == 3
+            value.schema_version.get() == 4
                 && !value.linux_boot_id.as_str().is_empty()
                 && !value.binary_version.as_str().is_empty()
                 && !value.git_revision.as_str().is_empty()
         }
         JournalEventPayload::RuntimeRecoveryPerformed(value) => {
-            value.schema_version.get() == 3 && value.counts_are_persistable()
+            value.schema_version.get() == 4 && value.counts_are_persistable()
         }
         JournalEventPayload::RuntimeStopping(value) => {
             value.shutdown_reason == RuntimeShutdownReason::GracefulShutdown
@@ -1741,7 +1741,7 @@ mod tests {
                     process_id: DiagnosticPid::try_new(42).unwrap(),
                     binary_version: PackageVersion::try_new("0.0.1").unwrap(),
                     git_revision: GitRevision::try_new("test").unwrap(),
-                    schema_version: SchemaVersion::try_new(3).unwrap(),
+                    schema_version: SchemaVersion::try_new(4).unwrap(),
                     started_at: at(),
                 })
             }
@@ -1763,7 +1763,7 @@ mod tests {
                     cleanup_unconfirmed: 11,
                     recovery_duration_ms: 12,
                     binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                    schema_version: SchemaVersion::try_new(3).unwrap(),
+                    schema_version: SchemaVersion::try_new(4).unwrap(),
                     recovered_at: at(),
                 })
             }

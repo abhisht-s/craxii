@@ -12,8 +12,8 @@ use crate::domain::{
     CanonicalByteCount, CanonicalModelToolCall, ContextManifestId, LogicalInvocationId,
     ModelInputItem, ModelInputRole, ModelInvocationState, ModelRequest, ModelRequestInput,
     ModelTextPart, ModelToolCallId, ModelToolChoicePolicy, ModelToolDefinition, NormalizedError,
-    ProviderNativeOptions, ProviderOpaqueEvidence, Sha256Digest, ToolExecutionState, UtcTimestamp,
-    WorkId, WorkState, model_toolset_fingerprint,
+    ProviderNativeOptions, ProviderOpaqueEvidence, Sha256Digest, TokenCount, ToolExecutionState,
+    UtcTimestamp, WorkId, WorkState, model_toolset_fingerprint,
 };
 use crate::ports::artifact_store::{
     ArtifactObjectReference, ArtifactStore, ArtifactStoreErrorKind,
@@ -305,6 +305,261 @@ impl fmt::Debug for ContextAssemblyError {
 
 impl std::error::Error for ContextAssemblyError {}
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenModelInputs(Box<[ModelInputItem]>);
+
+impl FrozenModelInputs {
+    fn as_slice(&self) -> &[ModelInputItem] {
+        &self.0
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, ModelInputItem> {
+        self.0.iter()
+    }
+
+    const fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Default)]
+struct CanonicalInputBuilder {
+    items: Vec<ModelInputItem>,
+    rendered_input_item_count: usize,
+}
+
+impl CanonicalInputBuilder {
+    fn push(&mut self, item: ModelInputItem) -> Result<(), ContextAssemblyError> {
+        let rendered_input_item_count =
+            self.rendered_input_item_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+                })?;
+        self.items.push(item);
+        self.rendered_input_item_count = rendered_input_item_count;
+        Ok(())
+    }
+
+    fn finish(self) -> Result<FrozenModelInputs, ContextAssemblyError> {
+        if self.items.len() != self.rendered_input_item_count {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ContractViolation,
+            ));
+        }
+        Ok(FrozenModelInputs(self.items.into_boxed_slice()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FrozenModelTools(Box<[ModelToolDefinition]>);
+
+impl FrozenModelTools {
+    fn from_registry(registry: &ToolRegistry) -> Result<Self, ContextAssemblyError> {
+        let definitions = project_model_tool_definitions(registry)
+            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ContractViolation))?;
+        let frozen = Self(definitions.into_boxed_slice());
+        if frozen.fingerprint() != registry.model_projection_fingerprint()
+            || frozen.len() != 2
+            || frozen.as_slice()[0].name().as_str() != "read_file"
+            || frozen.as_slice()[1].name().as_str() != "run_shell"
+        {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ToolsetMismatch,
+            ));
+        }
+        Ok(frozen)
+    }
+
+    fn as_slice(&self) -> &[ModelToolDefinition] {
+        &self.0
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, ModelToolDefinition> {
+        self.0.iter()
+    }
+
+    const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn fingerprint(&self) -> Sha256Digest {
+        model_toolset_fingerprint(self.as_slice())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SelectedOutputLimit(TokenCount);
+
+impl SelectedOutputLimit {
+    fn from_selection(selection: &ModelSelectionResult) -> Self {
+        Self(selection.selected_target().requested_output_tokens())
+    }
+
+    const fn get(self) -> TokenCount {
+        self.0
+    }
+
+    const fn as_u64(self) -> u64 {
+        self.0.get() as u64
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FinalModelRequest {
+    request: ModelRequest,
+    canonical_bytes: Box<[u8]>,
+    request_sha256: Sha256Digest,
+    estimation_units: Box<[TokenEstimateUnit]>,
+    serialized_byte_count: u64,
+    selected_output_limit: SelectedOutputLimit,
+    toolset_fingerprint: Sha256Digest,
+}
+
+impl FinalModelRequest {
+    #[allow(clippy::too_many_arguments)]
+    fn construct(
+        selection: &ModelSelectionResult,
+        canonical_inputs: FrozenModelInputs,
+        canonical_tools: FrozenModelTools,
+        instructions: &VersionedInstructionSnapshot,
+        selected_output_limit: SelectedOutputLimit,
+        tool_choice_policy: ModelToolChoicePolicy,
+        logical_invocation_id: LogicalInvocationId,
+        context_manifest_id: ContextManifestId,
+    ) -> Result<Self, ContextAssemblyError> {
+        let selected = selection.selected_target();
+        let canonical_input_count = canonical_inputs.len();
+        if canonical_inputs.as_slice().is_empty()
+            || canonical_inputs.iter().count() != canonical_input_count
+        {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ContractViolation,
+            ));
+        }
+        let canonical_tool_count = canonical_tools.len();
+        let toolset_fingerprint = canonical_tools.fingerprint();
+        let request = ModelRequest::try_new(ModelRequestInput {
+            logical_invocation_id,
+            target: selected.clone(),
+            ordered_input_items: canonical_inputs.0.into_vec(),
+            instructions: instructions.request_instructions(),
+            tool_definitions: canonical_tools.0.into_vec(),
+            requested_output_limit: selected_output_limit.get(),
+            tool_choice_policy,
+            provider_native_options: selected.provider_native_options(),
+            context_manifest_id,
+        })
+        .map_err(contract_error)?;
+        if request.ordered_input_items().len() != canonical_input_count
+            || request.tool_definitions().len() != canonical_tool_count
+            || request.requested_output_limit() != selected_output_limit.get()
+            || request.requested_output_limit() != selected.requested_output_tokens()
+            || model_toolset_fingerprint(request.tool_definitions()) != toolset_fingerprint
+        {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ContractViolation,
+            ));
+        }
+
+        let canonical_bytes = request.canonical_bytes().into_boxed_slice();
+        let serialized_byte_count = u64::try_from(canonical_bytes.len())
+            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
+        let request_sha256 = Sha256Digest::hash_bytes(&canonical_bytes);
+        let mut estimation_units = Vec::new();
+        let mut represented = 0_u64;
+        for instruction in request.instructions() {
+            let length = u64::try_from(
+                serde_json::to_vec(instruction.as_str())
+                    .expect("validated instruction serializes")
+                    .len(),
+            )
+            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
+            represented = represented.checked_add(length).ok_or_else(|| {
+                ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+            })?;
+            estimation_units.push(TokenEstimateUnit::TextBytes(length));
+        }
+        for item in request.ordered_input_items() {
+            let length = u64::try_from(item.canonical_bytes().len()).map_err(|_| {
+                ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+            })?;
+            represented = represented.checked_add(length).ok_or_else(|| {
+                ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+            })?;
+            estimation_units.push(match item {
+                ModelInputItem::Message { .. }
+                | ModelInputItem::PriorAssistant { .. }
+                | ModelInputItem::HistoricalRefusal { .. }
+                | ModelInputItem::HistoricalReasoningSummary { .. } => {
+                    TokenEstimateUnit::TextBytes(length)
+                }
+                ModelInputItem::ProviderOpaqueContinuation(_) => {
+                    TokenEstimateUnit::ProviderOpaqueBytes(length)
+                }
+                ModelInputItem::ToolCall(_)
+                | ModelInputItem::ToolResult { .. }
+                | ModelInputItem::StructuredData { .. }
+                | ModelInputItem::SyntheticRuntimeStatus { .. } => {
+                    TokenEstimateUnit::StructuredBytes(length)
+                }
+            });
+        }
+        for tool in request.tool_definitions() {
+            let length = u64::try_from(tool.canonical_bytes().len()).map_err(|_| {
+                ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+            })?;
+            represented = represented.checked_add(length).ok_or_else(|| {
+                ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
+            })?;
+            estimation_units.push(TokenEstimateUnit::ToolDefinitionBytes(length));
+        }
+        if serialized_byte_count > represented {
+            estimation_units.push(TokenEstimateUnit::StructuredBytes(
+                serialized_byte_count - represented,
+            ));
+        }
+
+        Ok(Self {
+            request,
+            canonical_bytes,
+            request_sha256,
+            estimation_units: estimation_units.into_boxed_slice(),
+            serialized_byte_count,
+            selected_output_limit,
+            toolset_fingerprint,
+        })
+    }
+
+    const fn request(&self) -> &ModelRequest {
+        &self.request
+    }
+
+    fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    const fn request_sha256(&self) -> Sha256Digest {
+        self.request_sha256
+    }
+
+    fn estimation_units(&self) -> &[TokenEstimateUnit] {
+        &self.estimation_units
+    }
+
+    const fn serialized_byte_count(&self) -> u64 {
+        self.serialized_byte_count
+    }
+
+    const fn selected_output_limit(&self) -> SelectedOutputLimit {
+        self.selected_output_limit
+    }
+
+    const fn toolset_fingerprint(&self) -> Sha256Digest {
+        self.toolset_fingerprint
+    }
+}
+
 /// Immutable provider-neutral context package. It has no mutation surface.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextPackage {
@@ -324,6 +579,37 @@ pub struct ContextPackage {
 }
 
 impl ContextPackage {
+    fn from_final_request(
+        selection: &ModelSelectionResult,
+        ordered_sources: Box<[PreparedContextSource]>,
+        final_request: &FinalModelRequest,
+        estimator_id: String,
+        estimator_version: u64,
+        prompt_fingerprint: Sha256Digest,
+    ) -> Result<Self, ContextAssemblyError> {
+        let request = final_request.request();
+        if request.target() != selection.selected_target() {
+            return Err(ContextAssemblyError::new(
+                ContextAssemblyErrorKind::ContractViolation,
+            ));
+        }
+        Ok(Self {
+            context_manifest_id: request.context_manifest_id(),
+            logical_invocation_id: request.logical_invocation_id(),
+            selected_target: selection.clone(),
+            ordered_sources,
+            ordered_input_items: request.ordered_input_items().to_vec().into_boxed_slice(),
+            instructions: request.instructions().to_vec().into_boxed_slice(),
+            tool_definitions: request.tool_definitions().to_vec().into_boxed_slice(),
+            tool_choice: request.tool_choice_policy(),
+            requested_output_tokens: final_request.selected_output_limit().as_u64(),
+            estimator_id,
+            estimator_version,
+            prompt_fingerprint,
+            toolset_fingerprint: final_request.toolset_fingerprint(),
+        })
+    }
+
     pub const fn context_manifest_id(&self) -> ContextManifestId {
         self.context_manifest_id
     }
@@ -387,7 +673,7 @@ impl ContextPackage {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextAssemblyResult {
     package: ContextPackage,
-    request: ModelRequest,
+    final_request: FinalModelRequest,
     prepared_manifest: PreparedContextManifest,
     prepared_sources: Box<[PreparedContextSource]>,
     budget: ContextBudgetEvidence,
@@ -399,7 +685,7 @@ impl ContextAssemblyResult {
     }
 
     pub const fn request(&self) -> &ModelRequest {
-        &self.request
+        self.final_request.request()
     }
 
     pub const fn prepared_manifest(&self) -> &PreparedContextManifest {
@@ -492,8 +778,7 @@ impl ContextAssembler {
         let selected = package.selected_target().selected_target();
         let estimator_storage_id =
             format!("{}@{}", package.estimator_id(), package.estimator_version());
-        let current_tools = project_model_tool_definitions(&self.tool_registry)
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ContractViolation))?;
+        let current_tools = FrozenModelTools::from_registry(&self.tool_registry)?;
         if manifest.sources.as_slice() != prepared.prepared_sources.as_ref()
             || package.ordered_sources() != prepared.prepared_sources.as_ref()
             || prepared
@@ -503,14 +788,15 @@ impl ContextAssembler {
                 .any(|(index, source)| source.position != index as i64 + 1)
             || package.context_manifest_id() != manifest.context_manifest_id
             || package.logical_invocation_id() != manifest.logical_invocation_id
-            || prepared.request.context_manifest_id() != manifest.context_manifest_id
-            || prepared.request.logical_invocation_id() != manifest.logical_invocation_id
-            || prepared.request.target() != selected
+            || prepared.request().context_manifest_id() != manifest.context_manifest_id
+            || prepared.request().logical_invocation_id() != manifest.logical_invocation_id
+            || prepared.request().target() != selected
             || selected.reference() != &manifest.provider_model
             || package.selected_target().target_configuration_version()
                 != manifest.provider_model.target_configuration_version()
             || package.requested_output_tokens() != manifest.reserved_output_tokens
-            || selected.requested_output_tokens().get() as u64 != manifest.reserved_output_tokens
+            || prepared.final_request.selected_output_limit().as_u64()
+                != manifest.reserved_output_tokens
             || estimator_storage_id != manifest.token_estimator_id
             || package.prompt_fingerprint() != manifest.system_prompt_fingerprint
             || package.toolset_fingerprint() != manifest.toolset_fingerprint
@@ -518,12 +804,13 @@ impl ContextAssembler {
             || self.instructions.version() != V0_INSTRUCTION_VERSION
             || manifest.assembler_version != V0_CONTEXT_ASSEMBLER_VERSION
             || manifest.context_policy_version != V0_CONTEXT_POLICY_VERSION
-            || model_toolset_fingerprint(&current_tools) != manifest.toolset_fingerprint
+            || current_tools.fingerprint() != manifest.toolset_fingerprint
             || package.instructions() != self.instructions.request_instructions()
-            || package.tool_definitions() != current_tools
+            || package.tool_definitions() != current_tools.as_slice()
             || self.estimator.identity() != selected.estimator()
-            || prepared.request.requested_output_limit() != selected.requested_output_tokens()
-            || prepared.request.canonical_sha256() != manifest.rendered_request_sha256
+            || prepared.request().requested_output_limit()
+                != prepared.final_request.selected_output_limit().get()
+            || prepared.final_request.request_sha256() != manifest.rendered_request_sha256
         {
             return Err(ContextAssemblyError::new(
                 ContextAssemblyErrorKind::ReconstructionDrift,
@@ -548,8 +835,7 @@ impl ContextAssembler {
             ));
         }
         let selected = prepared.package.selected_target();
-        let tool_definitions = project_model_tool_definitions(&self.tool_registry)
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ContractViolation))?;
+        let canonical_tools = FrozenModelTools::from_registry(&self.tool_registry)?;
         let mut builder = AssemblyBuilder::default();
         for (expected, reloaded) in prepared
             .prepared_sources
@@ -557,13 +843,7 @@ impl ContextAssembler {
             .zip(snapshot.ordered_sources.iter())
         {
             let before = builder.sources.len();
-            self.render_exact_source(
-                &mut builder,
-                expected,
-                reloaded,
-                selected,
-                &tool_definitions,
-            )?;
+            self.render_exact_source(&mut builder, expected, reloaded, selected, &canonical_tools)?;
             if builder.sources.len() != before + 1 || builder.sources.last() != Some(expected) {
                 return Err(ContextAssemblyError::new(
                     ContextAssemblyErrorKind::ReconstructionDrift,
@@ -577,21 +857,24 @@ impl ContextAssembler {
                 ContextAssemblyErrorKind::ReconstructionDrift,
             ));
         }
-        let target = selected.selected_target();
-        let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let final_request = construct_final_model_request(FinalModelRequestInput {
-            logical_invocation_id: manifest.logical_invocation_id,
-            target,
-            canonical_input_items: canonical_input_items.as_ref(),
-            canonical_instructions: &self.instructions.request_instructions(),
-            canonical_tool_definitions: &tool_definitions,
-            expected_toolset_fingerprint: manifest.toolset_fingerprint,
-            context_manifest_id: manifest.context_manifest_id,
-        })?;
-        let canonical_request_bytes = final_request.canonical_bytes();
-        if canonical_request_bytes != prepared.request.canonical_bytes()
-            || final_request.canonical_sha256() != manifest.rendered_request_sha256
-            || canonical_request_bytes.len() as u64 != manifest.rendered_request_byte_count.get()
+        let finished = builder.finish()?;
+        let selected_output_limit = SelectedOutputLimit::from_selection(selected);
+        let final_request = FinalModelRequest::construct(
+            selected,
+            finished.canonical_inputs,
+            canonical_tools,
+            &self.instructions,
+            selected_output_limit,
+            ModelToolChoicePolicy::Automatic,
+            manifest.logical_invocation_id,
+            manifest.context_manifest_id,
+        )?;
+        if final_request.canonical_bytes() != prepared.final_request.canonical_bytes()
+            || final_request.request_sha256() != prepared.final_request.request_sha256()
+            || final_request.request() != prepared.final_request.request()
+            || final_request.estimation_units() != prepared.final_request.estimation_units()
+            || final_request.request_sha256() != manifest.rendered_request_sha256
+            || final_request.serialized_byte_count() != manifest.rendered_request_byte_count.get()
             || semantic_manifest_hash_from_prepared(
                 manifest,
                 selected,
@@ -612,14 +895,14 @@ impl ContextAssembler {
         expected: &PreparedContextSource,
         reloaded: &ContextReloadedSource,
         selection: &ModelSelectionResult,
-        tool_definitions: &[ModelToolDefinition],
+        canonical_tools: &FrozenModelTools,
     ) -> Result<(), ContextAssemblyError> {
         match reloaded {
             ContextReloadedSource::InstructionVersion => {
                 self.render_exact_instruction_source(builder, expected)
             }
             ContextReloadedSource::ToolDefinition => {
-                self.render_exact_tool_definition(builder, expected, tool_definitions)
+                self.render_exact_tool_definition(builder, expected, canonical_tools)
             }
             ContextReloadedSource::Workstation(source) => {
                 render_workstation_source(builder, source)
@@ -703,7 +986,7 @@ impl ContextAssembler {
         &self,
         builder: &mut AssemblyBuilder,
         expected: &PreparedContextSource,
-        definitions: &[ModelToolDefinition],
+        canonical_tools: &FrozenModelTools,
     ) -> Result<(), ContextAssemblyError> {
         let ContextSourceIdentity::Record {
             kind: ContextSourceRecordKind::ToolDefinition,
@@ -718,7 +1001,7 @@ impl ContextAssembler {
             .tool_registry
             .definitions()
             .iter()
-            .zip(definitions.iter())
+            .zip(canonical_tools.iter())
             .filter(|(durable, _)| {
                 format!(
                     "{}:{}:{}",
@@ -863,23 +1146,12 @@ impl ContextAssembler {
                 ContextAssemblyErrorKind::InvalidSelection,
             ));
         }
-        let tool_definitions = project_model_tool_definitions(&self.tool_registry)
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ContractViolation))?;
-        let toolset_fingerprint = model_toolset_fingerprint(&tool_definitions);
-        if toolset_fingerprint != self.tool_registry.model_projection_fingerprint()
-            || tool_definitions.len() != 2
-            || tool_definitions[0].name().as_str() != "read_file"
-            || tool_definitions[1].name().as_str() != "run_shell"
-        {
-            return Err(ContextAssemblyError::new(
-                ContextAssemblyErrorKind::ToolsetMismatch,
-            ));
-        }
+        let canonical_tools = FrozenModelTools::from_registry(&self.tool_registry)?;
 
         let mut builder = AssemblyBuilder::default();
         self.render_instruction_sources(&mut builder)?;
         render_capability_sources(&mut builder, &snapshot)?;
-        render_tool_sources(&mut builder, &self.tool_registry, &tool_definitions)?;
+        render_tool_sources(&mut builder, &self.tool_registry, &canonical_tools)?;
 
         for prior_work in &snapshot.prior_works {
             let message = exactly_one_prior_message(&snapshot, prior_work)?;
@@ -933,27 +1205,25 @@ impl ContextAssembler {
             ));
         }
 
-        let canonical_input_items = builder.freeze_canonical_input_items()?;
-        let instructions = self.instructions.request_instructions();
-        let requested_output = selected.requested_output_tokens();
-        let final_request = construct_final_model_request(FinalModelRequestInput {
+        let finished = builder.finish()?;
+        let selected_output_limit = SelectedOutputLimit::from_selection(selection);
+        let final_request = FinalModelRequest::construct(
+            selection,
+            finished.canonical_inputs,
+            canonical_tools,
+            &self.instructions,
+            selected_output_limit,
+            ModelToolChoicePolicy::Automatic,
             logical_invocation_id,
-            target: selected,
-            canonical_input_items: canonical_input_items.as_ref(),
-            canonical_instructions: &instructions,
-            canonical_tool_definitions: &tool_definitions,
-            expected_toolset_fingerprint: self.tool_registry.model_projection_fingerprint(),
             context_manifest_id,
-        })?;
-        let canonical_request_bytes = final_request.canonical_bytes();
-        let request_byte_count = u64::try_from(canonical_request_bytes.len())
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
+        )?;
+        let request_byte_count = final_request.serialized_byte_count();
         let context_window_tokens = selected
             .reference()
             .capabilities()
             .context_window_tokens()
             .get() as u64;
-        let requested_output_tokens = requested_output.get() as u64;
+        let requested_output_tokens = final_request.selected_output_limit().as_u64();
         let limit_evidence = |estimated_input_tokens| ContextLimitEvidence {
             estimated_input_tokens,
             requested_output_tokens,
@@ -967,8 +1237,8 @@ impl ContextAssembler {
             target_configuration_version: selected.reference().target_configuration_version().get(),
             estimator_id: selected.estimator().id().to_owned(),
             estimator_version: selected.estimator().version(),
-            source_count: u64::try_from(builder.sources.len()).unwrap_or(u64::MAX),
-            toolset_fingerprint,
+            source_count: u64::try_from(finished.sources.len()).unwrap_or(u64::MAX),
+            toolset_fingerprint: final_request.toolset_fingerprint(),
             prompt_fingerprint: self.instructions.fingerprint(),
         };
         if validate_request_byte_limit(request_byte_count, MAX_CANONICAL_MODEL_REQUEST_BYTES)
@@ -981,10 +1251,9 @@ impl ContextAssembler {
                 ContextAssemblyErrorKind::EstimatorMismatch,
             ));
         }
-        let units = complete_request_units(&final_request, request_byte_count)?;
         let estimate = self
             .estimator
-            .estimate(selected, &units)
+            .estimate(selected, final_request.estimation_units())
             .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::EstimatorFailure))?;
         if estimate.estimator() != selected.estimator()
             || estimate.estimator() != self.estimator.identity()
@@ -1024,11 +1293,11 @@ impl ContextAssembler {
             .ok_or_else(|| {
                 ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
             })?;
-        let canonical_byte_count = CanonicalByteCount::try_new(builder.canonical_source_bytes)
+        let canonical_byte_count = CanonicalByteCount::try_new(finished.canonical_source_bytes)
             .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
         let rendered_request_byte_count = CanonicalByteCount::try_new(request_byte_count)
             .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
-        let rendered_request_sha256 = final_request.canonical_sha256();
+        let rendered_request_sha256 = final_request.request_sha256();
         let estimator_storage_id = format!(
             "{}@{}",
             selected.estimator().id(),
@@ -1039,7 +1308,7 @@ impl ContextAssembler {
                 ContextAssemblyErrorKind::InvalidSelection,
             ));
         }
-        let transformed_source_count = builder
+        let transformed_source_count = finished
             .sources
             .iter()
             .filter(|source| source.transformed)
@@ -1067,7 +1336,7 @@ impl ContextAssembler {
             context_policy_version: versions.context_policy_version(),
             prompt_version: versions.prompt_version(),
             prompt_fingerprint: self.instructions.fingerprint(),
-            toolset_fingerprint,
+            toolset_fingerprint: final_request.toolset_fingerprint(),
             canonical_byte_count: canonical_byte_count.get(),
             request_byte_count,
             estimated_input_tokens,
@@ -1076,7 +1345,7 @@ impl ContextAssembler {
             utilization_basis_points,
             transformed_source_count,
             request_sha256: rendered_request_sha256,
-            sources: &builder.sources,
+            sources: &finished.sources,
         });
         let prepared_manifest = PreparedContextManifest {
             context_manifest_id,
@@ -1086,7 +1355,7 @@ impl ContextAssembler {
             assembler_version: versions.assembler_version().to_owned(),
             context_policy_version: versions.context_policy_version().to_owned(),
             system_prompt_fingerprint: self.instructions.fingerprint(),
-            toolset_fingerprint,
+            toolset_fingerprint: final_request.toolset_fingerprint(),
             eligibility_conversation_id: snapshot.active_work.conversation_id,
             active_work_ordinal: snapshot.active_work.ordinal.get(),
             highest_prior_terminal_work_ordinal: snapshot
@@ -1107,37 +1376,30 @@ impl ContextAssembler {
             rendered_request_artifact_id: None,
             omitted_source_count: 0,
             transformed_source_count,
-            sources: builder.sources.clone(),
+            sources: finished.sources.to_vec(),
             created_at,
         };
-        let package = ContextPackage {
-            context_manifest_id,
-            logical_invocation_id,
-            selected_target: selection.clone(),
-            ordered_sources: builder.sources.clone().into_boxed_slice(),
-            ordered_input_items: canonical_input_items.clone(),
-            instructions: instructions.clone().into_boxed_slice(),
-            tool_definitions: tool_definitions.clone().into_boxed_slice(),
-            tool_choice: ModelToolChoicePolicy::Automatic,
-            requested_output_tokens,
-            estimator_id: selected.estimator().id().to_owned(),
-            estimator_version: selected.estimator().version(),
-            prompt_fingerprint: self.instructions.fingerprint(),
-            toolset_fingerprint,
-        };
+        let package = ContextPackage::from_final_request(
+            selection,
+            finished.sources.clone(),
+            &final_request,
+            selected.estimator().id().to_owned(),
+            selected.estimator().version(),
+            self.instructions.fingerprint(),
+        )?;
         let budget = ContextBudgetEvidence {
             estimated_input_tokens,
             requested_output_tokens,
             context_window_tokens,
             request_serialized_bytes: request_byte_count,
             request_byte_limit: MAX_CANONICAL_MODEL_REQUEST_BYTES,
-            contributions: builder.contributions.into_boxed_slice(),
+            contributions: finished.contributions,
         };
         Ok(ContextAssemblyResult {
             package,
-            request: final_request,
+            final_request,
             prepared_manifest,
-            prepared_sources: builder.sources.into_boxed_slice(),
+            prepared_sources: finished.sources,
             budget,
         })
     }
@@ -1414,59 +1676,20 @@ impl ContextAssembler {
     }
 }
 
-struct FinalModelRequestInput<'a> {
-    logical_invocation_id: LogicalInvocationId,
-    target: &'a crate::domain::ModelTarget,
-    canonical_input_items: &'a [ModelInputItem],
-    canonical_instructions: &'a [ModelTextPart],
-    canonical_tool_definitions: &'a [ModelToolDefinition],
-    expected_toolset_fingerprint: Sha256Digest,
-    context_manifest_id: ContextManifestId,
-}
-
-fn construct_final_model_request(
-    input: FinalModelRequestInput<'_>,
-) -> Result<ModelRequest, ContextAssemblyError> {
-    if model_toolset_fingerprint(input.canonical_tool_definitions)
-        != input.expected_toolset_fingerprint
-    {
-        return Err(ContextAssemblyError::new(
-            ContextAssemblyErrorKind::ToolsetMismatch,
-        ));
-    }
-    let final_request = ModelRequest::try_new(ModelRequestInput {
-        logical_invocation_id: input.logical_invocation_id,
-        target: input.target.clone(),
-        ordered_input_items: input.canonical_input_items.to_vec(),
-        instructions: input.canonical_instructions.to_vec(),
-        tool_definitions: input.canonical_tool_definitions.to_vec(),
-        requested_output_limit: input.target.requested_output_tokens(),
-        tool_choice_policy: ModelToolChoicePolicy::Automatic,
-        provider_native_options: input.target.provider_native_options(),
-        context_manifest_id: input.context_manifest_id,
-    })
-    .map_err(contract_error)?;
-    if final_request.ordered_input_items() != input.canonical_input_items
-        || final_request.tool_definitions() != input.canonical_tool_definitions
-        || final_request.requested_output_limit() != input.target.requested_output_tokens()
-        || model_toolset_fingerprint(final_request.tool_definitions())
-            != input.expected_toolset_fingerprint
-    {
-        return Err(ContextAssemblyError::new(
-            ContextAssemblyErrorKind::ContractViolation,
-        ));
-    }
-    Ok(final_request)
-}
-
 #[derive(Default)]
 struct AssemblyBuilder {
     sources: Vec<PreparedContextSource>,
-    items: Vec<ModelInputItem>,
-    rendered_input_item_count: usize,
+    canonical_inputs: CanonicalInputBuilder,
     contributions: Vec<ContextByteContribution>,
     seen_source_identities: BTreeSet<String>,
     paired_tool_ids: BTreeSet<String>,
+    canonical_source_bytes: u64,
+}
+
+struct FinishedAssembly {
+    sources: Box<[PreparedContextSource]>,
+    canonical_inputs: FrozenModelInputs,
+    contributions: Box<[ContextByteContribution]>,
     canonical_source_bytes: u64,
 }
 
@@ -1483,12 +1706,6 @@ struct SourceSpec<'a> {
 
 impl AssemblyBuilder {
     fn add_item_source(&mut self, spec: SourceSpec<'_>) -> Result<(), ContextAssemblyError> {
-        let rendered_input_item_count =
-            self.rendered_input_item_count
-                .checked_add(1)
-                .ok_or_else(|| {
-                    ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
-                })?;
         let rendered_bytes = u64::try_from(spec.rendered.canonical_bytes().len())
             .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
         self.add_source(
@@ -1501,18 +1718,17 @@ impl AssemblyBuilder {
             spec.source_bytes,
             rendered_bytes,
         )?;
-        self.items.push(spec.rendered);
-        self.rendered_input_item_count = rendered_input_item_count;
+        self.canonical_inputs.push(spec.rendered)?;
         Ok(())
     }
 
-    fn freeze_canonical_input_items(&self) -> Result<Box<[ModelInputItem]>, ContextAssemblyError> {
-        if self.items.len() != self.rendered_input_item_count {
-            return Err(ContextAssemblyError::new(
-                ContextAssemblyErrorKind::ContractViolation,
-            ));
-        }
-        Ok(self.items.clone().into_boxed_slice())
+    fn finish(self) -> Result<FinishedAssembly, ContextAssemblyError> {
+        Ok(FinishedAssembly {
+            sources: self.sources.into_boxed_slice(),
+            canonical_inputs: self.canonical_inputs.finish()?,
+            contributions: self.contributions.into_boxed_slice(),
+            canonical_source_bytes: self.canonical_source_bytes,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1758,14 +1974,14 @@ fn render_workspace_source(
 fn render_tool_sources(
     builder: &mut AssemblyBuilder,
     registry: &ToolRegistry,
-    definitions: &[ModelToolDefinition],
+    canonical_tools: &FrozenModelTools,
 ) -> Result<(), ContextAssemblyError> {
-    if registry.definitions().len() != definitions.len() {
+    if registry.definitions().len() != canonical_tools.len() {
         return Err(ContextAssemblyError::new(
             ContextAssemblyErrorKind::ToolsetMismatch,
         ));
     }
-    for (durable, rendered) in registry.definitions().iter().zip(definitions) {
+    for (durable, rendered) in registry.definitions().iter().zip(canonical_tools.iter()) {
         if durable.name() != rendered.name() {
             return Err(ContextAssemblyError::new(
                 ContextAssemblyErrorKind::ToolsetMismatch,
@@ -1939,6 +2155,61 @@ fn render_prior_terminal_status(
     })
 }
 
+struct DefiniteObservedToolResult {
+    call_id: ModelToolCallId,
+    projection: Value,
+}
+
+struct UnknownToolOutcome {
+    provider_tool_call_id: String,
+    tool_execution_id: String,
+    tool_name: String,
+    work_id: String,
+}
+
+enum RenderedToolEvidence {
+    Definite(DefiniteObservedToolResult),
+    OutcomeUnknown(UnknownToolOutcome),
+}
+
+fn classify_rendered_tool_evidence(
+    tool: &ContextToolResultSource,
+    call_id: ModelToolCallId,
+) -> Result<RenderedToolEvidence, ContextAssemblyError> {
+    match tool.state {
+        ToolExecutionState::Completed => {
+            let result = tool
+                .result
+                .as_ref()
+                .ok_or_else(|| ContextAssemblyError::new(ContextAssemblyErrorKind::Source))?;
+            Ok(RenderedToolEvidence::Definite(DefiniteObservedToolResult {
+                call_id,
+                projection: json!({
+                    "artifacts": artifact_projection(tool),
+                    "provider_tool_call_id": tool.provider_tool_call_id,
+                    "result": result,
+                    "stderr": counts_projection(tool.stderr_counts.as_ref()),
+                    "stdout": counts_projection(tool.stdout_counts.as_ref()),
+                    "tool_execution_id": tool.tool_execution_id.to_string(),
+                    "tool_name": tool.tool_name.as_str(),
+                    "truncated": tool.truncated,
+                }),
+            }))
+        }
+        ToolExecutionState::OutcomeUnknown => {
+            Ok(RenderedToolEvidence::OutcomeUnknown(UnknownToolOutcome {
+                provider_tool_call_id: tool.provider_tool_call_id.clone(),
+                tool_execution_id: tool.tool_execution_id.to_string(),
+                tool_name: tool.tool_name.as_str().to_owned(),
+                work_id: tool.work_id.to_string(),
+            }))
+        }
+        _ => Err(ContextAssemblyError::new(
+            ContextAssemblyErrorKind::ToolPairing,
+        )),
+    }
+}
+
 fn render_tool_result(
     builder: &mut AssemblyBuilder,
     tool: &ContextToolResultSource,
@@ -1954,67 +2225,59 @@ fn render_tool_result(
     }
     let durable = tool_semantic_value(tool);
     let durable_bytes = canonical_json_bytes(&durable);
-    let (kind, item_class, rendered) = match tool.state {
-        ToolExecutionState::Completed => {
-            let result = tool
-                .result
-                .as_ref()
-                .ok_or_else(|| ContextAssemblyError::new(ContextAssemblyErrorKind::Source))?;
-            let projection = json!({
-                "artifacts": artifact_projection(tool),
-                "provider_tool_call_id": tool.provider_tool_call_id,
-                "result": result,
-                "stderr": counts_projection(tool.stderr_counts.as_ref()),
-                "stdout": counts_projection(tool.stdout_counts.as_ref()),
-                "tool_execution_id": tool.tool_execution_id.to_string(),
-                "tool_name": tool.tool_name.as_str(),
-                "truncated": tool.truncated,
-            });
-            (
-                ContextSourceKind::ObservedToolResult,
-                "observed_tool_result",
-                ModelInputItem::tool_result(call_id, projection).map_err(contract_error)?,
+    if tool.state == ToolExecutionState::InterruptedBeforeDispatch {
+        let details = json!({
+            "execution_dispatched": false,
+            "provider_tool_call_id": tool.provider_tool_call_id,
+            "tool_execution_id": tool.tool_execution_id.to_string(),
+            "tool_name": tool.tool_name.as_str(),
+            "work_id": tool.work_id.to_string(),
+        });
+        return builder.add_item_source(SourceSpec {
+            kind: ContextSourceKind::SyntheticInterruption,
+            identity: ContextSourceIdentity::Record {
+                kind: ContextSourceRecordKind::ToolExecution,
+                id: tool.tool_execution_id.to_string(),
+            },
+            model_role: Some(ContextModelRole::Tool),
+            item_class: "synthetic_tool_interruption",
+            source_hash: Sha256Digest::hash_bytes(&durable_bytes),
+            transform: ContextTransformKind::SyntheticStatus,
+            source_bytes: durable_bytes.len() as u64,
+            rendered: ModelInputItem::synthetic_runtime_status(
+                "tool_interrupted_before_dispatch",
+                details,
             )
-        }
-        ToolExecutionState::OutcomeUnknown => {
+            .map_err(contract_error)?,
+        });
+    }
+
+    let evidence = classify_rendered_tool_evidence(tool, call_id)?;
+    let (kind, item_class, transform, rendered) = match evidence {
+        RenderedToolEvidence::Definite(result) => (
+            ContextSourceKind::ObservedToolResult,
+            "observed_tool_result",
+            ContextTransformKind::InlineProjection,
+            ModelInputItem::tool_result(result.call_id, result.projection)
+                .map_err(contract_error)?,
+        ),
+        RenderedToolEvidence::OutcomeUnknown(status) => {
             let details = json!({
                 "execution_may_have_occurred": true,
                 "outcome": "unknown",
-                "provider_tool_call_id": tool.provider_tool_call_id,
+                "provider_tool_call_id": status.provider_tool_call_id,
                 "repeat_safety": "must_not_be_assumed_safe",
-                "tool_execution_id": tool.tool_execution_id.to_string(),
-                "tool_name": tool.tool_name.as_str(),
-                "work_id": tool.work_id.to_string(),
+                "tool_execution_id": status.tool_execution_id,
+                "tool_name": status.tool_name,
+                "work_id": status.work_id,
             });
             (
                 ContextSourceKind::SyntheticOutcomeUnknown,
                 "synthetic_tool_outcome_unknown",
+                ContextTransformKind::SyntheticStatus,
                 ModelInputItem::synthetic_runtime_status("tool_outcome_unknown", details)
                     .map_err(contract_error)?,
             )
-        }
-        ToolExecutionState::InterruptedBeforeDispatch => {
-            let details = json!({
-                "execution_dispatched": false,
-                "provider_tool_call_id": tool.provider_tool_call_id,
-                "tool_execution_id": tool.tool_execution_id.to_string(),
-                "tool_name": tool.tool_name.as_str(),
-                "work_id": tool.work_id.to_string(),
-            });
-            (
-                ContextSourceKind::SyntheticInterruption,
-                "synthetic_tool_interruption",
-                ModelInputItem::synthetic_runtime_status(
-                    "tool_interrupted_before_dispatch",
-                    details,
-                )
-                .map_err(contract_error)?,
-            )
-        }
-        _ => {
-            return Err(ContextAssemblyError::new(
-                ContextAssemblyErrorKind::ToolPairing,
-            ));
         }
     };
     builder.add_item_source(SourceSpec {
@@ -2026,10 +2289,7 @@ fn render_tool_result(
         model_role: Some(ContextModelRole::Tool),
         item_class,
         source_hash: Sha256Digest::hash_bytes(&durable_bytes),
-        transform: match tool.state {
-            ToolExecutionState::Completed => ContextTransformKind::InlineProjection,
-            _ => ContextTransformKind::SyntheticStatus,
-        },
+        transform,
         source_bytes: durable_bytes.len() as u64,
         rendered,
     })
@@ -2326,67 +2586,6 @@ fn normalized_output_source_bytes(output: &ContextModelOutputSource) -> Vec<u8> 
         "stop_reason": output.stop_reason,
         "work_id": output.work_id.to_string(),
     }))
-}
-
-fn complete_request_units(
-    request: &ModelRequest,
-    request_bytes: u64,
-) -> Result<Vec<TokenEstimateUnit>, ContextAssemblyError> {
-    let mut units = Vec::new();
-    let mut represented = 0_u64;
-    for instruction in request.instructions() {
-        let length = u64::try_from(
-            serde_json::to_vec(instruction.as_str())
-                .expect("validated instruction serializes")
-                .len(),
-        )
-        .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
-        represented = represented.checked_add(length).ok_or_else(|| {
-            ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
-        })?;
-        units.push(TokenEstimateUnit::TextBytes(length));
-    }
-    for item in request.ordered_input_items() {
-        let length = u64::try_from(item.canonical_bytes().len())
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
-        represented = represented.checked_add(length).ok_or_else(|| {
-            ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
-        })?;
-        units.push(match item {
-            ModelInputItem::Message { .. }
-            | ModelInputItem::PriorAssistant { .. }
-            | ModelInputItem::HistoricalRefusal { .. }
-            | ModelInputItem::HistoricalReasoningSummary { .. } => {
-                TokenEstimateUnit::TextBytes(length)
-            }
-            ModelInputItem::ProviderOpaqueContinuation(_) => {
-                TokenEstimateUnit::ProviderOpaqueBytes(length)
-            }
-            ModelInputItem::ToolCall(_)
-            | ModelInputItem::ToolResult { .. }
-            | ModelInputItem::StructuredData { .. }
-            | ModelInputItem::SyntheticRuntimeStatus { .. } => {
-                TokenEstimateUnit::StructuredBytes(length)
-            }
-        });
-    }
-    for tool in request.tool_definitions() {
-        let length = u64::try_from(tool.canonical_bytes().len())
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow))?;
-        represented = represented.checked_add(length).ok_or_else(|| {
-            ContextAssemblyError::new(ContextAssemblyErrorKind::ArithmeticOverflow)
-        })?;
-        units.push(TokenEstimateUnit::ToolDefinitionBytes(length));
-    }
-    // Exact residual covers request IDs, selected target, option/tool-choice framing, separators,
-    // and any escaping not already covered. If components exceed the envelope, the estimate remains
-    // conservative and no negative residual is created.
-    if request_bytes > represented {
-        units.push(TokenEstimateUnit::StructuredBytes(
-            request_bytes - represented,
-        ));
-    }
-    Ok(units)
 }
 
 /// Exact inclusive byte-limit helper used by boundary tests and assembly.
@@ -2950,7 +3149,9 @@ mod tests {
                     kind: ContextSourceRecordKind::ToolExecution,
                     id,
                 },
-                ContextSourceKind::ObservedToolResult | ContextSourceKind::SyntheticOutcomeUnknown,
+                ContextSourceKind::ObservedToolResult
+                | ContextSourceKind::SyntheticOutcomeUnknown
+                | ContextSourceKind::SyntheticInterruption,
             ) => snapshot
                 .observed_tool_results
                 .iter()
@@ -3114,6 +3315,78 @@ mod tests {
             VersionedInstructionSnapshot::v0(),
             clock(),
         )
+    }
+
+    #[test]
+    fn sealed_request_types_preserve_complete_inputs_tools_output_and_derivations() {
+        let mut input_builder = CanonicalInputBuilder::default();
+        input_builder
+            .push(
+                ModelInputItem::message(ModelInputRole::User, vec![model_text("first").unwrap()])
+                    .unwrap(),
+            )
+            .unwrap();
+        input_builder
+            .push(ModelInputItem::structured_data(json!({"second": true})).unwrap())
+            .unwrap();
+        let frozen_inputs = input_builder.finish().unwrap();
+        assert_eq!(frozen_inputs.len(), 2);
+        assert_eq!(frozen_inputs.iter().count(), 2);
+        assert!(matches!(
+            &frozen_inputs.as_slice()[1],
+            ModelInputItem::StructuredData { data } if data == &json!({"second": true})
+        ));
+
+        let registry = registry();
+        let frozen_tools = FrozenModelTools::from_registry(&registry).unwrap();
+        assert_eq!(frozen_tools.len(), registry.definitions().len());
+        assert_eq!(
+            frozen_tools.fingerprint(),
+            registry.model_projection_fingerprint()
+        );
+        assert_eq!(
+            frozen_tools
+                .iter()
+                .map(|tool| tool.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["read_file", "run_shell"]
+        );
+
+        let (selection, _) = target(100_000, 321, false);
+        let selected_output_limit = SelectedOutputLimit::from_selection(&selection);
+        assert_eq!(selected_output_limit.get().get(), 321);
+        let final_request = FinalModelRequest::construct(
+            &selection,
+            frozen_inputs,
+            frozen_tools,
+            &VersionedInstructionSnapshot::v0(),
+            selected_output_limit,
+            ModelToolChoicePolicy::Automatic,
+            LogicalInvocationId::generate(),
+            ContextManifestId::generate(),
+        )
+        .unwrap();
+        assert_eq!(final_request.request().ordered_input_items().len(), 2);
+        assert_eq!(final_request.request().tool_definitions().len(), 2);
+        assert_eq!(final_request.request().requested_output_limit().get(), 321);
+        assert_eq!(
+            final_request.canonical_bytes(),
+            final_request.request().canonical_bytes()
+        );
+        assert_eq!(
+            final_request.request_sha256(),
+            Sha256Digest::hash_bytes(final_request.canonical_bytes())
+        );
+        assert_eq!(
+            final_request.serialized_byte_count(),
+            final_request.canonical_bytes().len() as u64
+        );
+        assert!(
+            final_request.estimation_units().len()
+                >= final_request.request().instructions().len()
+                    + final_request.request().ordered_input_items().len()
+                    + final_request.request().tool_definitions().len()
+        );
     }
 
     #[tokio::test]

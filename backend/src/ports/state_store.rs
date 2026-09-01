@@ -24,6 +24,9 @@ use crate::domain::{
     WorkstationIdentity,
 };
 use crate::ports::artifact_store::FinalizedArtifact;
+use crate::ports::model_provider::{
+    ModelUsageStatus, ProviderErrorKind, ProviderOutcomeCertainty, ProviderRetryEvidence,
+};
 
 /// Boxed future used by the port without an async-trait or adapter dependency.
 pub type StateStoreFuture<'a, T> =
@@ -99,6 +102,7 @@ pub struct WorkExpectation {
     pub version: ProjectionVersion,
     pub runtime_owner: Option<RuntimeInstanceId>,
     pub current_attempt: CurrentWorkAttempt,
+    pub cancellation_reason: Option<crate::domain::WorkCancellationReason>,
 }
 
 impl WorkExpectation {
@@ -110,6 +114,7 @@ impl WorkExpectation {
             version: snapshot.projection_version(),
             runtime_owner: snapshot.runtime_owner(),
             current_attempt: snapshot.current_attempt(),
+            cancellation_reason: snapshot.cancellation_reason(),
         }
     }
 }
@@ -331,6 +336,7 @@ pub struct PreparedModelInvocation {
     pub provider_options: Vec<ProviderOption>,
     pub request_sha256: Sha256Digest,
     pub request_artifact_id: Option<ArtifactId>,
+    pub retry_evidence: Option<ProviderRetryEvidence>,
     pub started_at: UtcTimestamp,
 }
 
@@ -353,6 +359,10 @@ pub struct ModelTerminalOutcome {
     pub first_output_at: Option<UtcTimestamp>,
     pub completed_at: UtcTimestamp,
     pub usage: Option<ModelUsage>,
+    pub usage_status: ModelUsageStatus,
+    pub provider_error_kind: Option<ProviderErrorKind>,
+    pub provider_outcome_certainty: ProviderOutcomeCertainty,
+    pub billing_ambiguity: bool,
     pub stop_reason: Option<String>,
     pub tool_call_count: Option<u64>,
     pub draft_exposed: bool,
@@ -605,6 +615,30 @@ pub struct FinishModelInvocationRequest {
     pub work_next: WorkLifecycleSnapshot,
     pub model_event: EventIntent,
     pub work_event: EventIntent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadOwnedWorkRequest {
+    pub work_id: WorkId,
+    pub runtime_id: RuntimeInstanceId,
+}
+
+/// Current durable runtime-owned Work facts used at every agent-loop checkpoint.
+pub struct OwnedWorkState {
+    pub work: WorkItem,
+    pub lifecycle: WorkLifecycleSnapshot,
+    pub started_at: UtcTimestamp,
+    pub latest_work_event_id: JournalEventId,
+    pub model_attempt_count: u64,
+    pub tool_call_count: u64,
+}
+
+/// Generic exact terminal Work mutation for failures/limits/interruptions without an assistant.
+pub struct TerminalizeOwnedWorkRequest {
+    pub expected_work: WorkExpectation,
+    pub work_next: WorkLifecycleSnapshot,
+    pub terminal_at: UtcTimestamp,
+    pub event: EventIntent,
 }
 
 pub struct RequestToolExecutionRequest {
@@ -888,6 +922,10 @@ pub trait RuntimeStateStore: Send + Sync {
 
 /// Stage 8 model-attempt capability.
 pub trait ModelStateStore: Send + Sync {
+    fn load_owned_work(
+        &self,
+        request: LoadOwnedWorkRequest,
+    ) -> StateStoreFuture<'_, OwnedWorkState>;
     fn begin_model_invocation(
         &self,
         request: BeginModelInvocationRequest,
@@ -899,6 +937,10 @@ pub trait ModelStateStore: Send + Sync {
     fn finish_model_invocation(
         &self,
         request: FinishModelInvocationRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt>;
+    fn terminalize_owned_work(
+        &self,
+        request: TerminalizeOwnedWorkRequest,
     ) -> StateStoreFuture<'_, CommitReceipt>;
 }
 
@@ -1176,6 +1218,12 @@ mod tests {
     }
 
     impl ModelStateStore for FakeStateStore {
+        fn load_owned_work(
+            &self,
+            _: LoadOwnedWorkRequest,
+        ) -> StateStoreFuture<'_, OwnedWorkState> {
+            self.fail(Intent::BeginModel)
+        }
         fn begin_model_invocation(
             &self,
             _: BeginModelInvocationRequest,
@@ -1191,6 +1239,12 @@ mod tests {
         fn finish_model_invocation(
             &self,
             _: FinishModelInvocationRequest,
+        ) -> StateStoreFuture<'_, CommitReceipt> {
+            self.fail(Intent::FinishModel)
+        }
+        fn terminalize_owned_work(
+            &self,
+            _: TerminalizeOwnedWorkRequest,
         ) -> StateStoreFuture<'_, CommitReceipt> {
             self.fail(Intent::FinishModel)
         }

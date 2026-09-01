@@ -43,11 +43,11 @@ fn invariant() -> SqliteAdapterError {
     SqliteAdapterError::new(SqliteFailureKind::InternalInvariant)
 }
 
-struct ActiveWorkRow {
-    work: WorkItem,
-    lifecycle: WorkLifecycleSnapshot,
-    started_at: Option<UtcTimestamp>,
-    cancel_requested_at: Option<UtcTimestamp>,
+pub(super) struct ActiveWorkRow {
+    pub(super) work: WorkItem,
+    pub(super) lifecycle: WorkLifecycleSnapshot,
+    pub(super) started_at: Option<UtcTimestamp>,
+    pub(super) cancel_requested_at: Option<UtcTimestamp>,
 }
 
 fn decode_cancellation_reason(
@@ -77,7 +77,7 @@ fn decode_current_attempt(
     }
 }
 
-fn decode_active_work_row(
+pub(super) fn decode_active_work_row(
     row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ActiveWorkRow, SqliteAdapterError> {
     let work_id = WorkId::parse_canonical(&row.try_get::<String, _>("work_id")?)
@@ -542,7 +542,7 @@ async fn create_runtime(
     let evidence = &request.evidence;
     let linux_boot_id = evidence.linux_boot_id().ok_or_else(invariant)?;
     let process_id = evidence.diagnostic_pid().ok_or_else(invariant)?;
-    if evidence.schema_version().get() != 3 {
+    if evidence.schema_version().get() != 4 {
         return Err(invariant());
     }
     let mut transaction =

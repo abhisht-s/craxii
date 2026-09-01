@@ -2628,6 +2628,7 @@ mod tests {
                                 .unwrap(),
                             runtime_owner: request.work_next.runtime_owner(),
                             current_attempt: request.work_next.current_attempt(),
+                            cancellation_reason: request.work_next.cancellation_reason(),
                         },
                         reason: WorkCancellationReason::UserRequest,
                     };
@@ -3789,6 +3790,7 @@ mod tests {
                 version: ProjectionVersion::try_new(1).unwrap(),
                 runtime_owner: Some(before.runtime_id),
                 current_attempt: CurrentWorkAttempt::None,
+                cancellation_reason: Some(WorkCancellationReason::UserRequest),
             },
             reason: WorkCancellationReason::UserRequest,
         }));
@@ -3911,6 +3913,7 @@ mod tests {
                 version: ProjectionVersion::try_new(1).unwrap(),
                 runtime_owner: Some(fixture.runtime_id),
                 current_attempt: CurrentWorkAttempt::None,
+                cancellation_reason: Some(WorkCancellationReason::UserRequest),
             },
             reason: WorkCancellationReason::UserRequest,
         };

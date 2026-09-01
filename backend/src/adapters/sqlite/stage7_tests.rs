@@ -258,7 +258,7 @@ async fn migration_three_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3"
+        "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2"
     );
     assert_eq!(
         v1_schema_fingerprint(),

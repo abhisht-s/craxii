@@ -6,18 +6,20 @@ use crate::domain::{
     ArtifactId, ArtifactProducer, ArtifactRecordedV1, ArtifactRetention, ArtifactStorageKey,
     AuthorityDecision, CleanupStatus, ConversationId, CorrelationId, CraxiiId, CurrentWorkAttempt,
     JournalActor, JournalCurrentAttempt, JournalEvent, JournalEventPayload, JournalStreamId,
-    JournalWorkTerminalReason, ModelInvocationEventV1, ModelInvocationState, PrivilegeMode,
-    RuntimeInstanceId, ToolExecutionEventV1, ToolExecutionLifecycle, ToolExecutionState,
-    UtcTimestamp, WorkFailureReason, WorkId, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput,
-    WorkState, WorkTerminalReason, WorkTransitionV1, decide_tool_transition, is_legal_model_pair,
+    JournalWorkTerminalReason, MessageCommittedV1, MessageRole, ModelInvocationEventV1,
+    ModelInvocationState, PrivilegeMode, RuntimeInstanceId, ToolExecutionEventV1,
+    ToolExecutionLifecycle, ToolExecutionState, UtcTimestamp, WorkFailureReason, WorkId,
+    WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState, WorkTerminalReason,
+    WorkTransitionV1, decide_tool_transition, is_legal_model_pair,
 };
 use crate::ports::state_store::{
-    BeginModelInvocationRequest, CommitReceipt, CommitToolDispatchIntentRequest,
-    CommittedEventRange, ContextModelRole, ContextSourceIdentity, ContextSourceKind,
-    ContextSourceRecordKind, EventIntent, FinishModelInvocationRequest, FinishToolExecutionRequest,
-    MarkModelStreamingRequest, ModelSelectionReason, ModelStateStore, PreparedArtifact,
-    PreparedContextManifest, RequestToolExecutionRequest, StateStoreFuture, ToolStateStore,
-    ToolStreamCounts, WorkExpectation,
+    BeginModelInvocationRequest, CommitAssistantCompletionRequest, CommitReceipt,
+    CommitToolDispatchIntentRequest, CommittedEventRange, CompletionStateStore, ContextModelRole,
+    ContextSourceIdentity, ContextSourceKind, ContextSourceRecordKind, EventIntent,
+    FinishModelInvocationRequest, FinishToolExecutionRequest, LoadOwnedWorkRequest,
+    MarkModelStreamingRequest, ModelSelectionReason, ModelStateStore, ModelUsage, OwnedWorkState,
+    PreparedArtifact, PreparedContextManifest, RequestToolExecutionRequest, StateStoreFuture,
+    TerminalizeOwnedWorkRequest, ToolStateStore, ToolStreamCounts, WorkExpectation,
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
@@ -41,6 +43,256 @@ fn invalid() -> SqliteAdapterError {
 
 fn conflict() -> SqliteAdapterError {
     SqliteAdapterError::new(SqliteFailureKind::StateConflict)
+}
+
+async fn load_owned_work_state(
+    store: &SqliteStateStore,
+    request: LoadOwnedWorkRequest,
+) -> Result<OwnedWorkState, SqliteAdapterError> {
+    let mut connection = store.runtime.acquire().await?;
+    let row = sqlx::query("SELECT * FROM work_items WHERE work_id = ?")
+        .bind(request.work_id.to_string())
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?
+        .ok_or_else(conflict)?;
+    let decoded = super::stage10::decode_active_work_row(&row)?;
+    if decoded.lifecycle.runtime_owner() != Some(request.runtime_id)
+        || decoded.lifecycle.state().is_terminal()
+    {
+        return Err(conflict());
+    }
+    let latest: String = sqlx::query_scalar(
+        "SELECT event_id FROM journal_events WHERE stream_id = ? ORDER BY stream_seq DESC LIMIT 1",
+    )
+    .bind(crate::domain::JournalStreamId::Work(request.work_id).to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    let model_attempt_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_invocations WHERE work_id = ?")
+            .bind(request.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+    let tool_call_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tool_executions WHERE work_id = ?")
+            .bind(request.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+    Ok(OwnedWorkState {
+        work: decoded.work,
+        lifecycle: decoded.lifecycle,
+        started_at: decoded.started_at.ok_or_else(corrupt)?,
+        latest_work_event_id: latest.parse().map_err(|_| corrupt())?,
+        model_attempt_count: u64::try_from(model_attempt_count).map_err(|_| corrupt())?,
+        tool_call_count: u64::try_from(tool_call_count).map_err(|_| corrupt())?,
+    })
+}
+
+async fn terminalize_owned_work(
+    store: &SqliteStateStore,
+    request: TerminalizeOwnedWorkRequest,
+) -> Result<CommitReceipt, SqliteAdapterError> {
+    if !request.work_next.state().is_terminal()
+        || request.work_next.work_id() != request.expected_work.work_id
+        || request.expected_work.runtime_owner.is_none()
+    {
+        return Err(invalid());
+    }
+    let expected = expected_snapshot(request.expected_work)?;
+    if !crate::domain::is_legal_work_pair(expected.state(), request.work_next.state()) {
+        return Err(invalid());
+    }
+    let runtime_id = request.expected_work.runtime_owner.ok_or_else(invalid)?;
+    let mut transaction =
+        WriteTransaction::begin(&store.runtime, "terminalize_owned_work").await?;
+    let context = load_work_context(&mut transaction, request.expected_work).await?;
+    let latest: Option<String> = sqlx::query_scalar(
+        "SELECT event_id FROM journal_events WHERE stream_id = ? ORDER BY stream_seq DESC LIMIT 1",
+    )
+    .bind(crate::domain::JournalStreamId::Work(request.expected_work.work_id).to_string())
+    .fetch_optional(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if request.event.causation_event_id.map(|id| id.to_string()) != latest {
+        return Err(conflict());
+    }
+    guarded_work_update(
+        &mut transaction,
+        &expected,
+        &request.work_next,
+        WorkProjectionTimes {
+            started_at: Some(context.started_at),
+            cancel_requested_at: None,
+            terminal_at: Some(request.terminal_at),
+        },
+    )
+    .await
+    .map_err(map_projection_error)?;
+    let position = append_work_event(
+        &mut transaction,
+        &context,
+        Some(runtime_id),
+        request.event,
+        work_payload(&expected, &request.work_next, request.terminal_at)?,
+        request.terminal_at,
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(CommitReceipt {
+        committed_version: Some(request.work_next.projection_version()),
+        events: Some(CommittedEventRange {
+            first: position.offset,
+            last: position.offset,
+        }),
+    })
+}
+
+async fn commit_assistant_completion(
+    store: &SqliteStateStore,
+    request: CommitAssistantCompletionRequest,
+) -> Result<CommitReceipt, SqliteAdapterError> {
+    if request.expected_work.state != WorkState::Running
+        || request.expected_work.current_attempt != CurrentWorkAttempt::None
+        || request.expected_work.cancellation_reason.is_some()
+        || request.expected_model.state != ModelInvocationState::Completed
+        || request.work_next.state() != WorkState::Completed
+        || request.work_next.work_id() != request.expected_work.work_id
+        || request.assistant_message.role() != MessageRole::Assistant
+        || request.assistant_message.produced_by_work_id()
+            != Some(request.expected_work.work_id)
+        || request.assistant_event.causation_event_id.is_none()
+        || request.completion_event.causation_event_id
+            != Some(request.assistant_event.event_id)
+    {
+        return Err(invalid());
+    }
+    let runtime_id = request.expected_work.runtime_owner.ok_or_else(invalid)?;
+    let expected = expected_snapshot(request.expected_work)?;
+    let mut transaction =
+        WriteTransaction::begin(&store.runtime, "commit_assistant_completion").await?;
+    let context = load_work_context(&mut transaction, request.expected_work).await?;
+    if request.assistant_message.craxii_id() != context.craxii_id
+        || request.assistant_message.conversation_id() != context.conversation_id
+        || request.assistant_event.correlation_id != context.correlation_id
+        || request.completion_event.correlation_id != context.correlation_id
+    {
+        return Err(invalid());
+    }
+    let model_is_terminal: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM model_invocations WHERE model_invocation_id = ? AND work_id = ? \
+         AND runtime_instance_id = ? AND state = 'completed'",
+    )
+    .bind(request.expected_model.model_invocation_id.to_string())
+    .bind(request.expected_work.work_id.to_string())
+    .bind(runtime_id.to_string())
+    .fetch_one(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    let caused_by_terminal: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal_events WHERE event_id = ? \
+         AND event_type = 'model.invocation_completed' AND work_id = ? \
+         AND json_extract(payload_json, '$.model_invocation_id') = ?",
+    )
+    .bind(
+        request
+            .assistant_event
+            .causation_event_id
+            .ok_or_else(invalid)?
+            .to_string(),
+    )
+    .bind(request.expected_work.work_id.to_string())
+    .bind(request.expected_model.model_invocation_id.to_string())
+    .fetch_one(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if model_is_terminal != 1 || caused_by_terminal != 1 {
+        return Err(conflict());
+    }
+    let (content_json, content_sha256) =
+        super::codec::encode_message_content(request.assistant_message.content())?;
+    if content_sha256 != request.assistant_message.content_sha256() {
+        return Err(invalid());
+    }
+    sqlx::query(
+        "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
+         content_sha256, produced_by_work_id, client_device_id, client_message_id, committed_at) \
+         VALUES (?, ?, ?, 'assistant', ?, ?, ?, NULL, NULL, ?)",
+    )
+    .bind(request.assistant_message.message_id().to_string())
+    .bind(context.craxii_id.to_string())
+    .bind(context.conversation_id.to_string())
+    .bind(content_json)
+    .bind(content_sha256.to_string())
+    .bind(request.expected_work.work_id.to_string())
+    .bind(request.assistant_message.committed_at().to_string())
+    .execute(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    let assistant_position = append_event(
+        &mut transaction,
+        prepare_event(JournalAppendIntent {
+            event_id: request.assistant_event.event_id,
+            craxii_id: context.craxii_id,
+            stream_id: JournalStreamId::Conversation(context.conversation_id),
+            conversation_id: Some(context.conversation_id),
+            work_id: Some(request.expected_work.work_id),
+            causation_event_id: request.assistant_event.causation_event_id,
+            correlation_id: context.correlation_id,
+            actor: JournalActor::Runtime(runtime_id),
+            runtime_instance_id: Some(runtime_id),
+            payload: JournalEventPayload::AssistantMessageCommitted(MessageCommittedV1 {
+                message_id: request.assistant_message.message_id(),
+                craxii_id: context.craxii_id,
+                conversation_id: context.conversation_id,
+                role: MessageRole::Assistant,
+                content: request.assistant_message.content().clone(),
+                content_sha256,
+                produced_by_work_id: Some(request.expected_work.work_id),
+                device_id: None,
+                client_message_id: None,
+                committed_at: request.assistant_message.committed_at(),
+            }),
+            recorded_at: request.assistant_message.committed_at(),
+            occurred_at: None,
+        })?,
+    )
+    .await?;
+    guarded_work_update(
+        &mut transaction,
+        &expected,
+        &request.work_next,
+        WorkProjectionTimes {
+            started_at: Some(context.started_at),
+            cancel_requested_at: None,
+            terminal_at: Some(request.assistant_message.committed_at()),
+        },
+    )
+    .await
+    .map_err(map_projection_error)?;
+    let completion_position = append_work_event(
+        &mut transaction,
+        &context,
+        Some(runtime_id),
+        request.completion_event,
+        work_payload(
+            &expected,
+            &request.work_next,
+            request.assistant_message.committed_at(),
+        )?,
+        request.assistant_message.committed_at(),
+    )
+    .await?;
+    transaction.commit().await?;
+    Ok(CommitReceipt {
+        committed_version: Some(request.work_next.projection_version()),
+        events: Some(CommittedEventRange {
+            first: assistant_position.offset,
+            last: completion_position.offset,
+        }),
+    })
 }
 
 fn corrupt() -> SqliteAdapterError {
@@ -97,7 +349,7 @@ fn expected_snapshot(
         projection_version: expected.version,
         runtime_owner: expected.runtime_owner,
         current_attempt: expected.current_attempt,
-        cancellation_reason: None,
+        cancellation_reason: expected.cancellation_reason,
         terminal_reason: None,
     })
     .map_err(|_| invalid())
@@ -766,7 +1018,22 @@ async fn begin_model(
     request: BeginModelInvocationRequest,
 ) -> Result<CommitReceipt, SqliteAdapterError> {
     let attempt = &request.invocation.attempt;
-    if request.expected_work.state != WorkState::Running
+    let retry_evidence = request.invocation.retry_evidence;
+    let retry_shape_valid = if attempt.attempt_no().get() == 1 {
+        attempt.retry_of().is_none() && retry_evidence.is_none()
+    } else {
+        attempt.retry_of().is_some()
+            && retry_evidence.is_some_and(|evidence| {
+                evidence.reason
+                == crate::ports::model_provider::RetryReasonCode::ClassifiedTransientBeforeOutput
+                && evidence.delay <= std::time::Duration::from_secs(30)
+                && evidence
+                    .provider_retry_after
+                    .is_none_or(|delay| delay <= std::time::Duration::from_secs(30))
+            })
+    };
+    if !retry_shape_valid
+        || request.expected_work.state != WorkState::Running
         || request.expected_work.current_attempt != CurrentWorkAttempt::None
         || request.work_next.state() != WorkState::WaitingOnModel
         || request.work_next.current_attempt()
@@ -886,8 +1153,8 @@ async fn begin_model(
          retry_of_invocation_id, model_target_id, provider_id, provider_model_id, \
          target_configuration_version, model_capabilities_json, selection_reason, \
          required_capabilities_json, provider_options_json, state, request_sha256, \
-         request_artifact_id, started_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requesting', ?, ?, ?)",
+         request_artifact_id, retry_reason, retry_delay_ms, provider_retry_after_ms, started_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'requesting', ?, ?, ?, ?, ?, ?)",
     )
     .bind(attempt.model_invocation_id().to_string())
     .bind(attempt.logical_invocation_id().to_string())
@@ -920,6 +1187,18 @@ async fn begin_model(
             .invocation
             .request_artifact_id
             .map(|value| value.to_string()),
+    )
+    .bind(retry_evidence.map(|evidence| evidence.reason.as_str()))
+    .bind(
+        retry_evidence
+            .map(|evidence| i64::try_from(evidence.delay.as_millis()).map_err(|_| invalid()))
+            .transpose()?,
+    )
+    .bind(
+        retry_evidence
+            .and_then(|evidence| evidence.provider_retry_after)
+            .map(|delay| i64::try_from(delay.as_millis()).map_err(|_| invalid()))
+            .transpose()?,
     )
     .bind(request.invocation.started_at.to_string())
     .execute(transaction.connection())
@@ -1091,7 +1370,7 @@ async fn mark_model_streaming(
 
 fn validate_model_terminal(
     request: &FinishModelInvocationRequest,
-) -> Result<(Option<String>, Option<[i64; 5]>), SqliteAdapterError> {
+) -> Result<(Option<String>, Option<[i64; 5]>, Option<String>), SqliteAdapterError> {
     let outcome = &request.outcome;
     if !outcome.state.is_terminal()
         || !is_legal_model_pair(request.expected_model.state, outcome.state)
@@ -1134,6 +1413,16 @@ fn validate_model_terminal(
                 || outcome.stop_reason.is_none()
                 || outcome.tool_call_count.is_none()
                 || outcome.normalized_error.is_some()
+                || outcome.provider_error_kind.is_some()
+                || outcome.provider_outcome_certainty
+                    != crate::ports::model_provider::ProviderOutcomeCertainty::DefinitelyCompleted
+                || outcome.billing_ambiguity
+                || outcome.usage_status
+                    != if outcome.usage.is_some() {
+                        crate::ports::model_provider::ModelUsageStatus::Reported
+                    } else {
+                        crate::ports::model_provider::ModelUsageStatus::Unavailable
+                    }
             {
                 return Err(invalid());
             }
@@ -1165,11 +1454,55 @@ fn validate_model_terminal(
             if outcome.response_sha256.is_some()
                 || outcome.response_artifact_id.is_some()
                 || outcome.normalized_output.is_some()
-                || outcome.usage.is_some()
                 || outcome.stop_reason.is_some()
                 || outcome.tool_call_count.is_some()
                 || outcome.normalized_error.is_none()
+                || outcome.provider_error_kind.is_none()
+                || outcome.usage_status
+                    != if outcome.usage.is_some() {
+                        crate::ports::model_provider::ModelUsageStatus::Reported
+                    } else {
+                        crate::ports::model_provider::ModelUsageStatus::Unavailable
+                    }
             {
+                return Err(invalid());
+            }
+            let certainty = outcome.provider_outcome_certainty;
+            let kind = outcome.provider_error_kind.ok_or_else(invalid)?;
+            let evidence_valid = match outcome.state {
+                ModelInvocationState::Failed => {
+                    matches!(
+                        certainty,
+                        crate::ports::model_provider::ProviderOutcomeCertainty::DefinitelyNotSent
+                            | crate::ports::model_provider::ProviderOutcomeCertainty::DefiniteProviderFailure
+                            | crate::ports::model_provider::ProviderOutcomeCertainty::SemanticOutputObserved
+                    ) && !outcome.billing_ambiguity
+                }
+                ModelInvocationState::CancelledLocally => {
+                    kind == crate::ports::model_provider::ProviderErrorKind::Cancelled
+                        && matches!(
+                            certainty,
+                            crate::ports::model_provider::ProviderOutcomeCertainty::DefinitelyNotSent
+                                | crate::ports::model_provider::ProviderOutcomeCertainty::ProviderOutcomeUnknown
+                        )
+                        && outcome.billing_ambiguity
+                            == (certainty
+                                == crate::ports::model_provider::ProviderOutcomeCertainty::ProviderOutcomeUnknown)
+                }
+                ModelInvocationState::ProviderOutcomeUnknown => {
+                    matches!(
+                        kind,
+                        crate::ports::model_provider::ProviderErrorKind::TransportAfterPossibleProcessing
+                            | crate::ports::model_provider::ProviderErrorKind::TimeoutAfterOutput
+                            | crate::ports::model_provider::ProviderErrorKind::Cancelled
+                            | crate::ports::model_provider::ProviderErrorKind::ProviderOutcomeUnknown
+                    ) && certainty
+                        == crate::ports::model_provider::ProviderOutcomeCertainty::ProviderOutcomeUnknown
+                        && outcome.billing_ambiguity
+                }
+                _ => false,
+            };
+            if !evidence_valid {
                 return Err(invalid());
             }
             (None, None)
@@ -1189,14 +1522,34 @@ fn validate_model_terminal(
             encode_attempt_error(value, unknown)
         })
         .transpose()?;
-    Ok((output_json.or(error), usage))
+    let provider_usage = if outcome.state == ModelInvocationState::Completed {
+        None
+    } else {
+        outcome
+            .usage
+            .map(encode_provider_reported_usage)
+            .transpose()?
+    };
+    Ok((output_json.or(error), usage, provider_usage))
+}
+
+fn encode_provider_reported_usage(usage: ModelUsage) -> Result<String, SqliteAdapterError> {
+    let values = encode_model_usage(usage)?;
+    serde_json::to_string(&serde_json::json!({
+        "cached_input_tokens": values[1],
+        "input_tokens": values[0],
+        "output_tokens": values[2],
+        "reasoning_tokens": values[3],
+        "total_tokens": values[4],
+    }))
+    .map_err(|_| invalid())
 }
 
 async fn finish_model(
     store: &SqliteStateStore,
     request: FinishModelInvocationRequest,
 ) -> Result<CommitReceipt, SqliteAdapterError> {
-    let (output_or_error, usage) = validate_model_terminal(&request)?;
+    let (output_or_error, usage, provider_reported_usage_json) = validate_model_terminal(&request)?;
     let (output_json, error_json) = if request.outcome.state == ModelInvocationState::Completed {
         (output_or_error, None)
     } else {
@@ -1260,14 +1613,17 @@ async fn finish_model(
         .map(|value| value.to_string())
         .or(identity.try_get::<Option<String>, _>("first_output_at")?);
     let usage = usage.unwrap_or([0; 5]);
-    let usage_present = request.outcome.usage.is_some();
+    let usage_present =
+        request.outcome.state == ModelInvocationState::Completed && request.outcome.usage.is_some();
     let result = sqlx::query(
         "UPDATE model_invocations SET state = ?, response_sha256 = ?, response_artifact_id = ?, \
          normalized_output_json = ?, provider_request_id = coalesce(?, provider_request_id), \
          provider_response_id = coalesce(?, provider_response_id), first_byte_at = ?, \
          first_output_at = ?, completed_at = ?, input_tokens = ?, cached_input_tokens = ?, \
          output_tokens = ?, reasoning_tokens = ?, total_tokens = ?, stop_reason = ?, \
-         tool_call_count = ?, draft_exposed = ?, normalized_error_json = ? \
+         tool_call_count = ?, draft_exposed = ?, normalized_error_json = ?, usage_status = ?, \
+         provider_reported_usage_json = ?, provider_error_kind = ?, \
+         provider_outcome_certainty = ?, billing_ambiguity = ? \
          WHERE model_invocation_id = ? AND work_id = ? AND runtime_instance_id = ? AND state = ?",
     )
     .bind(request.outcome.state.as_str())
@@ -1303,6 +1659,11 @@ async fn finish_model(
     )
     .bind(i64::from(request.outcome.draft_exposed))
     .bind(error_json)
+    .bind(request.outcome.usage_status.as_str())
+    .bind(provider_reported_usage_json)
+    .bind(request.outcome.provider_error_kind.map(|kind| kind.code()))
+    .bind(request.outcome.provider_outcome_certainty.as_str())
+    .bind(i64::from(request.outcome.billing_ambiguity))
     .bind(request.expected_model.model_invocation_id.to_string())
     .bind(request.expected_work.work_id.to_string())
     .bind(runtime_id.to_string())
@@ -3059,6 +3420,12 @@ impl SqliteStateStore {
 }
 
 impl ModelStateStore for SqliteStateStore {
+    fn load_owned_work(
+        &self,
+        request: LoadOwnedWorkRequest,
+    ) -> StateStoreFuture<'_, OwnedWorkState> {
+        Box::pin(async move { load_owned_work_state(self, request).await.map_err(map_port_error) })
+    }
     fn begin_model_invocation(
         &self,
         request: BeginModelInvocationRequest,
@@ -3082,6 +3449,13 @@ impl ModelStateStore for SqliteStateStore {
         request: FinishModelInvocationRequest,
     ) -> StateStoreFuture<'_, CommitReceipt> {
         Box::pin(async move { finish_model(self, request).await.map_err(map_port_error) })
+    }
+
+    fn terminalize_owned_work(
+        &self,
+        request: TerminalizeOwnedWorkRequest,
+    ) -> StateStoreFuture<'_, CommitReceipt> {
+        Box::pin(async move { terminalize_owned_work(self, request).await.map_err(map_port_error) })
     }
 }
 

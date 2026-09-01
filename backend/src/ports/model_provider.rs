@@ -93,18 +93,31 @@ impl ProviderErrorKind {
 pub enum ProviderOutcomeCertainty {
     DefinitelyNotSent,
     DefiniteProviderFailure,
+    DefinitelyCompleted,
     SemanticOutputObserved,
     ProviderOutcomeUnknown,
 }
 
 impl ProviderOutcomeCertainty {
     #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DefinitelyNotSent => "definitely_not_sent",
+            Self::DefiniteProviderFailure => "definite_provider_failure",
+            Self::DefinitelyCompleted => "definitely_completed",
+            Self::SemanticOutputObserved => "semantic_output_observed",
+            Self::ProviderOutcomeUnknown => "outcome_unknown",
+        }
+    }
+
+    #[must_use]
     pub const fn normalized(self) -> Certainty {
         match self {
-            Self::ProviderOutcomeUnknown | Self::SemanticOutputObserved => {
-                Certainty::OutcomeUnknown
-            }
-            Self::DefinitelyNotSent | Self::DefiniteProviderFailure => Certainty::Definite,
+            Self::ProviderOutcomeUnknown => Certainty::OutcomeUnknown,
+            Self::DefinitelyNotSent
+            | Self::DefiniteProviderFailure
+            | Self::DefinitelyCompleted
+            | Self::SemanticOutputObserved => Certainty::Definite,
         }
     }
 }
@@ -263,6 +276,48 @@ pub enum RetryReasonCode {
     AttemptCapReached,
     Cancelled,
     DeadlineExhausted,
+}
+
+impl RetryReasonCode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ClassifiedTransientBeforeOutput => "classified_transient_before_output",
+            Self::SemanticOutputObserved => "semantic_output_observed",
+            Self::NonretryableCategory => "nonretryable_category",
+            Self::ProviderOutcomeAmbiguous => "provider_outcome_ambiguous",
+            Self::AttemptCapReached => "attempt_cap_reached",
+            Self::Cancelled => "cancelled",
+            Self::DeadlineExhausted => "deadline_exhausted",
+        }
+    }
+}
+
+/// Whether a physical provider attempt reported normalized usage evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModelUsageStatus {
+    Reported,
+    Unavailable,
+    NotApplicableOrUnknown,
+}
+
+impl ModelUsageStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reported => "reported",
+            Self::Unavailable => "unavailable",
+            Self::NotApplicableOrUnknown => "not_applicable_or_unknown",
+        }
+    }
+}
+
+/// Exact durable reason and bounded delay that caused a physical retry attempt to exist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderRetryEvidence {
+    pub reason: RetryReasonCode,
+    pub delay: Duration,
+    pub provider_retry_after: Option<Duration>,
 }
 
 /// Complete pure retry policy result. This never performs a retry or sleeps.

@@ -723,7 +723,7 @@ async fn transition_to_running(fixture: &Fixture, work_id: WorkId) -> RuntimeIns
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage9-test").unwrap(),
-                schema_version: SchemaVersion::try_new(3).unwrap(),
+                schema_version: SchemaVersion::try_new(4).unwrap(),
                 started_at: timestamp(T1),
             }),
             event_id: JournalEventId::generate(),

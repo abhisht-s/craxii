@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Complete annotated Craxii V0.0.01 architecture with plain-English explanations, real-life examples, a full flowchart, and an end-to-end use-case story.">
-  <meta name="craxii-source-sha256" content="30bac44e440e11f8c639a9b164d2a4648aec08020ed21dfbb0ee185dea471e0c">
+  <meta name="craxii-source-sha256" content="5c32c9233110de80401b18103f7b48ba6e5bdebf655e41784b15ba2dbd66b3b1">
   <title>Craxii V0.0.01 architecture — annotated engineering edition</title>
   <style>
 :root {
@@ -455,7 +455,7 @@ th { background: #f0f2f4; }
       <nav id="toc"></nav>
       <div class="sidebar-meta">
         <p><strong>337</strong> source sections carry companion explanations.</p>
-        <p>Source SHA-256:<br><code>30bac44e440e11f8…</code></p>
+        <p>Source SHA-256:<br><code>5c32c9233110de80…</code></p>
         <p><a href="craxii-v0.0.01-architecture.md">Open normative Markdown</a></p>
       </div>
     </aside>
@@ -4300,6 +4300,14 @@ assembler/context-policy/prompt versions
   package hash
 </code></pre>
 <p>The provider adapter translates this package to wire types. The assembler does not know Reqwest, OpenAI JSON field names, WebSocket deltas, or SQL rows. It reads through a narrow read-only <code>ContextSourceStore</code>; it does not receive the mutating State Store, selector, fallback target list, Workstation, Tool Execution Service, or provider. One assembly loads all durable eligibility facts under one bounded SQLite read transaction. The clock supplies only nonsemantic <code>created_at</code> metadata.</p>
+<p>Canonical semantic collections have a mutable construction phase and a sealed consumption phase.
+<code>CanonicalInputBuilder</code> is the only mutable canonical-input owner; consuming <code>finish()</code> produces
+<code>FrozenModelInputs</code> with private boxed-slice storage and immutable slice, iteration, and length reads
+only. <code>FrozenModelTools</code> is constructed only from the complete Stage 14 registry projection, retains
+stable order, recomputes its fingerprint from those exact frozen definitions, and exposes no mutable
+access. Neither frozen type has <code>AsMut</code>, <code>DerefMut</code>, <code>IndexMut</code>, a mutable accessor, a setter or
+replacer, a generic mutation callback, or an API that returns a mutable <code>Vec</code>. Successful final
+request construction accepts the frozen types, never raw canonical input/tool vectors.</p>
 <h3>Context eligibility</h3>
 <aside class="explain-card level-3" data-source-heading="Context eligibility">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -4333,6 +4341,12 @@ assembler/context-policy/prompt versions
 <p>The active trigger is loaded only through its exact <code>work_item_inputs</code> <code>trigger</code> relationship and is rendered exactly once. Every history query binds the active conversation and proves Work ownership. A later accepted Work at ordinal <code>N+1</code> is excluded from Work <code>N</code> regardless of commit time or journal offset. When <code>N+1</code> eventually assembles, a result committed for prior ordinal <code>N</code> after <code>N+1</code> was accepted is visible if it is durable at assembly time.</p>
 <p>Completed normalized output preserves original item order, including intermediate text, complete tool calls, structured data, refusal, provider-exposed reasoning summary, and compatible continuation. Reasoning summary remains a distinct provider-neutral historical item and is never converted to assistant text or used for hidden/private chain-of-thought. Partial/draft content, incomplete arguments, provider-outcome-unknown model content, and unknown correctness-bearing output are not ordinary history.</p>
 <p>A prior Work&#39;s committed final assistant Message is authoritative conversational output and is rendered exactly once; terminal model text representing that same final answer is not also rendered. Intermediate completed output that led to tool calls remains eligible. An ordinary tool result requires one definite observed Stage 14 result paired to its unique call by Work, conversation, source model invocation, agent step, tool ordinal, provider call ID, and tool name. Orphan, duplicate, mismatched, cross-Work, and cross-conversation results fail closed.</p>
+<p>Tool lifecycle classification returns a closed <code>RenderedToolEvidence</code> with exactly
+<code>Definite(DefiniteObservedToolResult)</code> and <code>OutcomeUnknown(UnknownToolOutcome)</code>. Definite evidence is
+constructed only from durable definite observed results. The durable <code>outcome_unknown</code> branch
+constructs only primitive <code>UnknownToolOutcome</code> fields. One exhaustive local match converts definite
+evidence to ordinary <code>ToolResult</code> and unknown evidence to synthetic runtime status; it has no
+wildcard, generic conversion, trait conversion, callback, function-pointer, or closure seam.</p>
 <h3>Prior interrupted and failed work</h3>
 <aside class="explain-card level-3" data-source-heading="Prior interrupted and failed work">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -4401,7 +4415,18 @@ assembler/context-policy/prompt versions
 </code></pre>
 <p>V0 sets provider truncation to disabled. It never asks the provider to drop the beginning of history automatically.</p>
 <p><code>reserved_output_tokens</code> is exactly the selected target&#39;s configured <code>requested_output_tokens</code>; there is no second additive Stage 16 safety-reserve field. The estimator includes conservative instruction, text/structured, tool definition, tool call/result, opaque continuation, framing, and provider-native overhead units. Its returned identity/version MUST equal the selected target configuration. Estimator failure or mismatch fails closed; no alternate estimator is chosen. Equality in the fit formula passes and one token over fails.</p>
+<p>Stage 16 freezes that configured value once as private <code>SelectedOutputLimit</code>, created directly from
+<code>selection.selected_target().requested_output_tokens()</code> with no arithmetic, clamp, helper-derived
+adjustment, or budget-dependent change. The same exact value supplies the <code>ModelRequest</code> limit,
+manifest reserve, <code>ContextPackage</code> requested output, and token-fit arithmetic.</p>
 <p>The complete compact canonical provider-neutral <code>ModelRequest</code> MUST also be at most 16,777,216 bytes. The assembler fully constructs and canonically serializes the request, measures its actual UTF-8 bytes, and enforces this ceiling before checking estimator identity or invoking the estimator. Exactly 16 MiB is permitted; one byte over fails explicitly as <code>context_limit_exceeded</code> without truncation or estimator work, even if that estimator would mismatch, fail, or overflow. All eligible history is mandatory: no windowing, oldest-turn pruning, retrieval, summarization, compression, clipping, tool or instruction removal, reduced output limit, or target fallback is permitted to make context fit.</p>
+<p>One private <code>FinalModelRequest</code> constructor consumes the frozen inputs, frozen tools, complete
+versioned instructions, exact selected output, selected target/native options, tool policy, and
+logical/manifest identities. It constructs <code>ModelRequest</code> once, then derives and immutably retains
+the canonical bytes, serialized byte count, SHA-256, and every <code>TokenEstimateUnit</code> from that exact
+request. The byte gate reads its byte count, the estimator reads its units, and manifest/package
+construction reads its request, hash, output, and tool fingerprint. No caller reconstructs request
+bytes, hashes a reduced request, or supplies estimator units from an arbitrary input slice.</p>
 <h3>Context manifest</h3>
 <aside class="explain-card level-3" data-source-heading="Context manifest">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -4425,7 +4450,24 @@ assembler/context-policy/prompt versions
 <p>The manifest provides provenance. It does not duplicate raw history or replace source records.</p>
 <p>Every source row has a contiguous one-based position, exact kind, exactly one durable identity category, role/item class, the SHA-256 of canonical durable source semantics before transformation, rendered byte contribution, and explicit transform. Normal tool history uses bounded Stage 14 projections plus artifact descriptors/hashes rather than arbitrary full artifact bytes. Artifact bytes are read only through verified artifact APIs when explicit content or reconstruction verification requires them; missing, corrupt, or partial data fails closed.</p>
 <p>The authoritative request hash is SHA-256 of the final canonical <code>ModelRequest</code>, including generated context/logical invocation IDs, selected target, instructions, ordered items, exact tools, tool choice, fixed <code>parallel=false</code>, requested output, and typed provider-native options, with no timestamp. The manifest hash covers the canonical semantic manifest envelope and ordered sources, including generated immutable IDs, but excludes its own hash field, <code>created_at</code>, assembly latency, storage paths, telemetry, and nonsemantic SQLite details. Reconstruction starts from the prepared/stored manifest and its source rows in recorded position order, reloads only those exact durable identities, verifies ownership/type/source hashes and every manifest-bound target/version/prompt/toolset/estimator identity, rebuilds with the committed IDs, and requires exact request bytes, request hash, and manifest hash. It MUST NOT query current eligibility, substitute a newer equivalent source, or reorder from current database state. A retry of an old prepared package therefore reconstructs identically after later eligible tool/model evidence or later Work acceptance changes what a fresh assembly would select.</p>
-<p>The Stage 16 structural checker freezes the named prior-history queries to <code>conversation_work_ordinal &lt; active_ordinal</code> and traverses assembler-reachable helpers with bounded, alias-aware provenance. The single final-request constructor MUST preserve the complete frozen canonical input and complete stable Stage 14 tool projection, MUST copy the selected target&#39;s configured requested-output limit exactly, and MUST feed that same final <code>ModelRequest</code> to canonical serialization, the byte gate, estimation, hashing, packaging, and return. The checker follows the <code>ToolExecutionState::OutcomeUnknown</code> return topology through helpers and conservative macro boundaries: that branch may return only synthetic uncertainty and never an ordinary <code>ToolResult</code>, even if a synthetic marker is separately constructed and discarded. Its compiling negative mutations cover broader/removal/offset/application-filtered causal cutoffs, direct and helper-mediated reselection, request/source/tool/output shortening, and direct/helper/alias/wrapper-mediated unknown-to-<code>ToolResult</code> conversion; positive controls retain immutable selection/input/tool inspection, exact full-value moves, bounded Stage 14 projections, definite tool results, synthetic unknown status and helper chains, complete-request byte inspection, and diagnostics-only sampling.</p>
+<p>The Stage 16 structural checker freezes the named prior-history queries to
+<code>conversation_work_ordinal &lt; active_ordinal</code> and verifies the small repository-specific sealed
+topology. It checks the exact private storage and immutable APIs of <code>FrozenModelInputs</code> and
+<code>FrozenModelTools</code>; the sole selected-output creation site; the single <code>FinalModelRequest</code>
+constructor; constructor-local byte/hash/estimator-unit derivation; byte-gate, estimator, package,
+and manifest reads from that object; the exact <code>RenderedToolEvidence</code> variants; the exhaustive final
+conversion; and direct construction of <code>UnknownToolOutcome</code> in the durable unknown branch. It also
+rejects alternate <code>ModelRequest</code>/tool-projection paths, raw canonical vectors at the final
+constructor, independent request hashes or estimator-unit builders, mutable frozen APIs, and
+unknown-to-result conversions.</p>
+<p>Checker evidence is reported honestly in three categories: structural negatives, compiling
+mutations rejected by the checker, and type-sealed mutations that cannot compile. The repository
+shape removes the semantic injection point for arbitrary generic helpers, closures, and function
+pointers; the checker does not claim to understand arbitrary Rust closure or function-pointer
+dataflow. Positive controls retain pre-freeze builder mutation, immutable frozen iteration, complete
+frozen consumption/projection, exact output reads, final-request bytes and estimation units,
+definite success/failure results, synthetic unknown status, primitive status-text helpers, and
+diagnostics-only sampling.</p>
 <h3>Context instrumentation</h3>
 <aside class="explain-card level-3" data-source-heading="Context instrumentation">
   <div class="explain-card-label">Subsection guide · plain-English companion</div>
@@ -8675,7 +8717,7 @@ Later extraction:
 </section>
 
       <footer class="source-footer">
-        <p><strong>Generated companion:</strong> 2026-08-31T14:01:17.975Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>30bac44e440e11f8c639a9b164d2a4648aec08020ed21dfbb0ee185dea471e0c</code>.</p>
+        <p><strong>Generated companion:</strong> 2026-08-31T19:25:54.632Z · Source: <a href="craxii-v0.0.01-architecture.md"><code>craxii-v0.0.01-architecture.md</code></a> · SHA-256 <code>5c32c9233110de80401b18103f7b48ba6e5bdebf655e41784b15ba2dbd66b3b1</code>.</p>
         <p>The Markdown source remains normative. This standalone HTML has no external stylesheet, font, script, or diagram dependency.</p>
       </footer>
     </main>

@@ -3014,6 +3014,15 @@ ContextPackage
 
 The provider adapter translates this package to wire types. The assembler does not know Reqwest, OpenAI JSON field names, WebSocket deltas, or SQL rows. It reads through a narrow read-only `ContextSourceStore`; it does not receive the mutating State Store, selector, fallback target list, Workstation, Tool Execution Service, or provider. One assembly loads all durable eligibility facts under one bounded SQLite read transaction. The clock supplies only nonsemantic `created_at` metadata.
 
+Canonical semantic collections have a mutable construction phase and a sealed consumption phase.
+`CanonicalInputBuilder` is the only mutable canonical-input owner; consuming `finish()` produces
+`FrozenModelInputs` with private boxed-slice storage and immutable slice, iteration, and length reads
+only. `FrozenModelTools` is constructed only from the complete Stage 14 registry projection, retains
+stable order, recomputes its fingerprint from those exact frozen definitions, and exposes no mutable
+access. Neither frozen type has `AsMut`, `DerefMut`, `IndexMut`, a mutable accessor, a setter or
+replacer, a generic mutation callback, or an API that returns a mutable `Vec`. Successful final
+request construction accepts the frozen types, never raw canonical input/tool vectors.
+
 ### Context eligibility
 
 Let active work have conversation ordinal `N`.
@@ -3046,6 +3055,13 @@ The active trigger is loaded only through its exact `work_item_inputs` `trigger`
 Completed normalized output preserves original item order, including intermediate text, complete tool calls, structured data, refusal, provider-exposed reasoning summary, and compatible continuation. Reasoning summary remains a distinct provider-neutral historical item and is never converted to assistant text or used for hidden/private chain-of-thought. Partial/draft content, incomplete arguments, provider-outcome-unknown model content, and unknown correctness-bearing output are not ordinary history.
 
 A prior Work's committed final assistant Message is authoritative conversational output and is rendered exactly once; terminal model text representing that same final answer is not also rendered. Intermediate completed output that led to tool calls remains eligible. An ordinary tool result requires one definite observed Stage 14 result paired to its unique call by Work, conversation, source model invocation, agent step, tool ordinal, provider call ID, and tool name. Orphan, duplicate, mismatched, cross-Work, and cross-conversation results fail closed.
+
+Tool lifecycle classification returns a closed `RenderedToolEvidence` with exactly
+`Definite(DefiniteObservedToolResult)` and `OutcomeUnknown(UnknownToolOutcome)`. Definite evidence is
+constructed only from durable definite observed results. The durable `outcome_unknown` branch
+constructs only primitive `UnknownToolOutcome` fields. One exhaustive local match converts definite
+evidence to ordinary `ToolResult` and unknown evidence to synthetic runtime status; it has no
+wildcard, generic conversion, trait conversion, callback, function-pointer, or closure seam.
 
 ### Prior interrupted and failed work
 
@@ -3108,7 +3124,20 @@ V0 sets provider truncation to disabled. It never asks the provider to drop the 
 
 `reserved_output_tokens` is exactly the selected target's configured `requested_output_tokens`; there is no second additive Stage 16 safety-reserve field. The estimator includes conservative instruction, text/structured, tool definition, tool call/result, opaque continuation, framing, and provider-native overhead units. Its returned identity/version MUST equal the selected target configuration. Estimator failure or mismatch fails closed; no alternate estimator is chosen. Equality in the fit formula passes and one token over fails.
 
+Stage 16 freezes that configured value once as private `SelectedOutputLimit`, created directly from
+`selection.selected_target().requested_output_tokens()` with no arithmetic, clamp, helper-derived
+adjustment, or budget-dependent change. The same exact value supplies the `ModelRequest` limit,
+manifest reserve, `ContextPackage` requested output, and token-fit arithmetic.
+
 The complete compact canonical provider-neutral `ModelRequest` MUST also be at most 16,777,216 bytes. The assembler fully constructs and canonically serializes the request, measures its actual UTF-8 bytes, and enforces this ceiling before checking estimator identity or invoking the estimator. Exactly 16 MiB is permitted; one byte over fails explicitly as `context_limit_exceeded` without truncation or estimator work, even if that estimator would mismatch, fail, or overflow. All eligible history is mandatory: no windowing, oldest-turn pruning, retrieval, summarization, compression, clipping, tool or instruction removal, reduced output limit, or target fallback is permitted to make context fit.
+
+One private `FinalModelRequest` constructor consumes the frozen inputs, frozen tools, complete
+versioned instructions, exact selected output, selected target/native options, tool policy, and
+logical/manifest identities. It constructs `ModelRequest` once, then derives and immutably retains
+the canonical bytes, serialized byte count, SHA-256, and every `TokenEstimateUnit` from that exact
+request. The byte gate reads its byte count, the estimator reads its units, and manifest/package
+construction reads its request, hash, output, and tool fingerprint. No caller reconstructs request
+bytes, hashes a reduced request, or supplies estimator units from an arbitrary input slice.
 
 ### Context manifest
 
@@ -3132,7 +3161,25 @@ Every source row has a contiguous one-based position, exact kind, exactly one du
 
 The authoritative request hash is SHA-256 of the final canonical `ModelRequest`, including generated context/logical invocation IDs, selected target, instructions, ordered items, exact tools, tool choice, fixed `parallel=false`, requested output, and typed provider-native options, with no timestamp. The manifest hash covers the canonical semantic manifest envelope and ordered sources, including generated immutable IDs, but excludes its own hash field, `created_at`, assembly latency, storage paths, telemetry, and nonsemantic SQLite details. Reconstruction starts from the prepared/stored manifest and its source rows in recorded position order, reloads only those exact durable identities, verifies ownership/type/source hashes and every manifest-bound target/version/prompt/toolset/estimator identity, rebuilds with the committed IDs, and requires exact request bytes, request hash, and manifest hash. It MUST NOT query current eligibility, substitute a newer equivalent source, or reorder from current database state. A retry of an old prepared package therefore reconstructs identically after later eligible tool/model evidence or later Work acceptance changes what a fresh assembly would select.
 
-The Stage 16 structural checker freezes the named prior-history queries to `conversation_work_ordinal < active_ordinal` and traverses assembler-reachable helpers with bounded, alias-aware provenance. The single final-request constructor MUST preserve the complete frozen canonical input and complete stable Stage 14 tool projection, MUST copy the selected target's configured requested-output limit exactly, and MUST feed that same final `ModelRequest` to canonical serialization, the byte gate, estimation, hashing, packaging, and return. The checker follows the `ToolExecutionState::OutcomeUnknown` return topology through helpers and conservative macro boundaries: that branch may return only synthetic uncertainty and never an ordinary `ToolResult`, even if a synthetic marker is separately constructed and discarded. Its compiling negative mutations cover broader/removal/offset/application-filtered causal cutoffs, direct and helper-mediated reselection, request/source/tool/output shortening, and direct/helper/alias/wrapper-mediated unknown-to-`ToolResult` conversion; positive controls retain immutable selection/input/tool inspection, exact full-value moves, bounded Stage 14 projections, definite tool results, synthetic unknown status and helper chains, complete-request byte inspection, and diagnostics-only sampling.
+The Stage 16 structural checker freezes the named prior-history queries to
+`conversation_work_ordinal < active_ordinal` and verifies the small repository-specific sealed
+topology. It checks the exact private storage and immutable APIs of `FrozenModelInputs` and
+`FrozenModelTools`; the sole selected-output creation site; the single `FinalModelRequest`
+constructor; constructor-local byte/hash/estimator-unit derivation; byte-gate, estimator, package,
+and manifest reads from that object; the exact `RenderedToolEvidence` variants; the exhaustive final
+conversion; and direct construction of `UnknownToolOutcome` in the durable unknown branch. It also
+rejects alternate `ModelRequest`/tool-projection paths, raw canonical vectors at the final
+constructor, independent request hashes or estimator-unit builders, mutable frozen APIs, and
+unknown-to-result conversions.
+
+Checker evidence is reported honestly in three categories: structural negatives, compiling
+mutations rejected by the checker, and type-sealed mutations that cannot compile. The repository
+shape removes the semantic injection point for arbitrary generic helpers, closures, and function
+pointers; the checker does not claim to understand arbitrary Rust closure or function-pointer
+dataflow. Positive controls retain pre-freeze builder mutation, immutable frozen iteration, complete
+frozen consumption/projection, exact output reads, final-request bytes and estimation units,
+definite success/failure results, synthetic unknown status, primitive status-text helpers, and
+diagnostics-only sampling.
 
 ### Context instrumentation
 

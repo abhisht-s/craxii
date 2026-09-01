@@ -64,6 +64,14 @@ outcome is unknown, and repetition must not be assumed safe. It is never an ordi
 implies no retry. Interrupted model attempts contribute no partial output. A cancelled prior Work
 gets no invented cancellation item; its accepted input and durable observed outputs remain.
 
+The lifecycle classifier returns only the closed internal enum `RenderedToolEvidence`, whose exact
+variants are `Definite(DefiniteObservedToolResult)` and
+`OutcomeUnknown(UnknownToolOutcome)`. A definite value is constructed only in the durable definite
+observed branch. The durable `outcome_unknown` branch directly constructs `UnknownToolOutcome` from
+primitive safe fields and has no generic semantic return, callback, closure, function pointer, or
+trait conversion. One exhaustive match with no wildcard converts definite evidence to ordinary
+`ToolResult` and unknown evidence to synthetic runtime status.
+
 The V0 instruction snapshot has explicit template version, ordered system and developer blocks,
 canonical bytes, and SHA-256 fingerprint. It contains no current time, secret, credential, or
 provider wire syntax. Historical reasoning summary is a distinct provider-neutral item containing
@@ -73,6 +81,15 @@ The Stage 14 tool registry projects exactly `read_file`, then `run_shell`, with 
 implementation/schema version, description, and canonical input schema, never handler identity.
 Assembly recomputes the semantic projection fingerprint and requires it to equal the registry
 fingerprint.
+
+Canonical semantic mutation ends before final request construction. `CanonicalInputBuilder`
+accepts deterministic pushes while rendering and is consumed by `finish()` into private
+`FrozenModelInputs(Box<[ModelInputItem]>)`. The frozen type permits only immutable slice, iterator,
+and length reads. `FrozenModelTools(Box<[ModelToolDefinition]>)` is constructed only from the
+complete Stage 14 registry projection, preserves its stable order, and recomputes its fingerprint
+from those exact contents. Neither type exposes mutable storage, `AsMut`, `DerefMut`, `IndexMut`, a
+mutable accessor, setter/replacer, generic mutation callback, or a mutable `Vec` escape. The final
+request constructor accepts only these frozen semantic collection types.
 
 Canonical order is: system instructions, developer instructions, durable Workstation capability
 summary, logical workspace identity, tool definitions, prior Work ordinal ascending, active
@@ -111,6 +128,11 @@ native options pass unchanged. Requested output and `reserved_output_tokens` are
 selected target's configured `requested_output_tokens`; Stage 16 has no additive safety reserve and
 never lowers this limit.
 
+The selected output is frozen once as private `SelectedOutputLimit`, created directly from
+`selection.selected_target().requested_output_tokens()` without arithmetic, min/clamp, helper
+adjustment, or budget-dependent change. Its exact value supplies the `ModelRequest` requested limit,
+manifest reserve, `ContextPackage` requested output, and token-fit arithmetic.
+
 The selected estimator's returned identity/version must exactly match configuration. There is no
 fallback or dynamic alternate. Complete deterministic units cover instruction/text framing,
 structured data, tool definitions, tool calls/results, opaque continuation, and conservative
@@ -123,6 +145,15 @@ bytes must be at most 16,777,216. Stage 16 fully constructs and canonically seri
 measures actual UTF-8 bytes, and applies the ceiling before estimator identity validation or
 estimator invocation. Exactly 16 MiB passes; one byte over returns `context_limit_exceeded` with
 zero estimator calls even if the estimator would mismatch, fail, or overflow.
+
+One private `FinalModelRequest::construct` call consumes the selected result, frozen inputs, frozen
+tools, complete versioned instructions, exact selected output, selected native options/tool policy,
+and immutable invocation/manifest identities. It constructs `ModelRequest` once and derives the
+canonical bytes, byte count, SHA-256, and complete estimator-unit array from that same request. The
+byte gate reads `FinalModelRequest::serialized_byte_count`, the estimator reads
+`FinalModelRequest::estimation_units`, and package/manifest provenance reads its immutable request,
+hash, selected output, and tool fingerprint. No external helper accepts arbitrary input slices to
+construct estimator units or independently reconstructs the request bytes/hash.
 
 All causally eligible V0 history is mandatory. There is no windowing, pruning, retrieval,
 summarization, compression, clipping, tool/instruction removal, output-reserve reduction, or target
@@ -167,19 +198,22 @@ or later Work acceptance changes a fresh assembly. Missing/corrupt sources or dr
 
 ## Structural checker boundary
 
-The Stage 16 checker freezes strict prior-history cutoff shape and exact active-ordinal binding and
-traverses assembler-reachable helpers with a bounded, alias-aware provenance analysis. The single
-final-request constructor conserves the complete frozen canonical input, complete stable Stage 14
-tool projection, and exact selected configured requested-output limit; canonical serialization, the
-byte gate, estimation, hashing, packaging, and return all use that final request and its unchanged
-sources. The checker follows the `OutcomeUnknown` return arm through helpers and conservative macro
-boundaries so it can reach only synthetic uncertainty, never ordinary `ToolResult`; an unused
-synthetic marker cannot satisfy the invariant. Compilation-gated mutations cover broader, removed,
-offset, and application-filtered ordinal predicates; direct/helper/alias reselection; input/byte/
-tool/output shortening; and direct/helper/alias/wrapper unknown-result conversion. Positive controls
-retain immutable selected-target/input/tool inspection, exact full-value moves, bounded Stage 14
-projections, definite tool results, synthetic unknown helper chains, complete-request byte
-inspection, and diagnostics-only sampling.
+The Stage 16 checker freezes strict prior-history cutoff shape and exact active-ordinal binding, then
+validates a small repository-specific sealed topology rather than attempting general Rust dataflow
+analysis. It checks the exact private frozen input/tool storage and APIs, the sole selected-output
+creation site, the single final-request constructor, constructor-local bytes/hash/estimator units,
+the byte-gate/estimator/package/manifest reads from that object, the exact evidence variants, the
+exhaustive conversion, and direct unknown-evidence construction. It rejects alternate
+`ModelRequest` or tool-projection paths, raw canonical vectors at the final constructor, mutable
+frozen APIs, independent request hashing/estimator-unit builders, and unknown-to-result conversion.
+
+Probe reporting separates structural checker negatives, compiling mutations rejected by the
+checker, and type-sealed adversarial mutations that cannot compile. The sealed production shape
+removes the semantic injection point for generic helpers, function pointers, and closures; the
+checker does not claim general closure/function-pointer understanding. Positive controls preserve
+pre-freeze builder pushes, immutable frozen iteration, complete frozen consumption and tool
+projection, exact output reads, final request bytes/estimator units, definite success/failure
+`ToolResult`, synthetic unknown status, primitive text helpers, and diagnostics-only sampling.
 
 ## Later-stage boundary and deferred verification
 
