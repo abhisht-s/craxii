@@ -1116,7 +1116,7 @@ impl ModelOutputItem {
         true
     }
 
-    /// Ordered text parts for answer, refusal, or provider-exposed reasoning-summary items.
+    /// Ordered text parts for answer, refusal, or explicit provider reasoning-summary items.
     #[must_use]
     pub fn content_parts(&self) -> Option<&[ModelTextPart]> {
         match self {
@@ -1127,7 +1127,6 @@ impl ModelOutputItem {
         }
     }
 
-    /// Canonicalized structured data, when this is a structured-data item.
     #[must_use]
     pub const fn structured_data_value(&self) -> Option<&Value> {
         match self {
@@ -1362,7 +1361,7 @@ pub struct ModelResponseInput {
     pub selected_target: ModelTargetIdentity,
     pub output_items: Vec<ModelOutputItem>,
     pub stop_reason: ModelStopReason,
-    pub usage: ModelUsage,
+    pub usage: Option<ModelUsage>,
     pub provider_request_id: Option<ProviderEvidenceId>,
     pub provider_response_id: Option<ProviderEvidenceId>,
     pub provider_continuation: Option<ProviderOpaqueEvidence>,
@@ -1375,7 +1374,7 @@ pub struct ModelResponse {
     selected_target: ModelTargetIdentity,
     output_items: Vec<ModelOutputItem>,
     stop_reason: ModelStopReason,
-    usage: ModelUsage,
+    usage: Option<ModelUsage>,
     provider_request_id: Option<ProviderEvidenceId>,
     provider_response_id: Option<ProviderEvidenceId>,
     provider_continuation: Option<ProviderOpaqueEvidence>,
@@ -1447,7 +1446,6 @@ impl ModelResponse {
                     && !semantics.answer_text
                     && !semantics.tool_call
                     && !semantics.structured_data
-                    && !semantics.reasoning_summary
                     && !semantics.unknown
             }
             ModelStopReason::IncompleteProviderLimit => {
@@ -1501,7 +1499,7 @@ impl ModelResponse {
     }
 
     #[must_use]
-    pub const fn usage(&self) -> ModelUsage {
+    pub const fn usage(&self) -> Option<ModelUsage> {
         self.usage
     }
 
@@ -1562,7 +1560,7 @@ impl ModelResponse {
             "provider_response_id": self.provider_response_id.as_ref().map(ProviderEvidenceId::as_str),
             "selected_target": self.selected_target.semantic_value(),
             "stop_reason": self.stop_reason.as_str(),
-            "usage": self.usage.semantic_value(),
+            "usage": self.usage.map(ModelUsage::semantic_value),
         })
     }
 }
@@ -1636,7 +1634,7 @@ pub enum ModelStreamEvent {
     },
     Usage(ModelUsage),
     UsageUnavailable,
-    Completed(ModelResponse),
+    Completed(Box<ModelResponse>),
     ProviderError {
         kind: ModelStreamProviderErrorKind,
     },
@@ -1917,8 +1915,8 @@ impl ModelStreamValidator {
             }
             ModelStreamEvent::Completed(response) => {
                 if !self.active_calls.is_empty()
-                    || self.usage != Some(response.usage())
-                    || self.usage_unavailable
+                    || self.usage != response.usage()
+                    || self.usage_unavailable != response.usage().is_none()
                     || self.started_target.as_ref() != Some(response.selected_target())
                 {
                     return Err(Self::reject());
@@ -2117,7 +2115,7 @@ mod tests {
             selected_target: target().identity(),
             output_items: items,
             stop_reason,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: None,
             provider_response_id: None,
             provider_continuation: None,
@@ -2445,7 +2443,7 @@ mod tests {
             selected_target: target().identity(),
             output_items: vec![],
             stop_reason: ModelStopReason::Completed,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: None,
             provider_response_id: None,
             provider_continuation: None,
@@ -2467,7 +2465,7 @@ mod tests {
             selected_target: target().identity(),
             output_items: vec![call],
             stop_reason: ModelStopReason::Completed,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: None,
             provider_response_id: None,
             provider_continuation: None,
@@ -2563,7 +2561,7 @@ mod tests {
                     selected_target: target().identity(),
                     output_items: vec![item(semantic_class)],
                     stop_reason,
-                    usage: usage(),
+                    usage: Some(usage()),
                     provider_request_id: None,
                     provider_response_id: None,
                     provider_continuation: None,
@@ -2647,7 +2645,7 @@ mod tests {
                 "refusal + reasoning summary",
                 ModelStopReason::Refusal,
                 vec![SemanticClass::Refusal, SemanticClass::ReasoningSummary],
-                false,
+                true,
             ),
             (
                 "provider failure + tool",
@@ -2735,7 +2733,7 @@ mod tests {
                 selected_target: target().identity(),
                 output_items,
                 stop_reason,
-                usage: usage(),
+                usage: Some(usage()),
                 provider_request_id: None,
                 provider_response_id: None,
                 provider_continuation: None,
@@ -2825,9 +2823,9 @@ mod tests {
         let completed = vec![
             started,
             ModelStreamEvent::Usage(usage()),
-            ModelStreamEvent::Completed(
+            ModelStreamEvent::Completed(Box::new(
                 response(vec![ModelOutputItem::text(vec![text("a")]).unwrap()]).unwrap(),
-            ),
+            )),
         ];
         assert_eq!(
             validate_model_stream(&completed).unwrap(),
@@ -2878,9 +2876,9 @@ mod tests {
             provider_response_id: None,
         };
         let completed = || {
-            ModelStreamEvent::Completed(
+            ModelStreamEvent::Completed(Box::new(
                 response(vec![ModelOutputItem::text(vec![text("done")]).unwrap()]).unwrap(),
-            )
+            ))
         };
         let invalid = [
             vec![started.clone(), completed()],
@@ -2918,8 +2916,32 @@ mod tests {
             );
         }
         assert_eq!(
-            validate_model_stream(&[started, ModelStreamEvent::Usage(usage()), completed(),])
-                .unwrap(),
+            validate_model_stream(&[
+                started.clone(),
+                ModelStreamEvent::Usage(usage()),
+                completed(),
+            ])
+            .unwrap(),
+            ModelStreamState::Completed
+        );
+        let without_usage = ModelResponse::try_new(ModelResponseInput {
+            selected_target: target().identity(),
+            output_items: vec![ModelOutputItem::text(vec![text("done")]).unwrap()],
+            stop_reason: ModelStopReason::Completed,
+            usage: None,
+            provider_request_id: None,
+            provider_response_id: None,
+            provider_continuation: None,
+            provider_metadata: ProviderMetadata::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            validate_model_stream(&[
+                started,
+                ModelStreamEvent::UsageUnavailable,
+                ModelStreamEvent::Completed(Box::new(without_usage)),
+            ])
+            .unwrap(),
             ModelStreamState::Completed
         );
     }

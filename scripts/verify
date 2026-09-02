@@ -110,3 +110,10 @@ npx --yes markdownlint-cli2@0.22.1 '**/*.md'
 
 echo "Checking documentation renderer syntax"
 node --check docs/scripts/render-implementation-plan.mjs
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  echo "Verifying the native Stage 21 macOS client"
+  scripts/verify-stage21-macos-client
+else
+  echo "Stage 21 native macOS execution is not run on this non-macOS host; structural invariants were checked"
+fi

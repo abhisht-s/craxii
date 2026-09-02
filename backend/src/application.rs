@@ -13,6 +13,7 @@ pub mod command_gateway;
 pub mod command_service;
 pub mod context_assembler;
 pub mod device_provisioning;
+pub mod event_delivery;
 pub mod model_gateway;
 pub mod model_selection;
 pub mod projector;

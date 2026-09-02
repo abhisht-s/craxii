@@ -3,8 +3,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -13,9 +14,12 @@ const EC2: &str = include_str!("fixtures/config/valid/ec2-shape.toml");
 const SECRET_SENTINEL: &str = "startup-secret-sentinel-XYZ";
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static STARTUP_TEST_SERIAL: Mutex<()> = Mutex::new(());
+const STARTUP_POLL_TIMEOUT: Duration = Duration::from_secs(10);
+const STARTUP_SOCKET_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[test]
-fn valid_local_config_emits_pretty_initial_live_unready_evidence() {
+fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
     let config = TempConfig::new(LOCAL);
     let output = run(&["--config", config.path().to_str().unwrap()]);
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
@@ -143,7 +147,7 @@ fn bind_failure_precedes_database_and_runtime_creation() {
 }
 
 #[test]
-fn unreadable_provider_credential_fails_with_a_fixed_redacted_code() {
+fn unsafe_provider_credential_fails_with_a_fixed_redacted_code() {
     let root = temporary_root();
     fs::create_dir_all(&root).unwrap();
     let state_root = root.join("state");
@@ -206,7 +210,11 @@ fn no_valid_startup_format_reports_ready() {
     for input in [LOCAL, EC2] {
         let config = TempConfig::new(input);
         let output = run(&["--config", config.path().to_str().unwrap()]);
-        assert!(output.status.success());
+        assert!(
+            output.status.success(),
+            "safe startup failure: {}",
+            text(&output.stderr)
+        );
         let stdout = text(&output.stdout);
         assert!(!stdout.contains("ready=true"));
         assert!(!stdout.contains("\"ready\":true"));
@@ -216,73 +224,169 @@ fn no_valid_startup_format_reports_ready() {
 }
 
 #[test]
-fn live_provider_composition_becomes_ready_after_scheduler_initial_scan() {
-    use std::io::{Read as _, Write as _};
-    use std::net::TcpStream;
-
+fn configured_live_provider_becomes_ready_after_initial_scan_without_network_probe() {
     let config = TempConfig::new(LOCAL);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_craxii-server"))
-        .args(["--config", config.path().to_str().unwrap()])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("craxii-server binary should execute");
+    let mut child = spawn(config.path());
     let mut ready = false;
-    for _ in 0..300 {
+    let startup_deadline = Instant::now() + STARTUP_POLL_TIMEOUT;
+    while Instant::now() < startup_deadline {
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        if let Ok(mut stream) = TcpStream::connect(&config.authority) {
-            stream
-                .write_all(
-                    format!(
-                        "GET /health/ready HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                        config.authority
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            let mut response = String::new();
-            stream.read_to_string(&mut response).unwrap();
-            if response.starts_with("HTTP/1.1 200") {
-                ready = true;
-                break;
-            }
+        if readiness_status(&config.authority) == Some(200) {
+            ready = true;
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }
-    terminate(&mut child);
-    let output = child.wait_with_output().unwrap();
-    assert!(ready, "composition did not become ready: {}", text(&output.stderr));
+    let output = terminate_and_wait(child);
+    assert!(
+        ready,
+        "composition did not become ready: {}",
+        text(&output.stderr)
+    );
     assert!(output.status.success(), "stderr: {}", text(&output.stderr));
 }
 
+#[test]
+fn missing_provider_credential_remains_live_unready() {
+    let config = TempConfig::new(LOCAL);
+    fs::remove_file(config.root.join("credentials/openai_primary")).unwrap();
+    let mut child = spawn(config.path());
+    let mut observed_unready = false;
+    let startup_deadline = Instant::now() + STARTUP_POLL_TIMEOUT;
+    while Instant::now() < startup_deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        match readiness_status(&config.authority) {
+            Some(503) => {
+                observed_unready = true;
+                break;
+            }
+            Some(200) => panic!("missing credential must not become ready"),
+            _ => {}
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = terminate_and_wait(child);
+    assert!(observed_unready);
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+}
+
+#[test]
+fn unsupported_initial_native_continuation_fails_before_runtime_side_effects() {
+    let config = TempConfig::new(&LOCAL.replacen(
+        "reasoning_continuation = false",
+        "reasoning_continuation = true",
+        2,
+    ));
+    let output = run(&["--config", config.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        text(&output.stderr),
+        "craxii fatal: provider_composition_failure\n"
+    );
+    assert!(!config.root.join("state/db/craxii.sqlite3").exists());
+}
+
 fn run(arguments: &[&str]) -> Output {
+    let authority = configured_authority(arguments);
     let mut child = Command::new(env!("CARGO_BIN_EXE_craxii-server"))
         .args(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("craxii-server binary should execute");
-    for _ in 0..200 {
+    let startup_deadline = Instant::now() + STARTUP_POLL_TIMEOUT;
+    while Instant::now() < startup_deadline {
         if child.try_wait().unwrap().is_some() {
             return child.wait_with_output().unwrap();
+        }
+        if authority.as_deref().and_then(readiness_status).is_some() {
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }
     // Successful Stage 10 startup is a long-lived process. Exercise the real
     // composition-edge SIGTERM path so these startup assertions also wait for
     // a graceful RuntimeInstance close instead of leaving stale test state.
-    terminate(&mut child);
-    child.wait_with_output().unwrap()
+    terminate_and_wait(child)
+}
+
+fn configured_authority(arguments: &[&str]) -> Option<String> {
+    let config_path = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--config")?
+        .get(1)?;
+    fs::read_to_string(config_path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix("bind_address = \"")
+                .and_then(|value| value.strip_suffix('"'))
+                .map(str::to_owned)
+        })
+}
+
+fn spawn(config: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_craxii-server"))
+        .args(["--config", config.to_str().unwrap()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("craxii-server binary should execute")
 }
 
 fn terminate(child: &mut std::process::Child) {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
-    // SAFETY: `child.id()` is the live child we own and signal 15 is SIGTERM on every Unix target.
+    // SAFETY: `child.id()` is the live child we own and signal 15 is SIGTERM on
+    // every Unix target supported by this repository.
     assert_eq!(unsafe { kill(child.id() as i32, 15) }, 0);
+}
+
+fn terminate_and_wait(mut child: std::process::Child) -> Output {
+    terminate(&mut child);
+    for attempt in 0..300 {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        // A live-unready response can race the brief handoff from completed
+        // bootstrap to installation of the process signal receiver. Repeating
+        // SIGTERM after that handoff preserves the production shutdown path.
+        if attempt == 4 {
+            terminate(&mut child);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    child.kill().unwrap();
+    let _ = child.wait_with_output();
+    panic!("craxii-server did not stop within the configured shutdown bound");
+}
+
+fn readiness_status(authority: &str) -> Option<u16> {
+    use std::io::{Read as _, Write as _};
+    let address = authority.parse().ok()?;
+    let mut stream = std::net::TcpStream::connect_timeout(&address, STARTUP_SOCKET_TIMEOUT).ok()?;
+    let socket_deadline = Some(STARTUP_SOCKET_TIMEOUT);
+    stream.set_read_timeout(socket_deadline).ok()?;
+    stream.set_write_timeout(socket_deadline).ok()?;
+    stream
+        .write_all(
+            format!("GET /health/ready HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|value| value.parse().ok())
 }
 
 fn text(bytes: &[u8]) -> String {
@@ -301,14 +405,21 @@ struct TempConfig {
     root: PathBuf,
     path: PathBuf,
     authority: String,
+    _serial_guard: MutexGuard<'static, ()>,
 }
 
 impl TempConfig {
     fn new(contents: &str) -> Self {
-        Self::new_with_authority(contents, &available_loopback_authority())
+        let serial_guard = startup_test_guard();
+        let authority = available_loopback_authority();
+        Self::new_locked(contents, &authority, serial_guard)
     }
 
     fn new_with_authority(contents: &str, authority: &str) -> Self {
+        Self::new_locked(contents, authority, startup_test_guard())
+    }
+
+    fn new_locked(contents: &str, authority: &str, serial_guard: MutexGuard<'static, ()>) -> Self {
         let root = temporary_root();
         fs::create_dir(&root).unwrap();
         let state_root = root.join("state");
@@ -388,12 +499,19 @@ impl TempConfig {
             root,
             path,
             authority: authority.to_owned(),
+            _serial_guard: serial_guard,
         }
     }
 
     fn path(&self) -> &Path {
         &self.path
     }
+}
+
+fn startup_test_guard() -> MutexGuard<'static, ()> {
+    STARTUP_TEST_SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn available_loopback_authority() -> String {

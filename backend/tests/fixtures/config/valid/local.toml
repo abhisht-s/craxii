@@ -40,7 +40,7 @@ token_estimator = "conservative_v1"
 context_window_tokens = 128000
 max_output_tokens = 16384
 requested_output_tokens = 8192
-reasoning_continuation = true
+reasoning_continuation = false
 
 [models.targets.capabilities]
 text_input = true
@@ -48,8 +48,8 @@ text_output = true
 custom_tool_calling = true
 streaming = true
 ordered_output_items = true
-structured_output = true
-reasoning_continuation = true
+structured_output = false
+reasoning_continuation = false
 
 [[models.targets]]
 id = "secondary"

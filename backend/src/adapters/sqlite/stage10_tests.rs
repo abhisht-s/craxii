@@ -2048,7 +2048,7 @@ impl ModelProvider for Stage17Provider {
                 selected_target: target.clone(),
                 output_items: items,
                 stop_reason,
-                usage,
+                usage: Some(usage),
                 provider_request_id: Some(request_id.clone()),
                 provider_response_id: Some(response_id.clone()),
                 provider_continuation: None,
@@ -2062,7 +2062,7 @@ impl ModelProvider for Stage17Provider {
             }]);
             events.extend(semantic_events);
             events.push_back(ModelStreamEvent::Usage(usage));
-            events.push_back(ModelStreamEvent::Completed(response));
+            events.push_back(ModelStreamEvent::Completed(Box::new(response)));
             Ok(Box::new(Stage17ProviderStream { events }) as Box<dyn ModelProviderStream>)
         })
     }

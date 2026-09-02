@@ -8,11 +8,19 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
 cd "${repository_root}"
 
 if [[ "${CRAXII_OPENAI_LIVE:-}" != "1" || -z "${OPENAI_API_KEY:-}" || -z "${CRAXII_OPENAI_MODEL:-}" ]]; then
-  echo "STAGE_19_LIVE_SMOKE: NOT_CONFIGURED"
-  if [[ "${CRAXII_OPENAI_LIVE_REQUIRED:-}" == "1" ]]; then
-    exit 2
-  fi
-  exit 0
+  echo "STAGE_19_LIVE_OPENAI_SMOKE: NOT_CONFIGURED" >&2
+  exit 2
 fi
 
-cargo test --locked -p craxii-server --test openai_live live_stateless_custom_tool_round_trip -- --ignored --nocapture
+live_root="$(mktemp -d "${TMPDIR:-/tmp}/craxii-stage19-openai-live.XXXXXX")"
+trap 'rm -rf -- "${live_root}"' EXIT
+credential_directory="${live_root}/credentials"
+mkdir -m 700 "${credential_directory}"
+umask 077
+printf '%s\n' "${OPENAI_API_KEY}" > "${credential_directory}/openai_live"
+chmod 600 "${credential_directory}/openai_live"
+export CRAXII_STAGE19_LIVE_CREDENTIAL_DIR="${credential_directory}"
+unset OPENAI_API_KEY
+
+cargo test --locked -p craxii-server --test openai_live \
+  live_openai_production_path_persists_tool_and_final_completion -- --ignored --nocapture

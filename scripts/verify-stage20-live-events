@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '%s\n' 'cargo is required to run the Stage 20 deterministic gate' >&2
+  exit 1
+fi
+
+cd "${repository_root}"
+
+cargo test --locked -p craxii-server --lib application::event_delivery::tests
+cargo test --locked -p craxii-server --lib application::model_gateway::tests::stage20
+cargo test --locked -p craxii-server --lib protocol::tests::language_neutral_protocol_v1_goldens_are_exact_and_safe
+cargo test --locked -p craxii-server --lib protocol::tests::stage20_simulated_client_converges_with_duplicates_delays_and_draft_loss
+cargo test --locked -p craxii-server --test stage20 -- --test-threads=1
+
+printf '%s\n' 'STAGE_20_DETERMINISTIC_LIVE_EVENTS: PASSED'

@@ -210,6 +210,7 @@ impl Harness {
             health.clone(),
             admission.clone(),
             cursors.clone(),
+            Arc::new(crate::application::event_delivery::LiveEventBroker::new()),
             fatal,
             ws_shutdown,
             connections.clone(),

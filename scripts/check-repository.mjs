@@ -3593,7 +3593,6 @@ function verifyStage15CanonicalModelStructure(rustRoot, productionFiles) {
   );
   const scripted = readFileSync(join(rustRoot, 'adapters', 'scripted_provider.rs'), 'utf8');
   const bootstrap = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
-  const cargoManifest = readFileSync(join(repositoryRoot, 'backend', 'Cargo.toml'), 'utf8');
 
   assert(
     /MAX_MODEL_OUTPUT_ITEMS:\s*usize\s*=\s*64;/.test(model) &&
@@ -4314,8 +4313,16 @@ function verifyStage17Boundaries(rustRoot, productionFiles, migration4) {
     'AgentLoop tool dispatch must remain sequential');
   assert(!/ScriptedProvider/.test(bootstrap),
     'production startup must not compose ScriptedProvider as a live provider');
-  assert(/start_scheduler\s*\(/.test(bootstrap) && /OpenAiProvider::try_new\s*\(/.test(bootstrap),
-    'Stage 19 production startup must install the Stage 17 runner only with the live provider');
+  assert(
+    /OpenAiProvider::try_new\s*\(/.test(bootstrap) &&
+      /OpenAiConservativeEstimator::new\s*\(/.test(bootstrap) &&
+      /load_credentials\s*\(/.test(bootstrap) &&
+      /AgentLoop::new\s*\(/.test(bootstrap) &&
+      /ModelGateway::new\s*\(/.test(bootstrap) &&
+      /start_scheduler\s*\(/.test(bootstrap) &&
+      /ReadyAfterInitialScan/.test(bootstrap),
+    'Stage 19 production startup does not compose OpenAI through ModelGateway and AgentLoop',
+  );
   const sqliteState = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'state_store.rs'), 'utf8');
   const sqliteJournal = readFileSync(join(rustRoot, 'adapters', 'sqlite', 'journal.rs'), 'utf8');
   assert(/const\s+SCHEMA_REVISION:\s*i64\s*=\s*4;/.test(sqliteState) &&
@@ -4354,7 +4361,6 @@ function verifyStage18Boundaries(rustRoot) {
   for (const path of requiredPaths) {
     assert(existsSync(join(repositoryRoot, path)), `Stage 18 required path is absent: ${path}`);
   }
-
   const script = readFileSync(
     join(repositoryRoot, 'scripts', 'verify-stage18-deterministic'),
     'utf8',
@@ -4409,76 +4415,262 @@ function verifyStage18Boundaries(rustRoot) {
   const bootstrap = stripRustComments(withoutRustTestModules(
     readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8'),
   ));
-  assert(!/ScriptedProvider/.test(bootstrap),
-    'Stage 18 test provider crossed into production composition');
+  assert(
+    !/\bScriptedProvider\b/.test(bootstrap),
+    'ScriptedProvider crossed the test-only production boundary',
+  );
 }
 
 function verifyStage19Boundaries(rustRoot, productionFiles, cargoManifest) {
   const requiredPaths = [
     'backend/src/adapters/openai/mod.rs',
+    'backend/src/adapters/openai/wire.rs',
+    'backend/src/adapters/openai/sse.rs',
     'backend/src/adapters/openai/tests.rs',
     'backend/tests/fixtures/openai/responses-text.sse',
     'backend/tests/fixtures/openai/responses-tool-call.sse',
-    'backend/tests/fixtures/openai/responses-reasoning.sse',
+    'backend/tests/fixtures/openai/responses-refusal.sse',
+    'backend/tests/fixtures/openai/responses-incomplete.sse',
+    'backend/tests/fixtures/openai/http-errors.json',
     'backend/tests/openai_live.rs',
+    'docs/decisions/stage19-openai-adapter.md',
     'docs/dependencies/reqwest.md',
     'scripts/verify-stage19-openai-live',
   ];
   for (const path of requiredPaths) {
     assert(existsSync(join(repositoryRoot, path)), `Stage 19 required path is absent: ${path}`);
   }
+
   assert(
-    /^reqwest\s*=\s*\{[^\n]*version\s*=\s*"0\.13\.4"[^\n]*default-features\s*=\s*false[^\n]*features\s*=\s*\["json", "rustls"\][^\n]*\}$/m.test(cargoManifest),
-    'Stage 19 Reqwest declaration differs from the reviewed feature set',
+    /^reqwest\s*=\s*\{[^\n]*version\s*=\s*"0\.13\.4"[^\n]*default-features\s*=\s*false[^\n]*features\s*=\s*\["rustls"\][^\n]*\}$/m.test(cargoManifest),
+    'Stage 19 Reqwest version or minimal rustls-only feature set differs',
   );
-  const openai = stripRustComments(withoutRustTestModules(
-    readFileSync(join(rustRoot, 'adapters', 'openai', 'mod.rs'), 'utf8'),
-  ));
-  for (const required of [
-    /impl\s+ModelProvider\s+for\s+OpenAiProvider/,
-    /"store"\.to_owned\(\),\s*false\.into\(\)/,
-    /"parallel_tool_calls"\.to_owned\(\),\s*false\.into\(\)/,
-    /"truncation"\.to_owned\(\),\s*"disabled"\.into\(\)/,
-    /"reasoning\.encrypted_content"/,
-    /MAX_STREAM_BYTES:\s*usize\s*=\s*8\s*\*\s*1024\s*\*\s*1024/,
-    /UnknownProviderEvent/,
-  ]) {
-    assert(required.test(openai), `Stage 19 OpenAI adapter contract is incomplete: ${required}`);
-  }
+  const dependencyRegistry = readFileSync(join(repositoryRoot, 'docs', 'dependency-registry.json'), 'utf8');
   assert(
-    !/\b(?:StateStore|SqliteStateStore|ToolExecutionService|Workstation|sqlx)\b/.test(openai),
-    'Stage 19 OpenAI adapter crossed persistence/tool/workstation boundaries',
+    /"package"\s*:\s*"reqwest"[\s\S]{0,400}"approved_compatible_requirement"\s*:\s*"\^0\.13\.4"[\s\S]{0,400}"enabled_features"\s*:\s*\[\s*"rustls"\s*\]/.test(dependencyRegistry),
+    'Stage 19 Reqwest registry entry differs from Cargo',
   );
-  const reqwestLocations = productionFiles
-    .filter((file) => /\breqwest\b/.test(stripRustComments(withoutRustTestModules(file.source))))
-    .map((file) => file.path);
+
+  const adapterFiles = productionFiles.filter((file) => file.path.startsWith('adapters/openai/'));
+  assert(equalStringArrays(sortedStrings(adapterFiles.map((file) => file.path)), [
+    'adapters/openai/mod.rs',
+    'adapters/openai/sse.rs',
+    'adapters/openai/wire.rs',
+  ]), 'Stage 19 production OpenAI adapter module inventory differs');
+  const reqwestUsers = productionFiles.filter((file) => /\breqwest\b/.test(stripRustComments(withoutRustTestModules(file.source))));
   assert(
-    equalStringArrays(reqwestLocations, ['adapters/openai/mod.rs']),
-    `Reqwest escaped the OpenAI adapter: ${reqwestLocations.join(', ')}`,
+    equalStringArrays(reqwestUsers.map((file) => file.path), ['adapters/openai/mod.rs']),
+    `Reqwest escaped the OpenAI adapter: ${reqwestUsers.map((file) => file.path).join(', ')}`,
+  );
+  const adapterProduction = adapterFiles.map((file) => stripRustComments(withoutRustTestModules(file.source))).join('\n');
+  assert(
+    /impl\s+ModelProvider\s+for\s+OpenAiProvider/.test(adapterProduction) &&
+      /store:\s*false/.test(adapterProduction) &&
+      /stream:\s*true/.test(adapterProduction) &&
+      /parallel_tool_calls:\s*false/.test(adapterProduction) &&
+      /truncation:\s*"disabled"/.test(adapterProduction) &&
+      /strict:\s*false/.test(adapterProduction) &&
+      /retry\(reqwest::retry::never\(\)\)/.test(adapterProduction) &&
+      /redirect\(reqwest::redirect::Policy::none\(\)\)/.test(adapterProduction) &&
+      /\.no_proxy\(\)/.test(adapterProduction),
+    'Stage 19 stateless request or explicit transport controls differ',
+  );
+  assert(
+    !/\b(?:StateStore|ToolExecutionService|Workstation|sqlx)\b/.test(adapterProduction),
+    'OpenAI adapter crossed persistence, tool execution, or workstation boundaries',
+  );
+
+  const outsideAdapter = productionFiles
+    .filter((file) => !file.path.startsWith('adapters/openai/'))
+    .map((file) => stripRustComments(withoutRustTestModules(file.source)))
+    .join('\n');
+  assert(
+    !/\b(?:ResponsesRequest|EventEnvelope|FunctionTool|InputItemWire)\b/.test(outsideAdapter),
+    'OpenAI wire type escaped the adapter boundary',
   );
   const bootstrap = stripRustComments(withoutRustTestModules(
     readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8'),
   ));
   assert(
-    /load_credentials\s*\(/.test(bootstrap) &&
+    /LiveEventBroker::new/.test(bootstrap) &&
+      /live_events\.clone\(\) as Arc<dyn DraftSink>/.test(bootstrap) &&
       /OpenAiProvider::try_new\s*\(/.test(bootstrap) &&
       /ModelGateway::new\s*\(/.test(bootstrap) &&
       /AgentLoop::new\s*\(/.test(bootstrap) &&
-      /start_scheduler\s*\(/.test(bootstrap) &&
-      /ReadyAfterInitialScan/.test(bootstrap) &&
-      /Some\(scheduler_notifier\)/.test(bootstrap) &&
-      !/ScriptedProvider/.test(bootstrap),
-    'Stage 19 production provider/runner/readiness composition is incomplete',
+      !/ScriptedProvider|NoopDraftSink/.test(bootstrap),
+    'Stage 20 production path must use OpenAI through ModelGateway/AgentLoop with LiveEventBroker',
   );
-  const liveScript = readFileSync(
-    join(repositoryRoot, 'scripts', 'verify-stage19-openai-live'),
+  const liveScript = readFileSync(join(repositoryRoot, 'scripts', 'verify-stage19-openai-live'), 'utf8');
+  assert(
+    /STAGE_19_LIVE_OPENAI_SMOKE: NOT_CONFIGURED/.test(liveScript) &&
+      /unset OPENAI_API_KEY/.test(liveScript) &&
+      /--ignored/.test(liveScript),
+    'Stage 19 live smoke is not explicit, credential-file based, and fail-closed when unconfigured',
+  );
+}
+
+function verifyStage20Boundaries(rustRoot) {
+  const broker = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'application', 'event_delivery.rs'), 'utf8'),
+  ));
+  assert(
+    /impl\s+DraftSink\s+for\s+LiveEventBroker/.test(broker) &&
+      /WEBSOCKET_OUTBOUND_FRAMES/.test(broker) &&
+      /enqueue_delta/.test(broker) &&
+      /enqueue_structural/.test(broker),
+    'Stage 20 bounded production LiveEventBroker is incomplete',
+  );
+  assert(
+    !/\bsqlx\b|StateStore|JournalEventPayload|finish_model_invocation|commit_assistant_completion/.test(broker),
+    'Stage 20 LiveEventBroker acquired persistence or canonical mutation authority',
+  );
+
+  const gateway = stripRustComments(withoutRustTestModules(
+    readFileSync(join(rustRoot, 'application', 'model_gateway.rs'), 'utf8'),
+  ));
+  assert(
+    /CanonicalDraftDelta::Text/.test(gateway) &&
+      /CanonicalDraftDelta::Refusal/.test(gateway) &&
+      !/CanonicalDraftDelta::(?:Reasoning|Tool|Structured|Opaque)/.test(gateway) &&
+      !/\bOpenAi|ResponsesRequest|response\.output_text\.delta/.test(gateway),
+    'Stage 20 gateway draft projection is not provider-neutral text/refusal only',
+  );
+
+  const protocol = readFileSync(join(rustRoot, 'protocol.rs'), 'utf8');
+  for (const publicName of [
+    'assistant.draft_started',
+    'assistant.draft_delta',
+    'assistant.draft_abandoned',
+  ]) {
+    assert(protocol.includes(publicName), `Stage 20 public protocol is missing ${publicName}`);
+  }
+  assert(
+    /enum DraftAbandonReason[\s\S]*ToolContinuation[\s\S]*DeliveryLimit/.test(protocol) &&
+      !/OpenAi|ReasoningSummary|ToolArgument|ProviderOpaque/.test(protocol),
+    'Stage 20 public protocol exposes a provider, reasoning, opaque, or tool-argument type',
+  );
+
+  const http = readFileSync(join(rustRoot, 'adapters', 'http.rs'), 'utf8');
+  const websocket = extractRustFunction(http, 'run_websocket');
+  const syncSend = websocket.indexOf('SyncCompleteEnvelope::new');
+  const draftSubscribe = websocket.indexOf('state.live_events.subscribe()');
+  assert(
+    syncSend !== -1 && draftSubscribe > syncSend &&
+      /ConnectionDraftState/.test(http) &&
+      /close_code::AGAIN/.test(websocket),
+    'Stage 20 WebSocket sync gating, local draft tracking, or 1013 pressure close is incomplete',
+  );
+}
+
+function verifyStage21MacOSClientBoundaries() {
+  const clientRoot = join(repositoryRoot, 'clients', 'macos');
+  const requiredPaths = [
+    'clients/macos/Craxii.xcodeproj/project.pbxproj',
+    'clients/macos/Craxii.xcodeproj/xcshareddata/xcschemes/Craxii.xcscheme',
+    'clients/macos/CraxiiClient/Package.swift',
+    'clients/macos/CraxiiClient/Sources/CraxiiProtocol/ProtocolModels.swift',
+    'clients/macos/CraxiiClient/Sources/CraxiiClientCore/ClientSession.swift',
+    'clients/macos/CraxiiClient/Sources/CraxiiAppleAdapters/KeychainDeviceCredentialStore.swift',
+    'clients/macos/CraxiiClient/Tests/CraxiiProtocolTests/ProtocolFixtureTests.swift',
+    'clients/macos/CraxiiApp/DiagnosticView.swift',
+    'clients/macos/CraxiiTests/CraxiiTests.swift',
+    'clients/macos/CraxiiUITests/CraxiiUITests.swift',
+    'docs/decisions/stage21-native-macos-client.md',
+    'scripts/verify-stage21-macos-client',
+  ];
+  for (const path of requiredPaths) {
+    assert(existsSync(join(repositoryRoot, path)), `Stage 21 required path is absent: ${path}`);
+  }
+
+  const project = readFileSync(join(clientRoot, 'Craxii.xcodeproj', 'project.pbxproj'), 'utf8');
+  for (const target of ['Craxii', 'CraxiiTests', 'CraxiiUITests']) {
+    assert(
+      new RegExp(`PBXNativeTarget;[\\s\\S]{0,300}name = ${target};`).test(project),
+      `Stage 21 Xcode target is absent: ${target}`,
+    );
+  }
+  assert(
+    /MACOSX_DEPLOYMENT_TARGET = 14\.0/.test(project) &&
+      /SWIFT_VERSION = 6\.0/.test(project) &&
+      /PRODUCT_BUNDLE_IDENTIFIER = com\.craxii\.client\.macos;/.test(project) &&
+      /CODE_SIGN_IDENTITY = "-"/.test(project) &&
+      !/DEVELOPMENT_TEAM = "[A-Z0-9]+"/.test(project),
+    'Stage 21 deployment, Swift mode, bundle identifier, or local signing settings differ',
+  );
+  const scheme = readFileSync(
+    join(clientRoot, 'Craxii.xcodeproj', 'xcshareddata', 'xcschemes', 'Craxii.xcscheme'),
+    'utf8',
+  );
+  for (const target of ['BlueprintName="Craxii"', 'BlueprintName="CraxiiTests"', 'BlueprintName="CraxiiUITests"']) {
+    assert(scheme.includes(target), `Stage 21 shared scheme is missing ${target}`);
+  }
+
+  const manifest = readFileSync(join(clientRoot, 'CraxiiClient', 'Package.swift'), 'utf8');
+  assert(
+    /dependencies:\s*\[\s*\]/.test(manifest) &&
+      !/\.package\s*\(\s*(?:url|path):/.test(manifest) &&
+      /name:\s*"CraxiiProtocol"/.test(manifest) &&
+      /name:\s*"CraxiiClientCore"\s*,\s*dependencies:\s*\["CraxiiProtocol"\]/.test(manifest) &&
+      /name:\s*"CraxiiAppleAdapters"[\s\S]{0,160}dependencies:\s*\["CraxiiProtocol", "CraxiiClientCore"\]/.test(manifest),
+    'Stage 21 local Swift package dependencies or module direction differ',
+  );
+
+  const swiftFiles = walkFiles(clientRoot).filter(
+    (path) => path.endsWith('.swift') && !path.includes(`${join('CraxiiClient', '.build')}/`),
+  );
+  const swiftSource = swiftFiles.map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert(
+    !/\bUserDefaults\b|\bSQLite\b|import\s+WebKit|\bElectron\b|\bReactNative\b|\bFlutter\b/.test(swiftSource),
+    'Stage 21 client contains forbidden credential/cache persistence or wrapper framework usage',
+  );
+  const protocolSource = walkFiles(join(clientRoot, 'CraxiiClient', 'Sources', 'CraxiiProtocol'))
+    .map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert(
+    !/\bOpenAI\b|\bOpenAi\b|\breqwest\b|\bsqlx\b|JournalEventPayload|ModelProvider/.test(protocolSource),
+    'Stage 21 public Swift protocol is coupled to a provider or Rust-internal type',
+  );
+
+  const keychain = readFileSync(
+    join(clientRoot, 'CraxiiClient', 'Sources', 'CraxiiAppleAdapters', 'KeychainDeviceCredentialStore.swift'),
     'utf8',
   );
   assert(
-    liveScript.includes('STAGE_19_LIVE_SMOKE: NOT_CONFIGURED') &&
-      liveScript.includes('--ignored --nocapture'),
-    'Stage 19 live gate lacks explicit prerequisite/deferred behavior',
+    /kSecClassGenericPassword/.test(keychain) &&
+      /com\.craxii\.device-token\.v1/.test(keychain) &&
+      /kSecAttrAccessibleWhenUnlockedThisDeviceOnly/.test(keychain) &&
+      /kSecAttrSynchronizable as String:\s*false/.test(keychain) &&
+      !/kSecAttrAccessGroup/.test(keychain),
+    'Stage 21 Keychain item contract differs',
   );
+  const fixtureTests = readFileSync(
+    join(clientRoot, 'CraxiiClient', 'Tests', 'CraxiiProtocolTests', 'ProtocolFixtureTests.swift'),
+    'utf8',
+  );
+  assert(
+    /backend\/tests\/fixtures\/protocol-v1/.test(fixtureTests) && /manifest\.sha256/.test(fixtureTests),
+    'Stage 21 Swift tests do not consume the backend protocol manifest',
+  );
+
+  const sensitiveSettings = [
+    join(clientRoot, 'Craxii.xcodeproj', 'project.pbxproj'),
+    join(clientRoot, 'CraxiiApp', 'Info.plist'),
+  ].map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert(
+    !/[a-f0-9]{64}/.test(sensitiveSettings) && !/NSAllowsArbitraryLoads/.test(sensitiveSettings),
+    'Stage 21 settings contain token-shaped material or broad ATS permission',
+  );
+  const appSource = walkFiles(join(clientRoot, 'CraxiiApp'))
+    .filter((path) => path.endsWith('.swift'))
+    .map((path) => readFileSync(path, 'utf8')).join('\n');
+  assert(
+    !/submitMessage\s*\(|cancel\s*\(workID:|TextEditor|NavigationStack|NavigationSplitView/.test(appSource),
+    'Stage 21 diagnostic shell crossed into Stage 22 chat or navigation UX',
+  );
+
+  const ignore = readFileSync(join(repositoryRoot, '.gitignore'), 'utf8');
+  for (const pattern of ['.build/', 'DerivedData/', '*.xcuserstate', 'xcuserdata/']) {
+    assert(ignore.includes(pattern), `Stage 21 Xcode/Swift ignore rule is absent: ${pattern}`);
+  }
 }
 
 function verifyStage16ProbeRepository() {
@@ -5609,10 +5801,13 @@ function verifyStage13Boundaries() {
       /ShutdownController/.test(runtimeController) && /classify_unresolved_shutdown_work/.test(runtimeController),
     'Stage 10 heartbeat and conservative graceful-shutdown controller are incomplete',
   );
+  const productionStartup = readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8');
   assert(
-    !/start_scheduler\s*\(/.test(readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8')) &&
-      !/mark_ready\s*\(/.test(readFileSync(join(rustRoot, 'bootstrap', 'startup.rs'), 'utf8')),
-    'production Stage 10 bootstrap must remain live_unready until a real Stage 17 WorkRunner exists',
+    /AgentLoop::new\s*\(/.test(productionStartup) &&
+      /start_scheduler\s*\(/.test(productionStartup) &&
+      /ReadyAfterInitialScan/.test(productionStartup) &&
+      !/mark_ready\s*\(/.test(productionStartup),
+    'production readiness must be owned by the Stage 17 AgentLoop scheduler initial-scan handshake',
   );
 
   const commandService = readFileSync(join(rustRoot, 'application', 'command_service.rs'), 'utf8')
@@ -5772,6 +5967,7 @@ function verifyStage13Boundaries() {
       'cancellation-request.json',
       'cancellation-response.json',
       'durable-events.json',
+      'ephemeral-drafts.json',
       'error-envelope.json',
       'health.json',
       'message-request.json',
@@ -5811,7 +6007,7 @@ function verifyStage13Boundaries() {
     'forbidden direct Hyper/HTTP/production WebSocket/TLS/CORS dependency is present',
   );
   const productionImplementationFiles = rustFiles
-    .filter((path) => !/_tests\.rs$/.test(path))
+    .filter((path) => !/(?:\/tests|_tests)\.rs$/.test(path))
     .map((path) => ({
       path: relative(rustRoot, path),
       source: readFileSync(path, 'utf8'),
@@ -5820,9 +6016,8 @@ function verifyStage13Boundaries() {
     (file) => ![
       'application/model_gateway.rs',
       'application/agent_loop.rs',
-      'adapters/openai/mod.rs',
       'bootstrap/startup.rs',
-    ].includes(file.path),
+    ].includes(file.path) && !file.path.startsWith('adapters/openai/'),
   );
   verifyStage13WorkstationStructure(rustRoot, productionImplementationFiles);
   const stage13CheckerNegativeProbeCount = verifyStage13CheckerNegativeProbes();
@@ -5841,6 +6036,8 @@ function verifyStage13Boundaries() {
   verifyStage17Boundaries(rustRoot, productionImplementationFiles, migration4);
   verifyStage18Boundaries(rustRoot);
   verifyStage19Boundaries(rustRoot, productionImplementationFiles, cargoManifest);
+  verifyStage20Boundaries(rustRoot);
+  verifyStage21MacOSClientBoundaries();
   const stage15CheckerNegativeProbeCount = stage15Checker.negativeProbeCount;
   const checkerNegativeProbeCount =
     stage13CheckerNegativeProbeCount + stage14CheckerNegativeProbeCount +
@@ -5995,6 +6192,8 @@ try {
   console.log('Stage 16 compilation-gated positive controls passed: 14.');
   console.log('Stage 16 structural invariants passed.');
   console.log('Stage 17 narrow boundaries and V4 evidence inventory passed.');
+  console.log('Stage 20 live-event boundaries and safe public projection passed.');
+  console.log('Stage 21 native macOS client structural boundaries passed.');
   }
 } catch (error) {
   console.error(`Repository invariant failed: ${error.message}`);

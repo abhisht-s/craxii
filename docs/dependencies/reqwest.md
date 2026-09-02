@@ -1,28 +1,11 @@
 # `reqwest` dependency decision
 
-- Package: `reqwest` from crates.io, direct normal dependency owned only by the OpenAI outward
-  adapter.
-- Purpose: bounded authenticated HTTP/1.1 requests and incremental response-body reads for the
-  OpenAI Responses API SSE transport.
-- Declaration: `version = "0.13.4"`, default features disabled, exactly `json` and `rustls`
-  enabled.
-- Resolution, MSRV, and license: `reqwest 0.13.4`, Rust `1.85`, MIT OR Apache-2.0; verified with
-  Rust `1.98` on 2026-09-01.
-- Feature policy: default TLS, charset, HTTP/2, system-proxy, compression, cookies, multipart,
-  SOCKS, and HTTP/3 features remain disabled. `rustls` supplies certificate verification and
-  `json` supplies request/fixture serialization. The adapter explicitly selects HTTP/1.1,
-  disallows redirects, applies connect/idle/absolute limits, and implements no transport retry.
-- Transitive notes: the locked Rustls graph includes Hyper transport crates, platform certificate
-  verification, `aws-lc-rs`/`aws-lc-sys`, and their build helpers. These remain transitive; no
-  provider wire or transport type crosses the adapter boundary.
-- Build/native/unsafe: `aws-lc-sys` has a CMake/C compiler build and native cryptographic code.
-  Platform networking/TLS crates contain reviewed unsafe internals; Craxii adds no unsafe provider
-  transport code.
-- Secret boundary: the API key enters only a sensitive Authorization header from `SecretString`.
-  Request bodies, response bodies, headers, provider messages, and keys are neither logged nor
-  formatted; only canonical hashes and bounded classified evidence leave the adapter.
-- Advisories: the locked cargo-deny advisory and license checks must pass without a Reqwest-specific
-  ignore.
-- Removal path: replace the outward adapter transport while retaining the canonical
-  `ModelProvider` request/stream/error contract and local fixture suite.
-- Review: approved by the repository/project owner on 2026-09-01 for Stage 19.
+- Package: `reqwest` from crates.io, direct normal dependency owned by the OpenAI outward adapter.
+- Purpose: authenticated HTTP/1.1 Responses API requests and incremental SSE body reads.
+- Declaration: `version = "0.13.4"`, default features disabled, exactly `rustls` enabled.
+- Resolution/MSRV/license: `reqwest 0.13.4`, Rust 1.85, MIT OR Apache-2.0; compatible with Craxii's Rust 1.98 policy as reviewed on 2026-09-02. The selected Rustls graph additionally uses the permissive ISC and MIT-0 software licenses and CDLA-Permissive-2.0 for the public certificate-root dataset. Those three licenses are admitted explicitly in `deny.toml`; no per-crate exception or confidence override is used.
+- Feature policy: no SDK, JSON feature, cookies, redirects, proxy discovery, compression, multipart, SOCKS, HTTP/2, or HTTP/3. Existing `serde_json` performs bounded wire serialization.
+- Transport policy: HTTP/1.1, no redirects, `no_proxy`, `retry(never)`, no verbose connection logging, explicit connect/idle/absolute deadlines, and HTTPS-only production endpoints. Local HTTP is accepted only in adapter unit tests.
+- Transitive notes: the locked Rustls/Hyper graph includes platform certificate verification and `aws-lc-rs`/`aws-lc-sys`; those remain adapter-internal transitive implementation details. The Rustls feature is retained over native TLS so production Linux does not acquire an OpenSSL system dependency.
+- Secret boundary: `SecretString` enters only a bearer header. Authorization, bodies, provider messages, tool data, error bodies, and opaque continuation bytes are never formatted or traced.
+- Removal path: replace the outward transport while retaining the provider-neutral `ModelProvider` request, stream, error, and certainty contracts.

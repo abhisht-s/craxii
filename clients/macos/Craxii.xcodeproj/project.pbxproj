@@ -1,0 +1,170 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		010000000000000000000001 /* CraxiiApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000001 /* CraxiiApp.swift */; };
+		010000000000000000000002 /* ConversationStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000002 /* ConversationStore.swift */; };
+		010000000000000000000003 /* DiagnosticView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000003 /* DiagnosticView.swift */; };
+		010000000000000000000004 /* CraxiiTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000005 /* CraxiiTests.swift */; };
+		010000000000000000000005 /* CraxiiUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 020000000000000000000006 /* CraxiiUITests.swift */; };
+		010000000000000000000006 /* CraxiiAppleAdapters in Frameworks */ = {isa = PBXBuildFile; productRef = 110000000000000000000001 /* CraxiiAppleAdapters */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		030000000000000000000001 = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 080000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 090000000000000000000001;
+			remoteInfo = Craxii;
+		};
+		030000000000000000000002 = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 080000000000000000000001 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 090000000000000000000001;
+			remoteInfo = Craxii;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		020000000000000000000001 /* CraxiiApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CraxiiApp.swift; sourceTree = "<group>"; };
+		020000000000000000000002 /* ConversationStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConversationStore.swift; sourceTree = "<group>"; };
+		020000000000000000000003 /* DiagnosticView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiagnosticView.swift; sourceTree = "<group>"; };
+		020000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		020000000000000000000005 /* CraxiiTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CraxiiTests.swift; sourceTree = "<group>"; };
+		020000000000000000000006 /* CraxiiUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CraxiiUITests.swift; sourceTree = "<group>"; };
+		020000000000000000000007 /* Craxii.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Craxii.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		020000000000000000000008 /* CraxiiTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CraxiiTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		020000000000000000000009 /* CraxiiUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = CraxiiUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		040000000000000000000001 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (010000000000000000000006 /* CraxiiAppleAdapters in Frameworks */,); runOnlyForDeploymentPostprocessing = 0; };
+		040000000000000000000002 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		040000000000000000000003 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		050000000000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				050000000000000000000002 /* CraxiiApp */,
+				050000000000000000000003 /* CraxiiTests */,
+				050000000000000000000004 /* CraxiiUITests */,
+				050000000000000000000005 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		050000000000000000000002 /* CraxiiApp */ = {isa = PBXGroup; children = (020000000000000000000001, 020000000000000000000002, 020000000000000000000003, 020000000000000000000004,); path = CraxiiApp; sourceTree = "<group>"; };
+		050000000000000000000003 /* CraxiiTests */ = {isa = PBXGroup; children = (020000000000000000000005,); path = CraxiiTests; sourceTree = "<group>"; };
+		050000000000000000000004 /* CraxiiUITests */ = {isa = PBXGroup; children = (020000000000000000000006,); path = CraxiiUITests; sourceTree = "<group>"; };
+		050000000000000000000005 /* Products */ = {isa = PBXGroup; children = (020000000000000000000007, 020000000000000000000008, 020000000000000000000009,); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		090000000000000000000001 /* Craxii */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000001;
+			buildPhases = (0D0000000000000000000001, 040000000000000000000001, 0E0000000000000000000001,);
+			buildRules = ();
+			dependencies = ();
+			name = Craxii;
+			packageProductDependencies = (110000000000000000000001 /* CraxiiAppleAdapters */,);
+			productName = Craxii;
+			productReference = 020000000000000000000007 /* Craxii.app */;
+			productType = "com.apple.product-type.application";
+		};
+		090000000000000000000002 /* CraxiiTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000002;
+			buildPhases = (0D0000000000000000000002, 040000000000000000000002, 0E0000000000000000000002,);
+			buildRules = ();
+			dependencies = (0F0000000000000000000001,);
+			name = CraxiiTests;
+			productName = CraxiiTests;
+			productReference = 020000000000000000000008;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		090000000000000000000003 /* CraxiiUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0A0000000000000000000003;
+			buildPhases = (0D0000000000000000000003, 040000000000000000000003, 0E0000000000000000000003,);
+			buildRules = ();
+			dependencies = (0F0000000000000000000002,);
+			name = CraxiiUITests;
+			productName = CraxiiUITests;
+			productReference = 020000000000000000000009;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		080000000000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {BuildIndependentTargetsInParallel = 1; LastSwiftUpdateCheck = 2660; LastUpgradeCheck = 2660; TargetAttributes = {090000000000000000000001 = {CreatedOnToolsVersion = 26.6;}; 090000000000000000000002 = {CreatedOnToolsVersion = 26.6; TestTargetID = 090000000000000000000001;}; 090000000000000000000003 = {CreatedOnToolsVersion = 26.6; TestTargetID = 090000000000000000000001;};};};
+			buildConfigurationList = 0A0000000000000000000000;
+			compatibilityVersion = "Xcode 16.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (en, Base,);
+			mainGroup = 050000000000000000000001;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (100000000000000000000001 /* XCLocalSwiftPackageReference "CraxiiClient" */,);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 050000000000000000000005;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (090000000000000000000001, 090000000000000000000002, 090000000000000000000003,);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		0E0000000000000000000001 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		0E0000000000000000000002 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+		0E0000000000000000000003 = {isa = PBXResourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		0D0000000000000000000001 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (010000000000000000000001, 010000000000000000000002, 010000000000000000000003,); runOnlyForDeploymentPostprocessing = 0; };
+		0D0000000000000000000002 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (010000000000000000000004,); runOnlyForDeploymentPostprocessing = 0; };
+		0D0000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (010000000000000000000005,); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		0F0000000000000000000001 = {isa = PBXTargetDependency; target = 090000000000000000000001; targetProxy = 030000000000000000000001; };
+		0F0000000000000000000002 = {isa = PBXTargetDependency; target = 090000000000000000000001; targetProxy = 030000000000000000000002; };
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		0B0000000000000000000001 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; ONLY_ACTIVE_ARCH = YES; SDKROOT = macosx; SWIFT_VERSION = 6.0;}; name = Debug; };
+		0B0000000000000000000002 = {isa = XCBuildConfiguration; buildSettings = {CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; SWIFT_VERSION = 6.0;}; name = Release; };
+		0B0000000000000000000011 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; COMBINE_HIDPI_IMAGES = YES; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; ENABLE_TESTABILITY = YES; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CraxiiApp/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.0.1; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_EMIT_LOC_STRINGS = YES; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0;}; name = Debug; };
+		0B0000000000000000000012 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; COMBINE_HIDPI_IMAGES = YES; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = CraxiiApp/Info.plist; LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks"; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.0.1; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_COMPILATION_MODE = wholemodule; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0;}; name = Release; };
+		0B0000000000000000000021 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Craxii.app/Contents/MacOS/Craxii";}; name = Debug; };
+		0B0000000000000000000022 = {isa = XCBuildConfiguration; buildSettings = {BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos.tests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Craxii.app/Contents/MacOS/Craxii";}; name = Release; };
+		0B0000000000000000000031 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = Craxii;}; name = Debug; };
+		0B0000000000000000000032 = {isa = XCBuildConfiguration; buildSettings = {CODE_SIGN_IDENTITY = "-"; CODE_SIGN_STYLE = Manual; DEVELOPMENT_TEAM = ""; GENERATE_INFOPLIST_FILE = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; PRODUCT_BUNDLE_IDENTIFIER = com.craxii.client.macos.uitests; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_STRICT_CONCURRENCY = complete; SWIFT_VERSION = 6.0; TEST_TARGET_NAME = Craxii;}; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0A0000000000000000000000 = {isa = XCConfigurationList; buildConfigurations = (0B0000000000000000000001, 0B0000000000000000000002,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		0A0000000000000000000001 = {isa = XCConfigurationList; buildConfigurations = (0B0000000000000000000011, 0B0000000000000000000012,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		0A0000000000000000000002 = {isa = XCConfigurationList; buildConfigurations = (0B0000000000000000000021, 0B0000000000000000000022,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		0A0000000000000000000003 = {isa = XCConfigurationList; buildConfigurations = (0B0000000000000000000031, 0B0000000000000000000032,); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+/* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		100000000000000000000001 /* XCLocalSwiftPackageReference "CraxiiClient" */ = {isa = XCLocalSwiftPackageReference; relativePath = CraxiiClient; };
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		110000000000000000000001 /* CraxiiAppleAdapters */ = {isa = XCSwiftPackageProductDependency; productName = CraxiiAppleAdapters; };
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 080000000000000000000001 /* Project object */;
+}

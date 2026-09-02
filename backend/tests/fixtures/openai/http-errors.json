@@ -1,0 +1,9 @@
+[
+  {"name":"authentication","status":401,"code":"invalid_api_key","expected":"authentication"},
+  {"name":"authorization","status":403,"code":"permission_denied","expected":"authorization"},
+  {"name":"invalid_request","status":400,"code":"invalid_request_error","expected":"invalid_request"},
+  {"name":"unknown_model","status":404,"code":"model_not_found","expected":"unknown_model"},
+  {"name":"temporary_rate_limit","status":429,"code":"rate_limit_exceeded","retry_after":"2","expected":"rate_limited"},
+  {"name":"quota_exhausted","status":429,"code":"credit_balance_exhausted","expected":"authorization"},
+  {"name":"temporary_server_failure","status":503,"code":"server_error","expected":"temporarily_unavailable"}
+]

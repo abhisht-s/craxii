@@ -9,7 +9,7 @@ use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyErrorKind, ContextAssemblyVersions,
 };
 use crate::application::model_gateway::{
-    DurableModelAttempt, DurableModelOutcome, GatewayInvocation, ModelGateway,
+    DraftAbandonCause, DurableModelAttempt, DurableModelOutcome, GatewayInvocation, ModelGateway,
 };
 use crate::application::model_selection::ModelSelectionPolicy;
 use crate::application::scheduler::{
@@ -289,6 +289,7 @@ impl AgentLoop {
                 .model_gateway
                 .invoke(GatewayInvocation {
                     craxii_id: owned.work.craxii_id(),
+                    conversation_id: owned.work.conversation_id(),
                     work: owned.lifecycle,
                     context,
                     selection,
@@ -366,6 +367,10 @@ impl AgentLoop {
                                 .await;
                         }
                         ModelStopReason::ToolContinuation => {
+                            self.model_gateway.abandon_draft(
+                                attempt.model_invocation_id,
+                                DraftAbandonCause::ToolContinuation,
+                            );
                             match self
                                 .execute_tool_batch(
                                     &claimed.work,
@@ -388,6 +393,10 @@ impl AgentLoop {
                             }
                         }
                         ModelStopReason::IncompleteProviderLimit => {
+                            self.model_gateway.abandon_draft(
+                                attempt.model_invocation_id,
+                                DraftAbandonCause::Failed,
+                            );
                             return self
                                 .fail_snapshot(
                                     attempt.work,
@@ -399,6 +408,14 @@ impl AgentLoop {
                                 .await;
                         }
                         ModelStopReason::Cancelled | ModelStopReason::ProviderFailure => {
+                            self.model_gateway.abandon_draft(
+                                attempt.model_invocation_id,
+                                if response.stop_reason() == ModelStopReason::Cancelled {
+                                    DraftAbandonCause::Cancelled
+                                } else {
+                                    DraftAbandonCause::Failed
+                                },
+                            );
                             return self
                                 .fail_snapshot(
                                     attempt.work,
@@ -501,6 +518,8 @@ impl AgentLoop {
         let content = match assistant_content(&response, reason) {
             Ok(value) => value,
             Err(_) => {
+                self.model_gateway
+                    .abandon_draft(attempt.model_invocation_id, DraftAbandonCause::Failed);
                 return self
                     .fail_snapshot(
                         attempt.work,
@@ -568,9 +587,15 @@ impl AgentLoop {
                 crate::test_failpoints::reach(
                     crate::test_failpoints::PhysicalHook::FinalAnswerAfterCommitBeforeNotification,
                 );
+                self.model_gateway
+                    .finalize_drafts_for_work(work_item.work_id());
                 WorkRunnerExit::TerminalCommitted
             }
-            Err(_) => WorkRunnerExit::Abnormal,
+            Err(_) => {
+                self.model_gateway
+                    .abandon_draft(attempt.model_invocation_id, DraftAbandonCause::Interrupted);
+                WorkRunnerExit::Abnormal
+            }
         }
     }
 

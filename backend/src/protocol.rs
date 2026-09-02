@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use crate::domain::{
     ClientCommandId, ClientMessageId, ContentBlock, ConversationId, ConversationLifecycle,
-    ConversationWorkOrdinal, CraxiiId, JournalEventId, JournalOffset, JournalWorkTerminalReason,
-    MessageContent, MessageId, MessageRole, ToolExecutionId, UtcTimestamp, WorkId, WorkState,
+    ConversationWorkOrdinal, CraxiiId, DraftId, JournalEventId, JournalOffset,
+    JournalWorkTerminalReason, MessageContent, MessageId, MessageRole, ModelInvocationId,
+    ToolExecutionId, UtcTimestamp, WorkId, WorkState,
 };
 
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -27,6 +28,8 @@ pub const REPLAY_PAGE_ROWS: u32 = 128;
 pub const CURSOR_BROADCAST_CAPACITY: usize = 256;
 pub const WEBSOCKET_OUTBOUND_FRAMES: usize = 16;
 pub const MAX_DURABLE_PAYLOAD_BYTES: usize = 262_144;
+pub const MAX_DRAFT_TEXT_BYTES: usize = 262_144;
+pub const MAX_DRAFT_EVENTS: u32 = 4_096;
 pub const MAX_WEBSOCKET_FRAME_BYTES: usize = 270_336;
 pub const MAX_BOOTSTRAP_MESSAGES: usize = 2_048;
 pub const MAX_BOOTSTRAP_TERMINAL_WORK: usize = 512;
@@ -86,6 +89,41 @@ impl fmt::Debug for RequestId {
 }
 
 impl Serialize for RequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+/// Server-generated identity for one non-durable live event.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub struct EphemeralEventId(Uuid);
+
+impl EphemeralEventId {
+    #[must_use]
+    pub fn generate() -> Self {
+        Self(Uuid::now_v7())
+    }
+}
+
+impl fmt::Display for EphemeralEventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.hyphenated().fmt(formatter)
+    }
+}
+
+impl fmt::Debug for EphemeralEventId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("EphemeralEventId")
+            .field(&self.to_string())
+            .finish()
+    }
+}
+
+impl Serialize for EphemeralEventId {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -383,6 +421,126 @@ pub enum DeliveryKind {
     Ephemeral,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftDeltaKind {
+    Text,
+    Refusal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftAbandonReason {
+    ToolContinuation,
+    Superseded,
+    Cancelled,
+    Failed,
+    Interrupted,
+    DeliveryLimit,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum DraftEventPayload {
+    Started {},
+    Delta { kind: DraftDeltaKind, text: String },
+    Abandoned { reason: DraftAbandonReason },
+}
+
+/// A lossy, non-replayable event. Its null cursor cannot enter the durable cursor namespace.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EphemeralDraftEnvelope {
+    pub protocol_version: ProtocolVersion,
+    pub delivery_kind: DeliveryKind,
+    pub event_id: EphemeralEventId,
+    pub cursor: Option<ReplayCursor>,
+    pub event_type: &'static str,
+    pub conversation_id: ConversationId,
+    pub work_id: WorkId,
+    pub invocation_id: ModelInvocationId,
+    pub draft_id: DraftId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta_sequence: Option<u32>,
+    pub payload: DraftEventPayload,
+}
+
+impl EphemeralDraftEnvelope {
+    #[must_use]
+    pub fn started(
+        conversation_id: ConversationId,
+        work_id: WorkId,
+        invocation_id: ModelInvocationId,
+        draft_id: DraftId,
+    ) -> Self {
+        Self {
+            protocol_version: ProtocolVersion,
+            delivery_kind: DeliveryKind::Ephemeral,
+            event_id: EphemeralEventId::generate(),
+            cursor: None,
+            event_type: "assistant.draft_started",
+            conversation_id,
+            work_id,
+            invocation_id,
+            draft_id,
+            delta_sequence: None,
+            payload: DraftEventPayload::Started {},
+        }
+    }
+
+    #[must_use]
+    pub fn delta(
+        conversation_id: ConversationId,
+        work_id: WorkId,
+        invocation_id: ModelInvocationId,
+        draft_id: DraftId,
+        delta_sequence: u32,
+        kind: DraftDeltaKind,
+        text: String,
+    ) -> Self {
+        Self {
+            protocol_version: ProtocolVersion,
+            delivery_kind: DeliveryKind::Ephemeral,
+            event_id: EphemeralEventId::generate(),
+            cursor: None,
+            event_type: "assistant.draft_delta",
+            conversation_id,
+            work_id,
+            invocation_id,
+            draft_id,
+            delta_sequence: Some(delta_sequence),
+            payload: DraftEventPayload::Delta { kind, text },
+        }
+    }
+
+    #[must_use]
+    pub fn abandoned(
+        conversation_id: ConversationId,
+        work_id: WorkId,
+        invocation_id: ModelInvocationId,
+        draft_id: DraftId,
+        reason: DraftAbandonReason,
+    ) -> Self {
+        Self {
+            protocol_version: ProtocolVersion,
+            delivery_kind: DeliveryKind::Ephemeral,
+            event_id: EphemeralEventId::generate(),
+            cursor: None,
+            event_type: "assistant.draft_abandoned",
+            conversation_id,
+            work_id,
+            invocation_id,
+            draft_id,
+            delta_sequence: None,
+            payload: DraftEventPayload::Abandoned { reason },
+        }
+    }
+
+    #[must_use]
+    pub const fn is_delta(&self) -> bool {
+        matches!(self.payload, DraftEventPayload::Delta { .. })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct DurableEventEnvelope {
     pub protocol_version: ProtocolVersion,
@@ -517,6 +675,7 @@ mod tests {
             include_str!("../tests/fixtures/protocol-v1/error-envelope.json"),
             include_str!("../tests/fixtures/protocol-v1/bootstrap-snapshot.json"),
             include_str!("../tests/fixtures/protocol-v1/durable-events.json"),
+            include_str!("../tests/fixtures/protocol-v1/ephemeral-drafts.json"),
         ] {
             let value: Value = serde_json::from_str(fixture).unwrap();
             let encoded = serde_json::to_string(&value).unwrap();
@@ -529,9 +688,122 @@ mod tests {
                 "provider_call_id",
                 "request_hash",
                 "artifact_path",
+                "reasoning_text",
+                "tool_arguments",
+                "provider_opaque",
+                "provider_request_id",
+                "provider_response_id",
             ] {
                 assert!(!encoded.contains(forbidden), "{forbidden}");
             }
+        }
+
+        let drafts: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/protocol-v1/ephemeral-drafts.json"
+        ))
+        .unwrap();
+        let drafts = drafts.as_array().unwrap();
+        assert!(drafts.iter().all(|event| {
+            event["protocol_version"] == 1
+                && event["delivery_kind"] == "ephemeral"
+                && event["cursor"].is_null()
+                && event.get("conversation_id").is_some()
+                && event.get("work_id").is_some()
+                && event.get("invocation_id").is_some()
+                && event.get("draft_id").is_some()
+        }));
+        assert_eq!(drafts[1]["delta_sequence"], 1);
+        assert_eq!(drafts[1]["payload"]["kind"], "text");
+        assert_eq!(drafts[4]["payload"]["kind"], "refusal");
+    }
+
+    #[test]
+    fn stage20_simulated_client_converges_with_duplicates_delays_and_draft_loss() {
+        use std::collections::{HashMap, HashSet};
+
+        #[derive(Default)]
+        struct Projection {
+            active_drafts: HashMap<String, String>,
+            finalized_work: HashSet<String>,
+            durable_events: HashSet<String>,
+            answers: HashMap<String, String>,
+        }
+
+        impl Projection {
+            fn reconnect(&mut self) {
+                self.active_drafts.clear();
+            }
+
+            fn apply(&mut self, event: &Value) {
+                let work = event["work_id"].as_str().unwrap_or_default().to_owned();
+                match event["delivery_kind"].as_str() {
+                    Some("durable") => {
+                        let event_id = event["event_id"].as_str().unwrap().to_owned();
+                        if !self.durable_events.insert(event_id) {
+                            return;
+                        }
+                        if event["event_type"] == "assistant.message_committed" {
+                            self.finalized_work.insert(work.clone());
+                            self.active_drafts.remove(&work);
+                            self.answers.insert(
+                                work,
+                                event["payload"]["content"][0]["text"]
+                                    .as_str()
+                                    .unwrap()
+                                    .to_owned(),
+                            );
+                        }
+                    }
+                    Some("ephemeral") if !self.finalized_work.contains(&work) => {
+                        if event["event_type"] == "assistant.draft_started" {
+                            self.active_drafts
+                                .insert(work, event["draft_id"].as_str().unwrap().to_owned());
+                        } else if event["event_type"] == "assistant.draft_abandoned" {
+                            self.active_drafts.remove(&work);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let drafts: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/protocol-v1/ephemeral-drafts.json"
+        ))
+        .unwrap();
+        let work = drafts[0]["work_id"].as_str().unwrap();
+        let committed = serde_json::json!({
+            "protocol_version": 1,
+            "delivery_kind": "durable",
+            "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa019",
+            "cursor": 20,
+            "event_type": "assistant.message_committed",
+            "conversation_id": drafts[0]["conversation_id"],
+            "work_id": work,
+            "recorded_at": "2026-08-28T00:00:03.000000Z",
+            "payload": {
+                "message_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa020",
+                "role": "assistant",
+                "content": [{"type": "text", "text": "canonical answer"}],
+                "work_id": work,
+                "committed_at": "2026-08-28T00:00:03.000000Z"
+            }
+        });
+
+        for delivery in [
+            vec![drafts[0].clone(), drafts[1].clone(), committed.clone()],
+            vec![drafts[0].clone(), committed.clone(), drafts[1].clone()],
+            vec![committed.clone(), committed.clone(), drafts[0].clone()],
+        ] {
+            let mut projection = Projection::default();
+            for event in delivery {
+                projection.apply(&event);
+            }
+            projection.reconnect();
+            projection.apply(&committed);
+            assert!(projection.active_drafts.is_empty());
+            assert_eq!(projection.answers.get(work).unwrap(), "canonical answer");
+            assert_eq!(projection.answers.len(), 1);
         }
     }
 }

@@ -91,6 +91,23 @@ pub fn load_credentials<'a>(
         CredentialSourceConfig::LocalDirectory { directory } => directory.as_path(),
         CredentialSourceConfig::Systemd => Path::new(SYSTEMD_CREDENTIAL_DIRECTORY),
     };
+    let directory_metadata = std::fs::symlink_metadata(directory).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            CredentialLoadError(CredentialLoadErrorKind::Missing)
+        } else {
+            CredentialLoadError(CredentialLoadErrorKind::Storage)
+        }
+    })?;
+    if !directory_metadata.is_dir() || directory_metadata.file_type().is_symlink() {
+        return Err(CredentialLoadError(CredentialLoadErrorKind::UnsafeFile));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if directory_metadata.mode() & 0o022 != 0 {
+            return Err(CredentialLoadError(CredentialLoadErrorKind::UnsafeFile));
+        }
+    }
     let mut loaded = BTreeMap::new();
     for reference in references {
         if loaded.contains_key(reference.as_str()) {
@@ -110,7 +127,10 @@ pub fn load_credentials<'a>(
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if metadata.mode() & 0o077 != 0 {
+            if metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+                || metadata.uid() != directory_metadata.uid()
+            {
                 return Err(CredentialLoadError(CredentialLoadErrorKind::UnsafeFile));
             }
         }
@@ -137,6 +157,18 @@ pub fn load_credentials<'a>(
         if !opened.is_file() || opened.len() != metadata.len() {
             return Err(CredentialLoadError(CredentialLoadErrorKind::UnsafeFile));
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if opened.dev() != metadata.dev()
+                || opened.ino() != metadata.ino()
+                || opened.mode() & 0o077 != 0
+                || opened.nlink() != 1
+                || opened.uid() != directory_metadata.uid()
+            {
+                return Err(CredentialLoadError(CredentialLoadErrorKind::UnsafeFile));
+            }
+        }
         let mut bytes = Vec::new();
         file.take(MAX_CREDENTIAL_BYTES + 1)
             .read_to_end(&mut bytes)
@@ -149,10 +181,7 @@ pub fn load_credentials<'a>(
         }
         let value = String::from_utf8(bytes)
             .map_err(|_| CredentialLoadError(CredentialLoadErrorKind::InvalidValue))?;
-        if value.is_empty()
-            || value.trim() != value
-            || value.chars().any(|character| character.is_control() || character.is_whitespace())
-        {
+        if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
             return Err(CredentialLoadError(CredentialLoadErrorKind::InvalidValue));
         }
         loaded.insert(reference.as_str().to_owned(), SecretString::new(value));
@@ -206,9 +235,19 @@ mod tests {
     #[test]
     fn symlink_permissive_empty_and_whitespace_credentials_fail_closed() {
         for (name, contents, mode, expected) in [
-            ("permissive", "key", 0o644, CredentialLoadErrorKind::UnsafeFile),
+            (
+                "permissive",
+                "key",
+                0o644,
+                CredentialLoadErrorKind::UnsafeFile,
+            ),
             ("empty", "", 0o600, CredentialLoadErrorKind::InvalidValue),
-            ("whitespace", "key value", 0o600, CredentialLoadErrorKind::InvalidValue),
+            (
+                "whitespace",
+                " key",
+                0o600,
+                CredentialLoadErrorKind::InvalidValue,
+            ),
         ] {
             let directory = root();
             let path = directory.join(name);
@@ -244,6 +283,95 @@ mod tests {
             .unwrap_err()
             .kind(),
             CredentialLoadErrorKind::UnsafeFile
+        );
+        fs::remove_dir_all(directory).unwrap();
+
+        let directory = root();
+        let actual = directory.join("actual");
+        fs::create_dir(&actual).unwrap();
+        let credential = actual.join("key");
+        fs::write(&credential, "key").unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        let linked = directory.join("linked-directory");
+        symlink(&actual, &linked).unwrap();
+        let reference = CredentialRef::new("key".to_owned());
+        assert_eq!(
+            load_credentials(
+                &CredentialSourceConfig::LocalDirectory { directory: linked },
+                [&reference],
+            )
+            .unwrap_err()
+            .kind(),
+            CredentialLoadErrorKind::UnsafeFile
+        );
+        fs::remove_dir_all(directory).unwrap();
+
+        let directory = root();
+        let credential = directory.join("key");
+        fs::write(&credential, "key").unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+        let reference = CredentialRef::new("key".to_owned());
+        assert_eq!(
+            load_credentials(
+                &CredentialSourceConfig::LocalDirectory {
+                    directory: directory.clone(),
+                },
+                [&reference],
+            )
+            .unwrap_err()
+            .kind(),
+            CredentialLoadErrorKind::UnsafeFile
+        );
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn missing_malformed_and_nonprefixed_credentials_have_redacted_outcomes() {
+        let directory = root();
+        let missing = CredentialRef::new("missing".to_owned());
+        let error = load_credentials(
+            &CredentialSourceConfig::LocalDirectory {
+                directory: directory.clone(),
+            },
+            [&missing],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), CredentialLoadErrorKind::Missing);
+        assert_eq!(error.to_string(), "provider credential unavailable");
+        assert!(!format!("{error:?}").contains(directory.to_str().unwrap()));
+
+        let invalid = directory.join("invalid");
+        fs::write(&invalid, [0xff, 0xfe]).unwrap();
+        fs::set_permissions(&invalid, fs::Permissions::from_mode(0o600)).unwrap();
+        let reference = CredentialRef::new("invalid".to_owned());
+        assert_eq!(
+            load_credentials(
+                &CredentialSourceConfig::LocalDirectory {
+                    directory: directory.clone(),
+                },
+                [&reference],
+            )
+            .unwrap_err()
+            .kind(),
+            CredentialLoadErrorKind::InvalidValue
+        );
+
+        let nonprefixed = directory.join("nonprefixed");
+        fs::write(&nonprefixed, "provider key without assumed prefix\n").unwrap();
+        fs::set_permissions(&nonprefixed, fs::Permissions::from_mode(0o600)).unwrap();
+        let reference = CredentialRef::new("nonprefixed".to_owned());
+        let loaded = load_credentials(
+            &CredentialSourceConfig::LocalDirectory {
+                directory: directory.clone(),
+            },
+            [&reference],
+        )
+        .unwrap();
+        assert_eq!(
+            loaded.get("nonprefixed").unwrap().expose_secret(),
+            "provider key without assumed prefix"
         );
         fs::remove_dir_all(directory).unwrap();
     }

@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  printf '%s\n' 'STAGE_21_NATIVE_MACOS_CLIENT: NOT_RUN_NON_MACOS_HOST'
+  exit 0
+fi
+
+for command in swift xcodebuild cargo node rg; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    printf 'error: %s is required for the Stage 21 macOS client gate\n' "${command}" >&2
+    exit 127
+  fi
+done
+
+cd "${repository_root}"
+package_path="clients/macos/CraxiiClient"
+
+printf '%s\n' 'Testing the Stage 21 Swift package'
+swift test --package-path "${package_path}"
+
+printf '%s\n' 'Checking the local-only Swift dependency graph'
+swift package --package-path "${package_path}" dump-package |
+  node -e 'let value=""; process.stdin.on("data", part => value += part); process.stdin.on("end", () => { const manifest = JSON.parse(value); if (manifest.dependencies.length !== 0) { console.error("error: external Swift dependencies are forbidden"); process.exit(1); } });'
+
+if rg -n --hidden --glob '!**/.build/**' --glob '*.plist' --glob '*.xcconfig' --glob '*.json' \
+  '[a-f0-9]{64}' clients/macos; then
+  printf '%s\n' 'error: token-shaped material exists in macOS settings, plist, or JSON' >&2
+  exit 1
+fi
+if rg -n --hidden --glob '!**/.build/**' \
+  'UserDefaults|NSAllowsArbitraryLoads|import WebKit|\bElectron\b|\bReactNative\b|\bFlutter\b' \
+  clients/macos; then
+  printf '%s\n' 'error: forbidden macOS persistence, ATS, or wrapper framework detected' >&2
+  exit 1
+fi
+
+printf '%s\n' 'Running the real localhost backend-client integration'
+probe_path="$(swift build --package-path "${package_path}" --show-bin-path)/CraxiiIntegrationProbe"
+if [[ ! -x "${probe_path}" ]]; then
+  printf '%s\n' 'error: native integration probe was not built by Swift package tests' >&2
+  exit 1
+fi
+CRAXII_STAGE21_PROBE="${probe_path}" \
+  cargo test --locked -p craxii-server --test stage21 \
+    real_native_client_transport_converges_and_cancels_against_localhost_backend \
+    -- --ignored --exact --test-threads=1
+
+printf '%s\n' 'Building and testing the macOS app, unit target, and UI smoke'
+derived_data="$(mktemp -d -t craxii-stage21-derived.XXXXXX)"
+cleanup() {
+  if [[ -d "${derived_data:-}" && "$(basename -- "${derived_data}")" == craxii-stage21-derived.* ]]; then
+    rm -rf -- "${derived_data}"
+  fi
+}
+trap cleanup EXIT
+xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Debug \
+  -destination "platform=macOS,arch=$(uname -m)" \
+  -derivedDataPath "${derived_data}" \
+  -quiet \
+  test
+
+printf '%s\n' 'STAGE_21_NATIVE_MACOS_CLIENT: PASSED'

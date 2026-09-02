@@ -25,7 +25,8 @@ use craxii_server::application::context_assembler::{
     ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
 };
 use craxii_server::application::device_provisioning::DeviceProvisioningService;
-use craxii_server::application::model_gateway::{ModelGateway, ModelGatewayLimits, NoopDraftSink};
+use craxii_server::application::event_delivery::LiveEventBroker;
+use craxii_server::application::model_gateway::{DraftSink, ModelGateway, ModelGatewayLimits};
 use craxii_server::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
 use craxii_server::application::runtime::{ControlledShutdown, HeartbeatTask, ShutdownController};
 use craxii_server::application::scheduler::{
@@ -212,9 +213,16 @@ impl MachineFacts {
 #[derive(Clone, Debug)]
 pub enum ProgramPlan {
     Tools(Vec<ToolPlan>),
+    MixedTextTools {
+        text: String,
+        tools: Vec<ToolPlan>,
+    },
     Answer {
         text: String,
         require_tool_result: Option<ModelToolCallId>,
+    },
+    Refusal {
+        text: String,
     },
     Fail(ProviderError),
 }
@@ -278,9 +286,10 @@ pub fn programs(plans: &[ProgramPlan]) -> Vec<ScriptedProgram> {
             let attempt = match plan {
                 ProgramPlan::Fail(_) => ProviderAttempt::try_new(u32::try_from(index + 1).unwrap())
                     .unwrap_or_else(|_| ProviderAttempt::try_new(1).unwrap()),
-                ProgramPlan::Tools(_) | ProgramPlan::Answer { .. } => {
-                    ProviderAttempt::try_new(1).unwrap()
-                }
+                ProgramPlan::Tools(_)
+                | ProgramPlan::MixedTextTools { .. }
+                | ProgramPlan::Answer { .. }
+                | ProgramPlan::Refusal { .. } => ProviderAttempt::try_new(1).unwrap(),
             };
             program(&target, ordinal, attempt, plan.clone())
         })
@@ -336,6 +345,77 @@ pub fn gated_answer_program(
     vec![scripted]
 }
 
+pub fn gated_after_delta_answer_program(
+    final_text: &str,
+    gate: ScriptGate,
+) -> Vec<ScriptedProgram> {
+    let target = target();
+    let mut scripted = program(
+        &target,
+        1,
+        ProviderAttempt::try_new(1).unwrap(),
+        ProgramPlan::Answer {
+            text: final_text.to_owned(),
+            require_tool_result: None,
+        },
+    );
+    scripted.steps.insert(2, ScriptedStep::AwaitRelease(gate));
+    vec![scripted]
+}
+
+pub fn gated_after_delta_refusal_program(
+    refusal_text: &str,
+    gate: ScriptGate,
+) -> Vec<ScriptedProgram> {
+    let target = target();
+    let mut scripted = program(
+        &target,
+        1,
+        ProviderAttempt::try_new(1).unwrap(),
+        ProgramPlan::Refusal {
+            text: refusal_text.to_owned(),
+        },
+    );
+    scripted.steps.insert(3, ScriptedStep::AwaitRelease(gate));
+    vec![scripted]
+}
+
+pub fn gated_mixed_text_tool_programs(
+    preliminary_text: &str,
+    tool: ToolPlan,
+    first_gate: ScriptGate,
+    final_text: &str,
+    final_gate: ScriptGate,
+) -> Vec<ScriptedProgram> {
+    let target = target();
+    let required = tool.call_id.clone();
+    let mut mixed = program(
+        &target,
+        1,
+        ProviderAttempt::try_new(1).unwrap(),
+        ProgramPlan::MixedTextTools {
+            text: preliminary_text.to_owned(),
+            tools: vec![tool],
+        },
+    );
+    mixed
+        .steps
+        .insert(2, ScriptedStep::AwaitRelease(first_gate));
+    let mut answer = program(
+        &target,
+        2,
+        ProviderAttempt::try_new(1).unwrap(),
+        ProgramPlan::Answer {
+            text: final_text.to_owned(),
+            require_tool_result: Some(required),
+        },
+    );
+    answer
+        .steps
+        .insert(2, ScriptedStep::AwaitRelease(final_gate));
+    vec![mixed, answer]
+}
+
 fn program(
     target: &ModelTarget,
     invocation_ordinal: u64,
@@ -383,6 +463,41 @@ fn program(
             }
             (items, ModelStopReason::ToolContinuation, None)
         }
+        ProgramPlan::MixedTextTools { text, tools } => {
+            let text = ModelTextPart::try_new(text).unwrap();
+            steps.push(ScriptedStep::emit(ModelStreamEvent::TextDelta {
+                item_ordinal: 0,
+                delta: text.clone(),
+            }));
+            let mut items = vec![ModelOutputItem::text(vec![text]).unwrap()];
+            for (index, tool) in tools.into_iter().enumerate() {
+                let item_ordinal = u32::try_from(index + 1).unwrap();
+                let call = CanonicalModelToolCall::try_new(
+                    tool.call_id.clone(),
+                    tool.name,
+                    tool.arguments,
+                )
+                .unwrap();
+                steps.extend([
+                    ScriptedStep::emit(ModelStreamEvent::ToolCallStarted {
+                        item_ordinal,
+                        call_id: call.call_id().clone(),
+                        name: call.name().clone(),
+                    }),
+                    ScriptedStep::emit(ModelStreamEvent::ToolArgumentDelta {
+                        item_ordinal,
+                        call_id: call.call_id().clone(),
+                        delta: call.raw_arguments().to_owned(),
+                    }),
+                    ScriptedStep::emit(ModelStreamEvent::ToolCallCompleted {
+                        item_ordinal,
+                        call: call.clone(),
+                    }),
+                ]);
+                items.push(ModelOutputItem::ToolCall(call));
+            }
+            (items, ModelStopReason::ToolContinuation, None)
+        }
         ProgramPlan::Answer {
             text,
             require_tool_result,
@@ -396,6 +511,21 @@ fn program(
                 vec![ModelOutputItem::text(vec![part]).unwrap()],
                 ModelStopReason::Completed,
                 require_tool_result,
+            )
+        }
+        ProgramPlan::Refusal { text } => {
+            let part = ModelTextPart::try_new(text).unwrap();
+            steps.extend([
+                ScriptedStep::emit(ModelStreamEvent::RefusalDelta {
+                    item_ordinal: 0,
+                    delta: part.clone(),
+                }),
+                ScriptedStep::emit(ModelStreamEvent::RefusalCompleted { item_ordinal: 0 }),
+            ]);
+            (
+                vec![ModelOutputItem::refusal(vec![part]).unwrap()],
+                ModelStopReason::Refusal,
+                None,
             )
         }
         ProgramPlan::Fail(error) => {
@@ -418,7 +548,7 @@ fn program(
         selected_target: target.identity(),
         output_items: items,
         stop_reason,
-        usage,
+        usage: Some(usage),
         provider_request_id: Some(request_id),
         provider_response_id: Some(response_id),
         provider_continuation: None,
@@ -426,7 +556,9 @@ fn program(
     })
     .unwrap();
     steps.push(ScriptedStep::emit(ModelStreamEvent::Usage(usage)));
-    steps.push(ScriptedStep::emit(ModelStreamEvent::Completed(response)));
+    steps.push(ScriptedStep::emit(ModelStreamEvent::Completed(Box::new(
+        response,
+    ))));
     ScriptedProgram {
         expectation: ScriptExpectation {
             target_id: target.reference().model_target_id().clone(),
@@ -660,6 +792,7 @@ pub struct Stage18Harness {
     pub provider: Arc<ScriptedProvider>,
     pub store: Arc<SqliteStateStore>,
     pub artifact_store: Arc<LocalArtifactStore>,
+    pub live_events: Arc<LiveEventBroker>,
     guard: Option<SqliteRuntimeGuard>,
     server: Option<ServerHandle>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
@@ -859,12 +992,13 @@ impl Stage18Harness {
         let gateway_store: Arc<dyn ModelStateStore> = store.clone();
         let gateway_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
         let gateway_clock: Arc<dyn Clock> = clock.clone();
+        let live_events = Arc::new(LiveEventBroker::new());
         let gateway = Arc::new(
             ModelGateway::new(
                 gateway_store,
                 gateway_artifacts,
                 gateway_provider,
-                Arc::new(NoopDraftSink),
+                live_events.clone() as Arc<dyn DraftSink>,
                 gateway_clock,
                 Box::new(MinimumJitter),
                 ModelGatewayLimits::default(),
@@ -952,6 +1086,7 @@ impl Stage18Harness {
             health.clone(),
             admission.clone(),
             cursors,
+            Arc::clone(&live_events),
             fatal,
             ws_shutdown,
             connections,
@@ -970,6 +1105,7 @@ impl Stage18Harness {
             provider: scripted,
             store,
             artifact_store,
+            live_events,
             guard: Some(guard),
             server: Some(server),
             shutdown,
@@ -1199,6 +1335,7 @@ impl Stage18Harness {
             .await
             .expect("shutdown harness executions");
         if let Some(server) = self.server.take() {
+            self.live_events.close_admission();
             server.close_websockets();
             self.shutdown
                 .finish()
@@ -1242,6 +1379,7 @@ impl Stage18Harness {
             .shutdown_executions_before(deadline)
             .await;
         if let Some(server) = self.server.take() {
+            self.live_events.close_admission();
             server.close_websockets();
             let _ = self.shutdown.finish().await;
             let _ = server.join_before(deadline).await;

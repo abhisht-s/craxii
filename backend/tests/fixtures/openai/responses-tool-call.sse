@@ -10,9 +10,11 @@ data: {"type":"response.function_call_arguments.delta","sequence_number":2,"outp
 event: response.function_call_arguments.delta
 data: {"type":"response.function_call_arguments.delta","sequence_number":3,"output_index":0,"item_id":"fc_fixture_1","delta":"\"Cargo.toml\"}"}
 
+event: response.function_call_arguments.done
+data: {"type":"response.function_call_arguments.done","sequence_number":4,"output_index":0,"item_id":"fc_fixture_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}
+
 event: response.output_item.done
-data: {"type":"response.output_item.done","sequence_number":4,"output_index":0,"item":{"id":"fc_fixture_1","type":"function_call","status":"completed","call_id":"call_fixture_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}}
+data: {"type":"response.output_item.done","sequence_number":5,"output_index":0,"item":{"id":"fc_fixture_1","type":"function_call","status":"completed","call_id":"call_fixture_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}}
 
 event: response.completed
-data: {"type":"response.completed","sequence_number":5,"response":{"id":"resp_tool_1","status":"completed","model":"fixture-openai-model","output":[{"id":"fc_fixture_1","type":"function_call","status":"completed","call_id":"call_fixture_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}}}
-
+data: {"type":"response.completed","sequence_number":6,"response":{"id":"resp_tool_1","status":"completed","model":"fixture-openai-model","output":[{"id":"fc_fixture_1","type":"function_call","status":"completed","call_id":"call_fixture_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}],"usage":{"input_tokens":11,"input_tokens_details":{"cached_tokens":3},"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}}}

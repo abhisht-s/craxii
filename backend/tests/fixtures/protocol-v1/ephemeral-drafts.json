@@ -1,0 +1,72 @@
+[
+  {
+    "protocol_version": 1,
+    "delivery_kind": "ephemeral",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa010",
+    "cursor": null,
+    "event_type": "assistant.draft_started",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "invocation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa011",
+    "draft_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa012",
+    "payload": {}
+  },
+  {
+    "protocol_version": 1,
+    "delivery_kind": "ephemeral",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa013",
+    "cursor": null,
+    "event_type": "assistant.draft_delta",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "invocation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa011",
+    "draft_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa012",
+    "delta_sequence": 1,
+    "payload": {
+      "kind": "text",
+      "text": "A safe preliminary answer."
+    }
+  },
+  {
+    "protocol_version": 1,
+    "delivery_kind": "ephemeral",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa014",
+    "cursor": null,
+    "event_type": "assistant.draft_abandoned",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "invocation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa011",
+    "draft_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa012",
+    "payload": {
+      "reason": "tool_continuation"
+    }
+  },
+  {
+    "protocol_version": 1,
+    "delivery_kind": "ephemeral",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa015",
+    "cursor": null,
+    "event_type": "assistant.draft_started",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "invocation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa016",
+    "draft_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa017",
+    "payload": {}
+  },
+  {
+    "protocol_version": 1,
+    "delivery_kind": "ephemeral",
+    "event_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa018",
+    "cursor": null,
+    "event_type": "assistant.draft_delta",
+    "conversation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007",
+    "work_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa003",
+    "invocation_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa016",
+    "draft_id": "01890f3e-7b2c-7cc1-8c23-5b8f7b3aa017",
+    "delta_sequence": 1,
+    "payload": {
+      "kind": "refusal",
+      "text": "I cannot help with that."
+    }
+  }
+]

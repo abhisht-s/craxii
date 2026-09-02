@@ -223,7 +223,7 @@ fn local_fixture_fingerprint_is_an_exact_stable_sha256() {
     assert_eq!(parsed.fingerprint(), loaded.fingerprint());
     assert_eq!(
         parsed.fingerprint().as_str(),
-        "sha256:43bb265b4219927aba58b30d5faed036321feed35e3061fa3203cab9de8191c5"
+        "sha256:42807d1a850e124ea56b577d2be653e72663d3e8b8a5303c2f615dee747509cf"
     );
 }
 
@@ -606,8 +606,8 @@ fn provider_endpoint_scheme_host_and_trailing_slash_are_normalized() {
 fn reasoning_continuation_requirement_needs_the_capability() {
     let inconsistent = replace_once(
         LOCAL,
-        "structured_output = true\nreasoning_continuation = true\n\n[[models.targets]]",
-        "structured_output = true\nreasoning_continuation = false\n\n[[models.targets]]",
+        "reasoning_continuation = false\n\n[models.targets.capabilities]",
+        "reasoning_continuation = true\n\n[models.targets.capabilities]",
     );
     assert!(matches!(
         invalid(&inconsistent),

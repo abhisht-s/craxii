@@ -1,8 +1,6 @@
 //! Provider-neutral durable model-attempt orchestration.
 
 use std::fmt::{self, Display, Formatter};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,13 +10,13 @@ use crate::domain::model::{ModelUsage as CanonicalModelUsage, RequiredModelCapab
 use crate::domain::{
     AgentStepNo, ArtifactEncoding, ArtifactId, ArtifactLogicalName, ArtifactMimeType,
     ArtifactProducer, ArtifactReference, ArtifactReferenceInput, ArtifactRetention,
-    ArtifactStorageKey, AttemptNo, CanonicalByteCount, CleanupStatus, CorrelationId, CraxiiId,
-    CurrentWorkAttempt, JournalEventId, ModelAttemptReference, ModelAttemptReferenceInput,
-    ModelContractErrorKind, ModelInvocationId, ModelInvocationState, ModelOutputItem,
-    ModelResponse, ModelStreamEvent, ModelStreamProviderErrorKind, ModelStreamState,
-    NormalizedError, ProviderOpaqueEvidence, UtcTimestamp, WorkInterruptionReason,
-    WorkLifecycleSnapshot, WorkTransitionGuard, WorkTransitionRequest, decide_work_transition,
-    validate_model_stream,
+    ArtifactStorageKey, AttemptNo, CanonicalByteCount, CleanupStatus, ConversationId,
+    CorrelationId, CraxiiId, CurrentWorkAttempt, DraftId, JournalEventId, ModelAttemptReference,
+    ModelAttemptReferenceInput, ModelContractErrorKind, ModelInvocationId, ModelInvocationState,
+    ModelOutputItem, ModelResponse, ModelStreamEvent, ModelStreamProviderErrorKind,
+    ModelStreamState, NormalizedError, ProviderOpaqueEvidence, UtcTimestamp, WorkId,
+    WorkInterruptionReason, WorkLifecycleSnapshot, WorkTransitionGuard, WorkTransitionRequest,
+    decide_work_transition, validate_model_stream,
 };
 use crate::ports::artifact_store::{ArtifactStore, BeginArtifactCapture};
 use crate::ports::clock::{Clock, MonotonicInstant};
@@ -40,43 +38,19 @@ use crate::ports::state_store::{
 
 const MAX_STREAM_EVENTS: usize = 4_096;
 
-pub type DraftSinkFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<DraftExposure, DraftSinkError>> + Send + 'a>>;
-
 /// Provider-neutral, already-validated semantic delta offered to future delivery code.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanonicalDraftDelta {
-    Text {
-        item_ordinal: u32,
-        text: crate::domain::ModelTextPart,
-    },
-    ReasoningSummary {
-        item_ordinal: u32,
-        text: crate::domain::ModelTextPart,
-    },
-    ToolCallStarted {
-        item_ordinal: u32,
-        call_id: crate::domain::ModelToolCallId,
-        tool_name: crate::domain::ToolName,
-    },
-    ToolArguments {
-        item_ordinal: u32,
-        call_id: crate::domain::ModelToolCallId,
-        delta: String,
-    },
-    ToolCallCompleted {
-        item_ordinal: u32,
-        call: crate::domain::CanonicalModelToolCall,
-    },
-    Refusal {
-        item_ordinal: u32,
-        text: Option<crate::domain::ModelTextPart>,
-        completed: bool,
-    },
-    StructuredData {
-        item_ordinal: u32,
-        data: serde_json::Value,
-    },
+    Text { text: String },
+    Refusal { text: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DraftIdentity {
+    pub conversation_id: ConversationId,
+    pub work_id: WorkId,
+    pub invocation_id: ModelInvocationId,
+    pub draft_id: DraftId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,24 +60,35 @@ pub enum DraftExposure {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DraftSinkError;
+pub enum DraftAbandonCause {
+    ToolContinuation,
+    Superseded,
+    Cancelled,
+    Failed,
+    Interrupted,
+    DeliveryLimit,
+}
 
 /// Stage 20 seam. Implementations must not treat a draft as conversation history.
 pub trait DraftSink: Send + Sync {
-    fn publish(&self, delta: CanonicalDraftDelta) -> DraftSinkFuture<'_>;
-    fn abandon(&self, logical_invocation_id: crate::domain::LogicalInvocationId);
+    /// Immediate best-effort offer; it must never wait for client I/O.
+    fn offer(&self, identity: DraftIdentity, delta: CanonicalDraftDelta) -> DraftExposure;
+    fn abandon(&self, invocation_id: ModelInvocationId, reason: DraftAbandonCause);
+    fn finalize_work(&self, work_id: WorkId);
 }
 
-/// Honest Stage 17 production composition: no client delivery protocol exists yet.
+/// Test/offline composition that deliberately exposes no draft output.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoopDraftSink;
 
 impl DraftSink for NoopDraftSink {
-    fn publish(&self, _: CanonicalDraftDelta) -> DraftSinkFuture<'_> {
-        Box::pin(async { Ok(DraftExposure::NotExposed) })
+    fn offer(&self, _: DraftIdentity, _: CanonicalDraftDelta) -> DraftExposure {
+        DraftExposure::NotExposed
     }
 
-    fn abandon(&self, _: crate::domain::LogicalInvocationId) {}
+    fn abandon(&self, _: ModelInvocationId, _: DraftAbandonCause) {}
+
+    fn finalize_work(&self, _: WorkId) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +125,7 @@ impl ModelGatewayLimits {
 
 pub struct GatewayInvocation {
     pub craxii_id: CraxiiId,
+    pub conversation_id: ConversationId,
     pub work: WorkLifecycleSnapshot,
     pub context: ContextAssemblyResult,
     pub selection: ModelSelectionResult,
@@ -257,6 +243,14 @@ impl ModelGateway {
             jitter: Mutex::new(jitter),
             limits: limits.validate()?,
         })
+    }
+
+    pub fn abandon_draft(&self, invocation_id: ModelInvocationId, reason: DraftAbandonCause) {
+        self.draft_sink.abandon(invocation_id, reason);
+    }
+
+    pub fn finalize_drafts_for_work(&self, work_id: WorkId) {
+        self.draft_sink.finalize_work(work_id);
     }
 
     /// Invokes one exact Stage 16 logical request, durably recording every physical attempt.
@@ -398,7 +392,12 @@ impl ModelGateway {
                     error_kind,
                     attempt,
                 } => {
-                    self.draft_sink.abandon(logical_id);
+                    let reason = if error_kind == ProviderErrorKind::Cancelled {
+                        DraftAbandonCause::Cancelled
+                    } else {
+                        DraftAbandonCause::Interrupted
+                    };
+                    self.draft_sink.abandon(attempt.model_invocation_id, reason);
                     return Ok(DurableModelOutcome::Interrupted {
                         error_kind,
                         attempt,
@@ -413,6 +412,8 @@ impl ModelGateway {
                     if error.kind() == ProviderErrorKind::Cancelled
                         && error.certainty() == ProviderOutcomeCertainty::DefinitelyNotSent
                     {
+                        self.draft_sink
+                            .abandon(attempt.model_invocation_id, DraftAbandonCause::Cancelled);
                         return Ok(DurableModelOutcome::CancelledBeforeAttempt {
                             work: attempt.work,
                         });
@@ -443,7 +444,12 @@ impl ModelGateway {
                     ) && !semantic_output_observed;
                     if !decision.retryable() || draft_exposed || cap_reached {
                         if draft_exposed {
-                            self.draft_sink.abandon(logical_id);
+                            let reason = if error.kind() == ProviderErrorKind::Cancelled {
+                                DraftAbandonCause::Cancelled
+                            } else {
+                                DraftAbandonCause::Failed
+                            };
+                            self.draft_sink.abandon(attempt.model_invocation_id, reason);
                         }
                         return Ok(DurableModelOutcome::Failed {
                             error_kind: error.kind(),
@@ -505,7 +511,11 @@ impl ModelGateway {
                     });
                     attempt_no = attempt_no.saturating_add(1);
                 }
-                PhysicalAttemptResult::Infrastructure(error) => return Err(error),
+                PhysicalAttemptResult::Infrastructure(error) => {
+                    self.draft_sink
+                        .abandon(attempt_id, DraftAbandonCause::Interrupted);
+                    return Err(error);
+                }
             }
         }
     }
@@ -594,6 +604,30 @@ impl ModelGateway {
                 )
                 .await;
         }
+        if *invocation.cancellation.borrow() {
+            cancellation.cancel();
+            let error = ProviderError::new(
+                ProviderErrorKind::Cancelled,
+                ProviderOutcomeCertainty::DefinitelyNotSent,
+            );
+            return self
+                .finish_failed_attempt(
+                    invocation,
+                    attempt_id,
+                    attempt_no,
+                    ModelInvocationState::Requesting,
+                    waiting_event,
+                    error,
+                    false,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await;
+        }
 
         let stream = tokio::select! {
             biased;
@@ -601,7 +635,7 @@ impl ModelGateway {
                 cancellation.cancel();
                 let error = ProviderError::new(
                     ProviderErrorKind::Cancelled,
-                    ProviderOutcomeCertainty::DefinitelyNotSent,
+                    ProviderOutcomeCertainty::ProviderOutcomeUnknown,
                 );
                 return self.finish_failed_attempt(
                     invocation,
@@ -623,7 +657,7 @@ impl ModelGateway {
                 cancellation.cancel();
                 let error = ProviderError::new(
                     ProviderErrorKind::TimeoutBeforeOutput,
-                    ProviderOutcomeCertainty::DefinitelyNotSent,
+                    ProviderOutcomeCertainty::ProviderOutcomeUnknown,
                 );
                 return self.finish_failed_attempt(
                     invocation,
@@ -672,6 +706,12 @@ impl ModelGateway {
         let mut first_byte_at = None;
         let mut first_output_at = None;
         let mut draft_exposed = false;
+        let draft_identity = DraftIdentity {
+            conversation_id: invocation.conversation_id,
+            work_id: invocation.work.work_id(),
+            invocation_id: attempt_id,
+            draft_id: DraftId::generate(),
+        };
         #[cfg(feature = "test-failpoints")]
         let mut first_semantic_delta_observed = false;
 
@@ -752,7 +792,7 @@ impl ModelGateway {
                         if accumulator.semantic_output_observed() {
                             ProviderOutcomeCertainty::SemanticOutputObserved
                         } else {
-                            ProviderOutcomeCertainty::DefiniteProviderFailure
+                            ProviderOutcomeCertainty::ProviderOutcomeUnknown
                         },
                     );
                     return self
@@ -841,9 +881,9 @@ impl ModelGateway {
                 );
             }
             if let Some(delta) = draft_delta(&event) {
-                match self.draft_sink.publish(delta).await {
-                    Ok(DraftExposure::Exposed) | Err(_) => draft_exposed = true,
-                    Ok(DraftExposure::NotExposed) => {}
+                match self.draft_sink.offer(draft_identity, delta) {
+                    DraftExposure::Exposed => draft_exposed = true,
+                    DraftExposure::NotExposed => {}
                 }
             }
             let terminal = event.is_terminal();
@@ -853,7 +893,7 @@ impl ModelGateway {
                     if accumulator.semantic_output_observed() {
                         ProviderOutcomeCertainty::SemanticOutputObserved
                     } else {
-                        ProviderOutcomeCertainty::DefiniteProviderFailure
+                        ProviderOutcomeCertainty::ProviderOutcomeUnknown
                     },
                 );
                 return self
@@ -994,7 +1034,7 @@ impl ModelGateway {
                         if accumulator.semantic_output_observed() {
                             ProviderOutcomeCertainty::SemanticOutputObserved
                         } else {
-                            ProviderOutcomeCertainty::DefiniteProviderFailure
+                            ProviderOutcomeCertainty::ProviderOutcomeUnknown
                         },
                     );
                     self.finish_provider_error(
@@ -1067,7 +1107,7 @@ impl ModelGateway {
                             response
                                 .provider_response_id()
                                 .map(|value| value.as_str().to_owned()),
-                            Some(response.usage()),
+                            response.usage(),
                         )
                         .await;
                 }
@@ -1117,8 +1157,12 @@ impl ModelGateway {
             first_byte_at,
             first_output_at,
             completed_at,
-            usage: Some(stored_usage(usage)),
-            usage_status: ModelUsageStatus::Reported,
+            usage: usage.map(stored_usage),
+            usage_status: if usage.is_some() {
+                ModelUsageStatus::Reported
+            } else {
+                ModelUsageStatus::Unavailable
+            },
             provider_error_kind: None,
             provider_outcome_certainty: ProviderOutcomeCertainty::DefinitelyCompleted,
             billing_ambiguity: false,
@@ -1168,7 +1212,7 @@ impl ModelGateway {
         );
         if retained_resumed.state().is_terminal() {
             self.draft_sink
-                .abandon(invocation.context.package().logical_invocation_id());
+                .abandon(attempt_id, DraftAbandonCause::Cancelled);
         }
         PhysicalAttemptResult::Completed {
             response: Box::new(response),
@@ -1423,6 +1467,7 @@ impl ModelGateway {
     ) -> Result<(NormalizedModelOutput, Vec<PreparedArtifact>), ModelGatewayError> {
         let mut normalized = Vec::with_capacity(response.output_items().len());
         let mut artifacts = Vec::new();
+        let mut captured_opaque = Vec::new();
         for (index, item) in response.output_items().iter().enumerate() {
             match item {
                 ModelOutputItem::Text { content_parts } => {
@@ -1460,6 +1505,11 @@ impl ModelGateway {
                 ModelOutputItem::ProviderOpaque(opaque) => {
                     let (item, artifact) =
                         self.capture_opaque(invocation, attempt_id, opaque, index, created_at)?;
+                    captured_opaque.push((
+                        opaque.provider_id().clone(),
+                        opaque.type_label().to_owned(),
+                        opaque.sha256(),
+                    ));
                     normalized.push(item);
                     artifacts.push(artifact);
                 }
@@ -1467,6 +1517,25 @@ impl ModelGateway {
                     return Err(ModelGatewayError::InvalidInvocation);
                 }
             }
+        }
+        if let Some(continuation) = response.provider_continuation()
+            && !captured_opaque
+                .iter()
+                .any(|(provider_id, type_label, digest)| {
+                    provider_id == continuation.provider_id()
+                        && type_label == continuation.type_label()
+                        && *digest == continuation.sha256()
+                })
+        {
+            let (item, artifact) = self.capture_opaque(
+                invocation,
+                attempt_id,
+                continuation,
+                response.output_items().len(),
+                created_at,
+            )?;
+            normalized.push(item);
+            artifacts.push(artifact);
         }
         Ok((NormalizedModelOutput { items: normalized }, artifacts))
     }
@@ -1632,7 +1701,7 @@ impl CanonicalStreamAccumulator {
                 response
                     .require_supported_semantics()
                     .map_err(|error| error.kind())?;
-                Ok(StreamTerminal::Completed(Box::new(response.clone())))
+                Ok(StreamTerminal::Completed(response.clone()))
             }
             (_, Some(ModelStreamEvent::ProviderError { kind })) => {
                 Ok(StreamTerminal::ProviderError(*kind))
@@ -1731,63 +1800,12 @@ fn started_ids(event: &ModelStreamEvent) -> (Option<String>, Option<String>) {
 
 fn draft_delta(event: &ModelStreamEvent) -> Option<CanonicalDraftDelta> {
     match event {
-        ModelStreamEvent::TextDelta {
-            item_ordinal,
-            delta,
-        } => Some(CanonicalDraftDelta::Text {
-            item_ordinal: *item_ordinal,
-            text: delta.clone(),
+        ModelStreamEvent::TextDelta { delta, .. } => Some(CanonicalDraftDelta::Text {
+            text: delta.as_str().to_owned(),
         }),
-        ModelStreamEvent::ReasoningSummaryDelta {
-            item_ordinal,
-            delta,
-        } => Some(CanonicalDraftDelta::ReasoningSummary {
-            item_ordinal: *item_ordinal,
-            text: delta.clone(),
+        ModelStreamEvent::RefusalDelta { delta, .. } => Some(CanonicalDraftDelta::Refusal {
+            text: delta.as_str().to_owned(),
         }),
-        ModelStreamEvent::ToolCallStarted {
-            item_ordinal,
-            call_id,
-            name,
-        } => Some(CanonicalDraftDelta::ToolCallStarted {
-            item_ordinal: *item_ordinal,
-            call_id: call_id.clone(),
-            tool_name: name.clone(),
-        }),
-        ModelStreamEvent::ToolArgumentDelta {
-            item_ordinal,
-            call_id,
-            delta,
-        } => Some(CanonicalDraftDelta::ToolArguments {
-            item_ordinal: *item_ordinal,
-            call_id: call_id.clone(),
-            delta: delta.clone(),
-        }),
-        ModelStreamEvent::ToolCallCompleted { item_ordinal, call } => {
-            Some(CanonicalDraftDelta::ToolCallCompleted {
-                item_ordinal: *item_ordinal,
-                call: call.clone(),
-            })
-        }
-        ModelStreamEvent::RefusalDelta {
-            item_ordinal,
-            delta,
-        } => Some(CanonicalDraftDelta::Refusal {
-            item_ordinal: *item_ordinal,
-            text: Some(delta.clone()),
-            completed: false,
-        }),
-        ModelStreamEvent::RefusalCompleted { item_ordinal } => Some(CanonicalDraftDelta::Refusal {
-            item_ordinal: *item_ordinal,
-            text: None,
-            completed: true,
-        }),
-        ModelStreamEvent::StructuredData { item_ordinal, data } => {
-            Some(CanonicalDraftDelta::StructuredData {
-                item_ordinal: *item_ordinal,
-                data: data.clone(),
-            })
-        }
         _ => None,
     }
 }
@@ -1825,7 +1843,7 @@ fn stream_error(kind: ModelStreamProviderErrorKind, semantic: bool) -> ProviderE
         ),
         ModelStreamProviderErrorKind::TimeoutBeforeOutput => (
             ProviderErrorKind::TimeoutBeforeOutput,
-            ProviderOutcomeCertainty::DefiniteProviderFailure,
+            ProviderOutcomeCertainty::ProviderOutcomeUnknown,
         ),
         ModelStreamProviderErrorKind::TimeoutAfterOutput => (
             ProviderErrorKind::TimeoutAfterOutput,
@@ -1836,7 +1854,7 @@ fn stream_error(kind: ModelStreamProviderErrorKind, semantic: bool) -> ProviderE
             if semantic {
                 ProviderOutcomeCertainty::SemanticOutputObserved
             } else {
-                ProviderOutcomeCertainty::DefiniteProviderFailure
+                ProviderOutcomeCertainty::ProviderOutcomeUnknown
             },
         ),
     };
@@ -1852,7 +1870,7 @@ fn timeout_error(semantic: bool) -> ProviderError {
     } else {
         ProviderError::new(
             ProviderErrorKind::TimeoutBeforeOutput,
-            ProviderOutcomeCertainty::DefiniteProviderFailure,
+            ProviderOutcomeCertainty::ProviderOutcomeUnknown,
         )
     }
 }
@@ -1894,10 +1912,12 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+    use crate::adapters::artifacts::LocalArtifactStore;
     use crate::adapters::scripted_provider::{
         ScriptExpectation, ScriptGate, ScriptedProgram, ScriptedProvider, ScriptedStep,
     };
     use crate::application::context_assembler::ContextAssemblyResult;
+    use crate::application::event_delivery::{LiveEventBroker, LiveEventReceive};
     use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
     use crate::domain::{
         ContextManifestId, ConversationId, JournalOffset, LogicalInvocationId,
@@ -1905,14 +1925,15 @@ mod tests {
         ModelInputItem, ModelInputRole, ModelRequest, ModelRequestInput, ModelResponseInput,
         ModelStopReason, ModelTarget, ModelTargetId, ModelTargetInput, ModelTextPart,
         ModelToolChoicePolicy, ProjectionVersion, ProviderEvidenceId, ProviderId, ProviderMetadata,
-        ProviderModelId, ProviderModelReference, ProviderNativeOptions, Sha256Digest,
-        TargetConfigurationVersion, TokenCount, TokenEstimatorIdentity, WorkId,
+        ProviderModelId, ProviderModelReference, ProviderNativeOptions, ProviderOpaqueEvidence,
+        Sha256Digest, TargetConfigurationVersion, TokenCount, TokenEstimatorIdentity, WorkId,
         WorkLifecycleSnapshotInput, WorkState,
     };
     use crate::ports::artifact_store::{
         ArtifactObjectReference, ArtifactOrphanReport, ArtifactStoreError, ArtifactStoreErrorKind,
     };
     use crate::ports::clock::TestClock;
+    use crate::ports::model_provider::{ModelProviderFuture, ModelProviderStream};
     use crate::ports::state_store::{
         CommitReceipt, CommittedEventRange, LoadOwnedWorkRequest, OwnedWorkState, StateStoreError,
         StateStoreErrorKind, StateStoreFuture, TerminalizeOwnedWorkRequest,
@@ -1926,6 +1947,51 @@ mod tests {
         }
     }
 
+    struct PendingInvocationProvider {
+        provider_id: ProviderId,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PendingInvocationProvider {
+        fn new(provider_id: ProviderId) -> Self {
+            Self {
+                provider_id,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::Acquire)
+        }
+    }
+
+    impl ModelProvider for PendingInvocationProvider {
+        fn provider_id(&self) -> &ProviderId {
+            &self.provider_id
+        }
+
+        fn capabilities(
+            &self,
+            target: &ModelTarget,
+        ) -> Result<ModelCapabilitySnapshot, ProviderError> {
+            if target.reference().provider_id() != &self.provider_id {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    ProviderOutcomeCertainty::DefinitelyNotSent,
+                ));
+            }
+            Ok(target.reference().capabilities().clone())
+        }
+
+        fn invoke_stream(
+            &self,
+            _: ModelProviderInvocation,
+        ) -> ModelProviderFuture<'_, Box<dyn ModelProviderStream>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Box::pin(std::future::pending())
+        }
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct AttemptEvidence {
         attempt_no: i64,
@@ -1933,6 +1999,7 @@ mod tests {
         retry: Option<ProviderRetryEvidence>,
         terminal_state: Option<ModelInvocationState>,
         usage_status: Option<ModelUsageStatus>,
+        draft_exposed: Option<bool>,
     }
 
     #[derive(Default)]
@@ -1978,6 +2045,7 @@ mod tests {
                         retry: request.invocation.retry_evidence,
                         terminal_state: None,
                         usage_status: None,
+                        draft_exposed: None,
                     });
                 Ok(Self::receipt())
             })
@@ -2004,6 +2072,7 @@ mod tests {
                     .ok_or_else(|| StateStoreError::new(StateStoreErrorKind::InternalInvariant))?;
                 attempt.terminal_state = Some(request.outcome.state);
                 attempt.usage_status = Some(request.outcome.usage_status);
+                attempt.draft_exposed = Some(request.outcome.draft_exposed);
                 Ok(Self::receipt())
             })
         }
@@ -2056,6 +2125,7 @@ mod tests {
         context: ContextAssemblyResult,
         work: WorkLifecycleSnapshot,
         craxii_id: CraxiiId,
+        conversation_id: ConversationId,
         correlation_id: CorrelationId,
         cause: JournalEventId,
         clock: Arc<TestClock>,
@@ -2111,6 +2181,7 @@ mod tests {
             .select(None, required)
             .unwrap();
         let work_id = WorkId::generate();
+        let conversation_id = ConversationId::generate();
         let runtime_id = crate::domain::RuntimeInstanceId::generate();
         let logical_id = LogicalInvocationId::generate();
         let manifest_id = ContextManifestId::generate();
@@ -2141,7 +2212,7 @@ mod tests {
             context_policy_version: "test-v1".to_owned(),
             system_prompt_fingerprint: Sha256Digest::hash_bytes(b"prompt"),
             toolset_fingerprint: crate::domain::model_toolset_fingerprint(&[]),
-            eligibility_conversation_id: ConversationId::generate(),
+            eligibility_conversation_id: conversation_id,
             active_work_ordinal: 1,
             highest_prior_terminal_work_ordinal: None,
             input_event_ids: Vec::new(),
@@ -2187,6 +2258,7 @@ mod tests {
             context,
             work,
             craxii_id: CraxiiId::generate(),
+            conversation_id,
             correlation_id: CorrelationId::generate(),
             cause: JournalEventId::generate(),
             clock: Arc::new(TestClock::new(
@@ -2207,7 +2279,7 @@ mod tests {
                 ModelOutputItem::text(vec![ModelTextPart::try_new(text).unwrap()]).unwrap(),
             ],
             stop_reason: ModelStopReason::Completed,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: Some(ProviderEvidenceId::try_new("request-1").unwrap()),
             provider_response_id: Some(ProviderEvidenceId::try_new("response-1").unwrap()),
             provider_continuation: None,
@@ -2228,7 +2300,9 @@ mod tests {
                 delta: ModelTextPart::try_new(text).unwrap(),
             }),
             ScriptedStep::emit(ModelStreamEvent::Usage(usage())),
-            ScriptedStep::emit(ModelStreamEvent::Completed(final_response(target, text))),
+            ScriptedStep::emit(ModelStreamEvent::Completed(Box::new(final_response(
+                target, text,
+            )))),
         ]
     }
 
@@ -2262,6 +2336,7 @@ mod tests {
             .unwrap();
         GatewayInvocation {
             craxii_id: fixture.craxii_id,
+            conversation_id: fixture.conversation_id,
             work: fixture.work,
             context: fixture.context,
             selection: fixture.selection,
@@ -2277,7 +2352,7 @@ mod tests {
 
     fn build_gateway(
         store: Arc<FakeGatewayStore>,
-        provider: Arc<ScriptedProvider>,
+        provider: Arc<dyn ModelProvider>,
         clock: Arc<TestClock>,
     ) -> ModelGateway {
         ModelGateway::new(
@@ -2292,12 +2367,171 @@ mod tests {
         .unwrap()
     }
 
+    struct TemporaryArtifactRoot(std::path::PathBuf);
+
+    impl TemporaryArtifactRoot {
+        fn new() -> Self {
+            Self(
+                std::env::temp_dir()
+                    .join(format!("craxii-stage19-gateway-{}", ArtifactId::generate())),
+            )
+        }
+    }
+
+    impl Drop for TemporaryArtifactRoot {
+        fn drop(&mut self) {
+            if self.0.file_name().is_some_and(|name| {
+                name.to_string_lossy()
+                    .starts_with("craxii-stage19-gateway-")
+            }) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+    }
+
     #[test]
     fn frozen_limits_are_exact_and_noop_drafts_are_never_exposed() {
         let limits = ModelGatewayLimits::default().validate().unwrap();
         assert_eq!(limits.maximum_attempts_per_logical_invocation, 3);
         assert_eq!(limits.maximum_attempts_per_work, 32);
         let _jitter: Box<dyn FullJitterSource + Send> = Box::new(MinimumJitter);
+    }
+
+    #[test]
+    fn stage20_safe_projection_is_text_and_refusal_only() {
+        let text = ModelTextPart::try_new("safe text").unwrap();
+        assert_eq!(
+            draft_delta(&ModelStreamEvent::TextDelta {
+                item_ordinal: 0,
+                delta: text.clone(),
+            }),
+            Some(CanonicalDraftDelta::Text {
+                text: "safe text".to_owned(),
+            })
+        );
+        assert_eq!(
+            draft_delta(&ModelStreamEvent::RefusalDelta {
+                item_ordinal: 0,
+                delta: text.clone(),
+            }),
+            Some(CanonicalDraftDelta::Refusal {
+                text: "safe text".to_owned(),
+            })
+        );
+        let call = crate::domain::CanonicalModelToolCall::try_new(
+            crate::domain::ModelToolCallId::try_new("private-call").unwrap(),
+            "run_shell",
+            r#"{"command":"private"}"#,
+        )
+        .unwrap();
+        let opaque = ProviderOpaqueEvidence::try_new(
+            ProviderId::try_new("fixture").unwrap(),
+            "private.opaque",
+            "private-provider-state",
+        )
+        .unwrap();
+        for event in [
+            ModelStreamEvent::ReasoningSummaryDelta {
+                item_ordinal: 0,
+                delta: text,
+            },
+            ModelStreamEvent::ToolCallStarted {
+                item_ordinal: 1,
+                call_id: call.call_id().clone(),
+                name: call.name().clone(),
+            },
+            ModelStreamEvent::ToolArgumentDelta {
+                item_ordinal: 1,
+                call_id: call.call_id().clone(),
+                delta: call.raw_arguments().to_owned(),
+            },
+            ModelStreamEvent::ToolCallCompleted {
+                item_ordinal: 1,
+                call,
+            },
+            ModelStreamEvent::RefusalCompleted { item_ordinal: 2 },
+            ModelStreamEvent::StructuredData {
+                item_ordinal: 3,
+                data: serde_json::json!({"private": true}),
+            },
+            ModelStreamEvent::UnknownProviderEvent(opaque),
+        ] {
+            assert!(draft_delta(&event).is_none());
+        }
+    }
+
+    #[test]
+    fn response_level_provider_continuation_is_captured_as_durable_opaque_evidence() {
+        let fixture = gateway_fixture();
+        let target = fixture.target.clone();
+        let clock = fixture.clock.clone();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            Vec::new(),
+            clock.clone(),
+        ));
+        let root = TemporaryArtifactRoot::new();
+        let artifact_store = Arc::new(LocalArtifactStore::initialize(&root.0).unwrap());
+        let gateway = ModelGateway::new(
+            Arc::new(FakeGatewayStore::default()),
+            artifact_store.clone(),
+            provider,
+            Arc::new(NoopDraftSink),
+            clock,
+            Box::new(MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap();
+        let continuation = ProviderOpaqueEvidence::try_new(
+            ProviderId::try_new("fixture").unwrap(),
+            "openai.reasoning.encrypted_content",
+            "bounded-encrypted-fixture",
+        )
+        .unwrap();
+        let response = ModelResponse::try_new(ModelResponseInput {
+            selected_target: target.identity(),
+            output_items: vec![
+                ModelOutputItem::text(vec![ModelTextPart::try_new("done").unwrap()]).unwrap(),
+            ],
+            stop_reason: ModelStopReason::Completed,
+            usage: Some(usage()),
+            provider_request_id: None,
+            provider_response_id: None,
+            provider_continuation: Some(continuation.clone()),
+            provider_metadata: ProviderMetadata::default(),
+        })
+        .unwrap();
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        let gateway_invocation = invocation(fixture, receiver);
+
+        let (normalized, artifacts) = gateway
+            .prepare_normalized_output(
+                &gateway_invocation,
+                ModelInvocationId::generate(),
+                &response,
+                "2026-09-01T00:00:01.000000Z".parse().unwrap(),
+            )
+            .unwrap();
+
+        assert_eq!(normalized.items.len(), 2);
+        assert!(matches!(
+            &normalized.items[1],
+            NormalizedModelOutputItem::ProviderOpaque {
+                provider_id,
+                item_type,
+                sha256,
+                ..
+            } if provider_id == continuation.provider_id()
+                && item_type == continuation.type_label()
+                && *sha256 == continuation.sha256()
+        ));
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(
+            artifact_store
+                .read_verified(artifacts[0].finalized.object_reference())
+                .unwrap(),
+            continuation.opaque().as_bytes()
+        );
     }
 
     #[tokio::test]
@@ -2483,6 +2717,240 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stage20_real_live_sink_receives_gateway_text_and_persists_conservative_exposure() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![program(
+                &fixture,
+                1,
+                1,
+                success_steps(&fixture.target, "visible draft"),
+            )],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let broker = Arc::new(LiveEventBroker::new());
+        let mut subscriber = broker.subscribe().unwrap();
+        let gateway = ModelGateway::new(
+            store.clone(),
+            Arc::new(RejectingArtifactStore),
+            provider,
+            broker as Arc<dyn DraftSink>,
+            fixture.clock.clone(),
+            Box::new(MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap();
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            gateway.invoke(invocation(fixture, receiver)).await.unwrap(),
+            DurableModelOutcome::Completed { .. }
+        ));
+        let LiveEventReceive::Event(started) = subscriber.recv().await else {
+            panic!("draft start expected");
+        };
+        let LiveEventReceive::Event(delta) = subscriber.recv().await else {
+            panic!("draft delta expected");
+        };
+        assert_eq!(started.event_type, "assistant.draft_started");
+        assert_eq!(delta.event_type, "assistant.draft_delta");
+        assert_eq!(delta.delta_sequence, Some(1));
+        assert_eq!(store.attempts()[0].draft_exposed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stage20_pre_output_retry_has_no_stale_draft_before_successful_attempt() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![
+                program(
+                    &fixture,
+                    1,
+                    1,
+                    vec![ScriptedStep::Fail(ProviderError::new(
+                        ProviderErrorKind::TemporarilyUnavailable,
+                        ProviderOutcomeCertainty::DefiniteProviderFailure,
+                    ))],
+                ),
+                program(
+                    &fixture,
+                    2,
+                    2,
+                    success_steps(&fixture.target, "retry answer"),
+                ),
+            ],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let broker = Arc::new(LiveEventBroker::new());
+        let mut subscriber = broker.subscribe().unwrap();
+        let gateway = ModelGateway::new(
+            store.clone(),
+            Arc::new(RejectingArtifactStore),
+            provider.clone(),
+            broker.clone() as Arc<dyn DraftSink>,
+            fixture.clock.clone(),
+            Box::new(MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap();
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            gateway.invoke(invocation(fixture, receiver)).await.unwrap(),
+            DurableModelOutcome::Completed { .. }
+        ));
+        assert_eq!(provider.invocation_count(), 2);
+        let LiveEventReceive::Event(started) = subscriber.recv().await else {
+            panic!("single successful draft start expected");
+        };
+        let LiveEventReceive::Event(delta) = subscriber.recv().await else {
+            panic!("single successful draft delta expected");
+        };
+        assert_eq!(started.event_type, "assistant.draft_started");
+        assert_eq!(delta.event_type, "assistant.draft_delta");
+        assert_eq!(broker.metrics().drafts_started, 1);
+        assert_eq!(broker.metrics().drafts_abandoned, 0);
+        assert_eq!(store.attempts()[0].draft_exposed, Some(false));
+        assert_eq!(store.attempts()[1].draft_exposed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stage20_definite_failure_after_live_output_abandons_without_retry() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![program(
+                &fixture,
+                1,
+                1,
+                vec![
+                    ScriptedStep::emit(ModelStreamEvent::ResponseStarted {
+                        target: fixture.target.identity(),
+                        provider_request_id: None,
+                        provider_response_id: None,
+                    }),
+                    ScriptedStep::emit(ModelStreamEvent::TextDelta {
+                        item_ordinal: 0,
+                        delta: ModelTextPart::try_new("partial").unwrap(),
+                    }),
+                    ScriptedStep::Fail(ProviderError::new(
+                        ProviderErrorKind::TemporarilyUnavailable,
+                        ProviderOutcomeCertainty::DefiniteProviderFailure,
+                    )),
+                ],
+            )],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let broker = Arc::new(LiveEventBroker::new());
+        let mut subscriber = broker.subscribe().unwrap();
+        let gateway = ModelGateway::new(
+            store.clone(),
+            Arc::new(RejectingArtifactStore),
+            provider.clone(),
+            broker as Arc<dyn DraftSink>,
+            fixture.clock.clone(),
+            Box::new(MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap();
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            gateway.invoke(invocation(fixture, receiver)).await.unwrap(),
+            DurableModelOutcome::Failed {
+                semantic_output_observed: true,
+                ..
+            }
+        ));
+        assert_eq!(provider.invocation_count(), 1);
+        for expected in [
+            "assistant.draft_started",
+            "assistant.draft_delta",
+            "assistant.draft_abandoned",
+        ] {
+            let LiveEventReceive::Event(event) = subscriber.recv().await else {
+                panic!("live event expected");
+            };
+            assert_eq!(event.event_type, expected);
+            if expected == "assistant.draft_abandoned" {
+                assert!(matches!(
+                    event.payload,
+                    crate::protocol::DraftEventPayload::Abandoned {
+                        reason: crate::protocol::DraftAbandonReason::Failed
+                    }
+                ));
+            }
+        }
+        assert_eq!(store.attempts()[0].draft_exposed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn stage20_provider_ambiguity_after_live_output_abandons_as_interrupted() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![program(
+                &fixture,
+                1,
+                1,
+                vec![
+                    ScriptedStep::emit(ModelStreamEvent::ResponseStarted {
+                        target: fixture.target.identity(),
+                        provider_request_id: None,
+                        provider_response_id: None,
+                    }),
+                    ScriptedStep::emit(ModelStreamEvent::TextDelta {
+                        item_ordinal: 0,
+                        delta: ModelTextPart::try_new("ambiguous partial").unwrap(),
+                    }),
+                    ScriptedStep::Fail(ProviderError::new(
+                        ProviderErrorKind::TransportAfterPossibleProcessing,
+                        ProviderOutcomeCertainty::ProviderOutcomeUnknown,
+                    )),
+                ],
+            )],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let broker = Arc::new(LiveEventBroker::new());
+        let mut subscriber = broker.subscribe().unwrap();
+        let gateway = ModelGateway::new(
+            store.clone(),
+            Arc::new(RejectingArtifactStore),
+            provider.clone(),
+            broker as Arc<dyn DraftSink>,
+            fixture.clock.clone(),
+            Box::new(MinimumJitter),
+            ModelGatewayLimits::default(),
+        )
+        .unwrap();
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        assert!(matches!(
+            gateway.invoke(invocation(fixture, receiver)).await.unwrap(),
+            DurableModelOutcome::Interrupted { .. }
+        ));
+        assert_eq!(provider.invocation_count(), 1);
+        let mut abandoned = None;
+        for _ in 0..3 {
+            let LiveEventReceive::Event(event) = subscriber.recv().await else {
+                panic!("live event expected");
+            };
+            if event.event_type == "assistant.draft_abandoned" {
+                abandoned = Some(event);
+            }
+        }
+        assert!(matches!(
+            abandoned.unwrap().payload,
+            crate::protocol::DraftEventPayload::Abandoned {
+                reason: crate::protocol::DraftAbandonReason::Interrupted
+            }
+        ));
+        assert_eq!(store.attempts()[0].draft_exposed, Some(true));
+    }
+
+    #[tokio::test]
     async fn cancellation_before_intent_is_zero_calls_and_during_provider_is_ambiguous() {
         let fixture = gateway_fixture();
         let provider = Arc::new(ScriptedProvider::with_clock(
@@ -2525,6 +2993,52 @@ mod tests {
         let result = task.await.unwrap().unwrap();
         assert!(matches!(result, DurableModelOutcome::Interrupted { .. }));
         assert_eq!(provider.invocation_count(), 1);
+        assert_eq!(
+            store.attempts()[0].terminal_state,
+            Some(ModelInvocationState::ProviderOutcomeUnknown)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_deadline_while_invoke_stream_is_pending_are_ambiguous() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(PendingInvocationProvider::new(
+            ProviderId::try_new("fixture").unwrap(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let gateway = build_gateway(store.clone(), provider.clone(), fixture.clock.clone());
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move { gateway.invoke(invocation(fixture, receiver)).await });
+        while provider.calls() == 0 {
+            tokio::task::yield_now().await;
+        }
+        sender.send_replace(true);
+        let result = task.await.unwrap().unwrap();
+        assert!(matches!(result, DurableModelOutcome::Interrupted { .. }));
+        assert_eq!(provider.calls(), 1);
+        assert_eq!(
+            store.attempts()[0].terminal_state,
+            Some(ModelInvocationState::ProviderOutcomeUnknown)
+        );
+
+        let fixture = gateway_fixture();
+        let clock = fixture.clock.clone();
+        let provider = Arc::new(PendingInvocationProvider::new(
+            ProviderId::try_new("fixture").unwrap(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let gateway = build_gateway(store.clone(), provider.clone(), clock.clone());
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        let mut pending = invocation(fixture, receiver);
+        pending.shutdown_deadline = Some(
+            clock
+                .monotonic_now()
+                .checked_add(Duration::from_millis(25))
+                .unwrap(),
+        );
+        let result = gateway.invoke(pending).await.unwrap();
+        assert!(matches!(result, DurableModelOutcome::Interrupted { .. }));
+        assert_eq!(provider.calls(), 1);
         assert_eq!(
             store.attempts()[0].terminal_state,
             Some(ModelInvocationState::ProviderOutcomeUnknown)

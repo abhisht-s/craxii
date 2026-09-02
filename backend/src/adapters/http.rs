@@ -35,6 +35,7 @@ use crate::application::command_gateway::{
     CommandGateway, CommandGatewayError, CommandGatewayErrorKind,
 };
 use crate::application::command_service::CommandServiceErrorKind;
+use crate::application::event_delivery::{LiveEventBroker, LiveEventReceive};
 use crate::application::publication::{
     PublicStateService, PublicationError, PublicationErrorKind, encode_public_event_frame,
 };
@@ -46,7 +47,8 @@ use crate::domain::{AuthenticatedDevice, ConversationId, IdempotencyKey, UtcTime
 use crate::ports::clock::Clock;
 use crate::protocol::{
     BootstrapResponse, CANCELLATION_BODY_LIMIT, CancellationRequest, CancellationResponse,
-    ErrorEnvelope, HTTP_CONCURRENCY_LIMIT, HealthResponse, HealthStatus, MESSAGE_BODY_LIMIT,
+    DraftEventPayload, EphemeralDraftEnvelope, ErrorEnvelope, HTTP_CONCURRENCY_LIMIT,
+    HealthResponse, HealthStatus, MAX_WEBSOCKET_FRAME_BYTES, MESSAGE_BODY_LIMIT,
     MUTATION_CONCURRENCY_LIMIT, MessageRequest, MessageResponse, ProtocolVersion, ReplayCursor,
     RequestId, SyncCompleteEnvelope, WEBSOCKET_CONNECTION_LIMIT, WEBSOCKET_OUTBOUND_FRAMES,
 };
@@ -65,6 +67,7 @@ pub struct HttpState {
     health: Health,
     command_gateway: Arc<CommandGateway<SqliteStateStore, SystemClock, CommandCommitEffects>>,
     cursors: CursorBroadcaster,
+    live_events: Arc<LiveEventBroker>,
     ws_limit: Arc<tokio::sync::Semaphore>,
     ws_shutdown: tokio::sync::watch::Sender<bool>,
     connections: ConnectionRegistry,
@@ -89,6 +92,7 @@ impl HttpState {
         health: Health,
         admission: MutationAdmission,
         cursors: CursorBroadcaster,
+        live_events: Arc<LiveEventBroker>,
         fatal: tokio::sync::watch::Sender<bool>,
         ws_shutdown: tokio::sync::watch::Sender<bool>,
         connections: ConnectionRegistry,
@@ -110,6 +114,7 @@ impl HttpState {
             health,
             command_gateway,
             cursors,
+            live_events,
             ws_limit: Arc::new(tokio::sync::Semaphore::new(WEBSOCKET_CONNECTION_LIMIT)),
             ws_shutdown,
             connections,
@@ -1608,6 +1613,7 @@ async fn run_websocket(
     replay_high_water: ReplayCursor,
 ) {
     let mut shutdown = state.ws_shutdown.subscribe();
+    let mut connection_drafts = ConnectionDraftState::default();
     if shutdown_is_latched(&shutdown) {
         close(&mut socket, close_code::AWAY, "server shutdown").await;
         return;
@@ -1619,6 +1625,7 @@ async fn run_websocket(
         &mut shutdown,
         &mut scanned,
         replay_high_water,
+        &mut connection_drafts,
     )
     .await
     {
@@ -1659,8 +1666,23 @@ async fn run_websocket(
             return;
         }
     }
+    state
+        .live_events
+        .observe_replay(0, replay_high_water.get().saturating_sub(after.get()));
+    let Some(mut drafts) = state.live_events.subscribe() else {
+        close(&mut socket, close_code::AWAY, "server shutdown").await;
+        return;
+    };
     if pending_live_scan {
-        match live_scan(&mut socket, &state, &mut shutdown, &mut scanned).await {
+        match live_scan(
+            &mut socket,
+            &state,
+            &mut shutdown,
+            &mut scanned,
+            &mut connection_drafts,
+        )
+        .await
+        {
             Ok(()) => {}
             Err(WebSocketFlowError::Shutdown) => {
                 close(&mut socket, close_code::AWAY, "server shutdown").await;
@@ -1695,7 +1717,13 @@ async fn run_websocket(
             hint = hints.recv() => {
                 match hint {
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        match live_scan(&mut socket, &state, &mut shutdown, &mut scanned).await {
+                        match live_scan(
+                            &mut socket,
+                            &state,
+                            &mut shutdown,
+                            &mut scanned,
+                            &mut connection_drafts,
+                        ).await {
                             Ok(()) => {}
                             Err(WebSocketFlowError::Shutdown) => {
                                 close(&mut socket, close_code::AWAY, "server shutdown").await;
@@ -1708,7 +1736,13 @@ async fn run_websocket(
                 }
             }
             _ = fallback.tick() => {
-                match live_scan(&mut socket, &state, &mut shutdown, &mut scanned).await {
+                match live_scan(
+                    &mut socket,
+                    &state,
+                    &mut shutdown,
+                    &mut scanned,
+                    &mut connection_drafts,
+                ).await {
                     Ok(()) => {}
                     Err(WebSocketFlowError::Shutdown) => {
                         close(&mut socket, close_code::AWAY, "server shutdown").await;
@@ -1717,6 +1751,97 @@ async fn run_websocket(
                     Err(WebSocketFlowError::Failed) => return,
                 }
             }
+            draft = drafts.recv() => {
+                match draft {
+                    LiveEventReceive::Event(event) => {
+                        if !connection_drafts.accept(&event) {
+                            continue;
+                        }
+                        if send_json(&mut socket, &state, &mut shutdown, &event).await.is_err() {
+                            state.live_events.observe_slow_disconnect();
+                            close(&mut socket, close_code::AGAIN, "slow consumer").await;
+                            return;
+                        }
+                    }
+                    LiveEventReceive::Overloaded => {
+                        state.live_events.observe_slow_disconnect();
+                        close(&mut socket, close_code::AGAIN, "temporary overload").await;
+                        return;
+                    }
+                    LiveEventReceive::Closed => {
+                        close(&mut socket, close_code::AWAY, "server shutdown").await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ConnectionDraft {
+    work_id: WorkId,
+    invocation_id: crate::domain::ModelInvocationId,
+    last_sequence: u32,
+}
+
+#[derive(Default)]
+struct ConnectionDraftState {
+    active: HashMap<crate::domain::DraftId, ConnectionDraft>,
+}
+
+impl ConnectionDraftState {
+    fn accept(&mut self, event: &EphemeralDraftEnvelope) -> bool {
+        match &event.payload {
+            DraftEventPayload::Started {} => {
+                if self.active.contains_key(&event.draft_id) {
+                    return false;
+                }
+                self.active.insert(
+                    event.draft_id,
+                    ConnectionDraft {
+                        work_id: event.work_id,
+                        invocation_id: event.invocation_id,
+                        last_sequence: 0,
+                    },
+                );
+                true
+            }
+            DraftEventPayload::Delta { .. } => {
+                let Some(sequence) = event.delta_sequence else {
+                    return false;
+                };
+                let Some(active) = self.active.get_mut(&event.draft_id) else {
+                    return false;
+                };
+                if active.work_id != event.work_id
+                    || active.invocation_id != event.invocation_id
+                    || sequence <= active.last_sequence
+                {
+                    return false;
+                }
+                active.last_sequence = sequence;
+                true
+            }
+            DraftEventPayload::Abandoned { .. } => {
+                self.active.remove(&event.draft_id).is_some_and(|active| {
+                    active.work_id == event.work_id && active.invocation_id == event.invocation_id
+                })
+            }
+        }
+    }
+
+    fn reconcile_durable(&mut self, event: &crate::protocol::DurableEventEnvelope) {
+        if matches!(
+            event.event_type,
+            "assistant.message_committed"
+                | "work.completed"
+                | "work.cancelled"
+                | "work.failed"
+                | "work.interrupted"
+        ) && let Some(work_id) = event.work_id
+        {
+            self.active.retain(|_, draft| draft.work_id != work_id);
         }
     }
 }
@@ -1744,6 +1869,7 @@ async fn live_scan(
     state: &HttpState,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     scanned: &mut ReplayCursor,
+    drafts: &mut ConnectionDraftState,
 ) -> Result<(), WebSocketFlowError> {
     let public_state = PublicStateService::new(state.store.as_ref());
     let high_water = match tokio::select! {
@@ -1761,7 +1887,7 @@ async fn live_scan(
             return Err(WebSocketFlowError::Failed);
         }
     };
-    scan_and_send(socket, state, shutdown, scanned, high_water).await
+    scan_and_send(socket, state, shutdown, scanned, high_water, drafts).await
 }
 
 async fn scan_and_send(
@@ -1770,6 +1896,7 @@ async fn scan_and_send(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     scanned: &mut ReplayCursor,
     through: ReplayCursor,
+    drafts: &mut ConnectionDraftState,
 ) -> Result<(), WebSocketFlowError> {
     while *scanned < through {
         let public_state = PublicStateService::new(state.store.as_ref());
@@ -1788,7 +1915,7 @@ async fn scan_and_send(
                 return Err(WebSocketFlowError::Failed);
             }
         };
-        match send_events(socket, state, shutdown, page.events).await {
+        match send_events(socket, state, shutdown, drafts, page.events).await {
             Ok(()) => {}
             Err(WebSocketFlowError::Shutdown) => return Err(WebSocketFlowError::Shutdown),
             Err(WebSocketFlowError::Failed) => {
@@ -1815,10 +1942,23 @@ async fn send_events(
     socket: &mut WebSocket,
     state: &HttpState,
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    drafts: &mut ConnectionDraftState,
     events: Vec<crate::protocol::DurableEventEnvelope>,
 ) -> Result<(), WebSocketFlowError> {
     let mut outbound = VecDeque::with_capacity(WEBSOCKET_OUTBOUND_FRAMES);
     for event in events {
+        drafts.reconcile_durable(&event);
+        if matches!(
+            event.event_type,
+            "assistant.message_committed"
+                | "work.completed"
+                | "work.cancelled"
+                | "work.failed"
+                | "work.interrupted"
+        ) && let Some(work_id) = event.work_id
+        {
+            state.live_events.finalize_work(work_id);
+        }
         let encoded = match encode_public_event_frame(&event) {
             Ok(encoded) => encoded,
             Err(_) => {
@@ -1871,6 +2011,9 @@ async fn send_json<T: serde::Serialize>(
     value: &T,
 ) -> Result<(), WebSocketFlowError> {
     let encoded = serde_json::to_string(value).map_err(|_| WebSocketFlowError::Failed)?;
+    if encoded.len() > MAX_WEBSOCKET_FRAME_BYTES {
+        return Err(WebSocketFlowError::Failed);
+    }
     send_frame(socket, state, shutdown, Message::Text(encoded.into())).await
 }
 

@@ -23,7 +23,8 @@ use crate::application::authority::{
 use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
 };
-use crate::application::model_gateway::{ModelGateway, ModelGatewayLimits, NoopDraftSink};
+use crate::application::event_delivery::LiveEventBroker;
+use crate::application::model_gateway::{DraftSink, ModelGateway, ModelGatewayLimits};
 use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
 use crate::application::runtime::{
     HeartbeatTask, RuntimeControlError, ShutdownController, bootstrap_runtime,
@@ -32,15 +33,15 @@ use crate::application::tool_execution_service::{ToolExecutionService, ToolRunti
 use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::application::transport::{CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::config;
-use crate::bootstrap::credential::load_credentials;
+use crate::bootstrap::credential::{CredentialLoadErrorKind, load_credentials};
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
+use crate::domain::model::RequiredModelCapabilities;
 use crate::domain::{
     ConversationId, CorrelationId, CraxiiId, GitRevision, JournalEventId, PackageVersion,
     RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput, SchemaVersion,
     UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
 };
-use crate::domain::model::RequiredModelCapabilities;
 use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
 use crate::ports::clock::Clock;
 use crate::ports::context_source_store::ContextSourceStore;
@@ -81,7 +82,7 @@ pub async fn run(
             .map_err(|_| StartupError::Configuration)?,
     );
     let model_selection_policy = Arc::new(ModelSelectionPolicy::new(Arc::clone(&model_targets)));
-    let credentials = load_credentials(
+    let credentials = match load_credentials(
         config.credentials().source(),
         config
             .models()
@@ -89,14 +90,41 @@ pub async fn run(
             .iter()
             .filter(|target| target.enabled())
             .map(|target| target.credential()),
-    )
-    .map_err(|_| StartupError::ProviderCredential)?;
+    ) {
+        Ok(credentials) => Some(credentials),
+        Err(error) if error.kind() == CredentialLoadErrorKind::Missing => None,
+        Err(_) => return Err(StartupError::ProviderCredential),
+    };
     let clock = Arc::new(SystemClock::new());
-    let provider_clock: Arc<dyn Clock> = clock.clone();
-    let model_provider: Arc<dyn ModelProvider> = Arc::new(
-        OpenAiProvider::try_new(credentials, provider_clock)
-            .map_err(|_| StartupError::ProviderComposition)?,
-    );
+    let model_provider: Option<Arc<dyn ModelProvider>> = credentials
+        .map(|credentials| {
+            let provider_clock: Arc<dyn Clock> = clock.clone();
+            OpenAiProvider::try_new(credentials, provider_clock)
+                .map(|provider| Arc::new(provider) as Arc<dyn ModelProvider>)
+        })
+        .transpose()
+        .map_err(|_| StartupError::ProviderComposition)?;
+    if let Some(provider) = model_provider.as_ref() {
+        let default_target = model_targets
+            .target(model_targets.default_target())
+            .ok_or(StartupError::ProviderComposition)?;
+        for target in model_targets
+            .targets()
+            .iter()
+            .filter(|target| target.enabled())
+        {
+            provider
+                .capabilities(target)
+                .map_err(|_| StartupError::ProviderComposition)?;
+            if target.reference().capabilities().structured_output()
+                || target.reference().capabilities().reasoning_continuation()
+                || target.provider_native_options().reasoning_continuation()
+                || target.estimator() != default_target.estimator()
+            {
+                return Err(StartupError::ProviderComposition);
+            }
+        }
+    }
     let build = BuildMetadata::embedded().map_err(|_| StartupError::BuildMetadata)?;
     let process = ProcessMetadata::capture(build, config.fingerprint(), clock.as_ref())
         .map_err(|_| StartupError::Clock)?;
@@ -268,6 +296,7 @@ pub async fn run(
     ));
     let mutation_admission = MutationAdmission::new();
     let cursors = CursorBroadcaster::new();
+    let live_events = Arc::new(LiveEventBroker::new());
     let connections = ConnectionRegistry::default();
     let (ws_shutdown, _) = tokio::sync::watch::channel(false);
     let controlled_shutdown: Arc<dyn crate::application::runtime::ControlledShutdown> =
@@ -314,102 +343,105 @@ pub async fn run(
         )
         .map_err(|_| StartupError::WorkstationLifecycle)?,
     );
-    let default_target = model_targets
-        .target(model_targets.default_target())
-        .ok_or(StartupError::ProviderComposition)?;
-    let estimator: Arc<dyn TokenEstimator> = Arc::new(OpenAiConservativeEstimator::new(
-        default_target.estimator().clone(),
-    ));
-    let source_store: Arc<dyn ContextSourceStore> = state_store.clone();
-    let context_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
-    let context_clock: Arc<dyn Clock> = clock.clone();
-    let context_assembler = Arc::new(ContextAssembler::new(
-        source_store,
-        Some(context_artifacts),
-        estimator,
-        Arc::clone(&tool_registry),
-        VersionedInstructionSnapshot::v0(),
-        context_clock,
-    ));
-    let model_store: Arc<dyn ModelStateStore> = state_store.clone();
-    let model_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
-    let model_clock: Arc<dyn Clock> = clock.clone();
-    let model_gateway = Arc::new(
-        ModelGateway::new(
-            model_store,
-            model_artifacts,
-            model_provider,
-            Arc::new(NoopDraftSink),
-            model_clock,
-            Box::new(SystemJitter),
-            ModelGatewayLimits::default(),
-        )
-        .map_err(|_| StartupError::ProviderComposition)?,
-    );
-    let loop_store: Arc<dyn crate::application::agent_loop::AgentLoopStateStore> =
-        state_store.clone();
-    let loop_clock: Arc<dyn Clock> = clock.clone();
-    let required_capabilities = RequiredModelCapabilities {
-        text_input: true,
-        text_output: true,
-        custom_tool_calling: true,
-        streaming: true,
-        ordered_output_items: true,
-        structured_output: true,
-        reasoning_continuation: default_target
-            .provider_native_options()
-            .reasoning_continuation(),
-        required_output_tokens: default_target.requested_output_tokens(),
-    };
-    let runner = Arc::new(
-        AgentLoop::new(
-            Arc::clone(&model_selection_policy),
-            context_assembler,
-            ContextAssemblyVersions::v0(),
-            model_gateway,
-            Arc::clone(&tool_execution_service),
-            loop_store,
-            loop_clock,
-            required_capabilities,
-            AgentLoopRuntimeContext {
-                workstation: snapshot.workstation.clone(),
-                workspace: snapshot.workspace.clone(),
-                authority_constraints: V0AuthorityConstraints::default(),
+    let scheduler_notifier = if let Some(model_provider) = model_provider {
+        let default_target = model_targets
+            .target(model_targets.default_target())
+            .ok_or(StartupError::ProviderComposition)?;
+        let estimator: Arc<dyn TokenEstimator> = Arc::new(OpenAiConservativeEstimator::new(
+            default_target.estimator().clone(),
+        ));
+        let source_store: Arc<dyn ContextSourceStore> = state_store.clone();
+        let context_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let context_clock: Arc<dyn Clock> = clock.clone();
+        let context_assembler = Arc::new(ContextAssembler::new(
+            source_store,
+            Some(context_artifacts),
+            estimator,
+            Arc::clone(&tool_registry),
+            VersionedInstructionSnapshot::v0(),
+            context_clock,
+        ));
+        let model_store: Arc<dyn ModelStateStore> = state_store.clone();
+        let model_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let model_clock: Arc<dyn Clock> = clock.clone();
+        let model_gateway = Arc::new(
+            ModelGateway::new(
+                model_store,
+                model_artifacts,
+                model_provider,
+                live_events.clone() as Arc<dyn DraftSink>,
+                model_clock,
+                Box::new(SystemJitter),
+                ModelGatewayLimits::default(),
+            )
+            .map_err(|_| StartupError::ProviderComposition)?,
+        );
+        let loop_store: Arc<dyn crate::application::agent_loop::AgentLoopStateStore> =
+            state_store.clone();
+        let loop_clock: Arc<dyn Clock> = clock.clone();
+        let runner = Arc::new(
+            AgentLoop::new(
+                Arc::clone(&model_selection_policy),
+                context_assembler,
+                ContextAssemblyVersions::v0(),
+                model_gateway,
+                Arc::clone(&tool_execution_service),
+                loop_store,
+                loop_clock,
+                RequiredModelCapabilities {
+                    text_input: true,
+                    text_output: true,
+                    custom_tool_calling: true,
+                    streaming: true,
+                    ordered_output_items: true,
+                    structured_output: false,
+                    reasoning_continuation: false,
+                    required_output_tokens: default_target.requested_output_tokens(),
+                },
+                AgentLoopRuntimeContext {
+                    workstation: snapshot.workstation.clone(),
+                    workspace: snapshot.workspace.clone(),
+                    authority_constraints: V0AuthorityConstraints::default(),
+                },
+                AgentLoopLimits::default(),
+            )
+            .map_err(|_| StartupError::ProviderComposition)?,
+        );
+        let scheduler = crate::application::scheduler::start_scheduler(
+            Arc::clone(&state_store),
+            runner,
+            Arc::clone(&clock),
+            health.clone(),
+            fatal.clone(),
+            crate::application::scheduler::SchedulerStart {
+                runtime_instance_id: runtime.runtime_instance_id,
+                conversation_id: snapshot.identity.conversation_id,
+                readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
             },
-            AgentLoopLimits::default(),
         )
-        .map_err(|_| StartupError::ProviderComposition)?,
-    );
-    let scheduler = crate::application::scheduler::start_scheduler(
-        Arc::clone(&state_store),
-        runner,
-        Arc::clone(&clock),
-        health.clone(),
-        fatal.clone(),
-        crate::application::scheduler::SchedulerStart {
-            runtime_instance_id: runtime.runtime_instance_id,
-            conversation_id: snapshot.identity.conversation_id,
-            readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
-        },
-    )
-    .map_err(|_| StartupError::RuntimeLifecycle)?;
-    let scheduler_notifier = scheduler.notifier();
-    shutdown
-        .install_scheduler(scheduler)
-        .await
         .map_err(|_| StartupError::RuntimeLifecycle)?;
+        let notifier = scheduler.notifier();
+        shutdown
+            .install_scheduler(scheduler)
+            .await
+            .map_err(|_| StartupError::RuntimeLifecycle)?;
+        Some(notifier)
+    } else {
+        None
+    };
     let http_state = HttpState::new(
         Arc::clone(&state_store),
         Arc::clone(&clock),
         health.clone(),
         mutation_admission.clone(),
         cursors,
+        Arc::clone(&live_events),
         fatal,
         ws_shutdown,
         connections,
         allowed_hosts(&config)?,
         Some(controlled_shutdown),
-        Some(scheduler_notifier),
+        scheduler_notifier,
     );
     let server = ServerHandle::start(listener, http_state);
     Ok(RunningBootstrap {
@@ -424,6 +456,7 @@ pub async fn run(
         model_selection_policy,
         shutdown,
         mutation_admission,
+        live_events,
         server,
         fatal_receiver,
     })
@@ -524,6 +557,7 @@ pub struct RunningBootstrap {
     model_selection_policy: Arc<ModelSelectionPolicy>,
     shutdown: Arc<ShutdownController<SqliteStateStore, SystemClock>>,
     mutation_admission: MutationAdmission,
+    live_events: Arc<LiveEventBroker>,
     server: ServerHandle,
     fatal_receiver: tokio::sync::watch::Receiver<bool>,
 }
@@ -626,6 +660,7 @@ impl RunningBootstrap {
         {
             runtime_cleanup_failed = true;
         }
+        self.live_events.close_admission();
         self.server.close_websockets();
         if self.shutdown.finish().await.is_err() {
             runtime_cleanup_failed = true;

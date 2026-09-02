@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_unknown_1","status":"in_progress","output":[]}}
+
+event: response.future_semantic.delta
+data: {"type":"response.future_semantic.delta","sequence_number":1,"delta":"not retained"}
+

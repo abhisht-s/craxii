@@ -734,7 +734,7 @@ mod tests {
             selected_target: ModelTargetIdentity::from_reference(target().reference()),
             output_items: items,
             stop_reason: stop,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: Some(ProviderEvidenceId::try_new("req-fixture").unwrap()),
             provider_response_id: Some(ProviderEvidenceId::try_new("resp-fixture").unwrap()),
             provider_continuation: None,
@@ -845,7 +845,7 @@ mod tests {
                     delta: text("done"),
                 },
                 ModelStreamEvent::Usage(usage()),
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -887,7 +887,7 @@ mod tests {
                     item_ordinal: 0,
                     call,
                 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -921,7 +921,7 @@ mod tests {
                     item_ordinal: 1,
                     call,
                 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -955,7 +955,7 @@ mod tests {
                     item_ordinal: 1,
                     call: second,
                 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -1013,7 +1013,7 @@ mod tests {
                 call: second.clone(),
             },
             ModelStreamEvent::Usage(usage()),
-            ModelStreamEvent::Completed(final_response),
+            ModelStreamEvent::Completed(Box::new(final_response)),
         ];
         let (_, events) = run_events(request(vec![]), expected.clone()).await;
         assert_eq!(events, expected);
@@ -1055,7 +1055,7 @@ mod tests {
             request(vec![]),
             vec![
                 started(),
-                ModelStreamEvent::Completed(final_response.clone()),
+                ModelStreamEvent::Completed(Box::new(final_response.clone())),
             ],
         )
         .await;
@@ -1080,7 +1080,7 @@ mod tests {
                     delta: text("cannot"),
                 },
                 ModelStreamEvent::RefusalCompleted { item_ordinal: 0 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -1101,7 +1101,7 @@ mod tests {
                     item_ordinal: 0,
                     data: json!({"a": 1, "b": 2}),
                 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -1125,7 +1125,7 @@ mod tests {
                     item_ordinal: 0,
                     delta: text("summary"),
                 },
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -1150,7 +1150,7 @@ mod tests {
                 ModelOutputItem::ProviderOpaque(opaque.clone()),
             ],
             stop_reason: ModelStopReason::Completed,
-            usage: usage(),
+            usage: Some(usage()),
             provider_request_id: None,
             provider_response_id: None,
             provider_continuation: Some(opaque.clone()),
@@ -1159,7 +1159,7 @@ mod tests {
         let response = ModelResponse::try_new(final_response).unwrap();
         let (_, events) = run_events(
             request(vec![]),
-            vec![started(), ModelStreamEvent::Completed(response)],
+            vec![started(), ModelStreamEvent::Completed(Box::new(response))],
         )
         .await;
         let ModelStreamEvent::Completed(response) = &events[1] else {
@@ -1182,14 +1182,14 @@ mod tests {
             vec![
                 started(),
                 ModelStreamEvent::Usage(usage()),
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
         let ModelStreamEvent::Completed(response) = &events[2] else {
             panic!()
         };
-        assert_eq!(response.usage(), usage());
+        assert_eq!(response.usage(), Some(usage()));
         assert_eq!(
             response.provider_request_id().unwrap().as_str(),
             "req-fixture"
@@ -1274,7 +1274,10 @@ mod tests {
         );
         let (_, events) = run_events(
             request(vec![]),
-            vec![started(), ModelStreamEvent::Completed(final_response)],
+            vec![
+                started(),
+                ModelStreamEvent::Completed(Box::new(final_response)),
+            ],
         )
         .await;
         assert_eq!(events.len(), 2);
@@ -1326,7 +1329,7 @@ mod tests {
                 selected_target: target().identity(),
                 output_items: duplicate,
                 stop_reason: ModelStopReason::ToolContinuation,
-                usage: usage(),
+                usage: Some(usage()),
                 provider_request_id: None,
                 provider_response_id: None,
                 provider_continuation: None,
@@ -1470,7 +1473,7 @@ mod tests {
             vec![
                 started(),
                 ModelStreamEvent::UnknownProviderEvent(unknown),
-                ModelStreamEvent::Completed(final_response),
+                ModelStreamEvent::Completed(Box::new(final_response)),
             ],
         )
         .await;
@@ -1515,7 +1518,10 @@ mod tests {
         let first_hash = request.canonical_sha256();
         let (provider, events) = run_events(
             request,
-            vec![started(), ModelStreamEvent::Completed(final_response)],
+            vec![
+                started(),
+                ModelStreamEvent::Completed(Box::new(final_response)),
+            ],
         )
         .await;
         assert_eq!(provider.captures()[0].request_sha256(), first_hash);
@@ -1536,10 +1542,10 @@ mod tests {
                 expectation: expected,
                 steps: vec![
                     ScriptedStep::emit(started()),
-                    ScriptedStep::emit(ModelStreamEvent::Completed(response(
+                    ScriptedStep::emit(ModelStreamEvent::Completed(Box::new(response(
                         vec![ModelOutputItem::text(vec![text("done")]).unwrap()],
                         ModelStopReason::Completed,
-                    ))),
+                    )))),
                 ],
             }],
         );
@@ -1701,7 +1707,7 @@ mod tests {
                             call: second,
                         },
                         ModelStreamEvent::Usage(usage()),
-                        ModelStreamEvent::Completed(final_response),
+                        ModelStreamEvent::Completed(Box::new(final_response)),
                     ];
                     Self::immediate_case(
                         request,
@@ -1723,7 +1729,7 @@ mod tests {
                         },
                         ModelStreamEvent::RefusalCompleted { item_ordinal: 0 },
                         ModelStreamEvent::Usage(usage()),
-                        ModelStreamEvent::Completed(final_response),
+                        ModelStreamEvent::Completed(Box::new(final_response)),
                     ];
                     Self::immediate_case(
                         request,
@@ -1758,7 +1764,7 @@ mod tests {
                             delta: text("summary"),
                         },
                         ModelStreamEvent::Usage(usage()),
-                        ModelStreamEvent::Completed(final_response),
+                        ModelStreamEvent::Completed(Box::new(final_response)),
                     ];
                     Self::immediate_case(
                         request,
@@ -1950,7 +1956,7 @@ mod tests {
                 delta: text("done"),
             },
             ModelStreamEvent::Usage(usage()),
-            ModelStreamEvent::Completed(final_response),
+            ModelStreamEvent::Completed(Box::new(final_response)),
         ];
         let (_, events) = run_events(request(vec![]), expected.clone()).await;
         assert_eq!(events, expected);
@@ -1969,10 +1975,10 @@ mod tests {
     #[tokio::test]
     async fn scripted_program_rejects_every_post_terminal_residue_before_emission() {
         let terminal_response = || {
-            ModelStreamEvent::Completed(response(
+            ModelStreamEvent::Completed(Box::new(response(
                 vec![ModelOutputItem::text(vec![text("done")]).unwrap()],
                 ModelStopReason::Completed,
-            ))
+            )))
         };
         let programs = [
             vec![
@@ -2197,7 +2203,7 @@ mod tests {
                 ScriptedStep::emit(started()),
                 ScriptedStep::AwaitRelease(gate.clone()),
                 ScriptedStep::emit(ModelStreamEvent::Usage(usage())),
-                ScriptedStep::emit(ModelStreamEvent::Completed(final_response)),
+                ScriptedStep::emit(ModelStreamEvent::Completed(Box::new(final_response))),
             ],
         );
         let cancellation = ProviderCancellationToken::new();
