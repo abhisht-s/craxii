@@ -26,14 +26,18 @@ struct CraxiiApp: App {
     @State private var store = ConversationStore()
 
     var body: some Scene {
-        WindowGroup("Craxii Diagnostics") {
-            DiagnosticView(store: store)
-                .frame(minWidth: 560, minHeight: 480)
+        WindowGroup("Craxii") {
+            ConversationRootView(store: store)
+                .frame(minWidth: 680, minHeight: 560)
                 .task {
                     appDelegate.store = store
                     await store.launch()
                 }
         }
         .windowResizability(.contentMinSize)
+
+        Settings {
+            DiagnosticView(store: store)
+        }
     }
 }

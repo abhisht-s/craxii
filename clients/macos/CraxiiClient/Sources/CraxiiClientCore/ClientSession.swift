@@ -12,18 +12,24 @@ public struct ClientSnapshot: Equatable, Sendable {
     public let projection: CanonicalProjection
     public let drafts: [DraftProjection]
     public let pendingCommandCount: Int
+    public let pendingCommands: [PendingCommandProjection]
     public let generation: UInt64
+    public let presentationRevision: UInt64
     public let lastError: ClientError?
+    public let lastBackendError: SafeBackendError?
 
     public init(
         credentialStatus: CredentialStatus, connectionState: ClientConnectionState,
         projection: CanonicalProjection, drafts: [DraftProjection], pendingCommandCount: Int,
-        generation: UInt64, lastError: ClientError?
+        pendingCommands: [PendingCommandProjection] = [], generation: UInt64,
+        presentationRevision: UInt64 = 0, lastError: ClientError?,
+        lastBackendError: SafeBackendError? = nil
     ) {
         self.credentialStatus = credentialStatus; self.connectionState = connectionState
         self.projection = projection; self.drafts = drafts
-        self.pendingCommandCount = pendingCommandCount; self.generation = generation
-        self.lastError = lastError
+        self.pendingCommandCount = pendingCommandCount; self.pendingCommands = pendingCommands
+        self.generation = generation; self.presentationRevision = presentationRevision
+        self.lastError = lastError; self.lastBackendError = lastBackendError
     }
 }
 
@@ -82,7 +88,13 @@ public actor ClientSession {
     private var credentialStatus: CredentialStatus = .required
     private var connectionState: ClientConnectionState = .disconnected
     private var lastError: ClientError?
+    private var lastBackendError: SafeBackendError?
     private var generation: UInt64 = 0
+    private var presentationRevision: UInt64 = 0
+    private var activeCommandIDs: Set<ProtocolID> = []
+    private var sendingCommandIDs: Set<ProtocolID> = []
+    private var commandDeliveryErrors: [ProtocolID: ClientError] = [:]
+    private var acceptedCommandOverlays: [PendingCommandProjection] = []
     private var currentConnection: (any EventStreamConnection)?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
@@ -166,11 +178,13 @@ public actor ClientSession {
         profile = profile.replacingCredential()
         persisted.profile = profile
         for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
+        acceptedCommandOverlays.removeAll()
         let committedAuthority = currentAuthority()
         try await localStore.save(persisted)
         guard isCurrent(committedAuthority) else { return }
         credentialStatus = .installed
         lastError = nil
+        lastBackendError = nil
         publish()
     }
 
@@ -185,11 +199,13 @@ public actor ClientSession {
         profile = profile.replacingCredential()
         persisted.profile = profile
         for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
+        acceptedCommandOverlays.removeAll()
         let committedAuthority = currentAuthority()
         try await localStore.save(persisted)
         guard isCurrent(committedAuthority) else { return }
         credentialStatus = .required
         connectionState = .disconnected
+        lastBackendError = nil
         publish()
     }
 
@@ -204,8 +220,11 @@ public actor ClientSession {
         persisted = DisposableClientState(profile: profile)
         projection = CanonicalProjection()
         drafts.clearAll()
+        acceptedCommandOverlays.removeAll()
+        commandDeliveryErrors.removeAll()
         connectionState = .disconnected
         lastError = nil
+        lastBackendError = nil
         try await localStore.save(persisted)
         publish()
     }
@@ -229,14 +248,22 @@ public actor ClientSession {
         persisted = DisposableClientState(profile: profile, outbox: retained)
         projection = CanonicalProjection()
         drafts.clearAll()
+        acceptedCommandOverlays.removeAll()
+        commandDeliveryErrors.removeAll()
         credentialStatus = .required
         connectionState = .disconnected
+        lastBackendError = nil
         try await localStore.save(persisted)
         publish()
     }
 
     @discardableResult
     public func submitMessage(text: String) async throws -> MessageReceipt {
+        let prepared = try await prepareMessage(text: text)
+        return try await sendPreparedMessage(prepared)
+    }
+
+    public func prepareMessage(text: String) async throws -> PreparedMessageCommand {
         guard let conversationID = projection.primaryConversation?.conversationID,
               !text.isEmpty, text.utf8.count <= 65_536 else { throw ClientError.commandRejected("invalid_request") }
         let authority = currentAuthority()
@@ -248,11 +275,29 @@ public actor ClientSession {
         guard body.count <= 512 * 1_024 else { throw ClientError.commandRejected("payload_too_large") }
         let pending = makePending(kind: .message, id: commandID, path: path, body: body)
         try await appendPending(pending)
-        return try await sendMessageCommand(commandID)
+        return PreparedMessageCommand(clientMessageID: commandID)
+    }
+
+    @discardableResult
+    public func sendPreparedMessage(_ prepared: PreparedMessageCommand) async throws -> MessageReceipt {
+        try requirePrepared(prepared.clientMessageID, kind: .message)
+        return try await sendMessageCommand(prepared.clientMessageID)
     }
 
     @discardableResult
     public func cancel(workID: WorkID) async throws -> CancellationReceipt {
+        let prepared = try await prepareCancellation(workID: workID)
+        return try await sendPreparedCancellation(prepared)
+    }
+
+    public func prepareCancellation(workID: WorkID) async throws -> PreparedCancellationCommand {
+        guard let work = projection.works.first(where: { $0.workID == workID }),
+              !work.state.isTerminal, work.state != .cancelRequested else {
+            throw ClientError.commandRejected("work_not_cancellable")
+        }
+        guard !pendingCommandProjections().contains(where: {
+            $0.kind == .cancellation && $0.workID == workID
+        }) else { throw ClientError.commandRejected("cancellation_already_pending") }
         let authority = currentAuthority()
         let commandID = try await identifiers.next()
         try requireCurrent(authority)
@@ -260,7 +305,15 @@ public actor ClientSession {
         let body = try encoder.encode(CancellationRequest(clientCommandID: commandID))
         let pending = makePending(kind: .cancellation, id: commandID, path: path, body: body)
         try await appendPending(pending)
-        do { return try await sendCancellationCommand(commandID) }
+        return PreparedCancellationCommand(clientCommandID: commandID, workID: workID)
+    }
+
+    @discardableResult
+    public func sendPreparedCancellation(
+        _ prepared: PreparedCancellationCommand
+    ) async throws -> CancellationReceipt {
+        try requirePrepared(prepared.clientCommandID, kind: .cancellation, workID: prepared.workID)
+        do { return try await sendCancellationCommand(prepared.clientCommandID) }
         catch ClientError.authentication { throw ClientError.authentication }
         catch let error as ClientError where isAmbiguousRetryable(error) {
             throw ClientError.cancellationTransportFailure
@@ -360,9 +413,11 @@ public actor ClientSession {
                 authority.profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
             connectionState = .bootstrapping
             lastError = nil
+            lastBackendError = nil
             publish()
             let token = try await readCredential(for: authority)
             try requireCurrent(authority)
+            publish()
             let response: HTTPResponse
             do {
                 response = try await http.execute(HTTPRequest(
@@ -492,6 +547,7 @@ public actor ClientSession {
             }
             if event.eventType == "assistant.message_committed" || terminalEventTypes.contains(event.eventType),
                let workID = event.workID { drafts.clear(workID: workID) }
+            reconcileAcceptedCommandOverlays()
             persisted.lastAppliedCursor = projection.lastAppliedCursor
             try await localStore.save(persisted)
             publish()
@@ -707,8 +763,24 @@ public actor ClientSession {
     private func appendPending(_ command: PendingCommand) async throws {
         guard persisted.outbox.count < 128 else { throw ClientError.outboxCorrupt }
         persisted.outbox.append(command)
-        try await localStore.save(persisted)
+        do {
+            try await localStore.save(persisted)
+        } catch {
+            persisted.outbox.removeAll { $0.commandID == command.commandID }
+            throw error
+        }
+        commandDeliveryErrors.removeValue(forKey: command.commandID)
         publish()
+    }
+
+    private func requirePrepared(
+        _ id: ProtocolID, kind: CommandKind, workID: WorkID? = nil
+    ) throws {
+        guard let pending = persisted.outbox.first(where: { $0.commandID == id }),
+              pending.kind == kind else { throw ClientError.outboxCorrupt }
+        if let workID {
+            guard cancellationWorkID(pending) == workID else { throw ClientError.outboxCorrupt }
+        }
     }
 
     private func sendMessageCommand(_ id: ProtocolID) async throws -> MessageReceipt {
@@ -719,7 +791,8 @@ public actor ClientSession {
             try await stopAutomaticResend(id)
             throw error
         }
-        try await removePending(id)
+        let overlay = pendingProjection(id: id, forcedState: .acceptedAwaitingProjection)
+        try await acceptPending(id, overlay: overlay)
         return receipt
     }
 
@@ -731,11 +804,16 @@ public actor ClientSession {
             try await stopAutomaticResend(id)
             throw error
         }
-        try await removePending(id)
+        let overlay = pendingProjection(id: id, forcedState: .acceptedAwaitingProjection)
+        try await acceptPending(id, overlay: overlay)
         return receipt
     }
 
     private func sendPending(_ id: ProtocolID) async throws -> HTTPResponse {
+        guard activeCommandIDs.insert(id).inserted else {
+            throw ClientError.commandRejected("command_already_sending")
+        }
+        defer { activeCommandIDs.remove(id) }
         guard let initial = persisted.outbox.first(where: { $0.commandID == id }) else {
             throw ClientError.outboxCorrupt
         }
@@ -749,6 +827,10 @@ public actor ClientSession {
             persisted.outbox[index].attempts += 1
             let attempt = persisted.outbox[index].attempts
             try await localStore.save(persisted)
+            sendingCommandIDs.insert(id)
+            commandDeliveryErrors.removeValue(forKey: id)
+            lastBackendError = nil
+            publish()
             let response: HTTPResponse
             do {
                 response = try await http.execute(HTTPRequest(
@@ -757,19 +839,28 @@ public actor ClientSession {
                     body: pending.body, timeout: 15,
                     maximumResponseBytes: ProtocolConstants.maximumCommandResponseBytes))
             } catch let error as ClientError {
+                sendingCommandIDs.remove(id)
+                commandDeliveryErrors[id] = error
+                publish()
                 if isAmbiguousRetryable(error), attempt < Self.maximumCommandAttempts {
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
                 throw error
             } catch {
+                sendingCommandIDs.remove(id)
+                commandDeliveryErrors[id] = mapTransportError(error)
+                publish()
                 if attempt < Self.maximumCommandAttempts {
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
                 throw mapTransportError(error)
             }
+            sendingCommandIDs.remove(id)
             if [502, 503, 504].contains(response.statusCode) {
+                commandDeliveryErrors[id] = .serverUnavailable
+                publish()
                 if attempt < Self.maximumCommandAttempts {
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
@@ -785,12 +876,17 @@ public actor ClientSession {
                 }
                 if response.statusCode != 409, response.statusCode != 401,
                    failure.retryable, attempt < Self.maximumCommandAttempts {
+                    commandDeliveryErrors[id] = .serverUnavailable
+                    publish()
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
+                lastBackendError = safeBackendError(failure)
                 try await stopAutomaticResend(id)
                 throw mapBackendFailure(failure, status: response.statusCode)
             }
+            commandDeliveryErrors.removeValue(forKey: id)
+            publish()
             return response
         }
         throw ClientError.outboxCorrupt
@@ -847,6 +943,7 @@ public actor ClientSession {
                   pending.craxiiID == projection.craxii?.craxiiID else { return false }
             return true
         }
+        reconcileAcceptedCommandOverlays()
     }
 
     private func resendReconciledOutbox(authority: OperationAuthority) async throws {
@@ -865,9 +962,24 @@ public actor ClientSession {
         }
     }
 
-    private func removePending(_ id: ProtocolID) async throws {
-        persisted.outbox.removeAll { $0.commandID == id }
-        try await localStore.save(persisted)
+    private func acceptPending(
+        _ id: ProtocolID, overlay: PendingCommandProjection?
+    ) async throws {
+        guard let index = persisted.outbox.firstIndex(where: { $0.commandID == id }) else {
+            throw ClientError.outboxCorrupt
+        }
+        let removed = persisted.outbox.remove(at: index)
+        if let overlay { acceptedCommandOverlays.append(overlay) }
+        sendingCommandIDs.remove(id)
+        commandDeliveryErrors.removeValue(forKey: id)
+        do {
+            try await localStore.save(persisted)
+        } catch {
+            persisted.outbox.insert(removed, at: index)
+            acceptedCommandOverlays.removeAll { $0.commandID == id }
+            throw error
+        }
+        reconcileAcceptedCommandOverlays()
         publish()
     }
 
@@ -881,6 +993,7 @@ public actor ClientSession {
     private func decodeHTTP<T: Decodable>(_ response: HTTPResponse, success: Set<Int>) throws -> T {
         guard success.contains(response.statusCode) else {
             let failure = try decodeBackendFailure(response)
+            lastBackendError = safeBackendError(failure)
             throw mapBackendFailure(failure, status: response.statusCode)
         }
         do { return try decoder.decode(T.self, from: response.body) }
@@ -889,23 +1002,34 @@ public actor ClientSession {
     }
 
     private func decodeBackendFailure(_ response: HTTPResponse) throws -> BackendErrorEnvelope.Detail {
-        if response.statusCode == 401 { throw ClientError.authentication }
         do { return try decoder.decode(BackendErrorEnvelope.self, from: response.body).error }
         catch ProtocolModelError.incompatibleVersion { throw ClientError.incompatibleProtocol }
-        catch { throw ClientError.malformedPayload }
+        catch {
+            if response.statusCode == 401 { throw ClientError.authentication }
+            throw ClientError.malformedPayload
+        }
     }
 
     private func mapBackendFailure(_ failure: BackendErrorEnvelope.Detail, status: Int) -> ClientError {
         if status == 401 || failure.code == "authentication_failed" { return .authentication }
-        if failure.code == "service_unavailable" || failure.code == "overloaded" { return .serverUnavailable }
+        if failure.code == "service_unavailable" || failure.code == "overloaded" {
+            return .serverUnavailable
+        }
         if failure.code == "bootstrap_limit_exceeded" { return .serverNotReady }
         if failure.code == "command_timeout" { return .timeout }
-        return .commandRejected(failure.code)
+        return .backend(safeBackendError(failure))
+    }
+
+    private func safeBackendError(_ failure: BackendErrorEnvelope.Detail) -> SafeBackendError {
+        SafeBackendError(
+            code: failure.code, message: failure.message, retryable: failure.retryable,
+            requestID: failure.requestID)
     }
 
     private func isAmbiguousRetryable(_ error: ClientError) -> Bool {
         switch error {
         case .networkOffline, .timeout, .serverUnavailable: true
+        case let .backend(detail): detail.retryable
         default: false
         }
     }
@@ -933,12 +1057,113 @@ public actor ClientSession {
         ["work.completed", "work.cancelled", "work.failed", "work.interrupted"]
     }
 
-    private func makeSnapshot() -> ClientSnapshot {
-        ClientSnapshot(
-            credentialStatus: credentialStatus, connectionState: connectionState,
-            projection: projection, drafts: drafts.drafts.values.sorted { $0.id < $1.id },
-            pendingCommandCount: persisted.outbox.count, generation: generation, lastError: lastError)
+    private func cancellationWorkID(_ pending: PendingCommand) -> WorkID? {
+        guard pending.kind == .cancellation,
+              pending.path.hasPrefix("/v1/work-items/"), pending.path.hasSuffix("/cancel")
+        else { return nil }
+        let start = pending.path.index(pending.path.startIndex, offsetBy: "/v1/work-items/".count)
+        let end = pending.path.index(pending.path.endIndex, offsetBy: -"/cancel".count)
+        return ProtocolID(rawValue: String(pending.path[start..<end]))
     }
 
-    private func publish() { snapshotHandler?(makeSnapshot()) }
+    private func pendingProjection(
+        id: ProtocolID, forcedState: PendingCommandDeliveryState? = nil
+    ) -> PendingCommandProjection? {
+        guard let pending = persisted.outbox.first(where: { $0.commandID == id }),
+              pending.profileID == profile.profileID,
+              pending.credentialGeneration == profile.credentialGeneration,
+              pending.craxiiID == projection.craxii?.craxiiID
+        else { return nil }
+
+        let state: PendingCommandDeliveryState
+        if let forcedState {
+            state = forcedState
+        } else if sendingCommandIDs.contains(id) {
+            state = .sending
+        } else if let error = commandDeliveryErrors[id] {
+            switch error {
+            case .networkOffline: state = .waitingForConnection
+            case .timeout, .serverUnavailable, .cancellationTransportFailure:
+                state = .deliveryNotConfirmed
+            case let .backend(detail) where detail.retryable:
+                state = .deliveryNotConfirmed
+            default: state = .notSent
+            }
+        } else if pending.disposition == .reconciliationOnly {
+            state = .notSent
+        } else if pending.attempts > 0 {
+            state = .deliveryNotConfirmed
+        } else {
+            state = .notSent
+        }
+
+        switch pending.kind {
+        case .message:
+            guard let request = try? decoder.decode(MessageRequest.self, from: pending.body)
+            else { return nil }
+            if projection.messages.contains(where: {
+                $0.clientMessageID == request.clientMessageID
+            }) { return nil }
+            return PendingCommandProjection(
+                commandID: pending.commandID, kind: .message,
+                conversationID: projection.primaryConversation?.conversationID, workID: nil,
+                clientMessageID: request.clientMessageID,
+                visibleMessageText: request.content.map(\.text).joined(separator: "\n"),
+                deliveryState: state)
+        case .cancellation:
+            guard let workID = cancellationWorkID(pending) else { return nil }
+            if let work = projection.works.first(where: { $0.workID == workID }),
+               work.state.isTerminal || work.state == .cancelRequested { return nil }
+            return PendingCommandProjection(
+                commandID: pending.commandID, kind: .cancellation,
+                conversationID: projection.primaryConversation?.conversationID, workID: workID,
+                clientMessageID: nil, visibleMessageText: nil, deliveryState: state)
+        }
+    }
+
+    private func pendingCommandProjections() -> [PendingCommandProjection] {
+        let persistedCommands = persisted.outbox.compactMap { pendingProjection(id: $0.commandID) }
+        return persistedCommands + acceptedCommandOverlays.filter { overlay in
+            switch overlay.kind {
+            case .message:
+                return !projection.messages.contains { $0.clientMessageID == overlay.clientMessageID }
+            case .cancellation:
+                guard let workID = overlay.workID,
+                      let work = projection.works.first(where: { $0.workID == workID }) else {
+                    return false
+                }
+                return !work.state.isTerminal && work.state != .cancelRequested
+            }
+        }
+    }
+
+    private func reconcileAcceptedCommandOverlays() {
+        acceptedCommandOverlays = acceptedCommandOverlays.filter { overlay in
+            switch overlay.kind {
+            case .message:
+                return !projection.messages.contains { $0.clientMessageID == overlay.clientMessageID }
+            case .cancellation:
+                guard let workID = overlay.workID,
+                      let work = projection.works.first(where: { $0.workID == workID }) else {
+                    return false
+                }
+                return !work.state.isTerminal && work.state != .cancelRequested
+            }
+        }
+    }
+
+    private func makeSnapshot() -> ClientSnapshot {
+        let commands = pendingCommandProjections()
+        return ClientSnapshot(
+            credentialStatus: credentialStatus, connectionState: connectionState,
+            projection: projection, drafts: drafts.drafts.values.sorted { $0.id < $1.id },
+            pendingCommandCount: commands.count, pendingCommands: commands,
+            generation: generation, presentationRevision: presentationRevision,
+            lastError: lastError, lastBackendError: lastBackendError)
+    }
+
+    private func publish() {
+        presentationRevision &+= 1
+        snapshotHandler?(makeSnapshot())
+    }
 }

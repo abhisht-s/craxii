@@ -346,6 +346,10 @@ public struct DraftReducer: Sendable {
         case "assistant.draft_started":
             guard event.deltaSequence == nil, !tombstones.contains(event.draftID),
                   drafts[event.draftID] == nil else { return }
+            for prior in drafts.values where prior.workID == event.workID {
+                tombstones.insert(prior.draftID)
+            }
+            drafts = drafts.filter { $0.value.workID != event.workID }
             drafts[event.draftID] = DraftProjection(
                 conversationID: event.conversationID, workID: event.workID,
                 invocationID: event.invocationID, draftID: event.draftID,

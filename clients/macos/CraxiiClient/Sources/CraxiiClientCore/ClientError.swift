@@ -1,4 +1,19 @@
 import Foundation
+import CraxiiProtocol
+
+public struct SafeBackendError: Error, Equatable, Sendable {
+    public let code: String
+    public let message: String
+    public let retryable: Bool
+    public let requestID: ProtocolID
+
+    public init(code: String, message: String, retryable: Bool, requestID: ProtocolID) {
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+        self.requestID = requestID
+    }
+}
 
 public enum ClientError: Error, Equatable, Sendable, CustomStringConvertible {
     case credentialRequired
@@ -13,6 +28,7 @@ public enum ClientError: Error, Equatable, Sendable, CustomStringConvertible {
     case malformedPayload
     case projectionInvariant
     case commandRejected(String)
+    case backend(SafeBackendError)
     case cancellationTransportFailure
     case cacheCorrupt
     case outboxCorrupt
@@ -32,6 +48,7 @@ public enum ClientError: Error, Equatable, Sendable, CustomStringConvertible {
         case .malformedPayload: "malformedPayload"
         case .projectionInvariant: "projectionInvariant"
         case .commandRejected: "commandRejected"
+        case let .backend(detail): "backend:\(detail.code)"
         case .cancellationTransportFailure: "cancellationTransportFailure"
         case .cacheCorrupt: "cacheCorrupt"
         case .outboxCorrupt: "outboxCorrupt"

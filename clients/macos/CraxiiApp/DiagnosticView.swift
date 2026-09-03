@@ -1,54 +1,128 @@
 import SwiftUI
+import CraxiiProtocol
+
+struct SetupView: View {
+    @Bindable var store: ConversationStore
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Connect to Craxii")
+                    .font(.largeTitle.weight(.semibold))
+                Text("Enter the endpoint and provisioned device credential.")
+                    .foregroundStyle(.secondary)
+            }
+            Form {
+                TextField("Endpoint", text: $store.endpoint)
+                    .accessibilityIdentifier("setup.endpoint")
+                SecureField("Device credential", text: $store.credentialInput)
+                    .accessibilityIdentifier("setup.credential")
+            }
+            .formStyle(.grouped)
+            if let error = store.presentation.error {
+                SafeErrorView(error: error, dismiss: store.dismissError)
+            }
+            HStack {
+                Button("Apply Endpoint") { Task { await store.applyEndpoint() } }
+                Button("Save Credential") { Task { await store.installCredential() } }
+                    .disabled(store.credentialInput.isEmpty)
+                if store.presentation.gate == .configurationMismatch {
+                    Button("Reset Disposable State", role: .destructive) {
+                        Task { await store.reset() }
+                    }
+                }
+                Spacer()
+                Button("Connect") { Task { await store.connect() } }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(32)
+        .frame(maxWidth: 620)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("setup.root")
+    }
+}
+
+struct ConnectingView: View {
+    @Bindable var store: ConversationStore
+
+    var body: some View {
+        VStack(spacing: 16) {
+            if store.presentation.gate == .fatalProtocol {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.largeTitle)
+                    .foregroundStyle(.orange)
+            } else {
+                ProgressView()
+            }
+            Text(store.presentation.banner?.title ?? "Connecting to Craxii")
+                .font(.title2)
+            if store.presentation.banner?.offersRetry == true {
+                Button("Try Again") { Task { await store.connect() } }
+            }
+            if let error = store.presentation.error {
+                SafeErrorView(error: error, dismiss: store.dismissError)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("connection.banner")
+    }
+}
 
 struct DiagnosticView: View {
     @Bindable var store: ConversationStore
 
     var body: some View {
         Form {
-            Section("Backend profile") {
+            Section("Backend") {
                 TextField("Endpoint", text: $store.endpoint)
-                    .accessibilityIdentifier("diagnostic.endpoint")
-                Button("Apply endpoint") { Task { await store.applyEndpoint() } }
-                    .accessibilityIdentifier("diagnostic.applyEndpoint")
+                    .accessibilityIdentifier("setup.endpoint")
+                Button("Apply Endpoint") { Task { await store.applyEndpoint() } }
             }
-            Section("Device credential") {
+            Section("Device Credential") {
                 LabeledContent("Status", value: store.snapshot.credentialStatus.rawValue)
-                    .accessibilityIdentifier("diagnostic.credentialStatus")
                 SecureField("Provisioned bearer token", text: $store.credentialInput)
-                    .accessibilityIdentifier("diagnostic.credential")
+                    .accessibilityIdentifier("setup.credential")
                 HStack {
-                    Button("Install credential") { Task { await store.installCredential() } }
-                        .accessibilityIdentifier("diagnostic.installCredential")
-                    Button("Delete credential") { Task { await store.deleteCredential() } }
-                        .accessibilityIdentifier("diagnostic.deleteCredential")
+                    Button("Save Credential") { Task { await store.installCredential() } }
+                    Button("Delete Credential", role: .destructive) {
+                        Task { await store.deleteCredential() }
+                    }
                 }
             }
             Section("Connection") {
                 LabeledContent("State", value: store.snapshot.connectionState.rawValue)
-                    .accessibilityIdentifier("diagnostic.connectionState")
                 HStack {
-                    Button("Connect / retry") { Task { await store.connect() } }
-                        .accessibilityIdentifier("diagnostic.connect")
-                    Button("Reset disposable state") { Task { await store.reset() } }
-                        .accessibilityIdentifier("diagnostic.reset")
+                    Button("Connect / Retry") { Task { await store.connect() } }
+                    Button("Reset Disposable State", role: .destructive) {
+                        Task { await store.reset() }
+                    }
                 }
             }
-            Section("Projection") {
-                LabeledContent("Craxii ID", value: store.snapshot.projection.craxii?.craxiiID.rawValue ?? "—")
-                LabeledContent("Conversation ID", value: store.snapshot.projection.primaryConversation?.conversationID.rawValue ?? "—")
+            Section("Safe Diagnostics") {
+                LabeledContent("App version", value: "0.0.1")
+                LabeledContent("Protocol version", value: String(ProtocolConstants.version))
+                LabeledContent("Connection", value: store.snapshot.connectionState.rawValue)
+                LabeledContent("Generation", value: String(store.snapshot.generation))
+                LabeledContent("Presentation revision", value: String(store.snapshot.presentationRevision))
                 LabeledContent("Durable cursor", value: String(store.snapshot.projection.lastAppliedCursor.rawValue))
                 LabeledContent("Messages", value: String(store.snapshot.projection.messages.count))
                 LabeledContent("Work items", value: String(store.snapshot.projection.works.count))
-                LabeledContent("Drafts", value: String(store.snapshot.drafts.count))
-                LabeledContent("Pending commands", value: String(store.snapshot.pendingCommandCount))
+                LabeledContent("Pending commands", value: String(store.snapshot.pendingCommands.count))
+                if let detail = store.snapshot.lastBackendError {
+                    LabeledContent("Public error code", value: detail.code)
+                    LabeledContent("Request ID", value: detail.requestID.rawValue)
+                }
             }
-            Section("Last safe error") {
-                Text((store.localActionError ?? store.snapshot.lastError)?.description ?? "none")
-                    .accessibilityIdentifier("diagnostic.lastError")
+            if let error = store.presentation.error {
+                Section("Last Safe Error") {
+                    SafeErrorView(error: error, dismiss: store.dismissError)
+                }
             }
         }
         .formStyle(.grouped)
         .padding()
-        .accessibilityIdentifier("diagnostic.root")
+        .frame(minWidth: 520, minHeight: 480)
+        .accessibilityIdentifier("settings.diagnostics")
     }
 }

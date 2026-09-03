@@ -107,8 +107,19 @@ private struct FixedRandom: UUIDv7RandomSource {
     let gap = try JSONDecoder().decode(EphemeralDraftEnvelope.self, from: JSONSerialization.data(withJSONObject: gapObject))
     try reducer.apply(gap, projection: projection)
     #expect(reducer.drafts.values.first?.greatestSequence == 3)
+    var supersedingObject = try #require(
+        JSONSerialization.jsonObject(with: JSONEncoder().encode(events[0])) as? [String: Any])
+    supersedingObject["event_id"] = testID("68").rawValue
+    supersedingObject["draft_id"] = testID("69").rawValue
+    supersedingObject["invocation_id"] = testID("70").rawValue
+    let superseding = try JSONDecoder().decode(
+        EphemeralDraftEnvelope.self,
+        from: JSONSerialization.data(withJSONObject: supersedingObject))
+    try reducer.apply(superseding, projection: projection)
+    #expect(reducer.drafts.count == 1)
+    #expect(reducer.drafts.values.first?.draftID == testID("69"))
     try reducer.apply(events[2], projection: projection)
-    #expect(reducer.drafts.isEmpty)
+    #expect(reducer.drafts.count == 1)
     try reducer.apply(events[3], projection: projection)
     try reducer.apply(events[4], projection: projection)
     let refusal = try #require(reducer.drafts.values.first)
@@ -154,6 +165,18 @@ private actor FakeLocalStore: LocalStateStoring {
     func load() -> DisposableClientState { state }
     func save(_ state: DisposableClientState) { self.state = state }
     func reset() { state = DisposableClientState() }
+}
+
+private actor FailingSaveLocalStore: LocalStateStoring {
+    var state = DisposableClientState(profile: profile)
+    var failSaves = false
+    func load() -> DisposableClientState { state }
+    func save(_ state: DisposableClientState) throws {
+        if failSaves { throw ClientError.cacheCorrupt }
+        self.state = state
+    }
+    func reset() { state = DisposableClientState() }
+    func setFailSaves(_ value: Bool) { failSaves = value }
 }
 
 private actor SuspendedLoadLocalStore: LocalStateStoring {
@@ -433,6 +456,155 @@ private func durableFrame(
     #expect(requests[0].body == requests[1].body)
 }
 
+@Test func messagePreparationPersistsExactVisibleMaterialBeforeAnySendAndReconcilesOnEvent() async throws {
+    let commandID = testID("60")
+    let receipt = try JSONDecoder().decode(MessageReceipt.self, from: fixture("message-response.json"))
+    let http = FakeHTTP([
+        .response(try bootstrapResponse()), .response(try response(receipt, status: 202)),
+    ])
+    let local = FakeLocalStore()
+    let connection = FakeConnection()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local, http: http,
+        streams: FakeOpener([connection]), identifiers: FixedIDs([commandID]),
+        sleeper: NoSleep(), jitter: ZeroJitter())
+    await session.start()
+    await connection.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    let text = "  exact\nbytes  "
+    let before = await session.currentSnapshot().presentationRevision
+    let prepared = try await session.prepareMessage(text: text)
+    let afterPrepare = await session.currentSnapshot()
+    #expect(prepared.clientMessageID == commandID)
+    #expect(await http.captured().filter { $0.method == "POST" }.isEmpty)
+    #expect(await local.state.outbox.count == 1)
+    #expect(afterPrepare.presentationRevision > before)
+    #expect(afterPrepare.pendingCommands == [PendingCommandProjection(
+        commandID: commandID, kind: .message,
+        conversationID: afterPrepare.projection.primaryConversation?.conversationID,
+        workID: nil, clientMessageID: commandID, visibleMessageText: text,
+        deliveryState: .notSent)])
+
+    _ = try await session.sendPreparedMessage(prepared)
+    let accepted = await session.currentSnapshot()
+    #expect(await local.state.outbox.isEmpty)
+    #expect(accepted.pendingCommands.first?.deliveryState == .acceptedAwaitingProjection)
+    #expect(accepted.projection.messages.count == 1)
+
+    let message = try durableFrame(
+        eventType: "message.accepted", cursor: 5, eventID: testID("61"),
+        payload: [
+            "message_id": testID("62").rawValue,
+            "role": "user",
+            "content": [["type": "text", "text": text]],
+            "client_message_id": commandID.rawValue,
+            "committed_at": "2026-09-03T00:00:00Z",
+        ])
+    await connection.feed(.frame(message))
+    #expect(await eventually { await session.currentSnapshot().projection.messages.count == 2 })
+    #expect(await session.currentSnapshot().pendingCommands.isEmpty)
+}
+
+@Test func failedMessagePreparationRollsBackMemoryAndLeavesNoPreparedCommand() async throws {
+    let commandID = testID("63")
+    let local = FailingSaveLocalStore()
+    let connection = FakeConnection()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([commandID]),
+        sleeper: NoSleep())
+    await session.start()
+    await connection.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    await local.setFailSaves(true)
+
+    await #expect(throws: ClientError.cacheCorrupt) {
+        _ = try await session.prepareMessage(text: "must remain in composer")
+    }
+    #expect(await session.currentSnapshot().pendingCommands.isEmpty)
+    #expect(await local.state.outbox.isEmpty)
+}
+
+@Test func repeatedIdenticalPreparedMessagesKeepDistinctClientIdentities() async throws {
+    let firstID = testID("64")
+    let secondID = testID("65")
+    let local = FakeLocalStore()
+    let connection = FakeConnection()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([firstID, secondID]),
+        sleeper: NoSleep())
+    await session.start()
+    await connection.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    let first = try await session.prepareMessage(text: "same")
+    let second = try await session.prepareMessage(text: "same")
+    #expect(first.clientMessageID == firstID)
+    #expect(second.clientMessageID == secondID)
+    #expect(await local.state.outbox.map(\.commandID) == [firstID, secondID])
+    #expect(await session.currentSnapshot().pendingCommands.map(\.visibleMessageText) == ["same", "same"])
+}
+
+@Test func ambiguousAndDefiniteCommandFailuresHaveDifferentSafeDeliveryStates() async throws {
+    let ambiguousID = testID("66")
+    let ambiguousConnection = FakeConnection()
+    let ambiguous = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(),
+        http: FakeHTTP([
+            .response(try bootstrapResponse()), .failure(.serverUnavailable),
+            .failure(.serverUnavailable), .failure(.serverUnavailable),
+        ]), streams: FakeOpener([ambiguousConnection]), identifiers: FixedIDs([ambiguousID]),
+        sleeper: NoSleep(), jitter: ZeroJitter())
+    await ambiguous.start()
+    await ambiguousConnection.feed(.frame(try syncData()))
+    #expect(await eventually { await ambiguous.currentSnapshot().connectionState == .live })
+    await #expect(throws: ClientError.serverUnavailable) {
+        _ = try await ambiguous.submitMessage(text: "ambiguous")
+    }
+    #expect(await ambiguous.currentSnapshot().pendingCommands.first?.deliveryState
+        == .deliveryNotConfirmed)
+
+    var object = try #require(
+        JSONSerialization.jsonObject(with: fixture("error-envelope.json")) as? [String: Any])
+    var detail = try #require(object["error"] as? [String: Any])
+    detail["code"] = "definite_rejection"
+    detail["message"] = "Safe definite rejection"
+    detail["retryable"] = false
+    object["error"] = detail
+    let definiteConnection = FakeConnection()
+    let definite = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(),
+        http: FakeHTTP([
+            .response(try bootstrapResponse()),
+            .response(HTTPResponse(
+                statusCode: 422,
+                body: try JSONSerialization.data(withJSONObject: object))),
+        ]), streams: FakeOpener([definiteConnection]), identifiers: FixedIDs([testID("67")]),
+        sleeper: NoSleep(), jitter: ZeroJitter())
+    await definite.start()
+    await definiteConnection.feed(.frame(try syncData()))
+    #expect(await eventually { await definite.currentSnapshot().connectionState == .live })
+    do {
+        _ = try await definite.submitMessage(text: "definite")
+        Issue.record("expected definite rejection")
+    } catch let ClientError.backend(error) {
+        #expect(error.code == "definite_rejection")
+        #expect(error.message == "Safe definite rejection")
+    }
+    let definiteSnapshot = await definite.currentSnapshot()
+    #expect(definiteSnapshot.pendingCommands.first?.deliveryState == .notSent)
+    #expect(definiteSnapshot.lastBackendError?.message == "Safe definite rejection")
+}
+
 @Test func nonretryableAuthenticationStopsCommandAndSuppressesReconnectHammering() async throws {
     let commandID = testID("41")
     let error = try fixture("error-envelope.json")
@@ -552,13 +724,51 @@ private func durableFrame(
         await Task.yield()
     }
     let workID = try #require((try bootstrap()).workItems.first?.workID)
-    _ = try await session.cancel(workID: workID)
+    let prepared = try await session.prepareCancellation(workID: workID)
+    #expect(prepared.clientCommandID == commandID)
+    #expect(await http.captured().filter { $0.method == "POST" }.isEmpty)
+    #expect(await local.state.outbox.count == 1)
+    #expect(await session.currentSnapshot().pendingCommands.first?.deliveryState == .notSent)
+    _ = try await session.sendPreparedCancellation(prepared)
     let request = try #require(await http.captured().last)
     #expect(request.idempotencyKey == commandID.rawValue)
     #expect(request.url.path == "/v1/work-items/\(workID.rawValue)/cancel")
     #expect(try JSONDecoder().decode(CancellationRequest.self, from: try #require(request.body)).clientCommandID == commandID)
     #expect(await session.currentSnapshot().projection.works.first?.state == .queued)
     #expect(await local.state.outbox.isEmpty)
+    #expect(await session.currentSnapshot().pendingCommands.first?.deliveryState
+        == .acceptedAwaitingProjection)
+}
+
+@Test func durableCompletionWinsCancellationRaceAndClearsCancellationTruth() throws {
+    var projection = try CanonicalProjection.bootstrap(bootstrap())
+    let workID = try #require(projection.works.first?.workID)
+    let requested = try JSONDecoder().decode(
+        DurableEventEnvelope.self,
+        from: durableFrame(
+            eventType: "work.cancel_requested", cursor: 5, eventID: testID("71"),
+            payload: [
+                "state": "cancel_requested",
+                "transitioned_at": "2026-09-03T00:00:01Z",
+            ]))
+    projection = try DurableReducer().applying(requested, to: projection)
+    #expect(projection.works.first?.state == .cancelRequested)
+    #expect(projection.works.first?.cleanupPending == true)
+
+    let completed = try JSONDecoder().decode(
+        DurableEventEnvelope.self,
+        from: durableFrame(
+            eventType: "work.completed", cursor: 6, eventID: testID("72"),
+            payload: [
+                "state": "completed",
+                "terminal_reason": "answered",
+                "transitioned_at": "2026-09-03T00:00:02Z",
+            ]))
+    projection = try DurableReducer().applying(completed, to: projection)
+    #expect(projection.works.first?.workID == workID)
+    #expect(projection.works.first?.state == .completed)
+    #expect(projection.works.first?.cancelRequestedAt == nil)
+    #expect(projection.works.first?.cleanupPending == false)
 }
 
 @Test func safeToolProjectionContainsOnlyPublicFactsAndTracksUnknownOutcome() throws {
