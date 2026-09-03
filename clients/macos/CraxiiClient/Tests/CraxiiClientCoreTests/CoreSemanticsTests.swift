@@ -156,6 +156,34 @@ private actor FakeLocalStore: LocalStateStoring {
     func reset() { state = DisposableClientState() }
 }
 
+private actor SuspendedLoadLocalStore: LocalStateStoring {
+    private var state: DisposableClientState
+    private var didSuspendFirstLoad = false
+    private var suspendedValue: DisposableClientState?
+    private var suspendedLoad: CheckedContinuation<DisposableClientState, Error>?
+
+    init(_ state: DisposableClientState) { self.state = state }
+
+    func load() async throws -> DisposableClientState {
+        guard !didSuspendFirstLoad else { return state }
+        didSuspendFirstLoad = true
+        suspendedValue = state
+        return try await withCheckedThrowingContinuation { suspendedLoad = $0 }
+    }
+
+    func save(_ state: DisposableClientState) { self.state = state }
+    func reset() { state = DisposableClientState() }
+    func hasSuspendedLoad() -> Bool { suspendedLoad != nil }
+    func storedState() -> DisposableClientState { state }
+
+    func releaseSuspendedLoad() {
+        guard let suspendedLoad, let suspendedValue else { return }
+        self.suspendedLoad = nil
+        self.suspendedValue = nil
+        suspendedLoad.resume(returning: suspendedValue)
+    }
+}
+
 private enum FakeHTTPAction: Sendable { case response(HTTPResponse), failure(ClientError) }
 private actor FakeHTTP: HTTPExecuting {
     var actions: [FakeHTTPAction]
@@ -169,6 +197,54 @@ private actor FakeHTTP: HTTPExecuting {
         case let .failure(error): throw error
         }
     }
+    func captured() -> [HTTPRequest] { requests }
+}
+
+private actor SuspendedHTTP: HTTPExecuting {
+    private struct Pending {
+        let id: Int
+        let request: HTTPRequest
+        let continuation: CheckedContinuation<HTTPResponse, Error>
+    }
+
+    private var nextID = 1
+    private var pending: [Pending] = []
+
+    func execute(_ request: HTTPRequest) async throws -> HTTPResponse {
+        try await withCheckedThrowingContinuation { continuation in
+            pending.append(Pending(id: nextID, request: request, continuation: continuation))
+            nextID += 1
+        }
+    }
+
+    func pendingID(port: Int) -> Int? {
+        pending.first(where: { $0.request.url.port == port })?.id
+    }
+
+    func pendingIDs(port: Int) -> [Int] {
+        pending.filter { $0.request.url.port == port }.map(\.id)
+    }
+
+    func release(id: Int, response: HTTPResponse) {
+        guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
+        pending.remove(at: index).continuation.resume(returning: response)
+    }
+}
+
+private actor RoutingHTTP: HTTPExecuting {
+    let responses: [Int: HTTPResponse]
+    private var requests: [HTTPRequest] = []
+
+    init(responses: [Int: HTTPResponse]) { self.responses = responses }
+
+    func execute(_ request: HTTPRequest) throws -> HTTPResponse {
+        requests.append(request)
+        guard let port = request.url.port, let response = responses[port] else {
+            throw ClientError.serverUnavailable
+        }
+        return response
+    }
+
     func captured() -> [HTTPRequest] { requests }
 }
 
@@ -187,6 +263,7 @@ private actor FakeConnection: EventStreamConnection {
     func ping() throws {}
     func close() { closed = true; for waiter in waiters { waiter.resume(returning: .failure(.networkOffline)) }; waiters.removeAll() }
     func feed(_ item: Item) { if waiters.isEmpty { items.append(item) } else { waiters.removeFirst().resume(returning: item) } }
+    func isClosed() -> Bool { closed }
 }
 
 private actor FakeOpener: EventStreamOpening {
@@ -200,6 +277,61 @@ private actor FakeOpener: EventStreamOpening {
         throw ClientError.serverUnavailable
     }
     func count() -> Int { opens }
+}
+
+private actor SuspendedOpener: EventStreamOpening {
+    private struct Pending {
+        let id: Int
+        let url: URL
+        let continuation: CheckedContinuation<any EventStreamConnection, Error>
+    }
+
+    private var nextID = 1
+    private var immediate: [any EventStreamConnection]
+    private var pending: [Pending] = []
+
+    init(immediate: [any EventStreamConnection] = []) { self.immediate = immediate }
+
+    func open(url: URL, authorization: BearerToken) async throws -> any EventStreamConnection {
+        if !immediate.isEmpty { return immediate.removeFirst() }
+        return try await withCheckedThrowingContinuation { continuation in
+            pending.append(Pending(id: nextID, url: url, continuation: continuation))
+            nextID += 1
+        }
+    }
+
+    func pendingID(port: Int) -> Int? { pending.first(where: { $0.url.port == port })?.id }
+    func pendingIDs() -> [Int] { pending.map(\.id) }
+
+    func release(id: Int, connection: any EventStreamConnection) {
+        guard let index = pending.firstIndex(where: { $0.id == id }) else { return }
+        pending.remove(at: index).continuation.resume(returning: connection)
+    }
+}
+
+private actor ShutdownJoinConnection: EventStreamConnection {
+    private var waiter: CheckedContinuation<EventStreamMessage, Error>?
+    private var closed = false
+
+    func receive() async throws -> EventStreamMessage {
+        try await withCheckedThrowingContinuation { waiter = $0 }
+    }
+
+    func ping() throws {}
+    func close() { closed = true }
+    func hasReceiveWaiter() -> Bool { waiter != nil }
+    func isClosed() -> Bool { closed }
+
+    func releaseReceive() {
+        waiter?.resume(throwing: ClientError.networkOffline)
+        waiter = nil
+    }
+}
+
+private actor CompletionFlag {
+    private var complete = false
+    func markComplete() { complete = true }
+    func isComplete() -> Bool { complete }
 }
 
 private struct NoSleep: ClientSleeping {
@@ -217,7 +349,36 @@ private actor FixedIDs: UUIDv7Generating {
 private func response<T: Encodable>(_ value: T, status: Int) throws -> HTTPResponse {
     HTTPResponse(statusCode: status, body: try JSONEncoder().encode(value))
 }
+
+private func pendingFixtureCommand(
+    profile: BackendProfile, craxiiID: ProtocolID?,
+    disposition: OutboxDisposition = .sendable
+) throws -> PendingCommand {
+    let request = try JSONDecoder().decode(
+        MessageRequest.self, from: fixture("message-request.json"))
+    let path = "/v1/conversations/01890f3e-7b2c-7cc1-8c23-5b8f7b3aa007/messages"
+    let body = try JSONEncoder().encode(request)
+    return PendingCommand(
+        kind: .message, commandID: request.clientMessageID, path: path, body: body,
+        idempotencyKey: request.clientMessageID.rawValue,
+        materialHash: CommandMaterial.hash(
+            method: "POST", path: path, idempotencyKey: request.clientMessageID.rawValue,
+            body: body),
+        profileID: profile.profileID, craxiiID: craxiiID,
+        credentialGeneration: profile.credentialGeneration, disposition: disposition)
+}
+
 private func bootstrapResponse() throws -> HTTPResponse { HTTPResponse(statusCode: 200, body: try fixture("bootstrap-snapshot.json")) }
+private func bootstrapResponse(craxiiID: ProtocolID, cursor: Int64) throws -> HTTPResponse {
+    var object = try #require(
+        JSONSerialization.jsonObject(with: fixture("bootstrap-snapshot.json")) as? [String: Any])
+    var craxii = try #require(object["craxii"] as? [String: Any])
+    craxii["craxii_id"] = craxiiID.rawValue
+    object["craxii"] = craxii
+    object["snapshot_cursor"] = cursor
+    return HTTPResponse(
+        statusCode: 200, body: try JSONSerialization.data(withJSONObject: object))
+}
 private func syncData(cursor: Int64 = 4) throws -> Data {
     var object = try #require(JSONSerialization.jsonObject(with: fixture("sync-complete.json")) as? [String: Any])
     object["through_cursor"] = cursor
@@ -225,6 +386,14 @@ private func syncData(cursor: Int64 = 4) throws -> Data {
 }
 private func testID(_ suffix: String) -> ProtocolID {
     ProtocolID(rawValue: "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c\(suffix)")!
+}
+
+private func eventually(_ predicate: @escaping @Sendable () async -> Bool) async -> Bool {
+    for _ in 0..<1_000 {
+        if await predicate() { return true }
+        await Task.yield()
+    }
+    return false
 }
 
 private func durableFrame(
@@ -505,4 +674,282 @@ private func durableFrame(
     }
     #expect(await opener.count() == 1 + ClientSession.maximumReconnectAttempts)
     #expect(await session.currentSnapshot().connectionState == .disconnected)
+}
+
+@Test func staleLocalStateLoadAfterProfileSwitchCannotInstallOrFailNewSession() async throws {
+    let staleCraxiiID = testID("54")
+    let profileBID = testID("55")
+    let craxiiBID = testID("56")
+    let pending = try pendingFixtureCommand(profile: profile, craxiiID: staleCraxiiID)
+    let local = SuspendedLoadLocalStore(DisposableClientState(
+        profile: profile, boundCraxiiID: staleCraxiiID,
+        lastAppliedCursor: Cursor(rawValue: 9)!, outbox: [pending]))
+    let http = RoutingHTTP(responses: [
+        8081: try bootstrapResponse(craxiiID: craxiiBID, cursor: 40),
+    ])
+    let connectionB = FakeConnection()
+    let opener = FakeOpener([connectionB])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local, http: http,
+        streams: opener, identifiers: FixedIDs([profileBID]), sleeper: NoSleep())
+
+    let startA = Task { await session.start() }
+    #expect(await eventually { await local.hasSuspendedLoad() })
+    try await session.changeEndpoint(to: "http://127.0.0.1:8081/")
+    let profileB = try #require((await local.storedState()).profile)
+    let pendingB = try pendingFixtureCommand(
+        profile: profileB, craxiiID: nil, disposition: .reconciliationOnly)
+    await local.save(DisposableClientState(profile: profileB, outbox: [pendingB]))
+    await session.retryConnection()
+    await connectionB.feed(.frame(try syncData(cursor: 40)))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    await local.releaseSuspendedLoad()
+    await startA.value
+
+    let snapshot = await session.currentSnapshot()
+    let stored = await local.storedState()
+    #expect(snapshot.connectionState == .live)
+    #expect(snapshot.lastError == nil)
+    #expect(snapshot.projection.craxii?.craxiiID == craxiiBID)
+    #expect(snapshot.projection.lastAppliedCursor.rawValue == 40)
+    #expect(stored.profile?.profileID == profileBID)
+    #expect(stored.boundCraxiiID == craxiiBID)
+    #expect(stored.lastAppliedCursor.rawValue == 40)
+    #expect(stored.outbox.count == 1)
+    #expect(stored.outbox.first?.profileID == profileBID)
+    #expect(stored.outbox.first?.craxiiID == nil)
+    #expect(stored.outbox.first?.disposition == .reconciliationOnly)
+    #expect(await http.captured().map(\.url.port) == [8081])
+    #expect(await opener.count() == 1)
+    await session.shutdown()
+}
+
+@Test func staleLocalStateLoadAfterCredentialReplacementCannotInstallOldNamespace() async throws {
+    let staleCraxiiID = testID("57")
+    let craxiiBID = testID("58")
+    let pending = try pendingFixtureCommand(profile: profile, craxiiID: staleCraxiiID)
+    let local = SuspendedLoadLocalStore(DisposableClientState(
+        profile: profile, boundCraxiiID: staleCraxiiID,
+        lastAppliedCursor: Cursor(rawValue: 9)!, outbox: [pending]))
+    let http = RoutingHTTP(responses: [
+        8080: try bootstrapResponse(craxiiID: craxiiBID, cursor: 45),
+    ])
+    let connectionB = FakeConnection()
+    let opener = FakeOpener([connectionB])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local, http: http,
+        streams: opener, identifiers: FixedIDs([]), sleeper: NoSleep())
+
+    let startA = Task { await session.start() }
+    #expect(await eventually { await local.hasSuspendedLoad() })
+    try await session.installCredential(String(repeating: "e", count: 64))
+    await session.retryConnection()
+    await connectionB.feed(.frame(try syncData(cursor: 45)))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    await local.releaseSuspendedLoad()
+    await startA.value
+
+    let snapshot = await session.currentSnapshot()
+    let stored = await local.storedState()
+    #expect(snapshot.connectionState == .live)
+    #expect(snapshot.lastError == nil)
+    #expect(snapshot.projection.craxii?.craxiiID == craxiiBID)
+    #expect(snapshot.projection.lastAppliedCursor.rawValue == 45)
+    #expect(stored.profile?.profileID == profile.profileID)
+    #expect(stored.profile?.credentialGeneration == 1)
+    #expect(stored.boundCraxiiID == craxiiBID)
+    #expect(stored.lastAppliedCursor.rawValue == 45)
+    #expect(stored.outbox.isEmpty)
+    #expect(await http.captured().count == 1)
+    #expect(await opener.count() == 1)
+    await session.shutdown()
+}
+
+@Test func currentLocalStateProfileMismatchRemainsFatal() async throws {
+    let mismatchedProfile = BackendProfile(
+        profileID: testID("59"), endpoint: "http://127.0.0.1:8081/")
+    let http = FakeHTTP([])
+    let opener = FakeOpener([])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(),
+        localStore: FakeLocalStore(DisposableClientState(profile: mismatchedProfile)),
+        http: http, streams: opener, identifiers: FixedIDs([]), sleeper: NoSleep())
+
+    await session.start()
+
+    let snapshot = await session.currentSnapshot()
+    #expect(snapshot.connectionState == .fatalProtocolError)
+    #expect(snapshot.lastError == .configurationMismatch)
+    #expect(await http.captured().isEmpty)
+    #expect(await opener.count() == 0)
+}
+
+@Test func staleBootstrapAfterProfileSwitchCannotCommitOldNamespace() async throws {
+    let profileBID = testID("50")
+    let craxiiBID = testID("51")
+    let endpointB = "http://127.0.0.1:8081/"
+    let http = SuspendedHTTP()
+    let local = FakeLocalStore()
+    let opener = FakeOpener([FakeConnection()])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local, http: http,
+        streams: opener, identifiers: FixedIDs([profileBID]), sleeper: NoSleep())
+
+    let startA = Task { await session.start() }
+    #expect(await eventually { await http.pendingID(port: 8080) != nil })
+    let requestA = try #require(await http.pendingID(port: 8080))
+
+    try await session.changeEndpoint(to: endpointB)
+    let startB = Task { await session.retryConnection() }
+    #expect(await eventually { await http.pendingID(port: 8081) != nil })
+    let requestB = try #require(await http.pendingID(port: 8081))
+    await http.release(id: requestB, response: try bootstrapResponse(craxiiID: craxiiBID, cursor: 40))
+    #expect(await eventually { await opener.count() == 1 })
+    await http.release(id: requestA, response: try bootstrapResponse())
+    await startA.value
+    await startB.value
+
+    let snapshot = await session.currentSnapshot()
+    #expect(snapshot.projection.craxii?.craxiiID == craxiiBID)
+    #expect(snapshot.projection.lastAppliedCursor.rawValue == 40)
+    #expect(await local.state.profile?.profileID == profileBID)
+    #expect(await local.state.boundCraxiiID == craxiiBID)
+    #expect(await opener.count() == 1)
+    await session.shutdown()
+}
+
+@Test func staleWebSocketOpenAfterProfileSwitchIsClosedBeforeInstallation() async throws {
+    let profileBID = testID("52")
+    let craxiiBID = testID("53")
+    let endpointB = "http://127.0.0.1:8081/"
+    let http = RoutingHTTP(responses: [
+        8080: try bootstrapResponse(),
+        8081: try bootstrapResponse(craxiiID: craxiiBID, cursor: 40),
+    ])
+    let opener = SuspendedOpener()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(), http: http,
+        streams: opener, identifiers: FixedIDs([profileBID]), sleeper: NoSleep())
+
+    let startA = Task { await session.start() }
+    #expect(await eventually { await opener.pendingID(port: 8080) != nil })
+    let openA = try #require(await opener.pendingID(port: 8080))
+    try await session.changeEndpoint(to: endpointB)
+
+    let startB = Task { await session.retryConnection() }
+    #expect(await eventually { await opener.pendingID(port: 8081) != nil })
+    let openB = try #require(await opener.pendingID(port: 8081))
+    let connectionB = FakeConnection()
+    await opener.release(id: openB, connection: connectionB)
+    await startB.value
+    await connectionB.feed(.frame(try syncData(cursor: 40)))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    let connectionA = FakeConnection()
+    await opener.release(id: openA, connection: connectionA)
+    await startA.value
+    #expect(await connectionA.isClosed())
+    #expect(!(await connectionB.isClosed()))
+    #expect(await session.currentSnapshot().projection.craxii?.craxiiID == craxiiBID)
+    #expect(await session.currentSnapshot().connectionState == .live)
+    await session.shutdown()
+}
+
+@Test func newerReconnectWinsWhenOlderSocketOpenCompletesLate() async throws {
+    let initial = FakeConnection()
+    let opener = SuspendedOpener(immediate: [initial])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(),
+        http: FakeHTTP([.response(try bootstrapResponse())]), streams: opener,
+        identifiers: FixedIDs([]), sleeper: NoSleep())
+    await session.start()
+    await initial.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    let olderReconnect = Task { await session.resumeTransport() }
+    #expect(await eventually { await opener.pendingIDs().count == 1 })
+    let olderOpen = try #require(await opener.pendingIDs().first)
+    let newerReconnect = Task { await session.resumeTransport() }
+    #expect(await eventually { await opener.pendingIDs().count == 2 })
+    let newerOpen = try #require(await opener.pendingIDs().last)
+
+    let newerConnection = FakeConnection()
+    await opener.release(id: newerOpen, connection: newerConnection)
+    await newerReconnect.value
+    await newerConnection.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+
+    let olderConnection = FakeConnection()
+    await opener.release(id: olderOpen, connection: olderConnection)
+    await olderReconnect.value
+    #expect(await olderConnection.isClosed())
+    #expect(!(await newerConnection.isClosed()))
+    #expect(await session.currentSnapshot().connectionState == .live)
+    await session.shutdown()
+}
+
+@Test func credentialGenerationReplacementRejectsPendingOldScopeBootstrap() async throws {
+    let http = SuspendedHTTP()
+    let opener = FakeOpener([FakeConnection()])
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local, http: http,
+        streams: opener, identifiers: FixedIDs([]), sleeper: NoSleep())
+
+    let oldStart = Task { await session.start() }
+    #expect(await eventually { await http.pendingIDs(port: 8080).count == 1 })
+    let oldRequest = try #require(await http.pendingIDs(port: 8080).first)
+    try await session.installCredential(String(repeating: "d", count: 64))
+    #expect(await local.state.profile?.credentialGeneration == 1)
+
+    await http.release(id: oldRequest, response: try bootstrapResponse())
+    await oldStart.value
+    #expect(await session.currentSnapshot().projection.craxii == nil)
+    #expect(await local.state.boundCraxiiID == nil)
+    #expect(await opener.count() == 0)
+
+    let currentStart = Task { await session.retryConnection() }
+    #expect(await eventually { await http.pendingIDs(port: 8080).count == 1 })
+    let currentRequest = try #require(await http.pendingIDs(port: 8080).first)
+    await http.release(id: currentRequest, response: try bootstrapResponse())
+    await currentStart.value
+    #expect(await session.currentSnapshot().projection.craxii != nil)
+    #expect(await opener.count() == 1)
+    await session.shutdown()
+}
+
+@Test func shutdownWaitsForOwnedReceiveTaskAndRejectsLateCallback() async throws {
+    let connection = ShutdownJoinConnection()
+    let opener = SuspendedOpener(immediate: [connection])
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(),
+        http: FakeHTTP([.response(try bootstrapResponse())]), streams: opener,
+        identifiers: FixedIDs([]), sleeper: NoSleep())
+    await session.start()
+    #expect(await eventually { await connection.hasReceiveWaiter() })
+
+    let completion = CompletionFlag()
+    let shutdown = Task {
+        await session.shutdown()
+        await completion.markComplete()
+    }
+    #expect(await eventually { await connection.isClosed() })
+    for _ in 0..<100 { await Task.yield() }
+    #expect(!(await completion.isComplete()))
+
+    await connection.releaseReceive()
+    await shutdown.value
+    #expect(await completion.isComplete())
+    #expect(await session.currentSnapshot().connectionState == .disconnected)
+    #expect(await session.currentSnapshot().drafts.isEmpty)
 }

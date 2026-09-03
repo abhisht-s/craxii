@@ -35,6 +35,27 @@ public struct SystemRetryJitter: RetryJitterSource {
     }
 }
 
+private enum SessionOperationError: Error {
+    case superseded
+}
+
+private struct OperationAuthority {
+    let generation: UInt64
+    let profile: BackendProfile
+}
+
+private struct SessionOperationFailure: Error {
+    let authority: OperationAuthority
+    let underlying: Error
+}
+
+private struct InvalidatedOperations {
+    let connection: (any EventStreamConnection)?
+    let receiveTask: Task<Void, Never>?
+    let pingTask: Task<Void, Never>?
+    let reconnectTask: Task<Void, Never>?
+}
+
 public actor ClientSession {
     public static let maximumCommandAttempts = 3
     public static let maximumReconnectAttempts = 8
@@ -66,9 +87,11 @@ public actor ClientSession {
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
+    private var reconnectTaskGeneration: UInt64?
     private var reconnectAttempt = 0
     private var lastInbound = ContinuousClock.now
     private var unknownEventRecoveryPending = false
+    private var isShuttingDown = false
     private var snapshotHandler: (@Sendable (ClientSnapshot) -> Void)?
 
     public init(
@@ -98,53 +121,86 @@ public actor ClientSession {
     public func currentSnapshot() -> ClientSnapshot { makeSnapshot() }
 
     public func start() async {
+        guard !isShuttingDown else { return }
+        let authority = currentAuthority()
         do {
-            try await loadAndBindLocalState()
-            try await connectWithBootstrap()
+            try await loadAndBindLocalState(authority: authority)
+            try await connectWithBootstrap(expectedAuthority: authority)
+        } catch SessionOperationError.superseded {
+            return
+        } catch let failure as SessionOperationFailure {
+            handleStartFailure(failure.underlying, authority: failure.authority)
         } catch {
-            await handleStartFailure(error)
+            handleStartFailure(error, authority: authority)
         }
     }
 
     public func retryConnection() async {
-        reconnectTask?.cancel()
+        guard !isShuttingDown else { return }
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
         reconnectAttempt = 0
         unknownEventRecoveryPending = false
+        await closeInvalidatedConnection(invalidated)
         await start()
     }
 
     public func installCredential(_ text: String) async throws {
         let token = try BearerToken(validating: text)
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
+        let authority = currentAuthority()
+        connectionState = .disconnected
+        await closeInvalidatedConnection(invalidated)
+        guard isCurrent(authority) else { return }
         do {
-            _ = try await credentialStore.read(profileID: profile.profileID)
-            try await credentialStore.update(token: token, profileID: profile.profileID)
+            _ = try await credentialStore.read(profileID: authority.profile.profileID)
+            try requireCurrent(authority)
+            try await credentialStore.update(token: token, profileID: authority.profile.profileID)
+            try requireCurrent(authority)
         } catch ClientError.credentialRequired {
-            try await credentialStore.add(token: token, profileID: profile.profileID)
+            try requireCurrent(authority)
+            try await credentialStore.add(token: token, profileID: authority.profile.profileID)
+            try requireCurrent(authority)
+        } catch SessionOperationError.superseded {
+            return
         }
         profile = profile.replacingCredential()
         persisted.profile = profile
         for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
+        let committedAuthority = currentAuthority()
         try await localStore.save(persisted)
+        guard isCurrent(committedAuthority) else { return }
         credentialStatus = .installed
         lastError = nil
         publish()
     }
 
     public func deleteCredential() async throws {
-        await invalidateConnection()
-        try await credentialStore.delete(profileID: profile.profileID)
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
+        let authority = currentAuthority()
+        connectionState = .disconnected
+        await closeInvalidatedConnection(invalidated)
+        guard isCurrent(authority) else { return }
+        try await credentialStore.delete(profileID: authority.profile.profileID)
+        guard isCurrent(authority) else { return }
         profile = profile.replacingCredential()
         persisted.profile = profile
         for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
+        let committedAuthority = currentAuthority()
         try await localStore.save(persisted)
+        guard isCurrent(committedAuthority) else { return }
         credentialStatus = .required
         connectionState = .disconnected
         publish()
     }
 
     public func resetDisposableState() async throws {
-        await invalidateConnection()
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
+        let authority = currentAuthority()
+        connectionState = .disconnected
+        await closeInvalidatedConnection(invalidated)
+        guard isCurrent(authority) else { return }
         try await localStore.reset()
+        guard isCurrent(authority) else { return }
         persisted = DisposableClientState(profile: profile)
         projection = CanonicalProjection()
         drafts.clearAll()
@@ -157,13 +213,19 @@ public actor ClientSession {
     public func changeEndpoint(to input: String) async throws {
         let endpoint = try EndpointPolicy.validate(input, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
         guard endpoint.absoluteString != profile.endpoint else { return }
-        await invalidateConnection()
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
+        let authority = currentAuthority()
+        connectionState = .disconnected
+        await closeInvalidatedConnection(invalidated)
+        guard isCurrent(authority) else { return }
+        let profileID = try await identifiers.next()
+        guard isCurrent(authority) else { return }
         let retained = persisted.outbox.map { command in
             var command = command
             command.disposition = .reconciliationOnly
             return command
         }
-        profile = BackendProfile(profileID: try await identifiers.next(), endpoint: endpoint.absoluteString)
+        profile = BackendProfile(profileID: profileID, endpoint: endpoint.absoluteString)
         persisted = DisposableClientState(profile: profile, outbox: retained)
         projection = CanonicalProjection()
         drafts.clearAll()
@@ -177,7 +239,9 @@ public actor ClientSession {
     public func submitMessage(text: String) async throws -> MessageReceipt {
         guard let conversationID = projection.primaryConversation?.conversationID,
               !text.isEmpty, text.utf8.count <= 65_536 else { throw ClientError.commandRejected("invalid_request") }
+        let authority = currentAuthority()
         let commandID = try await identifiers.next()
+        try requireCurrent(authority)
         let path = "/v1/conversations/\(conversationID.rawValue)/messages"
         let body = try encoder.encode(MessageRequest(
             clientMessageID: commandID, content: [ContentBlock(text: text)]))
@@ -189,7 +253,9 @@ public actor ClientSession {
 
     @discardableResult
     public func cancel(workID: WorkID) async throws -> CancellationReceipt {
+        let authority = currentAuthority()
         let commandID = try await identifiers.next()
+        try requireCurrent(authority)
         let path = "/v1/work-items/\(workID.rawValue)/cancel"
         let body = try encoder.encode(CancellationRequest(clientCommandID: commandID))
         let pending = makePending(kind: .cancellation, id: commandID, path: path, body: body)
@@ -203,91 +269,183 @@ public actor ClientSession {
     }
 
     public func suspendTransport() async {
-        await invalidateConnection()
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
         connectionState = .disconnected
         publish()
+        await closeInvalidatedConnection(invalidated)
     }
 
     public func resumeTransport() async {
+        guard !isShuttingDown else { return }
         guard projection.craxii != nil else { await retryConnection(); return }
         do {
             connectionState = .reconnecting
             publish()
             try await reconnectFromCursor()
+        } catch SessionOperationError.superseded {
+            return
         } catch { await reconnectFailed(error) }
     }
 
     public func shutdown() async {
-        reconnectTask?.cancel()
-        await invalidateConnection()
-        try? await localStore.save(persisted)
+        guard !isShuttingDown else { return }
+        isShuttingDown = true
+        let invalidated = invalidateConnectionAuthority(cancelReconnect: true)
         connectionState = .disconnected
         publish()
-    }
-
-    private func loadAndBindLocalState() async throws {
-        do { persisted = try await localStore.load().validated() }
-        catch ClientError.cacheCorrupt {
-            try await localStore.reset()
-            persisted = DisposableClientState(profile: profile)
-            try await localStore.save(persisted)
-            lastError = .cacheCorrupt
-        }
-        if let storedProfile = persisted.profile {
-            guard storedProfile == profile else { throw ClientError.configurationMismatch }
-        } else {
-            persisted.profile = profile
-            try await localStore.save(persisted)
-        }
-    }
-
-    private func connectWithBootstrap() async throws {
-        await invalidateConnection()
-        let baseURL = try EndpointPolicy.validate(profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
-        let token = try await readCredential()
-        connectionState = .bootstrapping
-        lastError = nil
+        await closeInvalidatedConnection(invalidated)
+        await invalidated.receiveTask?.value
+        await invalidated.pingTask?.value
+        await invalidated.reconnectTask?.value
+        try? await localStore.save(persisted)
         publish()
-        let response = try await http.execute(HTTPRequest(
-            url: try EndpointPolicy.endpoint(baseURL: baseURL, exactPath: "/v1/bootstrap"),
-            method: "GET", authorization: token, timeout: 35,
-            maximumResponseBytes: ProtocolConstants.maximumBootstrapBytes))
-        let bootstrap: BootstrapResponse = try decodeHTTP(response, success: [200])
-        let replacement = try CanonicalProjection.bootstrap(bootstrap)
-        if let bound = persisted.boundCraxiiID, bound != bootstrap.craxii.craxiiID {
-            for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
-            try await localStore.save(persisted)
-            throw ClientError.configurationMismatch
+    }
+
+    private func loadAndBindLocalState(authority: OperationAuthority) async throws {
+        var candidate: DisposableClientState
+        var recoveredCorruptState = false
+        do {
+            let loaded: DisposableClientState
+            do {
+                loaded = try await localStore.load()
+            } catch {
+                try requireCurrent(authority)
+                throw error
+            }
+            try requireCurrent(authority)
+            candidate = try loaded.validated()
+        } catch ClientError.cacheCorrupt {
+            try requireCurrent(authority)
+            do {
+                try await localStore.reset()
+            } catch {
+                try requireCurrent(authority)
+                throw error
+            }
+            try requireCurrent(authority)
+            candidate = DisposableClientState(profile: authority.profile)
+            do {
+                try await localStore.save(candidate)
+            } catch {
+                try requireCurrent(authority)
+                throw error
+            }
+            try requireCurrent(authority)
+            recoveredCorruptState = true
         }
-        projection = replacement
-        drafts.clearAll()
-        persisted.boundCraxiiID = bootstrap.craxii.craxiiID
-        persisted.lastAppliedCursor = bootstrap.snapshotCursor
-        try reconcileOutbox()
-        try await localStore.save(persisted)
-        try await resendReconciledOutbox(token: token, baseURL: baseURL)
-        try await openStream(token: token, baseURL: baseURL, cursor: projection.lastAppliedCursor)
+
+        try requireCurrent(authority)
+        if let storedProfile = candidate.profile {
+            guard storedProfile == authority.profile else { throw ClientError.configurationMismatch }
+        } else {
+            candidate.profile = authority.profile
+            do {
+                try await localStore.save(candidate)
+            } catch {
+                try requireCurrent(authority)
+                throw error
+            }
+            try requireCurrent(authority)
+        }
+        try requireCurrent(authority)
+        persisted = candidate
+        if recoveredCorruptState { lastError = .cacheCorrupt }
+    }
+
+    private func connectWithBootstrap(expectedAuthority: OperationAuthority? = nil) async throws {
+        if let expectedAuthority { try requireCurrent(expectedAuthority) }
+        let authority = try await beginConnectionOperation()
+        do {
+            let baseURL = try EndpointPolicy.validate(
+                authority.profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
+            connectionState = .bootstrapping
+            lastError = nil
+            publish()
+            let token = try await readCredential(for: authority)
+            try requireCurrent(authority)
+            let response: HTTPResponse
+            do {
+                response = try await http.execute(HTTPRequest(
+                    url: try EndpointPolicy.endpoint(baseURL: baseURL, exactPath: "/v1/bootstrap"),
+                    method: "GET", authorization: token, timeout: 35,
+                    maximumResponseBytes: ProtocolConstants.maximumBootstrapBytes))
+            } catch {
+                try requireCurrent(authority)
+                throw error
+            }
+            try requireCurrent(authority)
+            let bootstrap: BootstrapResponse = try decodeHTTP(response, success: [200])
+            let replacement = try CanonicalProjection.bootstrap(bootstrap)
+            try requireCurrent(authority)
+            if let bound = persisted.boundCraxiiID, bound != bootstrap.craxii.craxiiID {
+                for index in persisted.outbox.indices { persisted.outbox[index].disposition = .reconciliationOnly }
+                try await localStore.save(persisted)
+                try requireCurrent(authority)
+                throw ClientError.configurationMismatch
+            }
+            projection = replacement
+            drafts.clearAll()
+            persisted.boundCraxiiID = bootstrap.craxii.craxiiID
+            persisted.lastAppliedCursor = bootstrap.snapshotCursor
+            try reconcileOutbox()
+            try await localStore.save(persisted)
+            try requireCurrent(authority)
+            try await resendReconciledOutbox(authority: authority)
+            try requireCurrent(authority)
+            try await openStream(
+                token: token, baseURL: baseURL, cursor: projection.lastAppliedCursor,
+                authority: authority)
+        } catch SessionOperationError.superseded {
+            throw SessionOperationError.superseded
+        } catch {
+            throw SessionOperationFailure(authority: authority, underlying: error)
+        }
     }
 
     private func reconnectFromCursor() async throws {
-        guard await network.isOnline() else { throw ClientError.networkOffline }
-        let baseURL = try EndpointPolicy.validate(profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
-        let token = try await readCredential()
-        try await openStream(token: token, baseURL: baseURL, cursor: projection.lastAppliedCursor)
+        let authority = try await beginConnectionOperation()
+        guard await network.isOnline() else {
+            try requireCurrent(authority)
+            throw ClientError.networkOffline
+        }
+        try requireCurrent(authority)
+        let baseURL = try EndpointPolicy.validate(
+            authority.profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
+        let token = try await readCredential(for: authority)
+        try requireCurrent(authority)
+        try await openStream(
+            token: token, baseURL: baseURL, cursor: projection.lastAppliedCursor,
+            authority: authority)
     }
 
-    private func openStream(token: BearerToken, baseURL: URL, cursor: Cursor) async throws {
-        await invalidateConnection()
-        generation &+= 1
-        let openedGeneration = generation
+    private func openStream(
+        token: BearerToken, baseURL: URL, cursor: Cursor, authority: OperationAuthority
+    ) async throws {
+        try requireCurrent(authority)
         let url = try EndpointPolicy.webSocketURL(baseURL: baseURL, cursor: cursor)
-        let connection = try await streams.open(url: url, authorization: token)
+        let connection: any EventStreamConnection
+        do {
+            connection = try await streams.open(url: url, authorization: token)
+        } catch {
+            try requireCurrent(authority)
+            throw error
+        }
+        do {
+            try requireCurrent(authority)
+        } catch {
+            await connection.close()
+            throw error
+        }
         currentConnection = connection
         connectionState = .replaying
         lastInbound = ContinuousClock.now
         publish()
-        receiveTask = Task { await self.receiveLoop(connection: connection, generation: openedGeneration) }
-        pingTask = Task { await self.pingLoop(connection: connection, generation: openedGeneration) }
+        receiveTask = Task {
+            await self.receiveLoop(connection: connection, generation: authority.generation)
+        }
+        pingTask = Task {
+            await self.pingLoop(connection: connection, generation: authority.generation)
+        }
     }
 
     private func receiveLoop(connection: any EventStreamConnection, generation: UInt64) async {
@@ -360,28 +518,41 @@ public actor ClientSession {
         if unknownEventRecoveryPending {
             connectionState = .fatalProtocolError
             lastError = .incompatibleProtocol
-            await invalidateConnection()
+            let invalidated = invalidateConnectionAuthority()
+            await closeInvalidatedConnection(invalidated)
             publish()
             return
         }
         unknownEventRecoveryPending = true
-        await invalidateConnection()
+        let invalidated = invalidateConnectionAuthority()
+        let recoveryGeneration = self.generation
+        await closeInvalidatedConnection(invalidated)
+        guard recoveryGeneration == self.generation, !isShuttingDown else { return }
         connectionState = .bootstrapping
         publish()
+        reconnectTaskGeneration = recoveryGeneration
         reconnectTask = Task {
             do {
                 try await self.connectWithBootstrap()
-                self.clearReconnectTask()
+                self.clearReconnectTask(expectedGeneration: recoveryGeneration)
+            } catch SessionOperationError.superseded {
+                self.clearReconnectTask(expectedGeneration: recoveryGeneration)
+            } catch let failure as SessionOperationFailure {
+                guard self.clearReconnectTask(expectedGeneration: recoveryGeneration) else { return }
+                self.handleStartFailure(failure.underlying, authority: failure.authority)
             } catch {
-                self.clearReconnectTask()
-                await self.handleStartFailure(error)
+                guard self.clearReconnectTask(expectedGeneration: recoveryGeneration) else { return }
+                self.handleStartFailure(error, authority: self.currentAuthority())
             }
         }
     }
 
     private func transportEnded(_ error: Error, generation: UInt64) async {
         guard generation == self.generation else { return }
-        await invalidateConnection()
+        let invalidated = invalidateConnectionAuthority()
+        let authority = currentAuthority()
+        await closeInvalidatedConnection(invalidated)
+        guard isCurrent(authority) else { return }
         let mapped = mapTransportError(error)
         lastError = mapped
         if mapped == .authentication {
@@ -408,22 +579,36 @@ public actor ClientSession {
         let exponent = min(reconnectAttempt - 1, 16)
         let maximum = min(Self.reconnectCapMilliseconds, Self.reconnectBaseMilliseconds << exponent)
         let delay = jitter.milliseconds(upperBound: maximum)
+        let authority = currentAuthority()
+        reconnectTaskGeneration = authority.generation
         reconnectTask = Task {
             do {
                 try await self.sleeper.sleep(for: .milliseconds(delay))
-                self.clearReconnectTask()
+                try self.requireCurrent(authority)
                 try await self.reconnectFromCursor()
-            } catch is CancellationError { self.clearReconnectTask() }
+                self.clearReconnectTask(expectedGeneration: authority.generation)
+            } catch is CancellationError {
+                self.clearReconnectTask(expectedGeneration: authority.generation)
+            } catch SessionOperationError.superseded {
+                self.clearReconnectTask(expectedGeneration: authority.generation)
+            }
             catch {
-                self.clearReconnectTask()
+                guard self.clearReconnectTask(expectedGeneration: authority.generation) else { return }
                 await self.reconnectFailed(error)
             }
         }
     }
 
-    private func clearReconnectTask() { reconnectTask = nil }
+    @discardableResult
+    private func clearReconnectTask(expectedGeneration: UInt64) -> Bool {
+        guard reconnectTaskGeneration == expectedGeneration else { return false }
+        reconnectTask = nil
+        reconnectTaskGeneration = nil
+        return true
+    }
 
     private func reconnectFailed(_ error: Error) async {
+        if error is SessionOperationError { return }
         let mapped = mapTransportError(error)
         lastError = mapped
         if mapped == .authentication {
@@ -437,26 +622,76 @@ public actor ClientSession {
         publish()
     }
 
-    private func invalidateConnection() async {
+    private func currentAuthority() -> OperationAuthority {
+        OperationAuthority(generation: generation, profile: profile)
+    }
+
+    private func isCurrent(_ authority: OperationAuthority) -> Bool {
+        !isShuttingDown && generation == authority.generation && profile == authority.profile
+    }
+
+    private func requireCurrent(_ authority: OperationAuthority) throws {
+        guard isCurrent(authority) else {
+            throw SessionOperationError.superseded
+        }
+    }
+
+    private func invalidateConnectionAuthority(
+        cancelReconnect: Bool = false
+    ) -> InvalidatedOperations {
         generation &+= 1
-        receiveTask?.cancel(); receiveTask = nil
-        pingTask?.cancel(); pingTask = nil
-        if let connection = currentConnection { await connection.close() }
+        let invalidated = InvalidatedOperations(
+            connection: currentConnection,
+            receiveTask: receiveTask,
+            pingTask: pingTask,
+            reconnectTask: cancelReconnect ? reconnectTask : nil)
+        invalidated.receiveTask?.cancel()
+        invalidated.pingTask?.cancel()
+        invalidated.reconnectTask?.cancel()
         currentConnection = nil
+        receiveTask = nil
+        pingTask = nil
+        if cancelReconnect {
+            reconnectTask = nil
+            reconnectTaskGeneration = nil
+        }
         drafts.clearAll()
+        return invalidated
+    }
+
+    private func closeInvalidatedConnection(_ invalidated: InvalidatedOperations) async {
+        if let connection = invalidated.connection { await connection.close() }
+    }
+
+    private func beginConnectionOperation() async throws -> OperationAuthority {
+        let invalidated = invalidateConnectionAuthority()
+        let authority = currentAuthority()
+        await closeInvalidatedConnection(invalidated)
+        try requireCurrent(authority)
+        return authority
     }
 
     private func readCredential() async throws -> BearerToken {
+        try await readCredential(for: currentAuthority())
+    }
+
+    private func readCredential(for authority: OperationAuthority) async throws -> BearerToken {
         do {
-            let token = try await credentialStore.read(profileID: profile.profileID)
+            let token = try await credentialStore.read(profileID: authority.profile.profileID)
+            try requireCurrent(authority)
             credentialStatus = .installed
             return token
         } catch ClientError.credentialMalformed {
+            try requireCurrent(authority)
             credentialStatus = .malformed
             throw ClientError.credentialMalformed
         } catch ClientError.credentialRequired {
+            try requireCurrent(authority)
             credentialStatus = .required
             throw ClientError.credentialRequired
+        } catch {
+            try requireCurrent(authority)
+            throw error
         }
     }
 
@@ -614,15 +849,18 @@ public actor ClientSession {
         }
     }
 
-    private func resendReconciledOutbox(token _: BearerToken, baseURL _: URL) async throws {
+    private func resendReconciledOutbox(authority: OperationAuthority) async throws {
         let pendingIDs = persisted.outbox.filter { $0.disposition == .sendable }.map(\.commandID)
         for id in pendingIDs {
+            try requireCurrent(authority)
             guard let kind = persisted.outbox.first(where: { $0.commandID == id })?.kind else { continue }
             do {
                 if kind == .message { _ = try await sendMessageCommand(id) }
                 else { _ = try await sendCancellationCommand(id) }
+                try requireCurrent(authority)
             } catch ClientError.authentication { throw ClientError.authentication }
             catch ClientError.outboxCorrupt { throw ClientError.outboxCorrupt }
+            catch SessionOperationError.superseded { throw SessionOperationError.superseded }
             catch { continue }
         }
     }
@@ -678,7 +916,8 @@ public actor ClientSession {
         return .serverUnavailable
     }
 
-    private func handleStartFailure(_ error: Error) async {
+    private func handleStartFailure(_ error: Error, authority: OperationAuthority) {
+        guard isCurrent(authority) else { return }
         let mapped = mapTransportError(error)
         lastError = mapped
         switch mapped {
