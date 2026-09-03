@@ -9,10 +9,10 @@
 - Resolved version and MSRV: `sqlx 0.9.0`, MSRV `1.94.0`; verified with repository Rust `1.98.0`.
 - License and source: `MIT OR Apache-2.0`, crates.io registry. Cargo-deny policy accepts both.
 - Transitive license implication: `hashbrown` selects `foldhash 0.2.0`, licensed under the
-  OSI-approved Zlib license. Stage 5 adds Zlib to the explicit cargo-deny allowlist; there is no
+  OSI-approved Zlib license. The repository explicitly admits Zlib in the cargo-deny allowlist; there is no
   per-crate license exception or confidence override.
 - Feature rationale: bundled SQLite removes a system-library dependency; Tokio supplies the chosen
-  runtime; migrate embeds the Stage 5 empty migration harness; macros supplies `migrate!`. The
+  runtime; `migrate` embeds the checked-in migration set; `macros` supplies `migrate!`. The
   top-level `sqlx/any`, JSON, time/UUID codecs, TLS, load extension, deserialize, regexp, and
   unlock-notify features remain disabled. SQLx 0.9's proc-macro crate unconditionally compiles an
   internal `sqlx-core/any` feature for macro expansion; no Any driver or MySQL/PostgreSQL package is

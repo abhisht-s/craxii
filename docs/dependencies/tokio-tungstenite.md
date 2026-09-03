@@ -1,6 +1,6 @@
 # `tokio-tungstenite` dependency decision
 
-- Package: `tokio-tungstenite` from crates.io, direct dev dependency owned by Stage 11 real-socket
+- Package: `tokio-tungstenite` from crates.io, direct dev dependency owned by real-socket
   protocol tests; it is not linked by production targets.
 - Purpose: Connect test clients to real ephemeral loopback WebSocket listeners and observe frames,
   close codes, replay, backpressure, and shutdown.
@@ -17,4 +17,4 @@
   an ignore.
 - Removal path: Replace with another independent real-socket client that can assert exact RFC close
   behavior without sharing the server adapter implementation.
-- Review: Approved by the repository/project owner on 2026-08-28 for Stage 11 tests.
+- Review: Approved by the repository/project owner on 2026-08-28 for WebSocket integration tests.

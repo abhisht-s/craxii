@@ -16,7 +16,7 @@ At the end of a stage, use at most three validation layers:
 
 Do not verify the verifier. Do not rerun a passing full gate unless subsequent code changes could invalidate it. Do not repeat old-stage validation unless the current change touches those invariants.
 
-Treat `scripts/check-repository.mjs`, `scripts/verify`, full Cargo test matrices, cargo-deny, schema/fingerprint audits, and similar expensive checks as end-of-stage gates unless the current task specifically changes those systems.
+Treat `scripts/check-public-repository.mjs`, `scripts/verify`, full Cargo test matrices, cargo-deny, schema/fingerprint audits, and similar expensive checks as final gates unless the current task specifically changes those systems.
 
 Avoid long polling loops and repetitive progress narration for quiet commands. Wait in bounded intervals and report only meaningful state changes, failures, or final results.
 

@@ -25,4 +25,4 @@
 - Removal/replacement path: Replace with standard-library APIs only if they provide equivalent
   owned nonblocking locking and platform filesystem identity; preserve classifier and process tests.
 - Review date and approval: 2026-08-29, feature expansion explicitly approved by the
-  repository/project owner for Stage 13.
+  repository/project owner for the current Unix workstation adapter.

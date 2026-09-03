@@ -103,17 +103,30 @@ echo "Checking Rust dependency licenses, bans, and sources"
 cargo deny --locked check licenses bans sources
 
 echo "Checking repository invariants"
-node scripts/check-repository.mjs
+node scripts/check-public-repository.mjs
 
 echo "Linting Markdown"
-npx --yes markdownlint-cli2@0.22.1 '**/*.md'
-
-echo "Checking documentation renderer syntax"
-node --check docs/scripts/render-implementation-plan.mjs
+npx --yes markdownlint-cli2@0.22.1 \
+  AGENTS.md \
+  CHANGELOG.md \
+  CODE_OF_CONDUCT.md \
+  CONTRIBUTING.md \
+  README.md \
+  SECURITY.md \
+  THIRD_PARTY_NOTICES.md \
+  TRADEMARKS.md \
+  'docs/dependencies/*.md' \
+  docs/architecture-overview.md \
+  docs/configuration.md \
+  docs/dependency-policy.md \
+  docs/development.md \
+  docs/getting-started.md \
+  docs/protocol.md \
+  docs/security-model.md
 
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  echo "Verifying the native Stage 21 macOS client"
-  scripts/verify-stage21-macos-client
+  echo "Verifying the native macOS client"
+  scripts/verify-macos-client
 else
-  echo "Stage 21 native macOS execution is not run on this non-macOS host; structural invariants were checked"
+  echo "Native macOS execution is not run on this non-macOS host; structural invariants were checked"
 fi

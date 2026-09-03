@@ -1,6 +1,6 @@
 # `futures-util` dependency decision
 
-- Package: `futures-util` from crates.io, direct dev dependency owned by Stage 11 WebSocket tests.
+- Package: `futures-util` from crates.io, direct dev dependency owned by WebSocket tests.
 - Purpose: Test-only `SinkExt`/`StreamExt` operations over tokio-tungstenite connections.
 - Declaration: `version = "0.3.34"`, default features disabled, exactly `sink` and `std` enabled.
 - Resolution, MSRV, and license: `futures-util 0.3.34`, Rust `1.71`, MIT OR Apache-2.0; verified
@@ -14,4 +14,4 @@
   code.
 - Advisories: The locked cargo-deny advisory check includes it and must pass without an ignore.
 - Removal path: Remove with tokio-tungstenite if tests adopt equivalent stream/sink helpers.
-- Review: Approved by the repository/project owner on 2026-08-28 for Stage 11 tests.
+- Review: Approved by the repository/project owner on 2026-08-28 for WebSocket tests.

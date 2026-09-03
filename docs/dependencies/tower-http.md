@@ -16,4 +16,4 @@
 - Advisories: The locked cargo-deny advisory check must pass without an ignore.
 - Removal path: A replacement must preserve predecode bounds, exact timeout classes, sensitive
   headers, fixed security headers, and matched-route-only traces.
-- Review: Approved by the repository/project owner on 2026-08-28 for Stage 11.
+- Review: Approved by the repository/project owner on 2026-08-28 for the public HTTP adapter.

@@ -1,0 +1,36 @@
+name: Feature request
+description: Propose a public Craxii capability or improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Craxii is pre-alpha. Explain the problem before prescribing a design. Do not include security-sensitive details.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Who is affected, and what cannot be done safely or reliably today?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior and important constraints.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note workarounds or simpler approaches.
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Public-report check
+      options:
+        - label: This request is safe to discuss publicly and is not a vulnerability report.
+          required: true

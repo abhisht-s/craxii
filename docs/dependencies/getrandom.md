@@ -2,7 +2,7 @@
 
 - Package or tool: `getrandom` from crates.io.
 - Dependency kind: Direct normal Cargo dependency.
-- Owning subsystem: Stage 9 offline device credential generation.
+- Owning subsystem: Offline device credential generation.
 - Responsible maintainer or owner role: Repository or project owner.
 - Primitive supplied: Fill exactly 32 bytes with operating-system cryptographically secure random
   data for one new bearer credential.
@@ -49,5 +49,5 @@
 - Resolved and tested version: `0.4.3` from crates.io.
 - Review date: 2026-08-28.
 - Approval status and approver role: Approved by the repository/project owner through the explicit
-  Stage 9 implementation direction on 2026-08-28. Codex recorded the decision and is not the
+  device-authentication implementation direction on 2026-08-28. Codex recorded the decision and is not the
   approver.

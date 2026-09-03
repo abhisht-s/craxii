@@ -12,8 +12,8 @@
 - Feature rationale: macros supports the binary/test runtime; multi-thread runtime supports SQLx and
   owned tasks; signal supplies only composition-edge Ctrl-C/SIGTERM handling; sync supplies
   `Mutex`, `Notify`, `watch`, `mpsc`, `broadcast`, and `oneshot`; time supplies heartbeat, fallback
-  scans, and bounded waits; net and io-util supply the Stage 11 listener/socket and owned I/O
-  primitives; process supplies the Stage 13 child handle, pipes, wait, and kill-on-drop defense.
+  scans, and bounded waits; `net` and `io-util` supply listener/socket and owned I/O
+  primitives; `process` supplies child handles, pipes, waits, and kill-on-drop defense.
   Direct `full` and fs features remain disabled.
 - Proc-macro/runtime graph: resolves `tokio-macros 2.7.2`, `pin-project-lite`, and the platform
   runtime dependencies activated transitively by SQLx. The signal feature additionally activates
@@ -30,4 +30,4 @@
 - Removal/replacement path: A runtime replacement must first replace SQLx runtime integration and
   every owned-task/timer/synchronization seam without changing StateStore semantics.
 - Review date and approval: 2026-08-29, expanded and explicitly approved by the
-  repository/project owner for Stage 13.
+  repository/project owner for the current async runtime and process-execution use.

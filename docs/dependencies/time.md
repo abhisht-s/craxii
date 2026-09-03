@@ -12,7 +12,7 @@
   `SystemTime` represents an instant relative to an epoch but has no checked UTC
   calendar representation or RFC 3339 formatting support.
 - Permitted layer or scope: Clock ports/adapters, bootstrap metadata/telemetry
-  presentation, and the Stage 3 canonical durable timestamp value. `time` types do
+  presentation, and the canonical durable timestamp value. `time` types do
   not become application ordering authority or persistence-adapter codecs.
 - Alternatives considered: Manual Gregorian calendar conversion and a broader date
   framework. The former is unnecessary correctness risk; the latter adds unused

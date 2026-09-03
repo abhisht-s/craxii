@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a reproducible Craxii defect without sensitive data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use the private process in SECURITY.md. Redact credentials, private model content, personal data, and machine-specific paths.
+  - type: input
+    id: revision
+    attributes:
+      label: Craxii commit or version
+      description: Prefer the full commit SHA.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, and relevant tool versions.
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Describe the observed and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide minimal steps or a minimal safe test case.
+    validations:
+      required: true
+  - type: textarea
+    id: validation
+    attributes:
+      label: Additional evidence
+      description: Add only redacted logs, tests, or diagnostics that are safe to publish.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: This report does not disclose a suspected vulnerability or contain credentials or other sensitive data.
+          required: true
