@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use crate::domain::{
     Certainty, ModelCapabilitySnapshot, ModelRequest, ModelStreamEvent,
-    ModelStreamProviderErrorKind, ModelTarget, NormalizedError, ProviderId, TokenEstimatorIdentity,
+    ModelStreamProviderErrorKind, ModelTarget, NormalizedError, ProviderEvidenceId, ProviderId,
+    SourceStatus, TokenEstimatorIdentity,
 };
 use crate::ports::clock::MonotonicInstant;
 
@@ -128,6 +129,8 @@ pub struct ProviderError {
     kind: ProviderErrorKind,
     certainty: ProviderOutcomeCertainty,
     retry_after: Option<Duration>,
+    provider_http_status: Option<u16>,
+    provider_request_id: Option<ProviderEvidenceId>,
 }
 
 impl ProviderError {
@@ -137,6 +140,8 @@ impl ProviderError {
             kind,
             certainty,
             retry_after: None,
+            provider_http_status: None,
+            provider_request_id: None,
         }
     }
 
@@ -150,7 +155,21 @@ impl ProviderError {
             kind,
             certainty,
             retry_after: Some(retry_after.min(PROVIDER_RETRY_AFTER_CAP)),
+            provider_http_status: None,
+            provider_request_id: None,
         }
+    }
+
+    /// Attaches only validated numeric HTTP status and bounded correlation evidence.
+    #[must_use]
+    pub fn with_http_evidence(
+        mut self,
+        status: u16,
+        provider_request_id: Option<ProviderEvidenceId>,
+    ) -> Self {
+        self.provider_http_status = (100..=599).contains(&status).then_some(status);
+        self.provider_request_id = provider_request_id;
+        self
     }
 
     #[must_use]
@@ -166,6 +185,16 @@ impl ProviderError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    #[must_use]
+    pub const fn provider_http_status(&self) -> Option<u16> {
+        self.provider_http_status
+    }
+
+    #[must_use]
+    pub const fn provider_request_id(&self) -> Option<&ProviderEvidenceId> {
+        self.provider_request_id.as_ref()
     }
 
     /// Canonical terminal stream classification preserving outcome certainty.
@@ -217,11 +246,19 @@ impl ProviderError {
                     | ProviderOutcomeCertainty::DefiniteProviderFailure
             )
         {
-            NormalizedError::provider_bounded(self.certainty.normalized(), None)
+            NormalizedError::provider_bounded(
+                self.certainty.normalized(),
+                self.provider_http_status
+                    .and_then(SourceStatus::provider_http),
+            )
         } else if self.kind == ProviderErrorKind::Cancelled {
             NormalizedError::cancellation(self.certainty.normalized())
         } else {
-            NormalizedError::provider(self.certainty.normalized(), None)
+            NormalizedError::provider(
+                self.certainty.normalized(),
+                self.provider_http_status
+                    .and_then(SourceStatus::provider_http),
+            )
         }
     }
 }
@@ -239,6 +276,11 @@ impl fmt::Debug for ProviderError {
             .field("kind", &self.kind)
             .field("certainty", &self.certainty)
             .field("retry_after", &self.retry_after)
+            .field("provider_http_status", &self.provider_http_status)
+            .field(
+                "has_provider_request_id",
+                &self.provider_request_id.is_some(),
+            )
             .finish()
     }
 }
@@ -837,8 +879,24 @@ mod tests {
         assert_eq!(error.normalized().retryability(), Retryability::Bounded);
         assert_eq!(
             format!("{error:?}"),
-            "ProviderError { kind: RateLimited, certainty: DefiniteProviderFailure, retry_after: Some(30s) }"
+            "ProviderError { kind: RateLimited, certainty: DefiniteProviderFailure, retry_after: Some(30s), provider_http_status: None, has_provider_request_id: false }"
         );
+    }
+
+    #[test]
+    fn stage23_provider_http_evidence_preserves_safe_facts_and_redacts_raw_correlation() {
+        let sentinel = "SENTINEL_RAW_PROVIDER_REQUEST_ID_23";
+        let error = ProviderError::new(
+            ProviderErrorKind::TemporarilyUnavailable,
+            ProviderOutcomeCertainty::DefiniteProviderFailure,
+        )
+        .with_http_evidence(503, Some(ProviderEvidenceId::try_new(sentinel).unwrap()));
+        assert_eq!(error.provider_http_status(), Some(503));
+        assert_eq!(error.normalized().source_status().unwrap().code(), 503);
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains(sentinel));
+        assert!(rendered.contains("provider_http_status: Some(503)"));
+        assert!(rendered.contains("has_provider_request_id: true"));
     }
 
     #[test]

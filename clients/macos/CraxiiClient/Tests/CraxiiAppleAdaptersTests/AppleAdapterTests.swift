@@ -86,7 +86,10 @@ private final class URLStub: URLProtocol, @unchecked Sendable {
         #expect(request.value(forHTTPHeaderField: "Idempotency-Key") == "stable-id")
         let response = HTTPURLResponse(
             url: request.url!, statusCode: 202, httpVersion: "HTTP/1.1",
-            headerFields: ["Content-Type": "application/json"])!
+            headerFields: [
+                "Content-Type": "application/json",
+                "x-request-id": "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d",
+            ])!
         return (response, Data("{}".utf8))
     }
     let accepted = try await executor.execute(HTTPRequest(
@@ -94,6 +97,7 @@ private final class URLStub: URLProtocol, @unchecked Sendable {
         authorization: token, idempotencyKey: "stable-id", body: Data("{}".utf8),
         timeout: 15, maximumResponseBytes: 1_024))
     #expect(accepted.statusCode == 202)
+    #expect(accepted.requestID?.rawValue == "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d")
 
     URLStub.handler = { request in
         (HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!,

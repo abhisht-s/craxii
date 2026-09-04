@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '%s\n' 'error: cargo is required to run the Stage 24 local deterministic gate' >&2
+  exit 127
+fi
+
+cd "${repository_root}"
+
+printf '%s\n' 'Running the canonical Stage 24 local product composition twice'
+cargo test --locked -p craxii-server --features test-failpoints --test stage24 -- --test-threads=1
+
+printf '%s\n' 'STAGE_24_PORTABLE_LOCAL_EXECUTION: PASSED'
+printf '%s\n' 'STAGE_24_UBUNTU_TARGET_EXECUTION: DEFERRED_BY_USER_TO_STAGE_27'

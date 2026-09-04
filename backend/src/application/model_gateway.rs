@@ -2,7 +2,10 @@
 
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::Instrument;
+
+use crate::application::observability::SafeProviderCorrelation;
 
 use crate::application::context_assembler::ContextAssemblyResult;
 use crate::application::model_selection::{ModelSelectionReason, ModelSelectionResult};
@@ -39,10 +42,25 @@ use crate::ports::state_store::{
 const MAX_STREAM_EVENTS: usize = 4_096;
 
 /// Provider-neutral, already-validated semantic delta offered to future delivery code.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum CanonicalDraftDelta {
     Text { text: String },
     Refusal { text: String },
+}
+
+impl fmt::Debug for CanonicalDraftDelta {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Text { text } => formatter
+                .debug_struct("CanonicalDraftDelta::Text")
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::Refusal { text } => formatter
+                .debug_struct("CanonicalDraftDelta::Refusal")
+                .field("text_bytes", &text.len())
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -267,8 +285,8 @@ impl ModelGateway {
 
         let logical_id = invocation.context.package().logical_invocation_id();
         let mut attempt_no = 1_u32;
-        let mut retry_of = None;
-        let mut retry_evidence = None;
+        let mut retry_of: Option<ModelInvocationId> = None;
+        let mut retry_evidence: Option<ProviderRetryEvidence> = None;
         let mut preceding_event = invocation.causation_event_id;
 
         loop {
@@ -292,6 +310,60 @@ impl ModelGateway {
 
             let attempt_id = ModelInvocationId::generate();
             let started_at = self.wall_now()?;
+            let target = invocation.selection.selected_target().reference();
+            let attempt_observation = ModelAttemptObservation {
+                work_id: invocation.work.work_id().to_string(),
+                logical_invocation_id: logical_id.to_string(),
+                model_invocation_id: attempt_id.to_string(),
+                attempt_ordinal: attempt_no,
+                target: target.model_target_id().as_str().to_owned(),
+                provider: target.provider_id().as_str().to_owned(),
+                model: target.provider_model_id().as_str().to_owned(),
+                request_sha256: invocation.context.request().canonical_sha256().to_string(),
+                request_bytes: invocation.context.budget().request_serialized_bytes,
+                retry_of_invocation_id: retry_of.map(|value| value.to_string()),
+                retry_reason: retry_evidence.map(|value| value.reason.as_str()),
+                retry_delay_ms: retry_evidence
+                    .map(|value| u64::try_from(value.delay.as_millis()).unwrap_or(u64::MAX)),
+            };
+            let attempt_span = tracing::info_span!(
+                "model_invocation_attempt",
+                craxii_id = %invocation.craxii_id,
+                conversation_id = %invocation.conversation_id,
+                work_id = attempt_observation.work_id.as_str(),
+                runtime_instance_id = %invocation.work.runtime_owner().ok_or(ModelGatewayError::InvalidInvocation)?,
+                logical_invocation_id = attempt_observation.logical_invocation_id.as_str(),
+                model_invocation_id = attempt_observation.model_invocation_id.as_str(),
+                agent_step = invocation.agent_step.get(),
+                attempt_ordinal = attempt_observation.attempt_ordinal,
+                target = attempt_observation.target.as_str(),
+                provider = attempt_observation.provider.as_str(),
+                model = attempt_observation.model.as_str(),
+                request_sha256 = attempt_observation.request_sha256.as_str(),
+                request_bytes = attempt_observation.request_bytes,
+                retry_of_invocation_id = attempt_observation.retry_of_invocation_id.as_deref(),
+                retry_reason = attempt_observation.retry_reason,
+                retry_delay_ms = attempt_observation.retry_delay_ms,
+                result_class = tracing::field::Empty,
+                certainty = tracing::field::Empty,
+                provider_error_kind = tracing::field::Empty,
+                provider_http_status = tracing::field::Empty,
+                total_latency_ms = tracing::field::Empty,
+                first_response_latency_ms = tracing::field::Empty,
+                first_semantic_output_latency_ms = tracing::field::Empty,
+                output_item_count = tracing::field::Empty,
+                tool_call_count = tracing::field::Empty,
+                stop_reason = tracing::field::Empty,
+                draft_exposed = tracing::field::Empty,
+                input_tokens = tracing::field::Empty,
+                cached_input_tokens = tracing::field::Empty,
+                output_tokens = tracing::field::Empty,
+                reasoning_tokens = tracing::field::Empty,
+                total_tokens = tracing::field::Empty,
+                provider_request_digest = tracing::field::Empty,
+                provider_response_digest = tracing::field::Empty,
+            );
+            let attempt_started = Instant::now();
             let wait = decide_work_transition(
                 &invocation.work,
                 WorkTransitionGuard::for_snapshot(&invocation.work),
@@ -382,7 +454,20 @@ impl ModelGateway {
                     started_event,
                     waiting_event,
                 )
+                .instrument(attempt_span.clone())
                 .await;
+
+            let total_latency_ms =
+                u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            attempt_span.record("total_latency_ms", total_latency_ms);
+            attempt_span.in_scope(|| {
+                observe_model_attempt(
+                    &attempt_span,
+                    &attempt_observation,
+                    total_latency_ms,
+                    &attempt_result,
+                );
+            });
 
             match attempt_result {
                 PhysicalAttemptResult::Completed { response, attempt } => {
@@ -482,6 +567,16 @@ impl ModelGateway {
                             attempt,
                         });
                     };
+                    attempt_span.in_scope(|| {
+                        observe_model_retry_scheduled(
+                            &attempt_observation,
+                            total_latency_ms,
+                            error.kind(),
+                            error.certainty(),
+                            decision.reason().as_str(),
+                            delay,
+                        );
+                    });
                     preceding_event = attempt.terminal_work_event_id;
                     retry_of = Some(attempt.model_invocation_id);
                     invocation.work = attempt.work;
@@ -629,9 +724,23 @@ impl ModelGateway {
                 .await;
         }
 
+        let attempt_observation_span = tracing::Span::current();
+        let provider_span = tracing::info_span!(
+            "provider_stream",
+            provider = self.provider.provider_id().as_str(),
+            model_invocation_id = %attempt_id,
+            attempt_ordinal = attempt_no,
+            first_response_latency_ms = tracing::field::Empty,
+            first_semantic_output_latency_ms = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        let mut provider_observation =
+            ProviderStreamObservation::new(provider_span.clone(), attempt_observation_span);
         let stream = tokio::select! {
             biased;
             () = cancellation_requested(&mut invocation.cancellation) => {
+                provider_observation.classify("cancelled");
                 cancellation.cancel();
                 let error = ProviderError::new(
                     ProviderErrorKind::Cancelled,
@@ -654,6 +763,7 @@ impl ModelGateway {
                 ).await;
             }
             () = tokio::time::sleep(remaining) => {
+                provider_observation.classify("timeout");
                 cancellation.cancel();
                 let error = ProviderError::new(
                     ProviderErrorKind::TimeoutBeforeOutput,
@@ -675,11 +785,12 @@ impl ModelGateway {
                     None,
                 ).await;
             }
-            result = self.provider.invoke_stream(provider_invocation) => result,
+            result = self.provider.invoke_stream(provider_invocation).instrument(provider_span.clone()) => result,
         };
         let mut stream = match stream {
             Ok(value) => value,
             Err(error) => {
+                provider_observation.classify("open_failed");
                 return self
                     .finish_provider_error(
                         invocation,
@@ -718,6 +829,7 @@ impl ModelGateway {
         loop {
             let remaining = remaining_duration(effective_deadline, self.clock.as_ref());
             if remaining.is_zero() {
+                provider_observation.classify("timeout");
                 cancellation.cancel();
                 let error = timeout_error(accumulator.semantic_output_observed());
                 return self
@@ -742,6 +854,7 @@ impl ModelGateway {
             let event = tokio::select! {
                 biased;
                 () = cancellation_requested(&mut invocation.cancellation) => {
+                    provider_observation.classify("cancelled");
                     cancellation.cancel();
                     let error = ProviderError::new(
                         ProviderErrorKind::Cancelled,
@@ -764,6 +877,7 @@ impl ModelGateway {
                     ).await;
                 }
                 () = tokio::time::sleep(idle) => {
+                    provider_observation.classify("timeout");
                     cancellation.cancel();
                     let error = timeout_error(accumulator.semantic_output_observed());
                     return self.finish_provider_error(
@@ -782,11 +896,12 @@ impl ModelGateway {
                         accumulator.usage(),
                     ).await;
                 }
-                result = stream.next_event() => result,
+                result = stream.next_event().instrument(provider_span.clone()) => result,
             };
             let event = match event {
                 Ok(Some(value)) => value,
                 Ok(None) => {
+                    provider_observation.classify("unexpected_end");
                     let error = ProviderError::new(
                         ProviderErrorKind::MalformedResponse,
                         if accumulator.semantic_output_observed() {
@@ -814,6 +929,7 @@ impl ModelGateway {
                         .await;
                 }
                 Err(error) => {
+                    provider_observation.classify("stream_failed");
                     return self
                         .finish_provider_error(
                             invocation,
@@ -840,6 +956,7 @@ impl ModelGateway {
             };
             if first_byte_at.is_none() {
                 first_byte_at = Some(observed_at);
+                provider_observation.observe_first_response();
                 let (request_id, response_id) = started_ids(&event);
                 let streaming_event = JournalEventId::generate();
                 if let Err(error) = self
@@ -872,6 +989,7 @@ impl ModelGateway {
             }
             if event.is_semantic_output() && first_output_at.is_none() {
                 first_output_at = Some(observed_at);
+                provider_observation.observe_first_semantic_output();
             }
             #[cfg(feature = "test-failpoints")]
             if event.is_semantic_output() && !first_semantic_delta_observed {
@@ -888,6 +1006,7 @@ impl ModelGateway {
             }
             let terminal = event.is_terminal();
             if let Err(kind) = accumulator.observe(event) {
+                provider_observation.classify("malformed_stream");
                 let error = ProviderError::new(
                     contract_error_kind(kind),
                     if accumulator.semantic_output_observed() {
@@ -935,12 +1054,13 @@ impl ModelGateway {
                         cancellation.cancel();
                         None
                     }
-                    result = stream.next_event() => Some(result),
+                    result = stream.next_event().instrument(provider_span.clone()) => Some(result),
                 }
             };
             match trailing {
                 Some(Ok(None)) => {}
                 Some(Ok(Some(_))) => {
+                    provider_observation.classify("malformed_stream");
                     let error = ProviderError::new(
                         ProviderErrorKind::MalformedResponse,
                         if accumulator.semantic_output_observed() {
@@ -968,6 +1088,7 @@ impl ModelGateway {
                         .await;
                 }
                 Some(Err(_)) | None => {
+                    provider_observation.classify("incomplete_stream");
                     let error = ProviderError::new(
                         ProviderErrorKind::ProviderOutcomeUnknown,
                         ProviderOutcomeCertainty::ProviderOutcomeUnknown,
@@ -995,7 +1116,9 @@ impl ModelGateway {
                 Ok(StreamTerminal::Completed(response)) => {
                     if first_output_at.is_none() && !response.output_items().is_empty() {
                         first_output_at = Some(observed_at);
+                        provider_observation.observe_first_semantic_output();
                     }
+                    provider_observation.classify("completed");
                     self.finish_completed_attempt(
                         invocation,
                         attempt_id,
@@ -1010,6 +1133,7 @@ impl ModelGateway {
                     .await
                 }
                 Ok(StreamTerminal::ProviderError(kind)) => {
+                    provider_observation.classify("provider_error");
                     let error = stream_error(kind, accumulator.semantic_output_observed());
                     self.finish_provider_error(
                         invocation,
@@ -1029,6 +1153,7 @@ impl ModelGateway {
                     .await
                 }
                 Err(kind) => {
+                    provider_observation.classify("malformed_stream");
                     let error = ProviderError::new(
                         contract_error_kind(kind),
                         if accumulator.semantic_output_observed() {
@@ -1244,6 +1369,11 @@ impl ModelGateway {
         provider_response_id: Option<String>,
         usage: Option<CanonicalModelUsage>,
     ) -> PhysicalAttemptResult {
+        let provider_request_id = provider_request_id.or_else(|| {
+            error
+                .provider_request_id()
+                .map(|value| value.as_str().to_owned())
+        });
         self.finish_failed_attempt(
             invocation,
             attempt_id,
@@ -1640,6 +1770,336 @@ enum PhysicalAttemptResult {
         attempt: DurableModelAttempt,
     },
     Infrastructure(ModelGatewayError),
+}
+
+struct ModelAttemptObservation {
+    work_id: String,
+    logical_invocation_id: String,
+    model_invocation_id: String,
+    attempt_ordinal: u32,
+    target: String,
+    provider: String,
+    model: String,
+    request_sha256: String,
+    request_bytes: u64,
+    retry_of_invocation_id: Option<String>,
+    retry_reason: Option<&'static str>,
+    retry_delay_ms: Option<u64>,
+}
+
+struct ProviderStreamObservation {
+    span: tracing::Span,
+    attempt_span: tracing::Span,
+    started: Instant,
+    result_class: &'static str,
+    finished: bool,
+    first_response_observed: bool,
+    first_semantic_output_observed: bool,
+}
+
+impl ProviderStreamObservation {
+    fn new(span: tracing::Span, attempt_span: tracing::Span) -> Self {
+        Self {
+            span,
+            attempt_span,
+            started: Instant::now(),
+            result_class: "incomplete",
+            finished: false,
+            first_response_observed: false,
+            first_semantic_output_observed: false,
+        }
+    }
+
+    fn classify(&mut self, result_class: &'static str) {
+        if self.finished {
+            return;
+        }
+        self.result_class = result_class;
+        self.finished = true;
+        self.record_terminal();
+    }
+
+    fn observe_first_response(&mut self) {
+        if self.first_response_observed {
+            return;
+        }
+        self.first_response_observed = true;
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.span.record("first_response_latency_ms", elapsed);
+        self.attempt_span
+            .record("first_response_latency_ms", elapsed);
+    }
+
+    fn observe_first_semantic_output(&mut self) {
+        if self.first_semantic_output_observed {
+            return;
+        }
+        self.first_semantic_output_observed = true;
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.span
+            .record("first_semantic_output_latency_ms", elapsed);
+        self.attempt_span
+            .record("first_semantic_output_latency_ms", elapsed);
+    }
+
+    fn record_terminal(&self) {
+        self.span.record("result_class", self.result_class);
+        self.span.record(
+            "duration_ms",
+            u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+    }
+}
+
+impl Drop for ProviderStreamObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record_terminal();
+        }
+    }
+}
+
+fn observe_model_attempt(
+    span: &tracing::Span,
+    observation: &ModelAttemptObservation,
+    total_latency_ms: u64,
+    result: &PhysicalAttemptResult,
+) {
+    match result {
+        PhysicalAttemptResult::Completed {
+            response,
+            attempt: _,
+        } => {
+            span.record("result_class", "completed");
+            span.record("certainty", "definitely_completed");
+            span.record(
+                "output_item_count",
+                u64::try_from(response.output_items().len()).unwrap_or(u64::MAX),
+            );
+            span.record(
+                "tool_call_count",
+                u64::try_from(
+                    response
+                        .output_items()
+                        .iter()
+                        .filter(|item| matches!(item, ModelOutputItem::ToolCall(_)))
+                        .count(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+            if let Some(usage) = response.usage() {
+                span.record("input_tokens", usage.input_tokens());
+                span.record("cached_input_tokens", usage.cached_input_tokens());
+                span.record("output_tokens", usage.output_tokens());
+                span.record("reasoning_tokens", usage.reasoning_tokens());
+                span.record("total_tokens", usage.total_tokens());
+            }
+            span.record("stop_reason", response.stop_reason().as_str());
+            if let Some(value) = response.provider_request_id() {
+                span.record(
+                    "provider_request_digest",
+                    SafeProviderCorrelation::from_provider_id(value).as_str(),
+                );
+            }
+            if let Some(value) = response.provider_response_id() {
+                span.record(
+                    "provider_response_digest",
+                    SafeProviderCorrelation::from_provider_id(value).as_str(),
+                );
+            }
+            let usage = response.usage();
+            let provider_request_digest = response
+                .provider_request_id()
+                .map(SafeProviderCorrelation::from_provider_id);
+            let provider_response_digest = response
+                .provider_response_id()
+                .map(SafeProviderCorrelation::from_provider_id);
+            tracing::info!(
+                event_name = "model_attempt_terminal",
+                work_id = observation.work_id.as_str(),
+                logical_invocation_id = observation.logical_invocation_id.as_str(),
+                model_invocation_id = observation.model_invocation_id.as_str(),
+                attempt_ordinal = observation.attempt_ordinal,
+                target = observation.target.as_str(),
+                provider = observation.provider.as_str(),
+                model = observation.model.as_str(),
+                request_sha256 = observation.request_sha256.as_str(),
+                request_bytes = observation.request_bytes,
+                retry_of_invocation_id = observation.retry_of_invocation_id.as_deref(),
+                retry_reason = observation.retry_reason,
+                retry_delay_ms = observation.retry_delay_ms,
+                total_latency_ms,
+                result_class = "completed",
+                certainty = "definitely_completed",
+                stop_reason = response.stop_reason().as_str(),
+                output_item_count =
+                    u64::try_from(response.output_items().len()).unwrap_or(u64::MAX),
+                tool_call_count = u64::try_from(
+                    response
+                        .output_items()
+                        .iter()
+                        .filter(|item| matches!(item, ModelOutputItem::ToolCall(_)))
+                        .count(),
+                )
+                .unwrap_or(u64::MAX),
+                usage_status = if usage.is_some() {
+                    "reported"
+                } else {
+                    "unavailable"
+                },
+                input_tokens = usage.map(|value| value.input_tokens()),
+                cached_input_tokens = usage.map(|value| value.cached_input_tokens()),
+                output_tokens = usage.map(|value| value.output_tokens()),
+                reasoning_tokens = usage.map(|value| value.reasoning_tokens()),
+                total_tokens = usage.map(|value| value.total_tokens()),
+                provider_request_digest = provider_request_digest
+                    .as_ref()
+                    .map(SafeProviderCorrelation::as_str),
+                provider_response_digest = provider_response_digest
+                    .as_ref()
+                    .map(SafeProviderCorrelation::as_str),
+            );
+        }
+        PhysicalAttemptResult::Failed {
+            error,
+            semantic_output_observed,
+            draft_exposed,
+            attempt: _,
+        } => {
+            span.record(
+                "result_class",
+                if error.certainty() == ProviderOutcomeCertainty::ProviderOutcomeUnknown {
+                    "outcome_unknown"
+                } else {
+                    "failed"
+                },
+            );
+            span.record("certainty", error.certainty().as_str());
+            span.record("provider_error_kind", error.kind().code());
+            if let Some(status) = error.provider_http_status() {
+                span.record("provider_http_status", status);
+            }
+            if let Some(value) = error.provider_request_id() {
+                span.record(
+                    "provider_request_digest",
+                    SafeProviderCorrelation::from_provider_id(value).as_str(),
+                );
+            }
+            span.record("draft_exposed", *draft_exposed);
+            let provider_request_digest = error
+                .provider_request_id()
+                .map(SafeProviderCorrelation::from_provider_id);
+            tracing::warn!(
+                event_name = "model_attempt_terminal",
+                work_id = observation.work_id.as_str(),
+                logical_invocation_id = observation.logical_invocation_id.as_str(),
+                model_invocation_id = observation.model_invocation_id.as_str(),
+                attempt_ordinal = observation.attempt_ordinal,
+                target = observation.target.as_str(),
+                provider = observation.provider.as_str(),
+                model = observation.model.as_str(),
+                request_sha256 = observation.request_sha256.as_str(),
+                request_bytes = observation.request_bytes,
+                retry_of_invocation_id = observation.retry_of_invocation_id.as_deref(),
+                retry_reason = observation.retry_reason,
+                retry_delay_ms = observation.retry_delay_ms,
+                total_latency_ms,
+                result_class =
+                    if error.certainty() == ProviderOutcomeCertainty::ProviderOutcomeUnknown {
+                        "outcome_unknown"
+                    } else {
+                        "failed"
+                    },
+                provider_error_kind = error.kind().code(),
+                provider_http_status = error.provider_http_status(),
+                provider_request_digest = provider_request_digest
+                    .as_ref()
+                    .map(SafeProviderCorrelation::as_str),
+                certainty = error.certainty().as_str(),
+                semantic_output_observed = *semantic_output_observed,
+                draft_exposed = *draft_exposed,
+                usage_status = "not_observed",
+            );
+        }
+        PhysicalAttemptResult::Interrupted {
+            error_kind,
+            attempt: _,
+        } => {
+            span.record("result_class", "interrupted");
+            span.record("provider_error_kind", error_kind.code());
+            tracing::warn!(
+                event_name = "model_attempt_terminal",
+                work_id = observation.work_id.as_str(),
+                logical_invocation_id = observation.logical_invocation_id.as_str(),
+                model_invocation_id = observation.model_invocation_id.as_str(),
+                attempt_ordinal = observation.attempt_ordinal,
+                target = observation.target.as_str(),
+                provider = observation.provider.as_str(),
+                model = observation.model.as_str(),
+                request_sha256 = observation.request_sha256.as_str(),
+                request_bytes = observation.request_bytes,
+                retry_of_invocation_id = observation.retry_of_invocation_id.as_deref(),
+                retry_reason = observation.retry_reason,
+                retry_delay_ms = observation.retry_delay_ms,
+                total_latency_ms,
+                result_class = "interrupted",
+                provider_error_kind = error_kind.code(),
+                certainty = "outcome_unknown",
+                usage_status = "not_observed",
+            );
+        }
+        PhysicalAttemptResult::Infrastructure(error) => {
+            span.record("result_class", "infrastructure_failure");
+            tracing::warn!(
+                event_name = "model_attempt_terminal",
+                work_id = observation.work_id.as_str(),
+                logical_invocation_id = observation.logical_invocation_id.as_str(),
+                model_invocation_id = observation.model_invocation_id.as_str(),
+                attempt_ordinal = observation.attempt_ordinal,
+                target = observation.target.as_str(),
+                provider = observation.provider.as_str(),
+                model = observation.model.as_str(),
+                request_sha256 = observation.request_sha256.as_str(),
+                request_bytes = observation.request_bytes,
+                retry_of_invocation_id = observation.retry_of_invocation_id.as_deref(),
+                retry_reason = observation.retry_reason,
+                retry_delay_ms = observation.retry_delay_ms,
+                total_latency_ms,
+                result_class = "infrastructure_failure",
+                error_class = %error,
+                certainty = "not_observed",
+                usage_status = "not_observed",
+            );
+        }
+    }
+}
+
+fn observe_model_retry_scheduled(
+    observation: &ModelAttemptObservation,
+    total_latency_ms: u64,
+    provider_error_kind: ProviderErrorKind,
+    certainty: ProviderOutcomeCertainty,
+    retry_reason: &'static str,
+    retry_delay: Duration,
+) {
+    tracing::info!(
+        event_name = "model_attempt_retry_scheduled",
+        work_id = observation.work_id.as_str(),
+        logical_invocation_id = observation.logical_invocation_id.as_str(),
+        model_invocation_id = observation.model_invocation_id.as_str(),
+        attempt_ordinal = observation.attempt_ordinal,
+        target = observation.target.as_str(),
+        provider = observation.provider.as_str(),
+        model = observation.model.as_str(),
+        request_sha256 = observation.request_sha256.as_str(),
+        request_bytes = observation.request_bytes,
+        total_latency_ms,
+        result_class = "retry_scheduled",
+        provider_error_kind = provider_error_kind.code(),
+        certainty = certainty.as_str(),
+        retry_reason,
+        retry_delay_ms = u64::try_from(retry_delay.as_millis()).unwrap_or(u64::MAX),
+    );
 }
 
 enum StreamTerminal {

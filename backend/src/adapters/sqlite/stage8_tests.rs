@@ -13,9 +13,11 @@ use sqlx::Row;
 use crate::adapters::artifacts::LocalArtifactStore;
 #[cfg(feature = "test-failpoints")]
 use crate::adapters::local_workstation::{LocalWorkstation, LocalWorkstationOptions};
+use crate::adapters::sqlite::SqliteEvidenceQueryStore;
 #[cfg(feature = "test-failpoints")]
 #[cfg(feature = "test-failpoints")]
 use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
+use crate::application::evidence_inspection::{EvidenceInspectionService, EvidenceOutputFormat};
 #[cfg(feature = "test-failpoints")]
 use crate::application::tool_execution_service::{
     ToolExecutionCall, ToolExecutionService, ToolRuntimeLimits,
@@ -26,6 +28,7 @@ use crate::domain::*;
 use crate::ports::artifact_store::{ArtifactStore, BeginArtifactCapture};
 #[cfg(feature = "test-failpoints")]
 use crate::ports::clock::{Clock, MonotonicInstant, TestClock};
+use crate::ports::evidence_query::{EvidenceQueryStore, VerificationIssue};
 use crate::ports::state_store::*;
 #[cfg(feature = "test-failpoints")]
 use crate::ports::workstation::{HARD_FILE_READ_MAX_BYTES, Workstation};
@@ -653,6 +656,125 @@ async fn large_read_generic_artifact_survives_sqlite_restart_without_stream_misu
     );
     drop(connection);
     guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn stage23_evidence_reports_are_deterministic_and_exclude_stored_content() {
+    let (fixture, _, _) = completed_large_read_fixture().await;
+    let sentinels = [
+        "Authorization: Bearer SENTINEL_AUTH_23",
+        "SENTINEL_PROVIDER_API_KEY_23",
+        "SENTINEL_REQUEST_BODY_23",
+        "SENTINEL_USER_MESSAGE_23",
+        "SENTINEL_MODEL_PROMPT_23",
+        "SENTINEL_MODEL_OUTPUT_23",
+        "SENTINEL_MODEL_REFUSAL_23",
+        "SENTINEL_TOOL_ARGUMENTS_23",
+        "SENTINEL_SHELL_COMMAND_23",
+        "SENTINEL_STDOUT_23",
+        "SENTINEL_STDERR_23",
+        "SENTINEL_FILE_CONTENT_23",
+        "SENTINEL_ENV_SECRET_23",
+        "SENTINEL_URL_SECRET_23",
+        "/Users/sentinel/absolute/path/23",
+        "SENTINEL_PROVIDER_ERROR_BODY_23",
+        "SENTINEL_KEYCHAIN_TOKEN_23",
+    ];
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query("UPDATE messages SET content_json = ?")
+        .bind(format!(
+            "{{\"version\":1,\"blocks\":[{{\"type\":\"text\",\"text\":\"{}\"}}]}}",
+            sentinels[3]
+        ))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tool_executions SET arguments_json = ?, requested_cwd = ?")
+        .bind(format!("{{\"secret\":\"{}\"}}", sentinels[7]))
+        .bind(sentinels[14])
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE model_invocations SET normalized_output_json = ?")
+        .bind(format!(
+            "{{\"items\":[{{\"kind\":\"text\",\"text\":\"{}\"}}]}}",
+            sentinels[5]
+        ))
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+
+    let queries = SqliteEvidenceQueryStore::new(fixture.guard.runtime().clone());
+    let service = EvidenceInspectionService::new(&queries, &fixture.artifact_store);
+    let first = service
+        .inspect_work(fixture.work_id, EvidenceOutputFormat::Json)
+        .await
+        .unwrap();
+    let second = service
+        .inspect_work(fixture.work_id, EvidenceOutputFormat::Json)
+        .await
+        .unwrap();
+    let markdown = service
+        .inspect_work(fixture.work_id, EvidenceOutputFormat::Markdown)
+        .await
+        .unwrap();
+    assert_eq!(first, second);
+    assert!(first.contains(&fixture.work_id.to_string()));
+    assert!(markdown.starts_with("# Craxii operator evidence"));
+    for sentinel in sentinels {
+        assert!(!first.contains(sentinel));
+        assert!(!markdown.contains(sentinel));
+    }
+    assert!(!first.contains("payload_json"));
+    assert!(!first.contains("arguments_json"));
+    assert!(!first.contains("normalized_output_json"));
+}
+
+#[tokio::test]
+async fn stage23_verify_state_detects_projection_and_artifact_failures_without_repair() {
+    let (fixture, _, _) = completed_large_read_fixture().await;
+    let queries = SqliteEvidenceQueryStore::new(fixture.guard.runtime().clone());
+    let initial = queries.verify_state(&fixture.artifact_store).await.unwrap();
+    assert!(initial.consistent, "{initial:?}");
+    assert!(initial.referenced_artifact_count > 0);
+
+    let storage_key: String = {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        sqlx::query_scalar("SELECT storage_key FROM artifacts ORDER BY artifact_id LIMIT 1")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap()
+    };
+    let artifact_path = fixture
+        ._root
+        .path()
+        .join("artifacts/sha256")
+        .join(&storage_key[7..9])
+        .join(&storage_key[10..]);
+    fs::remove_file(artifact_path).unwrap();
+    let missing = queries.verify_state(&fixture.artifact_store).await.unwrap();
+    assert!(!missing.consistent);
+    assert!(
+        missing
+            .issues
+            .contains(&VerificationIssue::ReferencedArtifactMissingOrCorrupt)
+    );
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query("UPDATE work_items SET state_version = state_version + 1 WHERE work_id = ?")
+        .bind(fixture.work_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let inconsistent = queries.verify_state(&fixture.artifact_store).await.unwrap();
+    assert!(!inconsistent.consistent);
+    assert!(
+        inconsistent
+            .issues
+            .contains(&VerificationIssue::JournalProjectionInconsistent)
+    );
 }
 
 #[tokio::test]

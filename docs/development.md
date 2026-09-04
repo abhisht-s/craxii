@@ -87,6 +87,29 @@ cargo deny --locked check licenses bans sources
 - Public HTTP errors include an `x-request-id` and a safe error code. Server traces contain request metadata but intentionally omit bodies and credentials.
 - For reconnect bugs, record the bootstrap cursor, last applied durable cursor, `sync.complete` cursor, and event types—not message/model content or bearer tokens.
 
+## Tracing and offline evidence
+
+The `tracing.format` setting selects human-readable `pretty` output or newline-delimited `json`; both carry the same semantic span fields. The validated filters are `trace`, `debug`, `info`, `warn`, and `error`. The local fixture uses `pretty`/`info`, while service-shaped configuration uses JSON.
+
+Tracing is disposable operational evidence. SQLite projections are current truth, journal entries are historical evidence, and neither startup recovery nor a state transition may rely on a trace being present. Trace spans correlate request, command, replay, work, model, tool, workstation, artifact, and storage activity using Craxii-generated identifiers. Missing measurements are left unavailable rather than reported as zero.
+
+Stop the server before running the local evidence commands; they take the same exclusive state lock and open SQLite and artifacts read-only:
+
+```sh
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml preflight
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml verify-state --format markdown
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml inspect-work <work-uuid>
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml inspect-runtime <runtime-uuid>
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml evidence-export --format json
+```
+
+JSON is the default; `--format markdown` embeds the same deterministic JSON document. Every artifact declares `craxii.operator-evidence/v1` and a read-only, noncanonical role. `verify-state` exits nonzero after printing its report if journal/projection or referenced-artifact checks fail. These commands never repair state and have no HTTP equivalent.
+
 ## Pull requests and full verification
 
 Keep changes focused and describe the observable behavior, tests, platform impact, and any protocol/persistence/security/dependency consequences. See [CONTRIBUTING.md](../CONTRIBUTING.md).

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
@@ -40,12 +41,18 @@ const MAX_PER_STREAM_PROJECTION_BYTES: u64 = 32_768;
 const MAX_WEBSOCKET_DURABLE_PAYLOAD_BYTES: u64 = 262_144;
 const MAX_USER_TEXT_MESSAGE_BYTES: u64 = 65_536;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct NormalizedUrl(String);
 
 impl NormalizedUrl {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for NormalizedUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("NormalizedUrl([REDACTED])")
     }
 }
 
@@ -197,11 +204,22 @@ impl ServerConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct PathsConfig {
     pub(super) state_root: PathBuf,
     pub(super) artifact_root: PathBuf,
     pub(super) primary_workspace_root: PathBuf,
+}
+
+impl fmt::Debug for PathsConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PathsConfig")
+            .field("state_root", &"[REDACTED]")
+            .field("artifact_root", &"[REDACTED]")
+            .field("primary_workspace_root", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl PathsConfig {
@@ -564,13 +582,29 @@ pub enum ShellEnvironmentPolicy {
     Clean,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ShellConfig {
     pub(super) executable: PathBuf,
     pub(super) environment_policy: ShellEnvironmentPolicy,
     pub(super) inherited_variables: Vec<String>,
     pub(super) administrative_enabled: bool,
     pub(super) delegated_cgroup_root: Option<PathBuf>,
+}
+
+impl fmt::Debug for ShellConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ShellConfig")
+            .field("executable", &"[REDACTED]")
+            .field("environment_policy", &self.environment_policy)
+            .field("inherited_variable_count", &self.inherited_variables.len())
+            .field("administrative_enabled", &self.administrative_enabled)
+            .field(
+                "has_delegated_cgroup_root",
+                &self.delegated_cgroup_root.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl ShellConfig {

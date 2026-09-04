@@ -74,6 +74,37 @@ xcodebuild \
   -only-testing:CraxiiTests \
   test
 
+printf '%s\n' 'Building and inspecting the production Release app'
+if xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Release \
+  -destination "platform=macOS,arch=$(uname -m)" \
+  -derivedDataPath "${derived_data}" \
+  -showBuildSettings |
+    rg -q 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = .*CRAXII_UI_TEST_FIXTURES'; then
+  printf '%s\n' 'error: Release enables the UI-test fixture compilation condition' >&2
+  exit 1
+fi
+xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Release \
+  -destination "platform=macOS,arch=$(uname -m)" \
+  -derivedDataPath "${derived_data}" \
+  -quiet \
+  build
+release_executable="${derived_data}/Build/Products/Release/Craxii.app/Contents/MacOS/Craxii"
+if [[ ! -x "${release_executable}" ]]; then
+  printf '%s\n' 'error: Release app executable was not produced' >&2
+  exit 1
+fi
+if strings -a "${release_executable}" |
+    rg -q 'CRAXII_STAGE(21|22)_UI_SMOKE|Stage 22 smoke message|configureConversationSmokeState'; then
+  printf '%s\n' 'error: Release app contains the UI-test fixture trigger, payload, or installer' >&2
+  exit 1
+fi
+
 printf '%s\n' 'Running the minimal macOS UI smoke'
 ui_log="${derived_data}/stage22-ui-smoke.log"
 if xcodebuild \

@@ -1,7 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 use crate::application::scheduler::{SchedulerError, SchedulerHandle};
 use crate::bootstrap::health::{FatalReasonCode, Health, HealthState};
@@ -39,12 +40,33 @@ pub async fn bootstrap_runtime<S: RuntimeStateStore + RecoveryStateStore>(
     let binary_version = evidence.package_version().clone();
     let schema_version = evidence.schema_version();
     let recovery_started = clock.monotonic_now();
-    store
+    let recovery_span = tracing::info_span!(
+        "startup_recovery",
+        runtime_instance_id = %runtime_instance_id,
+        runtime_generation = evidence.workstation_generation().get(),
+        correlation_id = %correlation_id,
+        stale_runtime_count = tracing::field::Empty,
+        queued_work_retained = tracing::field::Empty,
+        work_interrupted = tracing::field::Empty,
+        model_attempts_marked_unknown = tracing::field::Empty,
+        tool_attempts_marked_unknown = tracing::field::Empty,
+        drafts_abandoned = tracing::field::Empty,
+        cleanup_checks_performed = tracing::field::Empty,
+        cleanup_unconfirmed = tracing::field::Empty,
+        orphan_count = orphan_artifacts_observed,
+        journal_offset_start = tracing::field::Empty,
+        journal_offset_end = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+        result_class = tracing::field::Empty,
+    );
+    let mut recovery_observation = RecoverySpanObservation::new(recovery_span.clone());
+    let runtime_started = store
         .create_runtime_and_started_event(CreateRuntimeRequest {
             evidence,
             event_id: started_event_id,
             correlation_id,
         })
+        .instrument(recovery_span.clone())
         .await?;
 
     let result = async {
@@ -103,7 +125,7 @@ pub async fn bootstrap_runtime<S: RuntimeStateStore + RecoveryStateStore>(
             .as_millis()
             .try_into()
             .map_err(|_| RuntimeControlError::Clock)?;
-        store
+        let commit = store
             .append_recovery_summary(AppendRecoverySummaryRequest {
                 summary: summary.clone(),
                 event_id: JournalEventId::generate(),
@@ -111,17 +133,55 @@ pub async fn bootstrap_runtime<S: RuntimeStateStore + RecoveryStateStore>(
                 correlation_id,
             })
             .await?;
-        Ok::<_, RuntimeControlError>(summary)
+        Ok::<_, RuntimeControlError>((summary, commit))
     }
+    .instrument(recovery_span.clone())
     .await;
 
     match result {
-        Ok(recovery) => Ok(RuntimeBootstrapReceipt {
-            runtime_instance_id,
-            started_event_id,
-            correlation_id,
-            recovery,
-        }),
+        Ok((recovery, recovery_commit)) => {
+            recovery_span.record("stale_runtime_count", recovery.stale_runtimes_observed);
+            recovery_span.record("queued_work_retained", recovery.retained_queued_work);
+            recovery_span.record("work_interrupted", recovery.interrupted_work);
+            recovery_span.record(
+                "model_attempts_marked_unknown",
+                recovery.model_attempts_provider_outcome_unknown,
+            );
+            recovery_span.record(
+                "tool_attempts_marked_unknown",
+                recovery.tool_attempts_outcome_unknown,
+            );
+            recovery_span.record("drafts_abandoned", recovery.drafts_abandoned);
+            recovery_span.record(
+                "cleanup_checks_performed",
+                recovery.cleanup_checks_performed,
+            );
+            recovery_span.record("cleanup_unconfirmed", recovery.cleanup_unconfirmed);
+            if let Some(range) = runtime_started.commit.events {
+                recovery_span.record("journal_offset_start", range.first.get());
+            }
+            if let Some(range) = recovery_commit.events {
+                recovery_span.record("journal_offset_end", range.last.get());
+            }
+            recovery_observation.complete(recovery.recovery_duration_ms);
+            tracing::info!(
+                parent: &recovery_span,
+                event_name = "startup_recovery_terminal",
+                runtime_instance_id = %runtime_instance_id,
+                result_class = "complete",
+                stale_runtime_count = recovery.stale_runtimes_observed,
+                work_interrupted = recovery.interrupted_work,
+                model_attempts_marked_unknown = recovery.model_attempts_provider_outcome_unknown,
+                tool_attempts_marked_unknown = recovery.tool_attempts_outcome_unknown,
+                cleanup_unconfirmed = recovery.cleanup_unconfirmed
+            );
+            Ok(RuntimeBootstrapReceipt {
+                runtime_instance_id,
+                started_event_id,
+                correlation_id,
+                recovery,
+            })
+        }
         Err(original) => {
             let _ = store
                 .mark_runtime_startup_failure(FinishRuntimeRequest {
@@ -133,6 +193,40 @@ pub async fn bootstrap_runtime<S: RuntimeStateStore + RecoveryStateStore>(
                 })
                 .await;
             Err(original)
+        }
+    }
+}
+
+struct RecoverySpanObservation {
+    span: tracing::Span,
+    started: Instant,
+    finished: bool,
+}
+
+impl RecoverySpanObservation {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    fn complete(&mut self, duration_ms: u64) {
+        self.finished = true;
+        self.span.record("duration_ms", duration_ms);
+        self.span.record("result_class", "complete");
+    }
+}
+
+impl Drop for RecoverySpanObservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.span.record(
+                "duration_ms",
+                u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            self.span.record("result_class", "failed");
         }
     }
 }

@@ -1,0 +1,85 @@
+{
+  "contract_version": "craxii.stage24.evidence/v1",
+  "schema_version": 4,
+  "protocol_version": 1,
+  "expected": {
+    "user_messages": 2,
+    "assistant_messages": 2,
+    "completed_work": 2,
+    "model_attempts": 3,
+    "tool_executions": 2,
+    "runtime_count": 2,
+    "first_work_model_steps": [1, 2],
+    "first_work_tools": ["run_shell", "read_file"],
+    "follow_up_model_steps": [1],
+    "message_roles": ["user", "assistant", "user", "assistant"],
+    "work_ordinals": [1, 2]
+  },
+  "required_result_classes": {
+    "works": ["completed:answered", "completed:answered"],
+    "tools": ["success", "success"],
+    "models": ["completed", "completed", "completed"]
+  },
+  "required_relationships": [
+    "retransmission_preserves_message_and_work_identity",
+    "tool_results_pair_by_provider_call_and_tool_execution_identity",
+    "tool_executions_link_to_source_model_and_workstation_execution",
+    "assistant_commit_precedes_atomic_work_completion",
+    "restart_preserves_product_and_conversation_identity",
+    "follow_up_context_contains_durable_prior_history",
+    "telemetry_links_request_command_work_model_tool_and_workstation",
+    "replay_and_bootstrap_converge_to_the_same_durable_cursor"
+  ],
+  "normalization": {
+    "removed": [
+      "uuidv7_values",
+      "request_ids",
+      "runtime_ids",
+      "process_ids",
+      "ports",
+      "timestamps",
+      "durations",
+      "temporary_roots",
+      "artifact_locations",
+      "machine_specific_values"
+    ],
+    "preserved": [
+      "ordering",
+      "counts",
+      "result_classes",
+      "identity_equalities",
+      "causal_relationships",
+      "artifact_integrity",
+      "provider_context_dependencies",
+      "live_and_replay_event_semantics"
+    ]
+  },
+  "portable_host": {
+    "required": [
+      "real_production_local_workstation_bash_with_profiles_disabled_and_pipefail_enabled",
+      "real_os",
+      "real_architecture",
+      "configured_working_directory",
+      "installed_git_version",
+      "workspace_file_read",
+      "credential_canary_absent",
+      "captured_output_metadata",
+      "owned_process_cleanup"
+    ],
+    "result": "passed"
+  },
+  "ubuntu_target": {
+    "excluded": [
+      "ubuntu_24_04",
+      "x86_64_deployment_target",
+      "craxii_unix_account",
+      "srv_craxii",
+      "systemd",
+      "cgroup_v2",
+      "cgroup_kill",
+      "sudo_n",
+      "linux_reboot_and_session_escape"
+    ],
+    "result": "deferred_by_user_to_stage_27"
+  }
+}

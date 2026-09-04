@@ -30,3 +30,39 @@ pub fn load(path: impl AsRef<Path>) -> Result<ValidatedConfig, ConfigError> {
     })?;
     parse(&input)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stage23_configuration_debug_and_errors_exclude_urls_paths_and_source_text() {
+        let input = include_str!("../../../tests/fixtures/config/valid/local.toml")
+            .replace("api.openai.example.invalid", "SENTINEL_URL_HOST_23.invalid")
+            .replace("/tmp/craxii-dev", "/Users/SENTINEL_ABSOLUTE_PATH_23");
+        let config = parse(&input).unwrap();
+        let rendered = format!(
+            "{:?}{:?}{:?}{:?}{:?}",
+            config.server(),
+            config.paths(),
+            config.credentials(),
+            config.models(),
+            config.shell(),
+        );
+        for sentinel in ["SENTINEL_URL_HOST_23", "SENTINEL_ABSOLUTE_PATH_23"] {
+            assert!(
+                !rendered.contains(sentinel),
+                "leaked {sentinel}: {rendered}"
+            );
+        }
+
+        let missing = Path::new("/Users/SENTINEL_CONFIG_PATH_23/missing.toml");
+        let error = match load(missing) {
+            Ok(_) => panic!("missing configuration unexpectedly loaded"),
+            Err(error) => error,
+        };
+        assert!(!format!("{error:?}").contains("SENTINEL_CONFIG_PATH_23"));
+        assert!(!error.to_string().contains("SENTINEL_CONFIG_PATH_23"));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+}

@@ -7,7 +7,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::Instrument;
 
 use serde_json::json;
 
@@ -135,7 +136,7 @@ pub struct ToolResultError {
 }
 
 /// Provider-neutral bounded result returned only after durable terminal commit.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ToolExecutionResult {
     pub tool_execution_id: ToolExecutionId,
     pub execution_id: ExecutionId,
@@ -150,6 +151,26 @@ pub struct ToolExecutionResult {
     pub artifact_ids: Vec<ArtifactId>,
     pub truncated: bool,
     pub error: Option<ToolResultError>,
+}
+
+impl std::fmt::Debug for ToolExecutionResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolExecutionResult")
+            .field("tool_execution_id", &self.tool_execution_id)
+            .field("execution_id", &self.execution_id)
+            .field("tool_name", &self.tool_name)
+            .field("tool_version", &self.tool_version)
+            .field("schema_version", &self.schema_version)
+            .field("status", &self.status)
+            .field("result_class", &self.result_class)
+            .field("effective_privilege", &self.effective_privilege)
+            .field("field_count", &self.fields.len())
+            .field("artifact_count", &self.artifact_ids.len())
+            .field("truncated", &self.truncated)
+            .field("has_error", &self.error.is_some())
+            .finish()
+    }
 }
 
 /// Safe service failure classes. None authorizes automatic tool replay.
@@ -260,6 +281,100 @@ impl ToolExecutionService {
     /// Executes one logical call with durable requested/dispatch/outcome ordering and no retry.
     pub async fn execute_call(
         &self,
+        call: ToolExecutionCall,
+    ) -> Result<ToolExecutionResult, ToolExecutionServiceError> {
+        let span = tracing::info_span!(
+            "tool_execution_service",
+            craxii_id = %call.craxii_id,
+            work_id = %call.work.work_id(),
+            runtime_instance_id = %call.runtime_instance_id,
+            source_model_invocation_id = %call.source_model_invocation_id,
+            agent_step = call.agent_step_no.get(),
+            tool_ordinal = call.tool_ordinal.get(),
+            workstation_id = %call.workstation_id,
+            workstation_generation = call.workstation_generation.get(),
+            tool_execution_id = tracing::field::Empty,
+            workstation_execution_id = tracing::field::Empty,
+            tool_name = tracing::field::Empty,
+            tool_version = tracing::field::Empty,
+            tool_schema_version = tracing::field::Empty,
+            arguments_sha256 = tracing::field::Empty,
+            validation_result = tracing::field::Empty,
+            authority_result = tracing::field::Empty,
+            requested_privilege = tracing::field::Empty,
+            effective_privilege = tracing::field::Empty,
+            effective_timeout_ms = tracing::field::Empty,
+            dispatch_intent_persisted = false,
+            result_class = tracing::field::Empty,
+            outcome_unknown = tracing::field::Empty,
+            artifact_count = tracing::field::Empty,
+            output_observed_bytes = tracing::field::Empty,
+            stdout_observed_bytes = tracing::field::Empty,
+            stdout_captured_bytes = tracing::field::Empty,
+            stderr_observed_bytes = tracing::field::Empty,
+            stderr_captured_bytes = tracing::field::Empty,
+            exit_code = tracing::field::Empty,
+            signal = tracing::field::Empty,
+            timed_out = tracing::field::Empty,
+            cancelled = tracing::field::Empty,
+            cleanup_result = tracing::field::Empty,
+            truncated = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+        );
+        let started = Instant::now();
+        let result = self.execute_call_inner(call).instrument(span.clone()).await;
+        span.record(
+            "duration_ms",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+        match &result {
+            Ok(value) => {
+                span.record(
+                    "tool_execution_id",
+                    tracing::field::display(value.tool_execution_id),
+                );
+                span.record(
+                    "workstation_execution_id",
+                    tracing::field::display(value.execution_id),
+                );
+                span.record("tool_name", value.tool_name.as_str());
+                if let Some(privilege) = value.effective_privilege {
+                    span.record("effective_privilege", tracing::field::debug(privilege));
+                }
+                span.record("result_class", value.result_class.as_str());
+                span.record("outcome_unknown", false);
+                span.record(
+                    "artifact_count",
+                    u64::try_from(value.artifact_ids.len()).unwrap_or(u64::MAX),
+                );
+                span.record("truncated", value.truncated);
+                tracing::info!(
+                    event_name = "tool_execution_terminal",
+                    tool_execution_id = %value.tool_execution_id,
+                    execution_id = %value.execution_id,
+                    result_class = value.result_class.as_str()
+                );
+            }
+            Err(error) => {
+                span.record("result_class", format!("{:?}", error.kind()).as_str());
+                if matches!(
+                    error.kind(),
+                    ToolExecutionServiceErrorKind::OutcomeUnknown
+                        | ToolExecutionServiceErrorKind::HandlerPanickedAfterPossibleHandoff
+                ) {
+                    span.record("outcome_unknown", true);
+                }
+                tracing::warn!(
+                    event_name = "tool_execution_terminal",
+                    result_class = ?error.kind()
+                );
+            }
+        }
+        result
+    }
+
+    async fn execute_call_inner(
+        &self,
         mut call: ToolExecutionCall,
     ) -> Result<ToolExecutionResult, ToolExecutionServiceError> {
         validate_call_context(&call)?;
@@ -278,6 +393,7 @@ impl ToolExecutionService {
         let tool_name = ToolName::try_new(call.tool_name.clone()).map_err(|_| {
             ToolExecutionServiceError::new(ToolExecutionServiceErrorKind::InvalidCallContext)
         })?;
+        tracing::Span::current().record("tool_name", tool_name.as_str());
         let definition = self.registry.lookup(&tool_name);
         let validation =
             definition.map(|definition| validate_arguments(definition, &call.raw_arguments));
@@ -289,6 +405,14 @@ impl ToolExecutionService {
             }
             Some(Ok(_)) => None,
         };
+        tracing::Span::current().record(
+            "validation_result",
+            match rejected {
+                Some(ToolResultClass::UnknownTool) => "unknown_tool",
+                Some(_) => "rejected",
+                None => "valid",
+            },
+        );
         let (tool_version, schema_version, arguments_json, arguments_sha256) =
             match validation.as_ref() {
                 Some(Ok(arguments)) => (
@@ -305,8 +429,22 @@ impl ToolExecutionService {
                 }
                 None => unresolved_arguments_identity(),
             };
+        tracing::Span::current().record("tool_version", tool_version.as_str());
+        tracing::Span::current().record("tool_schema_version", schema_version.get());
+        tracing::Span::current().record(
+            "arguments_sha256",
+            tracing::field::display(arguments_sha256),
+        );
         let tool_execution_id = ToolExecutionId::generate();
         let execution_id = ExecutionId::generate();
+        tracing::Span::current().record(
+            "tool_execution_id",
+            tracing::field::display(tool_execution_id),
+        );
+        tracing::Span::current().record(
+            "workstation_execution_id",
+            tracing::field::display(execution_id),
+        );
         let requested_cwd = match validation.as_ref().and_then(|value| value.as_ref().ok()) {
             Some(arguments) => requested_cwd(arguments, call.workspace.logical_root()),
             None => call.workspace.logical_root().clone(),
@@ -317,6 +455,10 @@ impl ToolExecutionService {
             .map_or(PrivilegeMode::User, |arguments| {
                 arguments.input().requested_privilege()
             });
+        tracing::Span::current().record(
+            "requested_privilege",
+            tracing::field::debug(requested_privilege),
+        );
         let requested_timeout_ms = validation
             .as_ref()
             .and_then(|value| value.as_ref().ok())
@@ -545,6 +687,19 @@ impl ToolExecutionService {
             constraints: call.authority_constraints,
             capabilities: &capabilities,
         });
+        tracing::Span::current().record(
+            "authority_result",
+            if authority.allowed() {
+                "allowed"
+            } else {
+                "denied"
+            },
+        );
+        tracing::Span::current().record(
+            "effective_privilege",
+            tracing::field::debug(authority.snapshot().effective_privilege()),
+        );
+        tracing::Span::current().record("effective_timeout_ms", effective_timeout_ms);
         if !authority.allowed() {
             return self
                 .finish_predispatch_result(
@@ -693,6 +848,7 @@ impl ToolExecutionService {
                 },
             })
             .await?;
+        tracing::Span::current().record("dispatch_intent_persisted", true);
         #[cfg(feature = "test-failpoints")]
         crate::test_failpoints::reach(
             crate::test_failpoints::PhysicalHook::AfterToolDispatchIntentCommit,
@@ -1503,6 +1659,7 @@ impl ToolExecutionService {
         duration: Duration,
         expected_path: LogicalPathReference,
     ) -> Result<ToolExecutionResult, ToolExecutionServiceError> {
+        tracing::Span::current().record("output_observed_bytes", result.byte_length.get());
         let byte_length_matches = u64::try_from(result.text.len())
             .ok()
             .is_some_and(|length| length == result.byte_length.get());
@@ -1688,6 +1845,22 @@ impl ToolExecutionService {
         expected_privilege: PrivilegeMode,
         expected_command_sha256: Sha256Digest,
     ) -> Result<ToolExecutionResult, ToolExecutionServiceError> {
+        if let Some(value) = result.exit_code {
+            tracing::Span::current().record("exit_code", value);
+        }
+        if let Some(value) = result.terminating_signal {
+            tracing::Span::current().record("signal", value);
+        }
+        tracing::Span::current().record("timed_out", result.timed_out);
+        tracing::Span::current().record("cancelled", result.cancelled);
+        tracing::Span::current().record(
+            "cleanup_result",
+            if result.cleanup.confirmed() {
+                "confirmed"
+            } else {
+                "unconfirmed"
+            },
+        );
         if result.certainty == Certainty::OutcomeUnknown
             || result.result_kind == ExecutionResultKind::CleanupFailed
             || !result.cleanup.confirmed()
@@ -1791,6 +1964,14 @@ impl ToolExecutionService {
                 return Err(error);
             }
         };
+        if let Some(counts) = stdout_counts {
+            tracing::Span::current().record("stdout_observed_bytes", counts.observed.get());
+            tracing::Span::current().record("stdout_captured_bytes", counts.captured.get());
+        }
+        if let Some(counts) = stderr_counts {
+            tracing::Span::current().record("stderr_observed_bytes", counts.observed.get());
+            tracing::Span::current().record("stderr_captured_bytes", counts.captured.get());
+        }
         let mut fields = BTreeMap::new();
         fields.insert(
             "command_sha256".to_owned(),
@@ -1894,6 +2075,16 @@ impl ToolExecutionService {
         dispatch_at: UtcTimestamp,
         error: NormalizedError,
     ) -> Result<(), ToolExecutionServiceError> {
+        tracing::Span::current().record("outcome_unknown", true);
+        tracing::info!(
+            event_name = "tool_outcome_unknown_observed",
+            work_id = %call.work.work_id(),
+            tool_execution_id = %tool_execution_id,
+            intent_observed_at = %dispatch_at,
+            certainty = "outcome_unknown",
+            retryable = false,
+            external_side_effect_may_have_occurred = true
+        );
         let completed_at = self.wall_now()?;
         let work_next = terminal_work_next(
             &expected_work,

@@ -3,6 +3,7 @@ import Foundation
 import FoundationNetworking
 #endif
 import CraxiiClientCore
+import CraxiiProtocol
 
 private final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     func urlSession(
@@ -56,7 +57,10 @@ public final class URLSessionHTTPExecutor: HTTPExecuting, @unchecked Sendable {
                 guard body.count < request.maximumResponseBytes else { throw ClientError.malformedPayload }
                 body.append(byte)
             }
-            return HTTPResponse(statusCode: httpResponse.statusCode, body: body)
+            let requestID = httpResponse.value(forHTTPHeaderField: "x-request-id")
+                .flatMap { ProtocolID(rawValue: $0) }
+            return HTTPResponse(
+                statusCode: httpResponse.statusCode, body: body, requestID: requestID)
         } catch let error as URLError {
             switch error.code {
             case .timedOut: throw ClientError.timeout

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Instant, UNIX_EPOCH};
 
 use nix::sys::statfs;
 use sha2::{Digest, Sha256};
@@ -67,6 +67,33 @@ impl LocalArtifactStore {
             .map_err(|_| error(ArtifactStoreErrorKind::UnsafeRoot))?
             .dev();
         if temp_device != digest_device {
+            return Err(error(ArtifactStoreErrorKind::UnsafeRoot));
+        }
+        Ok(Self {
+            root: root.to_owned(),
+            temp,
+            sha256,
+        })
+    }
+
+    /// Opens the pre-existing artifact layout without creating or changing it.
+    pub fn open_read_only(root: &Path) -> Result<Self, ArtifactStoreError> {
+        if !root.is_absolute() || root.parent().is_none() {
+            return Err(error(ArtifactStoreErrorKind::UnsafeRoot));
+        }
+        verify_secure_directory(root)?;
+        verify_supported_filesystem(root)?;
+        let temp = root.join(TEMP_DIRECTORY);
+        let sha256 = root.join(DIGEST_DIRECTORY);
+        verify_secure_directory(&temp)?;
+        verify_secure_directory(&sha256)?;
+        if fs::metadata(&temp)
+            .map_err(|_| error(ArtifactStoreErrorKind::UnsafeRoot))?
+            .dev()
+            != fs::metadata(&sha256)
+                .map_err(|_| error(ArtifactStoreErrorKind::UnsafeRoot))?
+                .dev()
+        {
             return Err(error(ArtifactStoreErrorKind::UnsafeRoot));
         }
         Ok(Self {
@@ -257,6 +284,18 @@ impl ArtifactCapture for LocalArtifactCapture {
     }
 
     fn finalize(mut self: Box<Self>) -> Result<FinalizedArtifact, ArtifactStoreError> {
+        let span = tracing::info_span!(
+            "artifact_write",
+            artifact_id = %self.artifact_id,
+            observed_bytes = self.observed,
+            captured_bytes = self.captured,
+            truncated = self.observed > self.captured,
+            sha256 = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let mut observation = ArtifactWriteObservation::new(span.clone());
         let mut file = self
             .file
             .take()
@@ -297,6 +336,8 @@ impl ArtifactCapture for LocalArtifactCapture {
             crate::test_failpoints::PhysicalHook::AfterArtifactRenameBeforeDbCommit,
         );
         verify_path_digest(&final_path, digest, self.captured)?;
+        span.record("sha256", tracing::field::display(digest));
+        observation.classify("published");
         Ok(FinalizedArtifact::from_durable_publication(
             self.artifact_id,
             storage_key,
@@ -307,6 +348,36 @@ impl ArtifactCapture for LocalArtifactCapture {
                 .map_err(|_| error(ArtifactStoreErrorKind::InvalidRequest))?,
             self.observed > self.captured,
         ))
+    }
+}
+
+struct ArtifactWriteObservation {
+    span: tracing::Span,
+    started: Instant,
+    result_class: &'static str,
+}
+
+impl ArtifactWriteObservation {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span,
+            started: Instant::now(),
+            result_class: "failed",
+        }
+    }
+
+    fn classify(&mut self, result_class: &'static str) {
+        self.result_class = result_class;
+    }
+}
+
+impl Drop for ArtifactWriteObservation {
+    fn drop(&mut self) {
+        self.span.record("result_class", self.result_class);
+        self.span.record(
+            "duration_micros",
+            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
     }
 }
 

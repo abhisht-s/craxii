@@ -685,15 +685,14 @@ pub struct InvocationRecord {
     pub request_sha256: String,
 }
 
-#[derive(Debug)]
 struct RecordingProvider {
-    inner: Arc<ScriptedProvider>,
+    inner: Arc<dyn ModelProvider>,
     database: PathBuf,
     ledger: PathBuf,
 }
 
 impl RecordingProvider {
-    fn new(inner: Arc<ScriptedProvider>, database: PathBuf, ledger: PathBuf) -> Self {
+    fn new(inner: Arc<dyn ModelProvider>, database: PathBuf, ledger: PathBuf) -> Self {
         Self {
             inner,
             database,
@@ -806,6 +805,23 @@ impl Stage18Harness {
         root: Stage18Root,
         provider_programs: Vec<ScriptedProgram>,
         estimator_mode: EstimatorMode,
+    ) -> Result<Self, String> {
+        Self::start_inner(root, provider_programs, estimator_mode, None).await
+    }
+
+    pub async fn start_with_provider(
+        root: Stage18Root,
+        provider: Arc<dyn ModelProvider>,
+        estimator_mode: EstimatorMode,
+    ) -> Result<Self, String> {
+        Self::start_inner(root, Vec::new(), estimator_mode, Some(provider)).await
+    }
+
+    async fn start_inner(
+        root: Stage18Root,
+        provider_programs: Vec<ScriptedProgram>,
+        estimator_mode: EstimatorMode,
+        provider_override: Option<Arc<dyn ModelProvider>>,
     ) -> Result<Self, String> {
         let state_root = root.state_root();
         let workspace = root.workspace();
@@ -984,8 +1000,10 @@ impl Stage18Harness {
             provider_programs,
             clock.clone(),
         ));
+        let selected_provider: Arc<dyn ModelProvider> =
+            provider_override.unwrap_or_else(|| Arc::clone(&scripted) as Arc<dyn ModelProvider>);
         let gateway_provider: Arc<dyn ModelProvider> = Arc::new(RecordingProvider::new(
-            Arc::clone(&scripted),
+            selected_provider,
             root.database(),
             root.invocation_log(),
         ));

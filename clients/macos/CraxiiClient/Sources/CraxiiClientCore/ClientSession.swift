@@ -78,6 +78,7 @@ public actor ClientSession {
     private let sleeper: any ClientSleeping
     private let network: any NetworkStatusProviding
     private let jitter: any RetryJitterSource
+    private let diagnostics: any ClientDiagnosticRecording
     private let decoder = JSONDecoder()
     private let encoder: JSONEncoder
     private let durableReducer = DurableReducer()
@@ -103,6 +104,8 @@ public actor ClientSession {
     private var reconnectAttempt = 0
     private var lastInbound = ContinuousClock.now
     private var unknownEventRecoveryPending = false
+    private var replayStartCursor: Cursor?
+    private var replayEventCount = 0
     private var isShuttingDown = false
     private var snapshotHandler: (@Sendable (ClientSnapshot) -> Void)?
 
@@ -113,13 +116,15 @@ public actor ClientSession {
         identifiers: any UUIDv7Generating = UUIDv7Generator(),
         sleeper: any ClientSleeping = ContinuousClientSleeper(),
         network: any NetworkStatusProviding = AlwaysOnlineNetworkStatus(),
-        jitter: any RetryJitterSource = SystemRetryJitter()
+        jitter: any RetryJitterSource = SystemRetryJitter(),
+        diagnostics: any ClientDiagnosticRecording = NoopClientDiagnosticRecorder()
     ) {
         self.profile = profile
         self.allowDebugLocalhostHTTP = allowDebugLocalhostHTTP
         self.credentialStore = credentialStore; self.localStore = localStore
         self.http = http; self.streams = streams; self.identifiers = identifiers
         self.sleeper = sleeper; self.network = network; self.jitter = jitter
+        self.diagnostics = diagnostics
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         self.encoder = encoder
@@ -135,6 +140,9 @@ public actor ClientSession {
     public func start() async {
         guard !isShuttingDown else { return }
         let authority = currentAuthority()
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .sessionStarted, result: .started, profileID: authority.profile.profileID,
+            generation: authority.generation))
         do {
             try await loadAndBindLocalState(authority: authority)
             try await connectWithBootstrap(expectedAuthority: authority)
@@ -274,6 +282,9 @@ public actor ClientSession {
             clientMessageID: commandID, content: [ContentBlock(text: text)]))
         guard body.count <= 512 * 1_024 else { throw ClientError.commandRejected("payload_too_large") }
         let pending = makePending(kind: .message, id: commandID, path: path, body: body)
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandPrepared, result: .succeeded, profileID: profile.profileID,
+            generation: generation, commandKind: .message, commandID: commandID))
         try await appendPending(pending)
         return PreparedMessageCommand(clientMessageID: commandID)
     }
@@ -304,6 +315,10 @@ public actor ClientSession {
         let path = "/v1/work-items/\(workID.rawValue)/cancel"
         let body = try encoder.encode(CancellationRequest(clientCommandID: commandID))
         let pending = makePending(kind: .cancellation, id: commandID, path: path, body: body)
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandPrepared, result: .succeeded, profileID: profile.profileID,
+            generation: generation, commandKind: .cancellation, commandID: commandID,
+            workID: workID))
         try await appendPending(pending)
         return PreparedCancellationCommand(clientCommandID: commandID, workID: workID)
     }
@@ -351,6 +366,9 @@ public actor ClientSession {
         await invalidated.pingTask?.value
         await invalidated.reconnectTask?.value
         try? await localStore.save(persisted)
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .sessionStopped, result: .succeeded, profileID: profile.profileID,
+            generation: generation))
         publish()
     }
 
@@ -402,12 +420,20 @@ public actor ClientSession {
         }
         try requireCurrent(authority)
         persisted = candidate
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .outboxRecovered, result: .succeeded,
+            profileID: authority.profile.profileID, generation: authority.generation,
+            count: candidate.outbox.count))
         if recoveredCorruptState { lastError = .cacheCorrupt }
     }
 
     private func connectWithBootstrap(expectedAuthority: OperationAuthority? = nil) async throws {
         if let expectedAuthority { try requireCurrent(expectedAuthority) }
         let authority = try await beginConnectionOperation()
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .bootstrapStarted, result: .started, profileID: authority.profile.profileID,
+            generation: authority.generation))
+        var bootstrapRequestID: ProtocolID?
         do {
             let baseURL = try EndpointPolicy.validate(
                 authority.profile.endpoint, allowDebugLocalhostHTTP: allowDebugLocalhostHTTP)
@@ -429,6 +455,7 @@ public actor ClientSession {
                 throw error
             }
             try requireCurrent(authority)
+            bootstrapRequestID = response.requestID
             let bootstrap: BootstrapResponse = try decodeHTTP(response, success: [200])
             let replacement = try CanonicalProjection.bootstrap(bootstrap)
             try requireCurrent(authority)
@@ -447,12 +474,22 @@ public actor ClientSession {
             try requireCurrent(authority)
             try await resendReconciledOutbox(authority: authority)
             try requireCurrent(authority)
+            recordProjectionAdvanced()
             try await openStream(
                 token: token, baseURL: baseURL, cursor: projection.lastAppliedCursor,
                 authority: authority)
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .bootstrapFinished, result: .succeeded,
+                profileID: authority.profile.profileID, generation: authority.generation,
+                requestID: bootstrapRequestID, cursorThrough: projection.lastAppliedCursor,
+                count: projection.messages.count))
         } catch SessionOperationError.superseded {
             throw SessionOperationError.superseded
         } catch {
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .bootstrapFinished, result: .failed,
+                errorClass: diagnosticErrorClass(error), profileID: authority.profile.profileID,
+                generation: authority.generation, requestID: bootstrapRequestID))
             throw SessionOperationFailure(authority: authority, underlying: error)
         }
     }
@@ -493,6 +530,11 @@ public actor ClientSession {
         }
         currentConnection = connection
         connectionState = .replaying
+        replayStartCursor = cursor
+        replayEventCount = 0
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .replayStarted, result: .started, profileID: authority.profile.profileID,
+            generation: authority.generation, cursorFrom: cursor))
         lastInbound = ContinuousClock.now
         publish()
         receiveTask = Task {
@@ -539,6 +581,7 @@ public actor ClientSession {
         catch { throw ClientError.malformedPayload }
         switch frame {
         case let .durable(event):
+            let wasReplaying = connectionState == .replaying
             do {
                 projection = try durableReducer.applying(event, to: projection)
             } catch ProtocolModelError.unknownEventType {
@@ -548,8 +591,10 @@ public actor ClientSession {
             if event.eventType == "assistant.message_committed" || terminalEventTypes.contains(event.eventType),
                let workID = event.workID { drafts.clear(workID: workID) }
             reconcileAcceptedCommandOverlays()
+            if wasReplaying { replayEventCount += 1 }
             persisted.lastAppliedCursor = projection.lastAppliedCursor
             try await localStore.save(persisted)
+            recordProjectionAdvanced()
             publish()
         case let .syncComplete(sync):
             guard connectionState == .replaying,
@@ -561,6 +606,12 @@ public actor ClientSession {
             connectionState = .live
             reconnectAttempt = 0
             unknownEventRecoveryPending = false
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .replayFinished, result: .succeeded, profileID: profile.profileID,
+                generation: generation, cursorFrom: replayStartCursor,
+                cursorThrough: sync.throughCursor, count: replayEventCount))
+            replayStartCursor = nil
+            replayEventCount = 0
             publish()
         case let .draft(event):
             guard connectionState == .live else { return }
@@ -618,6 +669,10 @@ public actor ClientSession {
         }
         if mapped == .incompatibleProtocol || mapped == .malformedPayload || mapped == .projectionInvariant {
             connectionState = .fatalProtocolError
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .fatalProtocol, result: .failed,
+                errorClass: diagnosticErrorClass(mapped), profileID: profile.profileID,
+                generation: generation))
             publish()
             return
         }
@@ -636,12 +691,21 @@ public actor ClientSession {
         let maximum = min(Self.reconnectCapMilliseconds, Self.reconnectBaseMilliseconds << exponent)
         let delay = jitter.milliseconds(upperBound: maximum)
         let authority = currentAuthority()
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .reconnectScheduled, result: .scheduled,
+            profileID: authority.profile.profileID, generation: authority.generation,
+            cursorFrom: projection.lastAppliedCursor, attempt: reconnectAttempt,
+            delayMilliseconds: delay))
         reconnectTaskGeneration = authority.generation
         reconnectTask = Task {
             do {
                 try await self.sleeper.sleep(for: .milliseconds(delay))
                 try self.requireCurrent(authority)
                 try await self.reconnectFromCursor()
+                self.diagnostics.record(ClientDiagnosticEvent(
+                    kind: .reconnectFinished, result: .succeeded,
+                    profileID: authority.profile.profileID, generation: authority.generation,
+                    cursorFrom: self.projection.lastAppliedCursor, attempt: self.reconnectAttempt))
                 self.clearReconnectTask(expectedGeneration: authority.generation)
             } catch is CancellationError {
                 self.clearReconnectTask(expectedGeneration: authority.generation)
@@ -666,6 +730,11 @@ public actor ClientSession {
     private func reconnectFailed(_ error: Error) async {
         if error is SessionOperationError { return }
         let mapped = mapTransportError(error)
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .reconnectFinished, result: .failed,
+            errorClass: diagnosticErrorClass(mapped), profileID: profile.profileID,
+            generation: generation, cursorFrom: projection.lastAppliedCursor,
+            attempt: reconnectAttempt))
         lastError = mapped
         if mapped == .authentication {
             connectionState = .authenticationFailed
@@ -688,6 +757,9 @@ public actor ClientSession {
 
     private func requireCurrent(_ authority: OperationAuthority) throws {
         guard isCurrent(authority) else {
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .staleGenerationSuppressed, result: .suppressed,
+                profileID: authority.profile.profileID, generation: authority.generation))
             throw SessionOperationError.superseded
         }
     }
@@ -696,6 +768,9 @@ public actor ClientSession {
         cancelReconnect: Bool = false
     ) -> InvalidatedOperations {
         generation &+= 1
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .profileGenerationChanged, result: .succeeded, profileID: profile.profileID,
+            generation: generation))
         let invalidated = InvalidatedOperations(
             connection: currentConnection,
             receiveTask: receiveTask,
@@ -770,6 +845,10 @@ public actor ClientSession {
             throw error
         }
         commandDeliveryErrors.removeValue(forKey: command.commandID)
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandPersisted, result: .persisted, profileID: profile.profileID,
+            generation: generation, commandKind: command.kind, commandID: command.commandID,
+            workID: cancellationWorkID(command)))
         publish()
     }
 
@@ -843,28 +922,37 @@ public actor ClientSession {
                 commandDeliveryErrors[id] = error
                 publish()
                 if isAmbiguousRetryable(error), attempt < Self.maximumCommandAttempts {
+                    recordCommandRetry(pending, attempt: attempt, error: error)
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
+                recordCommandFailure(pending, attempt: attempt, error: error)
                 throw error
             } catch {
                 sendingCommandIDs.remove(id)
-                commandDeliveryErrors[id] = mapTransportError(error)
+                let mapped = mapTransportError(error)
+                commandDeliveryErrors[id] = mapped
                 publish()
                 if attempt < Self.maximumCommandAttempts {
+                    recordCommandRetry(pending, attempt: attempt, error: mapped)
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
-                throw mapTransportError(error)
+                recordCommandFailure(pending, attempt: attempt, error: mapped)
+                throw mapped
             }
             sendingCommandIDs.remove(id)
             if [502, 503, 504].contains(response.statusCode) {
                 commandDeliveryErrors[id] = .serverUnavailable
                 publish()
                 if attempt < Self.maximumCommandAttempts {
+                    recordCommandRetry(pending, attempt: attempt, error: .serverUnavailable)
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
+                recordCommandFailure(
+                    pending, attempt: attempt, error: .serverUnavailable,
+                    requestID: response.requestID)
                 throw ClientError.serverUnavailable
             }
             if ![200, 202].contains(response.statusCode) {
@@ -872,20 +960,32 @@ public actor ClientSession {
                 do { failure = try decodeBackendFailure(response) }
                 catch {
                     try await stopAutomaticResend(id)
+                    recordCommandFailure(
+                        pending, attempt: attempt, error: mapTransportError(error),
+                        requestID: response.requestID)
                     throw error
                 }
                 if response.statusCode != 409, response.statusCode != 401,
                    failure.retryable, attempt < Self.maximumCommandAttempts {
                     commandDeliveryErrors[id] = .serverUnavailable
                     publish()
+                    recordCommandRetry(pending, attempt: attempt, error: .serverUnavailable)
                     try await sleepForCommandRetry(attempt: attempt)
                     continue
                 }
                 lastBackendError = safeBackendError(failure)
                 try await stopAutomaticResend(id)
-                throw mapBackendFailure(failure, status: response.statusCode)
+                let mapped = mapBackendFailure(failure, status: response.statusCode)
+                recordCommandFailure(
+                    pending, attempt: attempt, error: mapped, requestID: response.requestID)
+                throw mapped
             }
             commandDeliveryErrors.removeValue(forKey: id)
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .commandSent, result: .accepted, profileID: profile.profileID,
+                generation: generation, commandKind: pending.kind, commandID: pending.commandID,
+                workID: cancellationWorkID(pending), requestID: response.requestID,
+                attempt: attempt))
             publish()
             return response
         }
@@ -936,12 +1036,19 @@ public actor ClientSession {
                 }
             }
         }
-        persisted.outbox.removeAll { pending in
+        let reconciled = persisted.outbox.filter { pending in
             if pending.disposition != .reconciliationOnly { return false }
             guard pending.profileID == profile.profileID,
                   pending.credentialGeneration == profile.credentialGeneration,
                   pending.craxiiID == projection.craxii?.craxiiID else { return false }
             return true
+        }
+        persisted.outbox.removeAll { pending in reconciled.contains { $0.commandID == pending.commandID } }
+        for pending in reconciled {
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: .commandReconciled, result: .reconciled, profileID: profile.profileID,
+                generation: generation, commandKind: pending.kind, commandID: pending.commandID,
+                workID: cancellationWorkID(pending)))
         }
         reconcileAcceptedCommandOverlays()
     }
@@ -980,6 +1087,10 @@ public actor ClientSession {
             throw error
         }
         reconcileAcceptedCommandOverlays()
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandReconciled, result: .reconciled, profileID: profile.profileID,
+            generation: generation, commandKind: removed.kind, commandID: removed.commandID,
+            workID: cancellationWorkID(removed)))
         publish()
     }
 
@@ -1027,7 +1138,7 @@ public actor ClientSession {
     }
 
     private func isAmbiguousRetryable(_ error: ClientError) -> Bool {
-        switch error {
+        return switch error {
         case .networkOffline, .timeout, .serverUnavailable: true
         case let .backend(detail): detail.retryable
         default: false
@@ -1040,6 +1151,58 @@ public actor ClientSession {
         return .serverUnavailable
     }
 
+    private func diagnosticErrorClass(_ error: Error) -> ClientDiagnosticErrorClass {
+        if error is SessionOperationError { return .superseded }
+        guard let error = error as? ClientError else { return .unknown }
+        return switch error {
+        case .credentialRequired: .credentialRequired
+        case .credentialMalformed: .credentialMalformed
+        case .keychainFailure: .keychainFailure
+        case .networkOffline: .networkOffline
+        case .timeout: .timeout
+        case .authentication: .authentication
+        case .serverUnavailable: .serverUnavailable
+        case .serverNotReady: .serverNotReady
+        case .incompatibleProtocol: .incompatibleProtocol
+        case .malformedPayload: .malformedPayload
+        case .projectionInvariant: .projectionInvariant
+        case .commandRejected: .commandRejected
+        case .backend: .backend
+        case .cancellationTransportFailure: .cancellationTransportFailure
+        case .cacheCorrupt: .cacheCorrupt
+        case .outboxCorrupt: .outboxCorrupt
+        case .configurationMismatch: .configurationMismatch
+        }
+    }
+
+    private func recordProjectionAdvanced() {
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .projectionAdvanced, result: .succeeded, profileID: profile.profileID,
+            generation: generation, projectionRevision: presentationRevision &+ 1,
+            cursorThrough: projection.lastAppliedCursor))
+    }
+
+    private func recordCommandRetry(
+        _ pending: PendingCommand, attempt: Int, error: ClientError
+    ) {
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandRetried, result: .scheduled, errorClass: diagnosticErrorClass(error),
+            profileID: profile.profileID, generation: generation,
+            commandKind: pending.kind, commandID: pending.commandID,
+            workID: cancellationWorkID(pending), attempt: attempt))
+    }
+
+    private func recordCommandFailure(
+        _ pending: PendingCommand, attempt: Int, error: ClientError,
+        requestID: ProtocolID? = nil
+    ) {
+        diagnostics.record(ClientDiagnosticEvent(
+            kind: .commandFailed, result: .failed, errorClass: diagnosticErrorClass(error),
+            profileID: profile.profileID, generation: generation,
+            commandKind: pending.kind, commandID: pending.commandID,
+            workID: cancellationWorkID(pending), requestID: requestID, attempt: attempt))
+    }
+
     private func handleStartFailure(_ error: Error, authority: OperationAuthority) {
         guard isCurrent(authority) else { return }
         let mapped = mapTransportError(error)
@@ -1047,7 +1210,12 @@ public actor ClientSession {
         switch mapped {
         case .authentication: connectionState = .authenticationFailed
         case .incompatibleProtocol, .malformedPayload, .projectionInvariant,
-             .outboxCorrupt, .configurationMismatch: connectionState = .fatalProtocolError
+             .outboxCorrupt, .configurationMismatch:
+            connectionState = .fatalProtocolError
+            diagnostics.record(ClientDiagnosticEvent(
+                kind: mapped == .configurationMismatch ? .fatalConfiguration : .fatalProtocol,
+                result: .failed, errorClass: diagnosticErrorClass(mapped),
+                profileID: profile.profileID, generation: generation))
         default: connectionState = .disconnected
         }
         publish()

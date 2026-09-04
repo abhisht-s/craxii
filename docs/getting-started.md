@@ -59,6 +59,21 @@ cargo run --locked -p craxii-server --bin craxii-admin -- \
 
 The command writes the bearer token once to standard output. Treat it as a secret: do not paste it into an issue, shell history, repository file, log, or screenshot. Restart the backend after the administration command exits.
 
+## Inspect local evidence
+
+With the backend stopped, the same administration binary can inspect initialized state without migrating or mutating it:
+
+```sh
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml preflight
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml verify-state --format markdown
+cargo run --locked -p craxii-server --bin craxii-admin -- \
+  --config backend/tests/fixtures/config/valid/local.toml evidence-export
+```
+
+The default output is deterministic JSON; `--format markdown` is also supported. Use `inspect-work <work-uuid>` or `inspect-runtime <runtime-uuid>` for a single safe evidence view. Reports contain identifiers, classifications, timings, counts, hashes, and artifact integrity facts, but never conversation/model content, tool arguments/output, credentials, environment values, or arbitrary paths. `verify-state` prints its findings and exits nonzero when consistency fails; it never repairs data.
+
 For authenticated protocol requests, send the token as `Authorization: Bearer <token>`. Mutation requests also require `Content-Type: application/json` and an `Idempotency-Key` matching the command identity in the request body. See [Protocol](protocol.md).
 
 ## Build the macOS diagnostic client

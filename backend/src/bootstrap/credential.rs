@@ -31,10 +31,21 @@ impl std::fmt::Debug for CredentialRef {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum CredentialSourceConfig {
     LocalDirectory { directory: PathBuf },
     Systemd,
+}
+
+impl Debug for CredentialSourceConfig {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LocalDirectory { .. } => {
+                formatter.write_str("CredentialSourceConfig::LocalDirectory([REDACTED])")
+            }
+            Self::Systemd => formatter.write_str("CredentialSourceConfig::Systemd"),
+        }
+    }
 }
 
 impl CredentialSourceConfig {

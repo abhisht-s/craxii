@@ -1,8 +1,7 @@
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 use std::io;
 use std::path::PathBuf;
 
-#[derive(Debug)]
 pub enum ConfigError {
     Read {
         path: PathBuf,
@@ -91,13 +90,7 @@ pub enum ConfigError {
 impl Display for ConfigError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Read { path, source } => {
-                write!(
-                    formatter,
-                    "could not read configuration {}: {source}",
-                    path.display()
-                )
-            }
+            Self::Read { .. } => formatter.write_str("could not read configuration"),
             Self::TomlSyntaxOrShape => {
                 formatter.write_str("configuration TOML has invalid syntax or shape")
             }
@@ -195,11 +188,17 @@ impl Display for ConfigError {
     }
 }
 
+impl Debug for ConfigError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConfigError")
+            .field("summary", &self.to_string())
+            .finish()
+    }
+}
+
 impl std::error::Error for ConfigError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Read { source, .. } => Some(source),
-            _ => None,
-        }
+        None
     }
 }

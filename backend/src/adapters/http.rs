@@ -27,6 +27,7 @@ use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
+use tracing::Instrument;
 
 use crate::adapters::sqlite::SqliteStateStore;
 use crate::adapters::system_clock::SystemClock;
@@ -360,6 +361,7 @@ struct ConnectionActivation {
     hints: tokio::sync::broadcast::Receiver<ReplayCursor>,
     after: ReplayCursor,
     replay_high_water: ReplayCursor,
+    span: tracing::Span,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -720,6 +722,7 @@ impl PendingUpgrade {
         hints: tokio::sync::broadcast::Receiver<ReplayCursor>,
         after: ReplayCursor,
         replay_high_water: ReplayCursor,
+        span: tracing::Span,
     ) {
         if self
             .inner
@@ -750,6 +753,7 @@ impl PendingUpgrade {
                 hints,
                 after,
                 replay_high_water,
+                span,
                 _permit: permit,
             })));
     }
@@ -860,6 +864,7 @@ async fn supervise_connections(
                         if connections.mark_active(activation.id) {
                             let connection_state = state.clone();
                             let id = activation.id;
+                            let connection_span = activation.span.clone();
                             let task = tasks.spawn(async move {
                                 run_websocket(
                                     activation.socket,
@@ -869,7 +874,7 @@ async fn supervise_connections(
                                     activation.replay_high_water,
                                 ).await;
                                 id
-                            });
+                            }.instrument(connection_span));
                             task_connections.insert(task.id(), id);
                         }
                     }
@@ -1130,7 +1135,6 @@ pub enum ServerErrorKind {
     InjectedSharedFailure,
 }
 
-#[derive(Debug)]
 pub enum ServerError {
     Serve(std::io::Error),
     UnexpectedExit,
@@ -1140,6 +1144,15 @@ pub enum ServerError {
     ShutdownDeadline,
     #[cfg(test)]
     InjectedSharedFailure,
+}
+
+impl fmt::Debug for ServerError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServerError")
+            .field("kind", &self.kind())
+            .finish()
+    }
 }
 
 impl ServerError {
@@ -1271,14 +1284,41 @@ async fn safe_response_trace(request: Request, next: Next) -> Response {
         .map(|context| context.request_id.to_string())
         .unwrap_or_else(|| "unassigned".to_owned());
     let response = next.run(request).await;
-    tracing::info!(
-        request_id = %request_id,
-        method = %method,
-        matched_route = %route,
-        status = response.status().as_u16(),
-        latency_ms = started.elapsed().as_millis(),
-        "http request completed"
-    );
+    let observation = response.extensions().get::<HttpResponseObservation>();
+    let status = response.status().as_u16();
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let current = tracing::Span::current();
+    current.record("status", status);
+    current.record("duration_ms", duration_ms);
+    if let Some(observation) = observation {
+        current.record("error_code", observation.error_code.unwrap_or("none"));
+        if let Some(retryable) = observation.retryable {
+            current.record("retryable", retryable);
+        }
+    }
+    if status >= 400 {
+        tracing::warn!(
+            event_name = "http_request_terminal",
+            request_id = %request_id,
+            method = %method,
+            route_template = %route,
+            status,
+            duration_ms,
+            error_code = observation.and_then(|value| value.error_code).unwrap_or("unclassified"),
+            retryable = observation.and_then(|value| value.retryable),
+            result_class = "error"
+        );
+    } else {
+        tracing::info!(
+            event_name = "http_request_terminal",
+            request_id = %request_id,
+            method = %method,
+            route_template = %route,
+            status,
+            duration_ms,
+            result_class = "success"
+        );
+    }
     response
 }
 
@@ -1298,10 +1338,15 @@ fn safe_trace_layer() -> TraceLayer<
             .map(|context| context.request_id.to_string())
             .unwrap_or_else(|| "unassigned".to_owned());
         tracing::info_span!(
-            "http.request",
+            "http_request",
             request_id = %request_id,
             method = %request.method(),
-            matched_route = %route,
+            route_template = %route,
+            status = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            authentication_result = tracing::field::Empty,
+            error_code = tracing::field::Empty,
+            retryable = tracing::field::Empty,
         )
     })
 }
@@ -1309,6 +1354,12 @@ fn safe_trace_layer() -> TraceLayer<
 #[derive(Clone)]
 struct RequestContext {
     request_id: RequestId,
+}
+
+#[derive(Clone, Copy)]
+struct HttpResponseObservation {
+    error_code: Option<&'static str>,
+    retryable: Option<bool>,
 }
 
 async fn request_identity(mut request: Request, next: Next) -> Response {
@@ -1338,19 +1389,29 @@ async fn authenticate(state: HttpState, mut request: Request, next: Next) -> Res
     let request_id = context_id(&request);
     let token = match parse_authorization(request.headers()) {
         Ok(token) => token,
-        Err(()) => return ApiError::authentication(request_id).into_response(),
+        Err(()) => {
+            tracing::Span::current().record("authentication_result", "rejected");
+            return ApiError::authentication(request_id).into_response();
+        }
     };
     let observed_at = match current_time(state.clock.as_ref()) {
         Ok(value) => value,
-        Err(()) => return ApiError::authentication(request_id).into_response(),
+        Err(()) => {
+            tracing::Span::current().record("authentication_result", "unavailable");
+            return ApiError::authentication(request_id).into_response();
+        }
     };
     let authenticated = match DeviceAuthenticator::new(state.store.as_ref())
         .authenticate_bearer(token, observed_at)
         .await
     {
         Ok(value) => value,
-        Err(_) => return ApiError::authentication(request_id).into_response(),
+        Err(_) => {
+            tracing::Span::current().record("authentication_result", "rejected");
+            return ApiError::authentication(request_id).into_response();
+        }
     };
+    tracing::Span::current().record("authentication_result", "authenticated");
     request.extensions_mut().insert(authenticated);
     next.run(request).await
 }
@@ -1450,7 +1511,22 @@ async fn submit_message(
     let content = request
         .into_content()
         .map_err(|_| ApiError::invalid_request(context.request_id.clone()))?;
-    let outcome = tokio::time::timeout(
+    let command_started = Instant::now();
+    let command_span = tracing::info_span!(
+        "client_command",
+        command_kind = "message",
+        request_id = %context.request_id,
+        conversation_id = %conversation_id,
+        client_message_id = %client_message_id,
+        result_class = tracing::field::Empty,
+        message_id = tracing::field::Empty,
+        work_id = tracing::field::Empty,
+        work_ordinal = tracing::field::Empty,
+        journal_cursor = tracing::field::Empty,
+        commit_to_response_micros = tracing::field::Empty,
+        duration_micros = tracing::field::Empty,
+    );
+    let outcome = match tokio::time::timeout(
         COMMAND_TIMEOUT,
         state.command_gateway.accept_message(
             authenticated,
@@ -1460,15 +1536,88 @@ async fn submit_message(
             content,
         ),
     )
+    .instrument(command_span.clone())
     .await
-    .map_err(|_| ApiError::command_timeout(context.request_id.clone()))?
-    .map_err(|error| map_gateway_error(&state, context.request_id.clone(), error))?;
+    {
+        Err(_) => {
+            command_span.record("result_class", "timeout");
+            let duration_micros =
+                u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            command_span.record("duration_micros", duration_micros);
+            command_span.in_scope(|| {
+                tracing::info!(
+                    event_name = "client_command_terminal",
+                    request_id = %context.request_id,
+                    command_kind = "message",
+                    conversation_id = %conversation_id,
+                    client_message_id = %client_message_id,
+                    result_class = "timeout",
+                    duration_micros,
+                );
+            });
+            return Err(ApiError::command_timeout(context.request_id));
+        }
+        Ok(Err(error)) => {
+            let result_class = command_error_result(&error);
+            command_span.record("result_class", result_class);
+            let duration_micros =
+                u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            command_span.record("duration_micros", duration_micros);
+            command_span.in_scope(|| {
+                tracing::info!(
+                    event_name = "client_command_terminal",
+                    request_id = %context.request_id,
+                    command_kind = "message",
+                    conversation_id = %conversation_id,
+                    client_message_id = %client_message_id,
+                    result_class,
+                    duration_micros,
+                );
+            });
+            return Err(map_gateway_error(&state, context.request_id, error));
+        }
+        Ok(Ok(outcome)) => outcome,
+    };
     let duplicate = outcome.is_replay();
     let receipt = outcome.into_receipt();
+    command_span.record(
+        "result_class",
+        if duplicate {
+            "retransmission"
+        } else {
+            "accepted"
+        },
+    );
+    command_span.record("message_id", tracing::field::display(receipt.message_id));
+    command_span.record("work_id", tracing::field::display(receipt.work_id));
+    command_span.record("work_ordinal", receipt.work_ordinal.get());
+    command_span.record("journal_cursor", receipt.committed_cursor.get());
+    let response_started = Instant::now();
     #[cfg(test)]
     if let Some(gate) = &state.post_commit_gate {
         gate.hold_once().await;
     }
+    let commit_to_response_micros =
+        u64::try_from(response_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let duration_micros = u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    command_span.record("commit_to_response_micros", commit_to_response_micros);
+    command_span.record("duration_micros", duration_micros);
+    command_span.in_scope(|| {
+        tracing::info!(
+            event_name = "client_command_terminal",
+            request_id = %context.request_id,
+            command_kind = "message",
+            conversation_id = %conversation_id,
+            client_message_id = %client_message_id,
+            message_id = %receipt.message_id,
+            work_id = %receipt.work_id,
+            work_ordinal = receipt.work_ordinal.get(),
+            journal_cursor = receipt.committed_cursor.get(),
+            result_class = if duplicate { "retransmission" } else { "accepted" },
+            commit_to_response_micros,
+            duration_micros,
+        );
+    });
     Ok((
         StatusCode::ACCEPTED,
         Json(MessageResponse {
@@ -1497,17 +1646,100 @@ async fn cancel_work(
     let key = parse_idempotency_key(&headers, &context.request_id)?;
     key.require_command_id(request.client_command_id)
         .map_err(|_| ApiError::invalid_request(context.request_id.clone()))?;
-    let outcome = tokio::time::timeout(
+    let cancellation_command_id = request.client_command_id;
+    let command_started = Instant::now();
+    let command_span = tracing::info_span!(
+        "client_command",
+        command_kind = "cancellation",
+        request_id = %context.request_id,
+        work_id = %work_id,
+        cancellation_command_id = %cancellation_command_id,
+        result_class = tracing::field::Empty,
+        resulting_work_state = tracing::field::Empty,
+        journal_cursor = tracing::field::Empty,
+        cleanup_pending = tracing::field::Empty,
+        duration_micros = tracing::field::Empty,
+    );
+    let outcome = match tokio::time::timeout(
         COMMAND_TIMEOUT,
         state
             .command_gateway
-            .cancel_work(authenticated, work_id, key, request.client_command_id),
+            .cancel_work(authenticated, work_id, key, cancellation_command_id),
     )
+    .instrument(command_span.clone())
     .await
-    .map_err(|_| ApiError::command_timeout(context.request_id.clone()))?
-    .map_err(|error| map_gateway_error(&state, context.request_id.clone(), error))?;
+    {
+        Err(_) => {
+            command_span.record("result_class", "timeout");
+            let duration_micros =
+                u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            command_span.record("duration_micros", duration_micros);
+            command_span.in_scope(|| {
+                tracing::info!(
+                    event_name = "client_command_terminal",
+                    request_id = %context.request_id,
+                    command_kind = "cancellation",
+                    cancellation_command_id = %cancellation_command_id,
+                    work_id = %work_id,
+                    result_class = "timeout",
+                    duration_micros,
+                );
+            });
+            return Err(ApiError::command_timeout(context.request_id));
+        }
+        Ok(Err(error)) => {
+            let result_class = command_error_result(&error);
+            command_span.record("result_class", result_class);
+            let duration_micros =
+                u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            command_span.record("duration_micros", duration_micros);
+            command_span.in_scope(|| {
+                tracing::info!(
+                    event_name = "client_command_terminal",
+                    request_id = %context.request_id,
+                    command_kind = "cancellation",
+                    cancellation_command_id = %cancellation_command_id,
+                    work_id = %work_id,
+                    result_class,
+                    duration_micros,
+                );
+            });
+            return Err(map_gateway_error(&state, context.request_id, error));
+        }
+        Ok(Ok(outcome)) => outcome,
+    };
     let duplicate = outcome.is_replay();
     let receipt = outcome.into_receipt();
+    command_span.record(
+        "result_class",
+        if duplicate {
+            "retransmission"
+        } else {
+            "accepted"
+        },
+    );
+    command_span.record(
+        "resulting_work_state",
+        receipt.resulting_work_state.as_str(),
+    );
+    command_span.record("journal_cursor", receipt.committed_cursor.get());
+    command_span.record("cleanup_pending", receipt.cleanup.is_pending());
+    let duration_micros = u64::try_from(command_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    command_span.record("duration_micros", duration_micros);
+    command_span.in_scope(|| {
+        tracing::info!(
+            event_name = "client_command_terminal",
+            request_id = %context.request_id,
+            command_kind = "cancellation",
+            cancellation_command_id = %cancellation_command_id,
+            work_id = %receipt.work_id,
+            result_class = if duplicate { "retransmission" } else { "accepted" },
+            resulting_work_state = receipt.resulting_work_state.as_str(),
+            journal_cursor = receipt.committed_cursor.get(),
+            cleanup_pending = receipt.cleanup.is_pending(),
+            duration_micros,
+        );
+    });
     let status = StatusCode::from_u16(receipt.http_status())
         .map_err(|_| ApiError::internal(context.request_id.clone()))?;
     Ok((
@@ -1579,12 +1811,26 @@ async fn events(
     // or its future before polling it, dropping this owned wrapper still emits a real terminal
     // outcome instead of leaving the reservation silently unreachable.
     let callback_completion = UpgradeCallbackGuard::new(&ownership);
+    let websocket_span = tracing::info_span!(
+        parent: &tracing::Span::current(),
+        "websocket_connection",
+        request_id = %context.request_id,
+        connection_id = ownership.inner.id,
+        replay_after = after.get(),
+        replay_high_water = high_water.get(),
+        replay_count = tracing::field::Empty,
+        final_cursor = tracing::field::Empty,
+        broker_draft_coalesced_total = tracing::field::Empty,
+        broker_draft_dropped_total = tracing::field::Empty,
+        result_class = tracing::field::Empty,
+    );
     #[cfg(test)]
     let upgrade_gate = state.upgrade_gate.clone();
     Ok(upgrade
         .on_failed_upgrade(move |_| failed_ownership.upgrade_failed())
         .on_upgrade(move |socket| {
             let completion = callback_completion;
+            let websocket_span = websocket_span.clone();
             async move {
                 let _completion = completion;
                 let cancellation = ownership.cancellation();
@@ -1599,7 +1845,7 @@ async fn events(
                 if *cancellation.borrow() {
                     return;
                 }
-                ownership.activate(socket, receiver, after, high_water);
+                ownership.activate(socket, receiver, after, high_water, websocket_span);
             }
         })
         .into_response())
@@ -1612,14 +1858,27 @@ async fn run_websocket(
     after: ReplayCursor,
     replay_high_water: ReplayCursor,
 ) {
+    let mut result_observation = WebSocketResultObservation::new();
+    tracing::info!(
+        event_name = "websocket_connected",
+        result_class = "connected"
+    );
     let mut shutdown = state.ws_shutdown.subscribe();
     let mut connection_drafts = ConnectionDraftState::default();
     if shutdown_is_latched(&shutdown) {
+        result_observation.classify("server_shutdown");
         close(&mut socket, close_code::AWAY, "server shutdown").await;
         return;
     }
     let mut scanned = after;
-    match scan_and_send(
+    let replay_span = tracing::info_span!(
+        "event_replay",
+        cursor_start = after.get(),
+        cursor_end = replay_high_water.get(),
+        replay_count = tracing::field::Empty,
+        result_class = tracing::field::Empty,
+    );
+    let replayed = match scan_and_send(
         &mut socket,
         &state,
         &mut shutdown,
@@ -1627,15 +1886,26 @@ async fn run_websocket(
         replay_high_water,
         &mut connection_drafts,
     )
+    .instrument(replay_span.clone())
     .await
     {
-        Ok(()) => {}
+        Ok(count) => count,
         Err(WebSocketFlowError::Shutdown) => {
+            result_observation.classify("server_shutdown");
+            replay_span.record("result_class", "shutdown");
+            tracing::Span::current().record("result_class", "shutdown");
             close(&mut socket, close_code::AWAY, "server shutdown").await;
             return;
         }
-        Err(WebSocketFlowError::Failed) => return,
-    }
+        Err(WebSocketFlowError::Failed) => {
+            result_observation.classify("replay_failed");
+            replay_span.record("result_class", "failed");
+            tracing::Span::current().record("result_class", "replay_failed");
+            return;
+        }
+    };
+    replay_span.record("replay_count", replayed);
+    replay_span.record("result_class", "complete");
     let mut pending_live_scan = false;
     loop {
         match hints.try_recv() {
@@ -1658,18 +1928,39 @@ async fn run_websocket(
     {
         Ok(()) => {}
         Err(WebSocketFlowError::Shutdown) => {
+            result_observation.classify("server_shutdown");
             close(&mut socket, close_code::AWAY, "server shutdown").await;
             return;
         }
         Err(WebSocketFlowError::Failed) => {
+            result_observation.classify("send_failed");
             close(&mut socket, close_code::AGAIN, "temporary overload").await;
             return;
         }
     }
-    state
-        .live_events
-        .observe_replay(0, replay_high_water.get().saturating_sub(after.get()));
+    state.live_events.observe_replay(
+        replayed,
+        replay_high_water.get().saturating_sub(after.get()),
+    );
+    tracing::Span::current().record("replay_count", replayed);
+    tracing::Span::current().record("final_cursor", replay_high_water.get());
+    let delivery_metrics = state.live_events.metrics();
+    tracing::Span::current().record(
+        "broker_draft_coalesced_total",
+        delivery_metrics.coalesced_deltas,
+    );
+    tracing::Span::current().record(
+        "broker_draft_dropped_total",
+        delivery_metrics.dropped_deltas,
+    );
+    tracing::info!(
+        event_name = "websocket_live_handoff",
+        replay_count = replayed,
+        cursor = replay_high_water.get(),
+        result_class = "live"
+    );
     let Some(mut drafts) = state.live_events.subscribe() else {
+        result_observation.classify("server_shutdown");
         close(&mut socket, close_code::AWAY, "server shutdown").await;
         return;
     };
@@ -1683,12 +1974,16 @@ async fn run_websocket(
         )
         .await
         {
-            Ok(()) => {}
+            Ok(_) => {}
             Err(WebSocketFlowError::Shutdown) => {
+                result_observation.classify("server_shutdown");
                 close(&mut socket, close_code::AWAY, "server shutdown").await;
                 return;
             }
-            Err(WebSocketFlowError::Failed) => return,
+            Err(WebSocketFlowError::Failed) => {
+                result_observation.classify("live_scan_failed");
+                return;
+            }
         }
     }
 
@@ -1700,6 +1995,7 @@ async fn run_websocket(
             biased;
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
+                    result_observation.classify("server_shutdown");
                     close(&mut socket, close_code::AWAY, "server shutdown").await;
                     return;
                 }
@@ -1707,10 +2003,18 @@ async fn run_websocket(
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(_) | Message::Binary(_))) => {
+                        result_observation.classify("client_policy_violation");
                         close(&mut socket, close_code::POLICY, "server delivery only").await;
                         return;
                     }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    Some(Ok(Message::Close(_))) | None => {
+                        result_observation.classify("peer_closed");
+                        return;
+                    }
+                    Some(Err(_)) => {
+                        result_observation.classify("transport_failed");
+                        return;
+                    }
                     Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
                 }
             }
@@ -1724,12 +2028,16 @@ async fn run_websocket(
                             &mut scanned,
                             &mut connection_drafts,
                         ).await {
-                            Ok(()) => {}
+                            Ok(_) => {}
                             Err(WebSocketFlowError::Shutdown) => {
+                                result_observation.classify("server_shutdown");
                                 close(&mut socket, close_code::AWAY, "server shutdown").await;
                                 return;
                             }
-                            Err(WebSocketFlowError::Failed) => return,
+                            Err(WebSocketFlowError::Failed) => {
+                                result_observation.classify("live_scan_failed");
+                                return;
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
@@ -1743,12 +2051,16 @@ async fn run_websocket(
                     &mut scanned,
                     &mut connection_drafts,
                 ).await {
-                    Ok(()) => {}
+                    Ok(_) => {}
                     Err(WebSocketFlowError::Shutdown) => {
+                        result_observation.classify("server_shutdown");
                         close(&mut socket, close_code::AWAY, "server shutdown").await;
                         return;
                     }
-                    Err(WebSocketFlowError::Failed) => return,
+                    Err(WebSocketFlowError::Failed) => {
+                        result_observation.classify("live_scan_failed");
+                        return;
+                    }
                 }
             }
             draft = drafts.recv() => {
@@ -1758,23 +2070,50 @@ async fn run_websocket(
                             continue;
                         }
                         if send_json(&mut socket, &state, &mut shutdown, &event).await.is_err() {
+                            result_observation.classify("slow_consumer");
                             state.live_events.observe_slow_disconnect();
                             close(&mut socket, close_code::AGAIN, "slow consumer").await;
                             return;
                         }
                     }
                     LiveEventReceive::Overloaded => {
+                        result_observation.classify("delivery_overloaded");
                         state.live_events.observe_slow_disconnect();
                         close(&mut socket, close_code::AGAIN, "temporary overload").await;
                         return;
                     }
                     LiveEventReceive::Closed => {
+                        result_observation.classify("server_shutdown");
                         close(&mut socket, close_code::AWAY, "server shutdown").await;
                         return;
                     }
                 }
             }
         }
+    }
+}
+
+struct WebSocketResultObservation {
+    span: tracing::Span,
+    result_class: &'static str,
+}
+
+impl WebSocketResultObservation {
+    fn new() -> Self {
+        Self {
+            span: tracing::Span::current(),
+            result_class: "peer_closed",
+        }
+    }
+
+    fn classify(&mut self, result_class: &'static str) {
+        self.result_class = result_class;
+    }
+}
+
+impl Drop for WebSocketResultObservation {
+    fn drop(&mut self) {
+        self.span.record("result_class", self.result_class);
     }
 }
 
@@ -1870,7 +2209,7 @@ async fn live_scan(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     scanned: &mut ReplayCursor,
     drafts: &mut ConnectionDraftState,
-) -> Result<(), WebSocketFlowError> {
+) -> Result<u64, WebSocketFlowError> {
     let public_state = PublicStateService::new(state.store.as_ref());
     let high_water = match tokio::select! {
         biased;
@@ -1897,7 +2236,8 @@ async fn scan_and_send(
     scanned: &mut ReplayCursor,
     through: ReplayCursor,
     drafts: &mut ConnectionDraftState,
-) -> Result<(), WebSocketFlowError> {
+) -> Result<u64, WebSocketFlowError> {
+    let mut sent = 0_u64;
     while *scanned < through {
         let public_state = PublicStateService::new(state.store.as_ref());
         let page = match tokio::select! {
@@ -1916,7 +2256,7 @@ async fn scan_and_send(
             }
         };
         match send_events(socket, state, shutdown, drafts, page.events).await {
-            Ok(()) => {}
+            Ok(count) => sent = sent.saturating_add(count),
             Err(WebSocketFlowError::Shutdown) => return Err(WebSocketFlowError::Shutdown),
             Err(WebSocketFlowError::Failed) => {
                 close(socket, close_code::AGAIN, "slow consumer").await;
@@ -1935,7 +2275,7 @@ async fn scan_and_send(
             return Err(WebSocketFlowError::Failed);
         }
     }
-    Ok(())
+    Ok(sent)
 }
 
 async fn send_events(
@@ -1944,7 +2284,8 @@ async fn send_events(
     shutdown: &mut tokio::sync::watch::Receiver<bool>,
     drafts: &mut ConnectionDraftState,
     events: Vec<crate::protocol::DurableEventEnvelope>,
-) -> Result<(), WebSocketFlowError> {
+) -> Result<u64, WebSocketFlowError> {
+    let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
     let mut outbound = VecDeque::with_capacity(WEBSOCKET_OUTBOUND_FRAMES);
     for event in events {
         drafts.reconcile_durable(&event);
@@ -1972,7 +2313,8 @@ async fn send_events(
             flush_outbound(socket, state, shutdown, &mut outbound).await?;
         }
     }
-    flush_outbound(socket, state, shutdown, &mut outbound).await
+    flush_outbound(socket, state, shutdown, &mut outbound).await?;
+    Ok(event_count)
 }
 
 async fn flush_outbound(
@@ -1987,11 +2329,11 @@ async fn flush_outbound(
     Ok(())
 }
 
-async fn replay_failure(
+async fn replay_failure<T>(
     socket: &mut WebSocket,
     state: &HttpState,
     error: PublicationError,
-) -> Result<(), WebSocketFlowError> {
+) -> Result<T, WebSocketFlowError> {
     match error.kind() {
         PublicationErrorKind::Storage | PublicationErrorKind::Invariant => {
             state.fatal_protocol();
@@ -2117,6 +2459,26 @@ fn map_gateway_error(
             state.fatal_protocol();
             ApiError::internal(request_id)
         }
+    }
+}
+
+fn command_error_result(error: &CommandGatewayError) -> &'static str {
+    match (error.kind(), error.command_kind()) {
+        (CommandGatewayErrorKind::Command, Some(CommandServiceErrorKind::IdempotencyConflict)) => {
+            "conflict"
+        }
+        (CommandGatewayErrorKind::Command, Some(CommandServiceErrorKind::TargetNotFound))
+        | (
+            CommandGatewayErrorKind::Command,
+            Some(CommandServiceErrorKind::CommandValidationFailed),
+        ) => "rejected",
+        (CommandGatewayErrorKind::Unavailable, _)
+        | (CommandGatewayErrorKind::Command, Some(CommandServiceErrorKind::StorageFailure)) => {
+            "unavailable"
+        }
+        (CommandGatewayErrorKind::Clock, _)
+        | (CommandGatewayErrorKind::Command, Some(CommandServiceErrorKind::StorageInconsistent))
+        | (CommandGatewayErrorKind::Command, None) => "failed",
     }
 }
 
@@ -2301,7 +2663,12 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let observation = HttpResponseObservation {
+            error_code: Some(self.envelope.error.code),
+            retryable: Some(self.envelope.error.retryable),
+        };
         let mut response = (self.status, Json(self.envelope)).into_response();
+        response.extensions_mut().insert(observation);
         if self.authenticate {
             response
                 .headers_mut()
@@ -2313,7 +2680,36 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::Mutex;
+
+    use tower::{Layer as _, ServiceExt as _};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::fmt::writer::MakeWriter;
+
     use super::*;
+
+    #[derive(Clone)]
+    struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+    impl<'writer> MakeWriter<'writer> for TraceCapture {
+        type Writer = Self;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl std::io::Write for TraceCapture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn bearer_header_grammar_is_exact_and_scheme_only_is_case_insensitive() {
@@ -2349,6 +2745,74 @@ mod tests {
             HeaderValue::from_str(&format!("Bearer {}", "02".repeat(32))).unwrap(),
         );
         assert!(parse_authorization(&duplicate).is_err());
+    }
+
+    #[tokio::test]
+    async fn stage23_http_trace_omits_header_url_body_and_error_sentinels() {
+        let values = [
+            ("authorization", "Bearer SENTINEL_AUTH_HEADER_23"),
+            ("cookie", "session=SENTINEL_COOKIE_23"),
+            ("x-api-key", "SENTINEL_API_KEY_HEADER_23"),
+            ("proxy-authorization", "Basic SENTINEL_PROXY_AUTH_23"),
+            ("x-forwarded-for", "SENTINEL_FORWARDED_23"),
+            ("user-agent", "SENTINEL_USER_AGENT_23"),
+        ];
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("https://example.invalid/v1/private?SENTINEL_QUERY_23#SENTINEL_FRAGMENT_23")
+            .body(Body::from("SENTINEL_REQUEST_BODY_23"))
+            .unwrap();
+        for (name, value) in values {
+            request.headers_mut().insert(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        request.extensions_mut().insert(RequestContext {
+            request_id: RequestId::generate(),
+        });
+
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let capture = TraceCapture(Arc::clone(&bytes));
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .json()
+                .with_ansi(false)
+                .with_writer(capture)
+                .finish(),
+        );
+        let service = safe_trace_layer().layer(tower::service_fn(|_request| async {
+            tracing::info!(
+                event_name = "stage23_test_response",
+                result_class = "success"
+            );
+            Ok::<_, Infallible>(Response::new(Body::empty()))
+        }));
+        let response = service
+            .oneshot(request)
+            .with_subscriber(dispatch)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let output = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("http_request"));
+        assert!(output.contains("POST"));
+        for (_, sentinel) in values {
+            assert!(!output.contains(sentinel), "leaked header value: {output}");
+        }
+        for sentinel in [
+            "SENTINEL_QUERY_23",
+            "SENTINEL_FRAGMENT_23",
+            "SENTINEL_REQUEST_BODY_23",
+        ] {
+            assert!(!output.contains(sentinel), "leaked {sentinel}: {output}");
+        }
+
+        let source = std::io::Error::other("SENTINEL_SERVER_ERROR_PATH_23");
+        let error = ServerError::Serve(source);
+        assert!(!format!("{error:?}").contains("SENTINEL_SERVER_ERROR_PATH_23"));
+        assert_eq!(error.to_string(), "shared server execution failed");
     }
 
     #[tokio::test]

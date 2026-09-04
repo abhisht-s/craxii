@@ -165,6 +165,13 @@ async fn authenticated_http_machine_inspection_failures_idempotency_replay_and_c
     let replay_text = serde_json::to_string(&replay).unwrap();
     assert!(replay_text.contains("sync.complete"));
     assert!(replay_text.contains(&facts.git_version));
+    let replayed_durable = replay
+        .iter()
+        .filter(|frame| frame["delivery_kind"] == "durable")
+        .count() as u64;
+    let delivery_metrics = harness.live_events.metrics();
+    assert_eq!(delivery_metrics.replayed_durable_events, replayed_durable);
+    assert_eq!(delivery_metrics.replay_connections, 1);
 
     let ledger_before_restart = read_invocation_records(&harness.root.invocation_log());
     assert_eq!(ledger_before_restart.len(), 4);

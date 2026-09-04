@@ -14,6 +14,7 @@ use sqlx::sqlite::{
 };
 use sqlx::{ConnectOptions, Connection, SqliteConnection, SqlitePool};
 use tokio::sync::Mutex;
+use tracing::Instrument;
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 use super::schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION, MIGRATOR, classify_schema};
@@ -50,6 +51,36 @@ impl CheckpointReport {
     #[must_use]
     pub const fn checkpointed_frames(self) -> u64 {
         self.checkpointed_frames
+    }
+}
+
+struct SqliteOperationObservation {
+    span: tracing::Span,
+    started: Instant,
+    result_class: &'static str,
+}
+
+impl SqliteOperationObservation {
+    fn new(span: tracing::Span) -> Self {
+        Self {
+            span,
+            started: Instant::now(),
+            result_class: "error",
+        }
+    }
+
+    fn classify(&mut self, result_class: &'static str) {
+        self.result_class = result_class;
+    }
+}
+
+impl Drop for SqliteOperationObservation {
+    fn drop(&mut self) {
+        self.span.record("result_class", self.result_class);
+        self.span.record(
+            "duration_micros",
+            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
     }
 }
 
@@ -98,7 +129,27 @@ impl SqliteRuntime {
 
     /// Runs a bounded passive checkpoint and returns counters only.
     pub async fn checkpoint_passive(&self) -> Result<CheckpointReport, SqliteAdapterError> {
-        let started = Instant::now();
+        let span = tracing::info_span!(
+            target: "craxii::sqlite",
+            "sqlite_checkpoint",
+            subsystem = "sqlite",
+            checkpoint_kind = "passive",
+            result_class = tracing::field::Empty,
+            busy = tracing::field::Empty,
+            log_frames = tracing::field::Empty,
+            checkpointed_frames = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+        );
+        self.checkpoint_passive_inner(span.clone())
+            .instrument(span)
+            .await
+    }
+
+    async fn checkpoint_passive_inner(
+        &self,
+        span: tracing::Span,
+    ) -> Result<CheckpointReport, SqliteAdapterError> {
+        let mut observation = SqliteOperationObservation::new(span.clone());
         let mut connection = self.acquire().await?;
         let (busy, log_frames, checkpointed_frames) =
             sqlx::query_as::<_, (i64, i64, i64)>("PRAGMA wal_checkpoint(PASSIVE)")
@@ -110,15 +161,10 @@ impl SqliteRuntime {
             log_frames: nonnegative_counter(log_frames)?,
             checkpointed_frames: nonnegative_counter(checkpointed_frames)?,
         };
-        tracing::info!(
-            target: "craxii::sqlite",
-            operation = "checkpoint_passive",
-            outcome = "ok",
-            busy = report.busy,
-            log_frames = report.log_frames,
-            checkpointed_frames = report.checkpointed_frames,
-            duration_micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
-        );
+        span.record("busy", report.busy);
+        span.record("log_frames", report.log_frames);
+        span.record("checkpointed_frames", report.checkpointed_frames);
+        observation.classify("ok");
         Ok(report)
     }
 
@@ -184,6 +230,58 @@ impl SqliteRuntimeGuard {
         pool_connections: u64,
     ) -> Result<Self, SqliteAdapterError> {
         Self::start_with_timeout(state_root, pool_connections, ACQUIRE_TIMEOUT).await
+    }
+
+    /// Opens an existing, current database for deterministic offline inspection.
+    ///
+    /// The exclusive process lock proves that the service is not concurrently
+    /// mutating state. Migrations and product writes are deliberately disabled.
+    pub async fn start_read_only(state_root: &Path) -> Result<Self, SqliteAdapterError> {
+        let paths = StatePaths::inspect(state_root)?;
+        let process_lock = acquire_process_lock(paths.lock_file)?;
+        let options = connection_options(&paths.database).read_only(true);
+        let mut bootstrap = options
+            .clone()
+            .connect()
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+        verify_pragmas(&mut bootstrap)
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+        let started = Instant::now();
+        run_integrity_checks(&mut bootstrap).await?;
+        let disposition = classify_schema(&mut bootstrap).await?;
+        trace_integrity("read_only", started.elapsed(), disposition);
+        if disposition != DatabaseDisposition::Current {
+            return Err(SqliteAdapterError::new(match disposition {
+                DatabaseDisposition::NewerSchema => SqliteFailureKind::NewerSchema,
+                DatabaseDisposition::Corrupt => SqliteFailureKind::Corrupt,
+                _ => SqliteFailureKind::InconsistentSchema,
+            }));
+        }
+        bootstrap
+            .close()
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(ACQUIRE_TIMEOUT)
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_with(options)
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)?;
+        Ok(Self {
+            runtime: SqliteRuntime {
+                inner: Arc::new(SqliteRuntimeInner {
+                    pool,
+                    write_coordinator: Arc::new(Mutex::new(())),
+                }),
+            },
+            process_lock,
+            disposition,
+        })
     }
 
     async fn start_with_timeout(
@@ -272,18 +370,35 @@ impl SqliteRuntimeGuard {
             }
             _ => unreachable!("non-migratable dispositions returned above"),
         };
-        let migration_started = Instant::now();
+        let migration_span = tracing::info_span!(
+            target: "craxii::sqlite",
+            "database_migration",
+            subsystem = "sqlite",
+            current_version = existing_migration_count,
+            max_supported_version = MAX_SUPPORTED_SCHEMA_VERSION,
+            applied_count = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        let mut migration_observation = SqliteOperationObservation::new(migration_span.clone());
         MIGRATOR
             .run(&mut bootstrap)
+            .instrument(migration_span.clone())
             .await
             .map_err(|_| SqliteAdapterError::new(SqliteFailureKind::InconsistentSchema))?;
+        migration_span.record(
+            "applied_count",
+            MAX_SUPPORTED_SCHEMA_VERSION.saturating_sub(existing_migration_count),
+        );
+        migration_observation.classify("ok");
         tracing::info!(
             target: "craxii::sqlite",
+            parent: &migration_span,
             operation = "migrate",
             current_version = MAX_SUPPORTED_SCHEMA_VERSION,
             max_supported_version = MAX_SUPPORTED_SCHEMA_VERSION,
             applied_count = MAX_SUPPORTED_SCHEMA_VERSION.saturating_sub(existing_migration_count),
-            duration_micros = u64::try_from(migration_started.elapsed().as_micros()).unwrap_or(u64::MAX)
+            result_class = "ok"
         );
 
         let postflight_started = Instant::now();
@@ -383,6 +498,29 @@ impl StatePaths {
         let lock_file = open_private_file(&lock_path)?;
         verify_open_file(&lock_file)?;
 
+        Ok(Self {
+            database,
+            lock_file,
+        })
+    }
+
+    fn inspect(state_root: &Path) -> Result<Self, SqliteAdapterError> {
+        verify_secure_directory(state_root)?;
+        verify_supported_filesystem(state_root)?;
+        let database_directory = state_root.join(DATABASE_DIRECTORY);
+        let lock_directory = state_root.join(LOCK_DIRECTORY);
+        verify_secure_directory(&database_directory)?;
+        verify_secure_directory(&lock_directory)?;
+        let database = database_directory.join(DATABASE_FILENAME);
+        let lock_path = lock_directory.join(LOCK_FILENAME);
+        verify_state_file(&database)?;
+        verify_state_file(&lock_path)?;
+        verify_optional_sidecar(&database, "-wal")?;
+        verify_optional_sidecar(&database, "-shm")?;
+        let lock_file = private_file_options(false)
+            .open(lock_path)
+            .map_err(|_| SqliteAdapterError::new(SqliteFailureKind::UnsafeStatePath))?;
+        verify_open_file(&lock_file)?;
         Ok(Self {
             database,
             lock_file,
@@ -1136,6 +1274,47 @@ pub(super) mod tests {
         let reopened = runtime(&root, 1).await;
         assert_eq!(reopened.disposition(), DatabaseDisposition::Current);
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stage23_offline_inspection_runtime_is_read_only_and_exclusively_locked() {
+        use crate::adapters::sqlite::SqliteEvidenceQueryStore;
+        use crate::ports::evidence_query::EvidenceQueryStore;
+
+        let root = TestRoot::new();
+        runtime(&root, 1).await.shutdown().await;
+
+        let inspection = SqliteRuntimeGuard::start_read_only(root.path())
+            .await
+            .unwrap();
+        let report = SqliteEvidenceQueryStore::new(inspection.runtime().clone())
+            .preflight()
+            .await
+            .unwrap();
+        assert_eq!(
+            report.schema_version,
+            u64::try_from(MAX_SUPPORTED_SCHEMA_VERSION).unwrap()
+        );
+        assert_eq!(report.journal_head, None);
+        assert_eq!(report.work_count, 0);
+
+        let mut connection = inspection.runtime().acquire().await.unwrap();
+        assert!(
+            sqlx::query("CREATE TABLE forbidden_stage23_write (id INTEGER)")
+                .execute(&mut *connection)
+                .await
+                .is_err()
+        );
+        drop(connection);
+        assert_eq!(
+            SqliteRuntimeGuard::start(root.path(), 1)
+                .await
+                .unwrap_err()
+                .kind(),
+            SqliteFailureKind::AlreadyOwned
+        );
+        inspection.shutdown().await;
+        runtime(&root, 1).await.shutdown().await;
     }
 
     #[tokio::test]

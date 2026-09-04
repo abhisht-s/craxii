@@ -4,6 +4,7 @@
 mod codec;
 mod context_source_store;
 mod error;
+mod evidence_query;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.
 mod journal;
 #[allow(dead_code)] // Stage 6 freezes guarded primitives before Stage 7 journal composition.
@@ -34,6 +35,7 @@ mod stage8_tests;
 mod stage9_tests;
 
 pub use error::{SqliteAdapterError, SqliteFailureKind};
+pub use evidence_query::SqliteEvidenceQueryStore;
 pub use runtime::{CheckpointReport, SqliteRuntime, SqliteRuntimeGuard};
 pub use schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION};
 pub use state_store::SqliteStateStore;

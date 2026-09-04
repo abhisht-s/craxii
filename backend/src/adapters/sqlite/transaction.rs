@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use sqlx::{Sqlite, SqliteConnection, Transaction};
 use tokio::sync::OwnedMutexGuard;
+use tracing::Instrument;
 
 use super::error::SqliteAdapterError;
 use super::runtime::SqliteRuntime;
@@ -12,6 +13,7 @@ pub(super) struct WriteTransaction {
     transaction: Option<Transaction<'static, Sqlite>>,
     intent: &'static str,
     started: Instant,
+    span: tracing::Span,
 }
 
 impl WriteTransaction {
@@ -21,7 +23,22 @@ impl WriteTransaction {
     ) -> Result<Self, SqliteAdapterError> {
         let coordinator = runtime.inner.write_coordinator.clone().lock_owned().await;
         let started = Instant::now();
-        let transaction = runtime.inner.pool.begin_with("BEGIN IMMEDIATE").await;
+        let span = tracing::info_span!(
+            target: "craxii::sqlite",
+            "journal_transaction",
+            subsystem = "sqlite",
+            operation = intent,
+            mode = "immediate",
+            action = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+        );
+        let transaction = runtime
+            .inner
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .instrument(span.clone())
+            .await;
         let transaction = match transaction {
             Ok(transaction) => transaction,
             Err(error) => {
@@ -34,6 +51,12 @@ impl WriteTransaction {
                     outcome = "error",
                     category = ?classified.kind(),
                     sqlite_code = ?classified.sqlite_code()
+                );
+                span.record("action", "begin");
+                span.record("result_class", "error");
+                span.record(
+                    "duration_micros",
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
                 );
                 return Err(classified);
             }
@@ -50,6 +73,7 @@ impl WriteTransaction {
             transaction: Some(transaction),
             intent,
             started,
+            span,
         })
     }
 
@@ -66,9 +90,19 @@ impl WriteTransaction {
             .take()
             .expect("unfinished transaction retains its transaction")
             .commit()
+            .instrument(self.span.clone())
             .await
             .map_err(SqliteAdapterError::from_sqlx);
         trace_finish(self.intent, "commit", self.started, result.as_ref().err());
+        self.span.record("action", "commit");
+        self.span.record(
+            "result_class",
+            if result.is_ok() { "committed" } else { "error" },
+        );
+        self.span.record(
+            "duration_micros",
+            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         if result.is_ok() {
             self.coordinator.take();
         }
@@ -81,9 +115,23 @@ impl WriteTransaction {
             .take()
             .expect("unfinished transaction retains its transaction")
             .rollback()
+            .instrument(self.span.clone())
             .await
             .map_err(SqliteAdapterError::from_sqlx);
         trace_finish(self.intent, "rollback", self.started, result.as_ref().err());
+        self.span.record("action", "rollback");
+        self.span.record(
+            "result_class",
+            if result.is_ok() {
+                "rolled_back"
+            } else {
+                "error"
+            },
+        );
+        self.span.record(
+            "duration_micros",
+            u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
         if result.is_ok() {
             self.coordinator.take();
         }
@@ -112,6 +160,12 @@ fn trace_finish(
 impl Drop for WriteTransaction {
     fn drop(&mut self) {
         if self.transaction.is_some() {
+            self.span.record("action", "drop_rollback");
+            self.span.record("result_class", "rollback_queued");
+            self.span.record(
+                "duration_micros",
+                u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
             tracing::debug!(
                 target: "craxii::sqlite",
                 operation = "transaction_finish",

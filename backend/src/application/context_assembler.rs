@@ -3,8 +3,10 @@
 use std::collections::BTreeSet;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
+use tracing::Instrument;
 
 use crate::application::model_selection::{ModelSelectionResult, project_model_tool_definitions};
 use crate::application::tool_registry::ToolRegistry;
@@ -806,18 +808,77 @@ impl ContextAssembler {
         selection: &ModelSelectionResult,
         versions: &ContextAssemblyVersions,
     ) -> Result<ContextAssemblyResult, ContextAssemblyError> {
-        let snapshot = self
+        let selected = selection.selected_target().reference();
+        let span = tracing::info_span!(
+            "context_assembly",
+            work_id = %work_id,
+            model_target = selected.model_target_id().as_str(),
+            provider = selected.provider_id().as_str(),
+            model = selected.provider_model_id().as_str(),
+            context_manifest_id = tracing::field::Empty,
+            logical_invocation_id = tracing::field::Empty,
+            source_count = tracing::field::Empty,
+            request_bytes = tracing::field::Empty,
+            estimated_input_tokens = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        let started = Instant::now();
+        let snapshot = match self
             .source_store
             .load_context_eligibility_snapshot(ContextEligibilityRequest { work_id })
+            .instrument(span.clone())
             .await
-            .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::Source))?;
-        self.assemble_snapshot(
-            snapshot,
-            selection,
-            versions,
-            ContextManifestId::generate(),
-            LogicalInvocationId::generate(),
-        )
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                span.record("result_class", "source_failure");
+                span.record(
+                    "duration_micros",
+                    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                );
+                return Err(ContextAssemblyError::new(ContextAssemblyErrorKind::Source));
+            }
+        };
+        let result = span.in_scope(|| {
+            self.assemble_snapshot(
+                snapshot,
+                selection,
+                versions,
+                ContextManifestId::generate(),
+                LogicalInvocationId::generate(),
+            )
+        });
+        match &result {
+            Ok(assembled) => {
+                span.record(
+                    "context_manifest_id",
+                    tracing::field::display(assembled.package().context_manifest_id()),
+                );
+                span.record(
+                    "logical_invocation_id",
+                    tracing::field::display(assembled.package().logical_invocation_id()),
+                );
+                span.record(
+                    "source_count",
+                    u64::try_from(assembled.package().ordered_sources().len()).unwrap_or(u64::MAX),
+                );
+                span.record("request_bytes", assembled.budget().request_serialized_bytes);
+                span.record(
+                    "estimated_input_tokens",
+                    assembled.budget().estimated_input_tokens,
+                );
+                span.record("result_class", "assembled");
+            }
+            Err(error) => {
+                span.record("result_class", format!("{:?}", error.kind()).as_str());
+            }
+        }
+        span.record(
+            "duration_micros",
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        result
     }
 
     /// Rebuilds from exact durable sources with the committed immutable IDs and compares bytes.

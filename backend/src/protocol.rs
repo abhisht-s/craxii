@@ -209,12 +209,22 @@ pub enum PublicContentType {
     Text,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PublicContentBlock {
     #[serde(rename = "type")]
     pub kind: PublicContentType,
     pub text: String,
+}
+
+impl fmt::Debug for PublicContentBlock {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicContentBlock")
+            .field("kind", &self.kind)
+            .field("text_bytes", &self.text.len())
+            .finish()
+    }
 }
 
 impl PublicContentBlock {
@@ -227,12 +237,31 @@ impl PublicContentBlock {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MessageRequest {
     pub protocol_version: ProtocolVersion,
     pub client_message_id: ClientMessageId,
     pub content: Vec<PublicContentBlock>,
+}
+
+impl fmt::Debug for MessageRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageRequest")
+            .field("protocol_version", &self.protocol_version)
+            .field("client_message_id", &self.client_message_id)
+            .field("content_block_count", &self.content.len())
+            .field(
+                "content_bytes",
+                &self
+                    .content
+                    .iter()
+                    .map(|block| block.text.len())
+                    .sum::<usize>(),
+            )
+            .finish()
+    }
 }
 
 impl MessageRequest {
@@ -324,7 +353,7 @@ impl ErrorEnvelope {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct BootstrapResponse {
     pub protocol_version: ProtocolVersion,
     pub snapshot_cursor: JournalOffset,
@@ -335,11 +364,39 @@ pub struct BootstrapResponse {
     pub unresolved_outcomes: Vec<UnresolvedOutcome>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+impl fmt::Debug for BootstrapResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BootstrapResponse")
+            .field("snapshot_cursor", &self.snapshot_cursor)
+            .field("craxii_id", &self.craxii.craxii_id)
+            .field(
+                "conversation_id",
+                &self.primary_conversation.conversation_id,
+            )
+            .field("message_count", &self.messages.len())
+            .field("work_item_count", &self.work_items.len())
+            .field("unresolved_outcome_count", &self.unresolved_outcomes.len())
+            .finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct PublicCraxii {
     pub craxii_id: CraxiiId,
     pub display_name: String,
     pub owner_label: String,
+}
+
+impl fmt::Debug for PublicCraxii {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicCraxii")
+            .field("craxii_id", &self.craxii_id)
+            .field("display_name_bytes", &self.display_name.len())
+            .field("owner_label_bytes", &self.owner_label.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -350,7 +407,7 @@ pub struct PublicConversation {
     pub created_at: UtcTimestamp,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct PublicMessage {
     pub message_id: MessageId,
     pub conversation_id: ConversationId,
@@ -362,6 +419,30 @@ pub struct PublicMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_id: Option<WorkId>,
     pub committed_at: UtcTimestamp,
+}
+
+impl fmt::Debug for PublicMessage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublicMessage")
+            .field("message_id", &self.message_id)
+            .field("conversation_id", &self.conversation_id)
+            .field("conversation_sequence", &self.conversation_sequence)
+            .field("role", &self.role)
+            .field("content_block_count", &self.content.len())
+            .field(
+                "content_bytes",
+                &self
+                    .content
+                    .iter()
+                    .map(|block| block.text.len())
+                    .sum::<usize>(),
+            )
+            .field("client_message_id", &self.client_message_id)
+            .field("work_id", &self.work_id)
+            .field("committed_at", &self.committed_at)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -439,7 +520,7 @@ pub enum DraftAbandonReason {
     DeliveryLimit,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum DraftEventPayload {
     Started {},
@@ -447,8 +528,25 @@ pub enum DraftEventPayload {
     Abandoned { reason: DraftAbandonReason },
 }
 
+impl fmt::Debug for DraftEventPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Started {} => formatter.write_str("DraftEventPayload::Started"),
+            Self::Delta { kind, text } => formatter
+                .debug_struct("DraftEventPayload::Delta")
+                .field("kind", kind)
+                .field("text_bytes", &text.len())
+                .finish(),
+            Self::Abandoned { reason } => formatter
+                .debug_struct("DraftEventPayload::Abandoned")
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 /// A lossy, non-replayable event. Its null cursor cannot enter the durable cursor namespace.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Eq, PartialEq, Serialize)]
 pub struct EphemeralDraftEnvelope {
     pub protocol_version: ProtocolVersion,
     pub delivery_kind: DeliveryKind,
@@ -462,6 +560,22 @@ pub struct EphemeralDraftEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delta_sequence: Option<u32>,
     pub payload: DraftEventPayload,
+}
+
+impl fmt::Debug for EphemeralDraftEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EphemeralDraftEnvelope")
+            .field("event_id", &self.event_id)
+            .field("event_type", &self.event_type)
+            .field("conversation_id", &self.conversation_id)
+            .field("work_id", &self.work_id)
+            .field("invocation_id", &self.invocation_id)
+            .field("draft_id", &self.draft_id)
+            .field("delta_sequence", &self.delta_sequence)
+            .field("payload", &self.payload)
+            .finish()
+    }
 }
 
 impl EphemeralDraftEnvelope {
@@ -541,7 +655,7 @@ impl EphemeralDraftEnvelope {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub struct DurableEventEnvelope {
     pub protocol_version: ProtocolVersion,
     pub delivery_kind: DeliveryKind,
@@ -554,6 +668,21 @@ pub struct DurableEventEnvelope {
     pub work_id: Option<WorkId>,
     pub recorded_at: UtcTimestamp,
     pub payload: Value,
+}
+
+impl fmt::Debug for DurableEventEnvelope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DurableEventEnvelope")
+            .field("event_id", &self.event_id)
+            .field("cursor", &self.cursor)
+            .field("event_type", &self.event_type)
+            .field("conversation_id", &self.conversation_id)
+            .field("work_id", &self.work_id)
+            .field("recorded_at", &self.recorded_at)
+            .field("payload_bytes", &self.payload.to_string().len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -649,6 +778,49 @@ mod tests {
         let parsed = Uuid::parse_str(&request_id).unwrap();
         assert_eq!(parsed.get_version_num(), 7);
         assert_eq!(parsed.hyphenated().to_string(), request_id);
+    }
+
+    #[test]
+    fn stage23_content_bearing_protocol_debug_is_metadata_only() {
+        let message_sentinel = "SENTINEL_USER_MESSAGE_23";
+        let draft_sentinel = "SENTINEL_MODEL_DRAFT_23";
+        let payload_sentinel = "SENTINEL_DURABLE_PAYLOAD_23";
+        let request: MessageRequest = serde_json::from_value(serde_json::json!({
+            "protocol_version": 1,
+            "client_message_id": V7,
+            "content": [{"type": "text", "text": message_sentinel}],
+        }))
+        .unwrap();
+        let draft = EphemeralDraftEnvelope::delta(
+            ConversationId::generate(),
+            WorkId::generate(),
+            ModelInvocationId::generate(),
+            DraftId::generate(),
+            1,
+            DraftDeltaKind::Text,
+            draft_sentinel.to_owned(),
+        );
+        let durable = DurableEventEnvelope {
+            protocol_version: ProtocolVersion,
+            delivery_kind: DeliveryKind::Durable,
+            event_id: JournalEventId::generate(),
+            cursor: JournalOffset::try_new(1).unwrap(),
+            event_type: "message.accepted",
+            conversation_id: Some(ConversationId::generate()),
+            work_id: None,
+            recorded_at: "2026-09-04T00:00:00.000000Z".parse().unwrap(),
+            payload: serde_json::json!({"text": payload_sentinel}),
+        };
+        let rendered = format!("{request:?}{draft:?}{durable:?}");
+        for sentinel in [message_sentinel, draft_sentinel, payload_sentinel] {
+            assert!(
+                !rendered.contains(sentinel),
+                "leaked {sentinel}: {rendered}"
+            );
+        }
+        assert!(rendered.contains(V7));
+        assert!(rendered.contains("text_bytes"));
+        assert!(rendered.contains("payload_bytes"));
     }
 
     #[test]

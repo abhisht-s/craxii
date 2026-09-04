@@ -40,7 +40,10 @@ public struct HTTPRequest: Sendable {
 public struct HTTPResponse: Sendable {
     public let statusCode: Int
     public let body: Data
-    public init(statusCode: Int, body: Data) { self.statusCode = statusCode; self.body = body }
+    public let requestID: ProtocolID?
+    public init(statusCode: Int, body: Data, requestID: ProtocolID? = nil) {
+        self.statusCode = statusCode; self.body = body; self.requestID = requestID
+    }
 }
 
 public protocol HTTPExecuting: Sendable {

@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::Instrument;
 
 use crate::application::command_service::CommandPostCommit;
 use crate::bootstrap::health::{FatalReasonCode, Health};
@@ -98,6 +99,7 @@ struct RegistryEntry {
     runtime_instance_id: RuntimeInstanceId,
     cancellation: tokio::sync::watch::Sender<bool>,
     task_id: tokio::task::Id,
+    span: tracing::Span,
 }
 
 #[derive(Clone, Default)]
@@ -237,21 +239,29 @@ where
     let claiming = Arc::new(AtomicBool::new(true));
     let claim_gate = Arc::new(tokio::sync::Mutex::new(()));
     let loop_registry = registry.clone();
-    let join = tokio::spawn(run_scheduler(
-        store,
-        runner,
-        clock,
-        health,
-        start.runtime_instance_id,
-        start.conversation_id,
-        notify,
-        commands,
-        fatal,
-        loop_registry,
-        Arc::clone(&claiming),
-        Arc::clone(&claim_gate),
-        start.readiness,
-    ));
+    let scheduler_span = tracing::info_span!(
+        "scheduler",
+        runtime_instance_id = %start.runtime_instance_id,
+        conversation_id = %start.conversation_id,
+    );
+    let join = tokio::spawn(
+        run_scheduler(
+            store,
+            runner,
+            clock,
+            health,
+            start.runtime_instance_id,
+            start.conversation_id,
+            notify,
+            commands,
+            fatal,
+            loop_registry,
+            Arc::clone(&claiming),
+            Arc::clone(&claim_gate),
+            start.readiness,
+        )
+        .instrument(scheduler_span),
+    );
     notifier.wake();
     Ok(SchedulerHandle {
         notifier,
@@ -470,14 +480,26 @@ where
 
     if registry.is_empty() {
         let claim_section = claim_gate.lock().await;
+        let claimed_at = now(clock)?;
+        let queue_span = tracing::info_span!(
+            "work_queue_wait",
+            runtime_instance_id = %runtime_instance_id,
+            conversation_id = %conversation_id,
+            work_id = tracing::field::Empty,
+            work_ordinal = tracing::field::Empty,
+            queue_duration_ms = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        queue_span.record("result_class", "empty");
         if claiming.load(Ordering::Acquire)
             && let Some(claimed) = store
                 .claim_next_work(ClaimNextWorkRequest {
                     conversation_id,
                     runtime_id: runtime_instance_id,
-                    claimed_at: now(clock)?,
+                    claimed_at,
                     event_id: JournalEventId::generate(),
                 })
+                .instrument(queue_span.clone())
                 .await?
         {
             #[cfg(feature = "test-failpoints")]
@@ -485,10 +507,37 @@ where
                 crate::test_failpoints::PhysicalHook::AfterWorkClaimCommit,
             );
             let work_id = claimed.work.work_id();
+            queue_span.record("work_id", tracing::field::display(work_id));
+            queue_span.record(
+                "work_ordinal",
+                claimed.work.conversation_work_ordinal().get(),
+            );
+            queue_span.record(
+                "queue_duration_ms",
+                nonnegative_duration_ms(claimed.work.queued_at(), claimed_at),
+            );
+            queue_span.record("result_class", "claimed");
+            let work_span = tracing::info_span!(
+                "work_execution",
+                runtime_instance_id = %runtime_instance_id,
+                craxii_id = %claimed.work.craxii_id(),
+                conversation_id = %claimed.work.conversation_id(),
+                work_id = %work_id,
+                work_ordinal = claimed.work.conversation_work_ordinal().get(),
+                correlation_id = %claimed.work.correlation_id(),
+                result_class = tracing::field::Empty,
+            );
             let (cancellation, receiver) = tokio::sync::watch::channel(false);
             let future = match runner.start(claimed, WorkCancellation { receiver }) {
                 Ok(future) => future,
                 Err(_) => {
+                    work_span.record("result_class", "runner_start_failed");
+                    tracing::warn!(
+                        parent: &work_span,
+                        event_name = "work_terminal",
+                        work_id = %work_id,
+                        result_class = "runner_start_failed"
+                    );
                     store
                         .interrupt_abnormal_runner(InterruptOwnedWorkRequest {
                             work_id,
@@ -501,7 +550,34 @@ where
                     return Ok(());
                 }
             };
-            let abort = tasks.spawn(async move { (work_id, future.await) });
+            let task_span = work_span.clone();
+            let registry_span = work_span.clone();
+            let abort = tasks.spawn(
+                async move {
+                    let exit = future.await;
+                    let result_class = match exit {
+                        WorkRunnerExit::TerminalCommitted => "terminal_committed",
+                        WorkRunnerExit::CancellationConfirmed => "cancellation_confirmed",
+                        WorkRunnerExit::Abnormal => "abnormal",
+                    };
+                    task_span.record("result_class", result_class);
+                    if exit == WorkRunnerExit::Abnormal {
+                        tracing::warn!(
+                            event_name = "work_terminal",
+                            work_id = %work_id,
+                            result_class
+                        );
+                    } else {
+                        tracing::info!(
+                            event_name = "work_terminal",
+                            work_id = %work_id,
+                            result_class
+                        );
+                    }
+                    (work_id, exit)
+                }
+                .instrument(work_span),
+            );
             let task_id = abort.id();
             registry.insert(
                 work_id,
@@ -509,6 +585,7 @@ where
                     runtime_instance_id,
                     cancellation,
                     task_id,
+                    span: registry_span,
                 },
             );
             task_to_work.insert(task_id, work_id);
@@ -581,6 +658,15 @@ where
                 .await?;
         }
         Some(WorkRunnerExit::Abnormal) | None => {
+            if exit.is_none() {
+                let _entered = entry.span.enter();
+                tracing::warn!(
+                    event_name = "work_terminal",
+                    work_id = %work_id,
+                    runtime_instance_id = %runtime_instance_id,
+                    result_class = "task_failure"
+                );
+            }
             store
                 .interrupt_abnormal_runner(InterruptOwnedWorkRequest {
                     work_id,
@@ -592,6 +678,11 @@ where
         }
     }
     Ok(())
+}
+
+fn nonnegative_duration_ms(start: UtcTimestamp, end: UtcTimestamp) -> u64 {
+    let value = (end.to_offset_datetime() - start.to_offset_datetime()).whole_milliseconds();
+    u64::try_from(value.max(0)).unwrap_or(u64::MAX)
 }
 
 fn update_view(registry: &HashMap<WorkId, RegistryEntry>, view: &TaskRegistryView) {

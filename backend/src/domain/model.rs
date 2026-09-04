@@ -433,10 +433,7 @@ impl ModelToolCallId {
 
 impl fmt::Debug for ModelToolCallId {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_tuple("ModelToolCallId")
-            .field(&self.0)
-            .finish()
+        formatter.write_str("ModelToolCallId([REDACTED])")
     }
 }
 
@@ -1277,7 +1274,7 @@ impl ModelUsage {
 }
 
 /// Bounded provider request/response identifier with no raw body or header data.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ProviderEvidenceId(String);
 
 impl ProviderEvidenceId {
@@ -1298,6 +1295,12 @@ impl ProviderEvidenceId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Debug for ProviderEvidenceId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ProviderEvidenceId([REDACTED])")
     }
 }
 

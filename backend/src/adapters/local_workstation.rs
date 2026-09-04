@@ -5,7 +5,9 @@ use std::fs::{Metadata, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::Instrument;
 
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
@@ -532,16 +534,47 @@ impl Workstation for LocalWorkstation {
         }
 
         let adapter = self.clone();
+        let span = tracing::info_span!(
+            "workstation_read_file",
+            operation_id = %request.operation_id,
+            workstation_id = %request.workstation_id,
+            workstation_generation = request.expected_generation.get(),
+            workspace_id = %request.workspace_id,
+            path_class = ?request.path.kind(),
+            maximum_bytes = request.max_bytes,
+            byte_count = tracing::field::Empty,
+            truncated = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+        );
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || adapter.read_blocking(request))
+            let started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || adapter.read_blocking(request))
+                .instrument(span.clone())
                 .await
                 .map_err(|_| {
                     WorkstationError::new(WorkstationErrorKind::InternalWorkstationError)
-                })?
+                })?;
+            span.record(
+                "duration_ms",
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            match &result {
+                Ok(value) => {
+                    span.record("byte_count", value.byte_length.get());
+                    span.record("truncated", value.truncated);
+                    span.record("result_class", "success");
+                }
+                Err(error) => {
+                    span.record("result_class", error.kind().code());
+                }
+            }
+            result
         })
     }
 
     fn execute(&self, request: ExecutionRequest) -> WorkstationFuture<'_, ExecutionResult> {
+        let execution_id = request.execution_id;
         let validation = self
             .validate_identity(request.workstation_id, request.expected_generation)
             .and_then(|()| self.validate_workspace(request.workspace_id));
@@ -550,7 +583,74 @@ impl Workstation for LocalWorkstation {
         }
         let cwd = self.prepare_committed_execution_cwd(&request);
         let runtime = Arc::clone(&self.execution);
-        Box::pin(async move { runtime.execute(request, cwd?).await })
+        let span = tracing::info_span!(
+            "workstation_execute",
+            operation_id = %request.operation_id,
+            execution_id = %request.execution_id,
+            work_id = %request.work_id,
+            workstation_id = %request.workstation_id,
+            workstation_generation = request.expected_generation.get(),
+            workspace_id = %request.workspace_id,
+            effective_privilege = ?request.effective_privilege,
+            result_class = tracing::field::Empty,
+            exit_code = tracing::field::Empty,
+            signal = tracing::field::Empty,
+            timed_out = tracing::field::Empty,
+            cancelled = tracing::field::Empty,
+            cleanup_confirmed = tracing::field::Empty,
+            stdout_bytes = tracing::field::Empty,
+            stderr_bytes = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+        );
+        Box::pin(async move {
+            let result = async move { runtime.execute(request, cwd?).await }
+                .instrument(span.clone())
+                .await;
+            match &result {
+                Ok(value) => {
+                    span.record("result_class", execution_result_class(value.result_kind));
+                    if let Some(exit_code) = value.exit_code {
+                        span.record("exit_code", exit_code);
+                    }
+                    if let Some(signal) = value.terminating_signal {
+                        span.record("signal", signal);
+                    }
+                    span.record("timed_out", value.timed_out);
+                    span.record("cancelled", value.cancelled);
+                    span.record("cleanup_confirmed", value.cleanup.confirmed());
+                    if let Some(stdout) = &value.stdout {
+                        span.record("stdout_bytes", stdout.observed_bytes);
+                    }
+                    if let Some(stderr) = &value.stderr {
+                        span.record("stderr_bytes", stderr.observed_bytes);
+                    }
+                    span.record(
+                        "duration_ms",
+                        u64::try_from(value.duration.as_duration().as_millis()).unwrap_or(u64::MAX),
+                    );
+                    tracing::info!(
+                        parent: &span,
+                        event_name = "workstation_execution_terminal",
+                        execution_id = %value.execution_id,
+                        result_class = execution_result_class(value.result_kind),
+                        cleanup_confirmed = value.cleanup.confirmed(),
+                        "workstation execution observed"
+                    );
+                }
+                Err(error) => {
+                    span.record("result_class", error.kind().code());
+                    tracing::warn!(
+                        parent: &span,
+                        event_name = "workstation_execution_terminal",
+                        execution_id = %execution_id,
+                        result_class = error.kind().code(),
+                        cleanup_confirmed = false,
+                        "workstation execution observation failed"
+                    );
+                }
+            }
+            result
+        })
     }
 
     fn inspect_execution(
@@ -579,6 +679,19 @@ impl Workstation for LocalWorkstation {
                 .cancel(request.operation_id, request.execution_id)
                 .await)
         })
+    }
+}
+
+const fn execution_result_class(
+    value: crate::ports::workstation::ExecutionResultKind,
+) -> &'static str {
+    match value {
+        crate::ports::workstation::ExecutionResultKind::Exited => "exited",
+        crate::ports::workstation::ExecutionResultKind::Signaled => "signaled",
+        crate::ports::workstation::ExecutionResultKind::TimedOut => "timed_out",
+        crate::ports::workstation::ExecutionResultKind::Cancelled => "cancelled",
+        crate::ports::workstation::ExecutionResultKind::SpawnFailed => "spawn_failed",
+        crate::ports::workstation::ExecutionResultKind::CleanupFailed => "cleanup_failed",
     }
 }
 

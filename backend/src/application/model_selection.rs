@@ -2,6 +2,7 @@
 
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::application::tool_registry::ToolRegistry;
 use crate::bootstrap::config::{ModelProvider, ModelsConfig};
@@ -269,7 +270,19 @@ impl ModelSelectionPolicy {
         explicit: Option<&ModelTargetId>,
         required: RequiredModelCapabilities,
     ) -> Result<ModelSelectionResult, ModelSelectionError> {
-        match explicit {
+        let span = tracing::info_span!(
+            "model_selection",
+            explicit = explicit.is_some(),
+            requested_target = explicit.map(ModelTargetId::as_str),
+            selected_target = tracing::field::Empty,
+            provider = tracing::field::Empty,
+            model = tracing::field::Empty,
+            selection_reason = tracing::field::Empty,
+            duration_micros = tracing::field::Empty,
+            result_class = tracing::field::Empty,
+        );
+        let started = Instant::now();
+        let result = span.in_scope(|| match explicit {
             Some(explicit_id) => self.select_exact(
                 explicit_id,
                 required,
@@ -286,7 +299,31 @@ impl ModelSelectionPolicy {
                 ModelSelectionErrorKind::DefaultTargetDisabled,
                 ModelSelectionErrorKind::DefaultTargetIncapable,
             ),
+        });
+        match &result {
+            Ok(selection) => {
+                let selected = selection.selected_target().reference();
+                span.record("selected_target", selected.model_target_id().as_str());
+                span.record("provider", selected.provider_id().as_str());
+                span.record("model", selected.provider_model_id().as_str());
+                span.record(
+                    "selection_reason",
+                    match selection.reason() {
+                        ModelSelectionReason::Explicit => "explicit",
+                        ModelSelectionReason::ConfiguredDefault => "configured_default",
+                    },
+                );
+                span.record("result_class", "selected");
+            }
+            Err(error) => {
+                span.record("result_class", format!("{:?}", error.kind()).as_str());
+            }
         }
+        span.record(
+            "duration_micros",
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        );
+        result
     }
 
     fn select_exact(

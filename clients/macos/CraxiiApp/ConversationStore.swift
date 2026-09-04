@@ -68,6 +68,7 @@ final class ConversationStore {
     func launch() async {
         guard !launched else { return }
         launched = true
+        #if DEBUG && CRAXII_UI_TEST_FIXTURES
         let smokeMode = ProcessInfo.processInfo.environment["CRAXII_STAGE22_UI_SMOKE"]
         if smokeMode == "setup"
             || ProcessInfo.processInfo.environment["CRAXII_STAGE21_UI_SMOKE"] == "1" {
@@ -77,6 +78,7 @@ final class ConversationStore {
             configureConversationSmokeState()
             return
         }
+        #endif
         do {
             let session: any ConversationSession
             if let injectedSession {
@@ -100,7 +102,8 @@ final class ConversationStore {
                     localStore: stateStore,
                     http: URLSessionHTTPExecutor(),
                     streams: URLSessionEventStreamOpener(),
-                    identifiers: generator)
+                    identifiers: generator,
+                    diagnostics: OSLogClientDiagnosticRecorder())
             }
             await session.setSnapshotHandler { [weak self] snapshot in
                 Task { @MainActor [weak self] in self?.apply(snapshot) }
@@ -244,6 +247,7 @@ final class ConversationStore {
         wakeObserver = nil
     }
 
+    #if DEBUG && CRAXII_UI_TEST_FIXTURES
     private func configureConversationSmokeState() {
         let data = Data("""
         {
@@ -301,6 +305,7 @@ final class ConversationStore {
         lastAppliedPresentationRevision = 1
         composerFocusRevision &+= 1
     }
+    #endif
 
     private static var debugLocalhostAllowed: Bool {
         #if DEBUG

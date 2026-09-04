@@ -34,6 +34,12 @@ Assistant drafts are deliberately ephemeral, cursorless, and lossy. They are not
 
 The server validates the `Host` header, applies request/body/concurrency/time limits, marks authorization as sensitive for tracing, emits bounded public errors with request IDs, and sends `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`. Logs record route and status metadata rather than request bodies, authorization values, tool arguments, or model content.
 
+Telemetry uses typed allowlisted summaries. It may include Craxii-generated identifiers, validated provider/model/tool identifiers, fixed result and error classes, numeric statuses, counts, timings, booleans, approved evidence hashes, and one-way digests of provider correlation identifiers. URLs become scheme/host-class/port/route summaries; paths become logical containment classifications; process observations contain counts and lifecycle metadata only. Arbitrary error chains are collapsed to stable safe fields.
+
+Normal backend traces and native `os.Logger` diagnostics intentionally exclude credentials and headers, user or model content, prompts and drafts, tool arguments, shell commands, environment values, stdout/stderr and file contents, raw provider bodies/errors, URL userinfo/query/fragment, absolute paths, Keychain values, database URLs, and raw configuration. There is no conversational-content logging mode in V0.0.01.
+
+The offline evidence commands read canonical state and artifact integrity metadata but produce deterministic, versioned, redacted, noncanonical reports. They do not expose journal payload bodies, normalized model output, tool output, environment, or content. Deeper content inspection requires direct, separately authorized local access to the sensitive SQLite/artifact stores; copy only the minimum necessary material and redact it before sharing.
+
 The backend does not terminate production TLS itself in the documented local flow. Any non-loopback deployment would require an independently reviewed TLS, host, process-isolation, persistence, credential, monitoring, and recovery design; no such deployment is claimed here.
 
 ## Current limitations

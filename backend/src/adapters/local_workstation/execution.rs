@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::{Child, Command};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::{Id as TaskId, JoinHandle, JoinSet};
+use tracing::Instrument;
 
 use crate::domain::{
     ArtifactId, Certainty, ExecutionId, MonotonicDuration, PrivilegeMode, Sha256Digest,
@@ -806,6 +807,18 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
         }
     }
     launch.entry.set_terminating();
+    let cleanup_span = tracing::info_span!(
+        "process_cleanup",
+        execution_id = %execution_id,
+        diagnostic_pid = process_group.leader_pid(),
+        direct_child_reaped = tracing::field::Empty,
+        stdout_drain_joined = tracing::field::Empty,
+        stderr_drain_joined = tracing::field::Empty,
+        process_group_empty = tracing::field::Empty,
+        cgroup_empty = tracing::field::Empty,
+        cgroup_removed = tracing::field::Empty,
+        result_class = tracing::field::Empty,
+    );
     let owned_cleanup = finish_owned_process_tree(
         runtime,
         &launch.entry,
@@ -818,6 +831,7 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
             identity_stable: leader_identity_stable,
         },
     )
+    .instrument(cleanup_span.clone())
     .await;
     let status = owned_cleanup.status;
     let process_group_empty = owned_cleanup.process_group_empty;
@@ -860,6 +874,24 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
         process_group_empty,
     );
     let cleanup_confirmed = cleanup.confirmed();
+    cleanup_span.record("direct_child_reaped", cleanup.direct_child_reaped);
+    cleanup_span.record("stdout_drain_joined", cleanup.stdout_drain_joined);
+    cleanup_span.record("stderr_drain_joined", cleanup.stderr_drain_joined);
+    cleanup_span.record("process_group_empty", cleanup.process_group_empty);
+    if let Some(value) = cleanup.cgroup_empty {
+        cleanup_span.record("cgroup_empty", value);
+    }
+    if let Some(value) = cleanup.cgroup_removed {
+        cleanup_span.record("cgroup_removed", value);
+    }
+    cleanup_span.record(
+        "result_class",
+        if cleanup_confirmed {
+            "confirmed"
+        } else {
+            "unconfirmed"
+        },
+    );
     let cause = launch.entry.cause();
     let (mut result_kind, timed_out, cancelled) = match cause {
         TerminalCause::Timeout => (ExecutionResultKind::TimedOut, true, false),
@@ -899,8 +931,8 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
         lifecycle_phase = "terminal",
         result_kind = ?result_kind,
         duration_ms = started.elapsed().as_millis(),
-        stdout_observed = stdout.as_ref().map_or(0, |stream| stream.observed_bytes),
-        stderr_observed = stderr.as_ref().map_or(0, |stream| stream.observed_bytes),
+        stdout_observed = ?stdout.as_ref().map(|stream| stream.observed_bytes),
+        stderr_observed = ?stderr.as_ref().map(|stream| stream.observed_bytes),
         cleanup_confirmed,
         "workstation execution lifecycle completed"
     );

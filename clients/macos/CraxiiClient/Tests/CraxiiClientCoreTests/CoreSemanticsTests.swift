@@ -435,6 +435,67 @@ private func durableFrame(
     return try JSONSerialization.data(withJSONObject: object)
 }
 
+@Test func typedClientDiagnosticsCorrelateRequestsAndExcludeContentAndCredentials() async throws {
+    let commandID = testID("71")
+    let bootstrapRequestID = testID("72")
+    let commandRequestID = testID("73")
+    let secretMessage = "SENTINEL_CLIENT_MESSAGE_23"
+    let receipt = try JSONDecoder().decode(MessageReceipt.self, from: fixture("message-response.json"))
+    let bootstrapHTTP = HTTPResponse(
+        statusCode: 200, body: try fixture("bootstrap-snapshot.json"),
+        requestID: bootstrapRequestID)
+    let commandHTTP = HTTPResponse(
+        statusCode: 202, body: try JSONEncoder().encode(receipt),
+        requestID: commandRequestID)
+    let diagnostics = InMemoryClientDiagnosticRecorder()
+    let connection = FakeConnection()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: FakeLocalStore(),
+        http: FakeHTTP([.response(bootstrapHTTP), .response(commandHTTP)]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([commandID]),
+        sleeper: NoSleep(), jitter: ZeroJitter(), diagnostics: diagnostics)
+
+    await session.start()
+    await connection.feed(.frame(try syncData()))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    _ = try await session.submitMessage(text: secretMessage)
+
+    let events = diagnostics.events()
+    #expect(events.contains { $0.kind == .bootstrapFinished && $0.requestID == bootstrapRequestID })
+    #expect(events.contains {
+        $0.kind == .commandSent && $0.commandID == commandID && $0.requestID == commandRequestID
+    })
+    #expect(events.contains { $0.kind == .replayFinished && $0.count == 0 })
+    let rendered = String(reflecting: events)
+    let sentinels = [
+        secretMessage,
+        String(repeating: "a", count: 64),
+        profile.endpoint,
+        "Authorization: Bearer SENTINEL_AUTH_23",
+        "SENTINEL_PROVIDER_API_KEY_23",
+        "SENTINEL_REQUEST_BODY_23",
+        "SENTINEL_MODEL_PROMPT_23",
+        "SENTINEL_MODEL_OUTPUT_23",
+        "SENTINEL_MODEL_REFUSAL_23",
+        "SENTINEL_TOOL_ARGUMENTS_23",
+        "SENTINEL_SHELL_COMMAND_23",
+        "SENTINEL_STDOUT_23",
+        "SENTINEL_STDERR_23",
+        "SENTINEL_FILE_CONTENT_23",
+        "SENTINEL_ENV_SECRET_23",
+        "SENTINEL_URL_SECRET_23",
+        "/Users/sentinel/absolute/path/23",
+        "SENTINEL_PROVIDER_ERROR_BODY_23",
+        "SENTINEL_KEYCHAIN_TOKEN_23",
+    ]
+    for sentinel in sentinels {
+        #expect(!rendered.contains(sentinel))
+    }
+    #expect(rendered.contains(commandID.rawValue))
+    #expect(rendered.contains(commandRequestID.rawValue))
+}
+
 @Test func lostResponseRetryUsesIdenticalMessageIdentityPathBodyHeaderAndHash() async throws {
     let commandID = testID("40")
     let receipt = try JSONDecoder().decode(MessageReceipt.self, from: fixture("message-response.json"))

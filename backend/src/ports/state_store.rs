@@ -284,7 +284,7 @@ pub struct ProviderOption {
     pub value: ProviderOptionValue,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub enum NormalizedModelOutputItem {
     Text {
         text: String,
@@ -315,9 +315,63 @@ pub enum NormalizedModelOutputItem {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl std::fmt::Debug for NormalizedModelOutputItem {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("NormalizedModelOutputItem");
+        match self {
+            Self::Text { text } => debug
+                .field("kind", &"text")
+                .field("text_bytes", &text.len()),
+            Self::ToolCall {
+                call_id,
+                tool_name,
+                arguments_json,
+            } => debug
+                .field("kind", &"tool_call")
+                .field("call_id_bytes", &call_id.len())
+                .field("tool_name", tool_name)
+                .field("argument_bytes", &arguments_json.len()),
+            Self::StructuredData { canonical_json } => debug
+                .field("kind", &"structured_data")
+                .field("data_bytes", &canonical_json.len()),
+            Self::Refusal { text } => debug
+                .field("kind", &"refusal")
+                .field("text_bytes", &text.len()),
+            Self::ReasoningSummary { text } => debug
+                .field("kind", &"reasoning_summary")
+                .field("text_bytes", &text.len()),
+            Self::ProviderOpaque {
+                provider_id,
+                item_type,
+                sha256,
+                artifact_id,
+            } => debug
+                .field("kind", &"provider_opaque")
+                .field("provider_id", provider_id)
+                .field("item_type_bytes", &item_type.len())
+                .field("sha256", sha256)
+                .field("artifact_id", artifact_id),
+            Self::UnknownProviderItem { item_type, sha256 } => debug
+                .field("kind", &"unknown_provider_item")
+                .field("item_type_bytes", &item_type.len())
+                .field("sha256", sha256),
+        };
+        debug.finish()
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct NormalizedModelOutput {
     pub items: Vec<NormalizedModelOutputItem>,
+}
+
+impl std::fmt::Debug for NormalizedModelOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NormalizedModelOutput")
+            .field("item_count", &self.items.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1396,5 +1450,49 @@ mod tests {
             PreparedToolExecution::effective_requested_cwd(Some(explicit), &default).canonical(),
             "src"
         );
+    }
+
+    #[test]
+    fn stage23_normalized_model_output_debug_never_renders_content_or_arguments() {
+        let provider_call_id =
+            crate::domain::ModelToolCallId::try_new("SENTINEL_PROVIDER_TOOL_CALL_ID_23").unwrap();
+        assert!(!format!("{provider_call_id:?}").contains(provider_call_id.as_str()));
+        let output = NormalizedModelOutput {
+            items: vec![
+                NormalizedModelOutputItem::Text {
+                    text: "SENTINEL_MODEL_OUTPUT_23".to_owned(),
+                },
+                NormalizedModelOutputItem::Refusal {
+                    text: "SENTINEL_MODEL_REFUSAL_23".to_owned(),
+                },
+                NormalizedModelOutputItem::ToolCall {
+                    call_id: "SENTINEL_PROVIDER_TOOL_CALL_ID_23".to_owned(),
+                    tool_name: ToolName::try_new("read_file").unwrap(),
+                    arguments_json: "{\"secret\":\"SENTINEL_TOOL_ARGUMENTS_23\"}".to_owned(),
+                },
+                NormalizedModelOutputItem::UnknownProviderItem {
+                    item_type: "SENTINEL_PROVIDER_ITEM_TYPE_23".to_owned(),
+                    sha256: Sha256Digest::hash_bytes(b"opaque"),
+                },
+            ],
+        };
+        let item_rendering = output
+            .items
+            .iter()
+            .map(|item| format!("{item:?}"))
+            .collect::<String>();
+        let output_rendering = format!("{output:?}");
+        for sentinel in [
+            "SENTINEL_MODEL_OUTPUT_23",
+            "SENTINEL_MODEL_REFUSAL_23",
+            "SENTINEL_TOOL_ARGUMENTS_23",
+            "SENTINEL_PROVIDER_TOOL_CALL_ID_23",
+            "SENTINEL_PROVIDER_ITEM_TYPE_23",
+        ] {
+            assert!(!item_rendering.contains(sentinel));
+            assert!(!output_rendering.contains(sentinel));
+        }
+        assert!(item_rendering.contains("argument_bytes"));
+        assert!(output_rendering.contains("item_count"));
     }
 }

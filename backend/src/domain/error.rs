@@ -1486,7 +1486,7 @@ mod tests {
     }
 
     #[test]
-    fn normalized_serialization_display_debug_and_source_are_strictly_safe() {
+    fn stage23_normalized_serialization_display_debug_and_source_are_strictly_safe() {
         let sentinels = [
             "Bearer-fake-token-sentinel-a1b2c3",
             "/private/absolute/path-sentinel-d4e5f6",

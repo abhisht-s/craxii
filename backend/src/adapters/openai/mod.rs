@@ -518,7 +518,7 @@ fn classify_http_error(
         _ => status_kind,
     };
     let retry_after = parse_retry_after(headers, now);
-    retry_after.map_or_else(
+    let error = retry_after.map_or_else(
         || ProviderError::new(kind, ProviderOutcomeCertainty::DefiniteProviderFailure),
         |delay| {
             ProviderError::with_retry_after(
@@ -527,7 +527,8 @@ fn classify_http_error(
                 delay,
             )
         },
-    )
+    );
+    error.with_http_evidence(status.as_u16(), provider_request_id(headers).ok().flatten())
 }
 
 fn classify_provider_error_code(code: Option<&str>) -> ProviderErrorKind {

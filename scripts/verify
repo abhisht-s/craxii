@@ -105,6 +105,9 @@ cargo deny --locked check licenses bans sources
 echo "Checking repository invariants"
 node scripts/check-public-repository.mjs
 
+echo "Checking Stage 23 observability and evidence invariants"
+node scripts/check-stage23-observability.mjs
+
 echo "Linting Markdown"
 npx --yes markdownlint-cli2@0.22.1 \
   AGENTS.md \

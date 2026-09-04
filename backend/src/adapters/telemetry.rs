@@ -1,6 +1,8 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::io::{self, IsTerminal, Write};
 use std::sync::Arc;
+#[cfg(feature = "test-failpoints")]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tracing::{Dispatch, Level, Metadata};
@@ -54,12 +56,12 @@ impl Telemetry {
 
         let span = tracing::info_span!(
             target: "craxii::bootstrap",
-            "bootstrap.startup",
+            "service_startup",
             subsystem = "bootstrap"
         );
         let _entered = span.enter();
         tracing::event!(
-            name: "bootstrap.startup",
+            name: "service_startup",
             target: "craxii::bootstrap",
             Level::INFO,
             event_name = "startup",
@@ -144,6 +146,56 @@ trait TelemetrySink: Send + Sync + 'static {
     fn write_all(&self, bytes: &[u8]) -> io::Result<()>;
 
     fn flush(&self) -> io::Result<()>;
+}
+
+#[cfg(feature = "test-failpoints")]
+struct TestTelemetrySink(Mutex<Vec<u8>>);
+
+#[cfg(feature = "test-failpoints")]
+impl TelemetrySink for TestTelemetrySink {
+    fn write_all(&self, bytes: &[u8]) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Test-only capture for the exact production formatter and filter composition.
+#[cfg(feature = "test-failpoints")]
+#[derive(Clone)]
+pub struct TestTelemetryCapture(Arc<TestTelemetrySink>);
+
+#[cfg(feature = "test-failpoints")]
+impl TestTelemetryCapture {
+    #[must_use]
+    pub fn output(&self) -> String {
+        String::from_utf8(
+            self.0
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("telemetry formatter emits UTF-8")
+    }
+}
+
+/// Builds the same dispatch used in production while routing bytes to a test capture.
+#[cfg(feature = "test-failpoints")]
+#[doc(hidden)]
+#[must_use]
+pub fn production_test_dispatch(config: &TracingConfig) -> (Dispatch, TestTelemetryCapture) {
+    let sink = Arc::new(TestTelemetrySink(Mutex::new(Vec::new())));
+    let erased_sink: Arc<dyn TelemetrySink> = sink.clone();
+    let telemetry = Telemetry::new(erased_sink);
+    let dispatch = build_dispatch(config, telemetry.writer(), false);
+    (dispatch, TestTelemetryCapture(sink))
 }
 
 struct StdoutSink;
@@ -261,14 +313,35 @@ mod tests {
 
     use serde_json::Value;
     use time::OffsetDateTime;
+    use tracing::{Instrument, instrument::WithSubscriber};
 
     use super::*;
+    use crate::application::observability::{SafePathClassification, SafePathKind, SafeUrlSummary};
     use crate::bootstrap::config;
     use crate::bootstrap::metadata::BuildMetadata;
     use crate::ports::clock::TestClock;
 
     const REVISION: &str = "2a69e5dd8d0a4f5f923405245e1c75d07ddc73c1";
     const SECRET_SENTINEL: &str = "telemetry-secret-sentinel";
+    const STAGE23_SENTINELS: [&str; 17] = [
+        "Authorization: Bearer SENTINEL_AUTH_23",
+        "SENTINEL_PROVIDER_API_KEY_23",
+        "SENTINEL_REQUEST_BODY_23",
+        "SENTINEL_USER_MESSAGE_23",
+        "SENTINEL_MODEL_PROMPT_23",
+        "SENTINEL_MODEL_OUTPUT_23",
+        "SENTINEL_MODEL_REFUSAL_23",
+        "SENTINEL_TOOL_ARGUMENTS_23",
+        "SENTINEL_SHELL_COMMAND_23",
+        "SENTINEL_STDOUT_23",
+        "SENTINEL_STDERR_23",
+        "SENTINEL_FILE_CONTENT_23",
+        "SENTINEL_ENV_SECRET_23",
+        "SENTINEL_URL_SECRET_23",
+        "/Users/sentinel/absolute/path/23",
+        "SENTINEL_PROVIDER_ERROR_BODY_23",
+        "SENTINEL_KEYCHAIN_TOKEN_23",
+    ];
 
     struct MemorySink(Mutex<Vec<u8>>);
 
@@ -345,6 +418,106 @@ mod tests {
                 .emit_startup_evidence(&process_metadata(), &Health::new())
                 .unwrap();
         });
+        sink.output()
+    }
+
+    async fn capture_stage23_flow(format: &str) -> String {
+        let sink = Arc::new(MemorySink::new());
+        let erased_sink: Arc<dyn TelemetrySink> = sink.clone();
+        let telemetry = Telemetry::new(erased_sink);
+        let dispatch = build_dispatch(&tracing_config(format, "info"), telemetry.writer(), false);
+        async {
+            let url = SafeUrlSummary::parse(
+                "https://user:SENTINEL_URL_SECRET_23@example.test/v1/hidden?SENTINEL_URL_SECRET_23#SENTINEL_URL_SECRET_23",
+                Some("/v1/conversations/:conversation_id/messages"),
+            );
+            let path = SafePathClassification::new(
+                SafePathKind::Workspace,
+                std::path::Path::new("/Users/sentinel/absolute/path/23"),
+                Some(std::path::Path::new("/Users/sentinel/absolute/path/23")),
+            );
+            let request = tracing::info_span!(
+                "http_request",
+                request_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b901",
+                method = "POST",
+                route_template = "/v1/conversations/:conversation_id/messages",
+                url = ?url,
+            );
+            async {
+                let command = tracing::info_span!(
+                    "client_command",
+                    client_message_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b902",
+                    conversation_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b903",
+                    work_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b904",
+                );
+                async {
+                    let work = tracing::info_span!(
+                        "work_execution",
+                        work_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b904",
+                        runtime_instance_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b905",
+                    );
+                    tokio::spawn(
+                        async move {
+                            let model = tracing::info_span!(
+                                "model_invocation_attempt",
+                                logical_invocation_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b906",
+                                model_invocation_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b907",
+                            );
+                            async {
+                                let tool = tracing::info_span!(
+                                    "tool_execution_service",
+                                    tool_execution_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b908",
+                                );
+                                async {
+                                    let workstation = tracing::info_span!(
+                                        "workstation_execute",
+                                        execution_id = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b909",
+                                        path = ?path,
+                                    );
+                                    async {
+                                        tracing::info!(
+                                            event_name = "execution_observed",
+                                            result_class = "outcome_unknown",
+                                            certainty = "unknown",
+                                            retryable = false,
+                                            output_bytes = 23_u64,
+                                        );
+                                    }
+                                    .instrument(workstation)
+                                    .await;
+                                }
+                                .instrument(tool)
+                                .await;
+                            }
+                            .instrument(model)
+                            .await;
+                            tracing::warn!(
+                                event_name = "work_terminal",
+                                owner = "scheduler_agent_loop",
+                                result_class = "outcome_unknown",
+                            );
+                        }
+                        .instrument(work)
+                        .with_current_subscriber(),
+                    )
+                    .await
+                    .unwrap();
+                    tracing::info!(
+                        event_name = "startup_recovery_summary",
+                        stale_runtime_count = 1_u64,
+                        model_attempts_unknown = 1_u64,
+                        tool_attempts_unknown = 1_u64,
+                    );
+                }
+                .instrument(command)
+                .await;
+            }
+            .instrument(request)
+            .await;
+        }
+        .with_subscriber(dispatch)
+        .await;
+        telemetry.verify_sink().unwrap();
         sink.output()
     }
 
@@ -481,6 +654,31 @@ mod tests {
         assert_eq!(record["recovery_truth"], false);
         assert!(record.get("journal_offset").is_none());
         assert!(record.get("journal_event").is_none());
+    }
+
+    #[tokio::test]
+    async fn stage23_flow_is_correlated_across_spawned_tasks_and_secret_free() {
+        for format in ["pretty", "json"] {
+            let output = capture_stage23_flow(format).await;
+            for expected in [
+                "http_request",
+                "client_command",
+                "work_execution",
+                "model_invocation_attempt",
+                "tool_execution_service",
+                "workstation_execute",
+                "01890f6c-7b3a-7cc0-98f1-2e6f7a8b901",
+                "01890f6c-7b3a-7cc0-98f1-2e6f7a8b909",
+                "startup_recovery_summary",
+            ] {
+                assert!(output.contains(expected), "missing {expected} in {format}");
+            }
+            for sentinel in STAGE23_SENTINELS {
+                assert!(!output.contains(sentinel), "{format} leaked {sentinel}");
+            }
+            assert_eq!(output.matches("work_terminal").count(), 1);
+            assert_eq!(output.matches("scheduler_agent_loop").count(), 1);
+        }
     }
 
     #[test]

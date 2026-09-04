@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+
+for command in cargo node; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    printf 'error: %s is required for the Stage 23 observability gate\n' "${command}" >&2
+    exit 127
+  fi
+done
+
+cd "${repository_root}"
+
+printf '%s\n' 'Checking Stage 23 structural observability boundaries'
+node scripts/check-stage23-observability.mjs
+
+printf '%s\n' 'Testing typed telemetry, redaction, read-only evidence, and safe rendering'
+cargo test --locked -p craxii-server --lib stage23_ -- --test-threads=1
+cargo test --locked -p craxii-server --lib \
+  debug_redacts_text_tool_arguments_and_opaque_payloads
+cargo test --locked -p craxii-server --lib \
+  execution_debug_and_errors_redact_command_cwd_environment_and_output_canaries
+cargo test --locked -p craxii-server --bin craxii-admin \
+  cli_accepts_device_and_stage23_offline_operations_only
+
+printf '%s\n' 'Testing actual WebSocket replay accounting and request-to-work behavior'
+cargo test --locked -p craxii-server --features test-failpoints --test stage23 \
+  production_json_reconstructs_request_command_work_and_model_attempt \
+  -- --exact --test-threads=1
+cargo test --locked -p craxii-server --features test-failpoints --test stage18 \
+  authenticated_http_machine_inspection_failures_idempotency_replay_and_cold_continuity \
+  -- --exact --test-threads=1
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if ! command -v swift >/dev/null 2>&1; then
+    printf '%s\n' 'error: swift is required for the Stage 23 macOS diagnostic gate' >&2
+    exit 127
+  fi
+  printf '%s\n' 'Testing typed native diagnostics without reading unified logs or Keychain'
+  swift test --package-path clients/macos/CraxiiClient \
+    --filter typedClientDiagnosticsCorrelateRequestsAndExcludeContentAndCredentials
+  swift test --package-path clients/macos/CraxiiClient \
+    --filter nativeHTTPAdapterBuildsTransientAuthAndHonorsResponseBound
+else
+  printf '%s\n' 'STAGE_23_NATIVE_DIAGNOSTICS: NOT_RUN_NON_MACOS_HOST'
+fi
+
+printf '%s\n' 'STAGE_23_OBSERVABILITY_EVIDENCE_REDACTION: PASSED'
