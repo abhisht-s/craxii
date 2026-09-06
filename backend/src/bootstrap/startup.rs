@@ -372,7 +372,7 @@ pub async fn run(
                 live_events.clone() as Arc<dyn DraftSink>,
                 model_clock,
                 Box::new(SystemJitter),
-                ModelGatewayLimits::default(),
+                configured_model_gateway_limits(&config)?,
             )
             .map_err(|_| StartupError::ProviderComposition)?,
         );
@@ -403,7 +403,7 @@ pub async fn run(
                     workspace: snapshot.workspace.clone(),
                     authority_constraints: V0AuthorityConstraints::default(),
                 },
-                AgentLoopLimits::default(),
+                configured_agent_loop_limits(&config)?,
             )
             .map_err(|_| StartupError::ProviderComposition)?,
         );
@@ -459,6 +459,46 @@ pub async fn run(
         live_events,
         server,
         fatal_receiver,
+    })
+}
+
+fn configured_model_gateway_limits(
+    config: &config::ValidatedConfig,
+) -> Result<ModelGatewayLimits, StartupError> {
+    let gateway = config.model_gateway();
+    let agent = config.limits().agent();
+    Ok(ModelGatewayLimits {
+        maximum_attempts_per_logical_invocation: u32::try_from(
+            gateway.max_attempts_per_invocation(),
+        )
+        .map_err(|_| StartupError::Configuration)?,
+        maximum_attempts_per_work: u32::try_from(agent.max_model_attempts_per_work())
+            .map_err(|_| StartupError::Configuration)?,
+        provider_invocation_limit: std::time::Duration::from_millis(
+            gateway.invocation_timeout_ms(),
+        ),
+        stream_idle_limit: std::time::Duration::from_millis(gateway.response_idle_timeout_ms()),
+        maximum_ordered_output_items_per_response: usize::try_from(
+            agent.max_ordered_output_items_per_response(),
+        )
+        .map_err(|_| StartupError::Configuration)?,
+        maximum_raw_tool_argument_bytes: usize::try_from(agent.max_raw_tool_argument_bytes())
+            .map_err(|_| StartupError::Configuration)?,
+    })
+}
+
+fn configured_agent_loop_limits(
+    config: &config::ValidatedConfig,
+) -> Result<AgentLoopLimits, StartupError> {
+    let agent = config.limits().agent();
+    Ok(AgentLoopLimits {
+        model_steps_per_work: u32::try_from(agent.max_model_steps_per_work())
+            .map_err(|_| StartupError::Configuration)?,
+        provider_attempts_per_work: u32::try_from(agent.max_model_attempts_per_work())
+            .map_err(|_| StartupError::Configuration)?,
+        tool_calls_per_work: u32::try_from(agent.max_tool_calls_per_work())
+            .map_err(|_| StartupError::Configuration)?,
+        work_duration: std::time::Duration::from_millis(agent.max_work_item_duration_ms()),
     })
 }
 
@@ -857,6 +897,69 @@ mod tests {
         let mut output = Vec::new();
         write_fatal_diagnostic(&mut output, &StartupError::Configuration).unwrap();
         assert_eq!(output, b"craxii fatal: invalid_configuration\n");
+    }
+
+    #[test]
+    fn validated_nondefault_limits_are_wired_into_runtime_components() {
+        let source = include_str!("../../tests/fixtures/config/valid/local.toml")
+            .replace(
+                "max_attempts_per_invocation = 3",
+                "max_attempts_per_invocation = 2",
+            )
+            .replace(
+                "invocation_timeout_ms = 300000",
+                "invocation_timeout_ms = 120000",
+            )
+            .replace(
+                "response_idle_timeout_ms = 60000",
+                "response_idle_timeout_ms = 30000",
+            )
+            .replace(
+                "max_model_steps_per_work = 16",
+                "max_model_steps_per_work = 3",
+            )
+            .replace(
+                "max_model_attempts_per_work = 32",
+                "max_model_attempts_per_work = 5",
+            )
+            .replace(
+                "max_tool_calls_per_work = 32",
+                "max_tool_calls_per_work = 4",
+            )
+            .replace(
+                "max_ordered_output_items_per_response = 64",
+                "max_ordered_output_items_per_response = 7",
+            )
+            .replace(
+                "max_raw_tool_argument_bytes = 65536",
+                "max_raw_tool_argument_bytes = 2048",
+            )
+            .replace(
+                "max_work_item_duration_ms = 1800000",
+                "max_work_item_duration_ms = 900000",
+            );
+        let config = config::parse(&source).unwrap();
+
+        assert_eq!(
+            configured_model_gateway_limits(&config).unwrap(),
+            ModelGatewayLimits {
+                maximum_attempts_per_logical_invocation: 2,
+                maximum_attempts_per_work: 5,
+                provider_invocation_limit: std::time::Duration::from_secs(120),
+                stream_idle_limit: std::time::Duration::from_secs(30),
+                maximum_ordered_output_items_per_response: 7,
+                maximum_raw_tool_argument_bytes: 2_048,
+            }
+        );
+        assert_eq!(
+            configured_agent_loop_limits(&config).unwrap(),
+            AgentLoopLimits {
+                model_steps_per_work: 3,
+                provider_attempts_per_work: 5,
+                tool_calls_per_work: 4,
+                work_duration: std::time::Duration::from_secs(15 * 60),
+            }
+        );
     }
 
     #[test]

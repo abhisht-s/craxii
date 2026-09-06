@@ -110,7 +110,7 @@ async fn live_openai_production_path_persists_tool_and_final_completion() {
         &client_message_id.to_string(),
         &body,
     );
-    assert_eq!(response.0, 200);
+    assert_eq!(response.0, 202);
     let response: Value = serde_json::from_slice(&response.1).expect("message response JSON");
     let work_id: WorkId = response["work_id"]
         .as_str()

@@ -1,5 +1,7 @@
 #![cfg(all(feature = "test-failpoints", unix))]
 
+#[path = "support/headless_client.rs"]
+mod headless_client;
 #[path = "support/stage18_harness.rs"]
 mod stage18_harness;
 #[path = "support/stage24_harness.rs"]

@@ -1,5 +1,6 @@
 //! Provider-neutral durable model-attempt orchestration.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -9,7 +10,10 @@ use crate::application::observability::SafeProviderCorrelation;
 
 use crate::application::context_assembler::ContextAssemblyResult;
 use crate::application::model_selection::{ModelSelectionReason, ModelSelectionResult};
-use crate::domain::model::{ModelUsage as CanonicalModelUsage, RequiredModelCapabilities};
+use crate::domain::model::{
+    MAX_MODEL_OUTPUT_ITEMS, MAX_MODEL_TOOL_ARGUMENT_BYTES, ModelUsage as CanonicalModelUsage,
+    RequiredModelCapabilities,
+};
 use crate::domain::{
     AgentStepNo, ArtifactEncoding, ArtifactId, ArtifactLogicalName, ArtifactMimeType,
     ArtifactProducer, ArtifactReference, ArtifactReferenceInput, ArtifactRetention,
@@ -40,6 +44,7 @@ use crate::ports::state_store::{
 };
 
 const MAX_STREAM_EVENTS: usize = 4_096;
+const MAX_PROVIDER_ATTEMPTS_PER_WORK: u32 = 32;
 
 /// Provider-neutral, already-validated semantic delta offered to future delivery code.
 #[derive(Clone, Eq, PartialEq)]
@@ -115,6 +120,8 @@ pub struct ModelGatewayLimits {
     pub maximum_attempts_per_work: u32,
     pub provider_invocation_limit: Duration,
     pub stream_idle_limit: Duration,
+    pub maximum_ordered_output_items_per_response: usize,
+    pub maximum_raw_tool_argument_bytes: usize,
 }
 
 impl Default for ModelGatewayLimits {
@@ -124,16 +131,28 @@ impl Default for ModelGatewayLimits {
             maximum_attempts_per_work: 32,
             provider_invocation_limit: DEFAULT_PROVIDER_INVOCATION_LIMIT,
             stream_idle_limit: DEFAULT_PROVIDER_IDLE_TIMEOUT,
+            maximum_ordered_output_items_per_response: MAX_MODEL_OUTPUT_ITEMS,
+            maximum_raw_tool_argument_bytes: MAX_MODEL_TOOL_ARGUMENT_BYTES,
         }
     }
 }
 
 impl ModelGatewayLimits {
     fn validate(self) -> Result<Self, ModelGatewayError> {
-        if self.maximum_attempts_per_logical_invocation != MAX_PROVIDER_ATTEMPTS
-            || self.maximum_attempts_per_work != 32
-            || self.provider_invocation_limit != DEFAULT_PROVIDER_INVOCATION_LIMIT
-            || self.stream_idle_limit != DEFAULT_PROVIDER_IDLE_TIMEOUT
+        if self.maximum_attempts_per_logical_invocation == 0
+            || self.maximum_attempts_per_logical_invocation > MAX_PROVIDER_ATTEMPTS
+            || self.maximum_attempts_per_work == 0
+            || self.maximum_attempts_per_work > MAX_PROVIDER_ATTEMPTS_PER_WORK
+            || self.maximum_attempts_per_logical_invocation > self.maximum_attempts_per_work
+            || self.provider_invocation_limit.is_zero()
+            || self.provider_invocation_limit > DEFAULT_PROVIDER_INVOCATION_LIMIT
+            || self.stream_idle_limit.is_zero()
+            || self.stream_idle_limit > DEFAULT_PROVIDER_IDLE_TIMEOUT
+            || self.stream_idle_limit > self.provider_invocation_limit
+            || self.maximum_ordered_output_items_per_response == 0
+            || self.maximum_ordered_output_items_per_response > MAX_MODEL_OUTPUT_ITEMS
+            || self.maximum_raw_tool_argument_bytes == 0
+            || self.maximum_raw_tool_argument_bytes > MAX_MODEL_TOOL_ARGUMENT_BYTES
         {
             return Err(ModelGatewayError::InvalidComposition);
         }
@@ -811,7 +830,10 @@ impl ModelGateway {
             }
         };
 
-        let mut accumulator = CanonicalStreamAccumulator::new();
+        let mut accumulator = CanonicalStreamAccumulator::new(
+            self.limits.maximum_ordered_output_items_per_response,
+            self.limits.maximum_raw_tool_argument_bytes,
+        );
         let mut model_state = ModelInvocationState::Requesting;
         let mut last_attempt_event = started_event;
         let mut first_byte_at = None;
@@ -2114,16 +2136,25 @@ struct CanonicalStreamAccumulator {
     provider_request_id: Option<String>,
     provider_response_id: Option<String>,
     usage: Option<CanonicalModelUsage>,
+    maximum_ordered_output_items_per_response: usize,
+    maximum_raw_tool_argument_bytes: usize,
+    tool_argument_bytes: BTreeMap<String, usize>,
 }
 
 impl CanonicalStreamAccumulator {
-    fn new() -> Self {
+    fn new(
+        maximum_ordered_output_items_per_response: usize,
+        maximum_raw_tool_argument_bytes: usize,
+    ) -> Self {
         Self {
             events: Vec::new(),
             semantic_output_observed: false,
             provider_request_id: None,
             provider_response_id: None,
             usage: None,
+            maximum_ordered_output_items_per_response,
+            maximum_raw_tool_argument_bytes,
+            tool_argument_bytes: BTreeMap::new(),
         }
     }
 
@@ -2131,6 +2162,7 @@ impl CanonicalStreamAccumulator {
         if self.events.len() >= MAX_STREAM_EVENTS {
             return Err(ModelContractErrorKind::NormalizedOutputTooLarge);
         }
+        self.enforce_configured_content_limits(&event)?;
         if let ModelStreamEvent::ResponseStarted {
             provider_request_id,
             provider_response_id,
@@ -2152,6 +2184,67 @@ impl CanonicalStreamAccumulator {
         validate_model_stream(&self.events)
             .map(|_| ())
             .map_err(|error| error.kind())
+    }
+
+    fn enforce_configured_content_limits(
+        &mut self,
+        event: &ModelStreamEvent,
+    ) -> Result<(), ModelContractErrorKind> {
+        let item_ordinal = match event {
+            ModelStreamEvent::TextDelta { item_ordinal, .. }
+            | ModelStreamEvent::ReasoningSummaryDelta { item_ordinal, .. }
+            | ModelStreamEvent::ToolCallStarted { item_ordinal, .. }
+            | ModelStreamEvent::ToolArgumentDelta { item_ordinal, .. }
+            | ModelStreamEvent::ToolCallCompleted { item_ordinal, .. }
+            | ModelStreamEvent::RefusalDelta { item_ordinal, .. }
+            | ModelStreamEvent::RefusalCompleted { item_ordinal }
+            | ModelStreamEvent::StructuredData { item_ordinal, .. } => Some(*item_ordinal),
+            _ => None,
+        };
+        if item_ordinal.is_some_and(|ordinal| {
+            usize::try_from(ordinal)
+                .ok()
+                .is_none_or(|ordinal| ordinal >= self.maximum_ordered_output_items_per_response)
+        }) {
+            return Err(ModelContractErrorKind::TooManyOutputItems);
+        }
+
+        match event {
+            ModelStreamEvent::ToolCallStarted { call_id, .. } => {
+                self.tool_argument_bytes
+                    .entry(call_id.as_str().to_owned())
+                    .or_insert(0);
+            }
+            ModelStreamEvent::ToolArgumentDelta { call_id, delta, .. } => {
+                let bytes = self
+                    .tool_argument_bytes
+                    .entry(call_id.as_str().to_owned())
+                    .or_insert(0);
+                *bytes = bytes.saturating_add(delta.len());
+                if *bytes > self.maximum_raw_tool_argument_bytes {
+                    return Err(ModelContractErrorKind::ToolArgumentsTooLarge);
+                }
+            }
+            ModelStreamEvent::ToolCallCompleted { call, .. } => {
+                if call.raw_arguments().len() > self.maximum_raw_tool_argument_bytes {
+                    return Err(ModelContractErrorKind::ToolArgumentsTooLarge);
+                }
+            }
+            ModelStreamEvent::Completed(response) => {
+                if response.output_items().len() > self.maximum_ordered_output_items_per_response {
+                    return Err(ModelContractErrorKind::TooManyOutputItems);
+                }
+                if response.output_items().iter().any(|item| {
+                    item.tool_call().is_some_and(|call| {
+                        call.raw_arguments().len() > self.maximum_raw_tool_argument_bytes
+                    })
+                }) {
+                    return Err(ModelContractErrorKind::ToolArgumentsTooLarge);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn finish(&self) -> Result<StreamTerminal, ModelContractErrorKind> {
@@ -2815,6 +2908,15 @@ mod tests {
         provider: Arc<dyn ModelProvider>,
         clock: Arc<TestClock>,
     ) -> ModelGateway {
+        build_gateway_with_limits(store, provider, clock, ModelGatewayLimits::default())
+    }
+
+    fn build_gateway_with_limits(
+        store: Arc<FakeGatewayStore>,
+        provider: Arc<dyn ModelProvider>,
+        clock: Arc<TestClock>,
+        limits: ModelGatewayLimits,
+    ) -> ModelGateway {
         ModelGateway::new(
             store,
             Arc::new(RejectingArtifactStore),
@@ -2822,7 +2924,7 @@ mod tests {
             Arc::new(NoopDraftSink),
             clock,
             Box::new(MinimumJitter),
-            ModelGatewayLimits::default(),
+            limits,
         )
         .unwrap()
     }
@@ -2850,11 +2952,72 @@ mod tests {
     }
 
     #[test]
-    fn frozen_limits_are_exact_and_noop_drafts_are_never_exposed() {
+    fn frozen_defaults_remain_exact_and_safe_nondefault_limits_are_accepted() {
         let limits = ModelGatewayLimits::default().validate().unwrap();
         assert_eq!(limits.maximum_attempts_per_logical_invocation, 3);
         assert_eq!(limits.maximum_attempts_per_work, 32);
+        assert_eq!(limits.provider_invocation_limit, Duration::from_secs(300));
+        assert_eq!(limits.stream_idle_limit, Duration::from_secs(60));
+        assert_eq!(limits.maximum_ordered_output_items_per_response, 64);
+        assert_eq!(limits.maximum_raw_tool_argument_bytes, 65_536);
+
+        let configured = ModelGatewayLimits {
+            maximum_attempts_per_logical_invocation: 2,
+            maximum_attempts_per_work: 5,
+            provider_invocation_limit: Duration::from_secs(120),
+            stream_idle_limit: Duration::from_secs(30),
+            maximum_ordered_output_items_per_response: 7,
+            maximum_raw_tool_argument_bytes: 2_048,
+        };
+        assert_eq!(configured.validate().unwrap(), configured);
+        assert!(matches!(
+            ModelGatewayLimits {
+                stream_idle_limit: Duration::from_secs(121),
+                ..configured
+            }
+            .validate(),
+            Err(ModelGatewayError::InvalidComposition)
+        ));
         let _jitter: Box<dyn FullJitterSource + Send> = Box::new(MinimumJitter);
+    }
+
+    #[test]
+    fn configured_content_limits_are_enforced_by_the_stream_accumulator() {
+        let target = gateway_fixture().target;
+        let started = ModelStreamEvent::ResponseStarted {
+            target: target.identity(),
+            provider_request_id: None,
+            provider_response_id: None,
+        };
+
+        let mut items = CanonicalStreamAccumulator::new(1, 64);
+        items.observe(started.clone()).unwrap();
+        assert_eq!(
+            items.observe(ModelStreamEvent::TextDelta {
+                item_ordinal: 1,
+                delta: ModelTextPart::try_new("too many").unwrap(),
+            }),
+            Err(ModelContractErrorKind::TooManyOutputItems)
+        );
+
+        let call_id = crate::domain::ModelToolCallId::try_new("configured-limit-call").unwrap();
+        let mut arguments = CanonicalStreamAccumulator::new(2, 4);
+        arguments.observe(started).unwrap();
+        arguments
+            .observe(ModelStreamEvent::ToolCallStarted {
+                item_ordinal: 0,
+                call_id: call_id.clone(),
+                name: crate::domain::ToolName::try_new("run_shell").unwrap(),
+            })
+            .unwrap();
+        assert_eq!(
+            arguments.observe(ModelStreamEvent::ToolArgumentDelta {
+                item_ordinal: 0,
+                call_id,
+                delta: "12345".to_owned(),
+            }),
+            Err(ModelContractErrorKind::ToolArgumentsTooLarge)
+        );
     }
 
     #[test]
@@ -3084,6 +3247,37 @@ mod tests {
         ));
         assert_eq!(provider.invocation_count(), 3);
         assert_eq!(store.attempts().len(), 3);
+
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![
+                program(&fixture, 1, 1, vec![ScriptedStep::Fail(retryable())]),
+                program(&fixture, 2, 2, vec![ScriptedStep::Fail(retryable())]),
+            ],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::default());
+        let gateway = build_gateway_with_limits(
+            store.clone(),
+            provider.clone(),
+            fixture.clock.clone(),
+            ModelGatewayLimits {
+                maximum_attempts_per_logical_invocation: 2,
+                ..ModelGatewayLimits::default()
+            },
+        );
+        let (_, receiver) = tokio::sync::watch::channel(false);
+        let result = gateway.invoke(invocation(fixture, receiver)).await.unwrap();
+        assert!(matches!(
+            result,
+            DurableModelOutcome::Failed {
+                retries_exhausted: true,
+                ..
+            }
+        ));
+        assert_eq!(provider.invocation_count(), 2);
+        assert_eq!(store.attempts().len(), 2);
 
         let fixture = gateway_fixture();
         let provider = Arc::new(ScriptedProvider::with_clock(

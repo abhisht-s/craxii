@@ -66,10 +66,15 @@ impl Default for AgentLoopLimits {
 
 impl AgentLoopLimits {
     fn validate(self) -> Result<Self, AgentLoopError> {
-        if self.model_steps_per_work != MAX_MODEL_STEPS_PER_WORK
-            || self.provider_attempts_per_work != MAX_PROVIDER_ATTEMPTS_PER_WORK
-            || self.tool_calls_per_work != MAX_TOOL_CALLS_PER_WORK
-            || self.work_duration != MAX_WORK_DURATION
+        if self.model_steps_per_work == 0
+            || self.model_steps_per_work > MAX_MODEL_STEPS_PER_WORK
+            || self.provider_attempts_per_work == 0
+            || self.provider_attempts_per_work > MAX_PROVIDER_ATTEMPTS_PER_WORK
+            || self.provider_attempts_per_work < self.model_steps_per_work
+            || self.tool_calls_per_work == 0
+            || self.tool_calls_per_work > MAX_TOOL_CALLS_PER_WORK
+            || self.work_duration.is_zero()
+            || self.work_duration > MAX_WORK_DURATION
         {
             return Err(AgentLoopError::InvalidComposition);
         }
@@ -845,11 +850,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn frozen_agent_loop_limits_are_exact() {
+    fn frozen_defaults_remain_exact_and_safe_nondefault_limits_are_accepted() {
         let limits = AgentLoopLimits::default().validate().unwrap();
         assert_eq!(limits.model_steps_per_work, 16);
         assert_eq!(limits.provider_attempts_per_work, 32);
         assert_eq!(limits.tool_calls_per_work, 32);
         assert_eq!(limits.work_duration, Duration::from_secs(30 * 60));
+
+        let configured = AgentLoopLimits {
+            model_steps_per_work: 3,
+            provider_attempts_per_work: 5,
+            tool_calls_per_work: 4,
+            work_duration: Duration::from_secs(15 * 60),
+        };
+        assert_eq!(configured.validate().unwrap(), configured);
+        assert!(matches!(
+            AgentLoopLimits {
+                provider_attempts_per_work: 2,
+                ..configured
+            }
+            .validate(),
+            Err(AgentLoopError::InvalidComposition)
+        ));
     }
 }

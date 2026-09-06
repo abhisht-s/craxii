@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/Users/abhisht/.cargo/bin:${PATH:-/usr/bin:/bin}"
+cd "${repository_root}"
+
+if [[ "$#" -ne 0 ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: ARGUMENTS_FORBIDDEN" >&2
+  exit 2
+fi
+if [[ "${CRAXII_STAGE25_LIVE:-}" != "1" ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: LIVE_OPT_IN_REQUIRED" >&2
+  exit 2
+fi
+
+for raw_key_name in OPENAI_API_KEY OPENAI_KEY CRAXII_OPENAI_API_KEY CRAXII_STAGE25_OPENAI_API_KEY; do
+  if printenv "${raw_key_name}" >/dev/null 2>&1; then
+    echo "STAGE_25_OPENAI_HEADLESS: RAW_KEY_ENVIRONMENT_FORBIDDEN" >&2
+    exit 2
+  fi
+done
+
+credential_directory="/Users/abhisht/.config/craxii/credentials"
+# Expected raw secret file: /Users/abhisht/.config/craxii/credentials/openai_stage25
+credential_path="${credential_directory}/openai_stage25"
+
+if [[ ! -d "${credential_directory}" || -L "${credential_directory}" ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: CREDENTIAL_DIRECTORY_UNSAFE_OR_MISSING" >&2
+  exit 2
+fi
+if [[ ! -f "${credential_path}" || -L "${credential_path}" ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: CREDENTIAL_FILE_UNSAFE_OR_MISSING" >&2
+  exit 2
+fi
+
+stat_mode() {
+  if stat -f '%Lp' "$1" >/dev/null 2>&1; then
+    stat -f '%Lp' "$1"
+  else
+    stat -c '%a' "$1"
+  fi
+}
+
+if [[ "$(stat_mode "${credential_directory}")" != "700" ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: CREDENTIAL_DIRECTORY_MODE_MUST_BE_0700" >&2
+  exit 2
+fi
+if [[ "$(stat_mode "${credential_path}")" != "600" ]]; then
+  echo "STAGE_25_OPENAI_HEADLESS: CREDENTIAL_FILE_MODE_MUST_BE_0600" >&2
+  exit 2
+fi
+
+umask 077
+report_directory="$(mktemp -d "${TMPDIR:-/tmp}/craxii-stage25-report.XXXXXX")"
+chmod 700 "${report_directory}"
+export CRAXII_STAGE25_REPORT_PATH="${report_directory}/stage25-acceptance.json"
+
+if cargo test --locked -p craxii-server --test stage25 \
+  live_openai_headless_canonical_restart_follow_up -- --ignored --exact --nocapture; then
+  echo "STAGE_25_OPENAI_HEADLESS: PASS"
+  echo "STAGE_25_ACCEPTANCE_REPORT: ${CRAXII_STAGE25_REPORT_PATH}"
+else
+  echo "STAGE_25_OPENAI_HEADLESS: FAIL" >&2
+  if [[ -f "${CRAXII_STAGE25_REPORT_PATH}" ]]; then
+    echo "STAGE_25_REDACTED_FAILURE_REPORT: ${CRAXII_STAGE25_REPORT_PATH}" >&2
+  else
+    rmdir "${report_directory}" 2>/dev/null || true
+  fi
+  exit 1
+fi

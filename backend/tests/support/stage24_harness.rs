@@ -25,15 +25,14 @@ use craxii_server::ports::model_provider::{
     ProviderError, ProviderErrorKind, ProviderOutcomeCertainty,
 };
 use craxii_server::ports::state_store::BootstrapStateStore as _;
-use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::{Connection as _, Row as _};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::headless_client::{
+    HeadlessClient as Stage24Client, Socket, assert_durable_cursor_contract,
+    next_json_with_timeout, signal_owned_process_group, through_sync,
+};
 use crate::stage18_harness::{
     EstimatorMode, MachineFacts, ProgramPlan, Stage18Harness, Stage18Root, ToolPlan, programs,
 };
@@ -58,8 +57,6 @@ const CHILD_ROOT_ENV: &str = "CRAXII_STAGE24_CHILD_ROOT";
 const CHILD_PHASE_ENV: &str = "CRAXII_STAGE24_CHILD_PHASE";
 const FILE_WAIT: Duration = Duration::from_secs(30);
 const FAILURE_CLEANUP_WAIT: Duration = Duration::from_secs(8);
-
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 fn expected_first_answer(facts: &MachineFacts) -> String {
     format!(
@@ -800,17 +797,6 @@ pub fn validate_frozen_contract(
     Ok(())
 }
 
-struct HttpResponse {
-    status: u16,
-    body: Value,
-}
-
-struct Stage24Client {
-    authority: String,
-    bearer: String,
-    conversation_id: String,
-}
-
 struct Stage24ScenarioGuard {
     root: PathBuf,
     child: Option<Child>,
@@ -939,99 +925,6 @@ fn remove_stage24_root(root: &Path) {
     }
 }
 
-impl Stage24Client {
-    fn new(ready: &ReadyRecord) -> Self {
-        Self {
-            authority: ready.authority.clone(),
-            bearer: ready.bearer.clone(),
-            conversation_id: ready.conversation_id.clone(),
-        }
-    }
-
-    async fn submit(&self, text: &str, client_message_id: &str) -> HttpResponse {
-        let body = serde_json::to_vec(&json!({
-            "protocol_version": 1,
-            "client_message_id": client_message_id,
-            "content": [{"type": "text", "text": text}],
-        }))
-        .unwrap();
-        self.http(
-            "POST",
-            &format!("/v1/conversations/{}/messages", self.conversation_id),
-            Some(&body),
-            Some(client_message_id),
-        )
-        .await
-    }
-
-    async fn bootstrap(&self) -> HttpResponse {
-        self.http("GET", "/v1/bootstrap", None, None).await
-    }
-
-    async fn http(
-        &self,
-        method: &str,
-        path: &str,
-        body: Option<&[u8]>,
-        idempotency_key: Option<&str>,
-    ) -> HttpResponse {
-        let mut stream = TcpStream::connect(&self.authority)
-            .await
-            .expect("connect Stage 24 HTTP client");
-        let body = body.unwrap_or_default();
-        let mut request = format!(
-            "{method} {path} HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n",
-            self.authority, self.bearer
-        );
-        if let Some(value) = idempotency_key {
-            request.push_str(&format!("Idempotency-Key: {value}\r\n"));
-        }
-        if !body.is_empty() {
-            request.push_str(&format!(
-                "Content-Type: application/json\r\nContent-Length: {}\r\n",
-                body.len()
-            ));
-        }
-        request.push_str("\r\n");
-        stream.write_all(request.as_bytes()).await.unwrap();
-        stream.write_all(body).await.unwrap();
-        let mut bytes = Vec::new();
-        stream.read_to_end(&mut bytes).await.unwrap();
-        parse_http_response(&bytes)
-    }
-
-    async fn websocket(&self, after: u64) -> Socket {
-        let url = format!("ws://{}/v1/events?after={after}", self.authority);
-        let mut request = url.into_client_request().unwrap();
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {}", self.bearer).parse().unwrap(),
-        );
-        tokio_tungstenite::connect_async(request).await.unwrap().0
-    }
-}
-
-fn parse_http_response(bytes: &[u8]) -> HttpResponse {
-    let split = bytes
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .expect("HTTP header terminator");
-    let headers = std::str::from_utf8(&bytes[..split]).unwrap();
-    let status = headers
-        .lines()
-        .next()
-        .unwrap()
-        .split_whitespace()
-        .nth(1)
-        .unwrap()
-        .parse()
-        .unwrap();
-    HttpResponse {
-        status,
-        body: serde_json::from_slice(&bytes[split + 4..]).expect("JSON HTTP response"),
-    }
-}
-
 pub async fn run_canonical_scenario(label: &str) -> NormalizedStage24Evidence {
     let root_path = Stage18Root::new(&format!("stage24-{label}")).preserve();
     let root = Stage18Root::from_existing(root_path.clone());
@@ -1060,7 +953,11 @@ pub async fn run_canonical_scenario(label: &str) -> NormalizedStage24Evidence {
         PathBuf::from(&first_ready.workspace_root),
         canonical_workspace
     );
-    let first_client = Stage24Client::new(&first_ready);
+    let first_client = Stage24Client::from_parts(
+        first_ready.authority.clone(),
+        first_ready.bearer.clone(),
+        first_ready.conversation_id.clone(),
+    );
     let mut first_socket = first_client.websocket(0).await;
     let initial_sync = through_sync(&mut first_socket).await;
     assert!(
@@ -1150,7 +1047,11 @@ pub async fn run_canonical_scenario(label: &str) -> NormalizedStage24Evidence {
     assert_eq!(first_ready.workspace_id, second_ready.workspace_id);
     assert_eq!(first_ready.workspace_root, second_ready.workspace_root);
 
-    let second_client = Stage24Client::new(&second_ready);
+    let second_client = Stage24Client::from_parts(
+        second_ready.authority.clone(),
+        second_ready.bearer.clone(),
+        second_ready.conversation_id.clone(),
+    );
     let mut second_socket = second_client.websocket(saved_cursor).await;
     let reconnect_frames = through_sync(&mut second_socket).await;
     assert_reconnect_cursor_contract(&reconnect_frames, saved_cursor, &pre_saved_event_ids);
@@ -1308,21 +1209,6 @@ fn spawn_child(root: &Path, phase: &str) -> Child {
         .expect("spawn Stage 24 runtime child in its owned process group")
 }
 
-fn signal_owned_process_group(child: &Child, signal: i32) -> std::io::Result<()> {
-    let process_group = i32::try_from(child.id()).unwrap();
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    // SAFETY: spawn_child makes the child's PID the ID of a dedicated process group. A negative
-    // target therefore reaches only the Stage 24 runtime and descendants that it owns.
-    let result = unsafe { kill(-process_group, signal) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
-}
-
 fn kill_and_reap(child: Child) -> Output {
     signal_owned_process_group(&child, 9).expect("kill owned Stage 24 process group");
     child
@@ -1413,38 +1299,7 @@ fn write_configuration(root: &Stage18Root) -> PathBuf {
 }
 
 async fn next_json(socket: &mut Socket) -> Value {
-    loop {
-        let message = tokio::time::timeout(Duration::from_secs(20), socket.next())
-            .await
-            .expect("Stage 24 WebSocket frame timeout")
-            .expect("Stage 24 WebSocket closed")
-            .expect("Stage 24 WebSocket frame");
-        match message {
-            tokio_tungstenite::tungstenite::Message::Text(text) => {
-                return serde_json::from_str(&text).unwrap();
-            }
-            tokio_tungstenite::tungstenite::Message::Ping(bytes) => {
-                socket
-                    .send(tokio_tungstenite::tungstenite::Message::Pong(bytes))
-                    .await
-                    .unwrap();
-            }
-            tokio_tungstenite::tungstenite::Message::Pong(_) => {}
-            other => panic!("unexpected Stage 24 WebSocket frame: {other:?}"),
-        }
-    }
-}
-
-async fn through_sync(socket: &mut Socket) -> Vec<Value> {
-    let mut frames = Vec::new();
-    loop {
-        let frame = next_json(socket).await;
-        let complete = frame["event_type"] == "sync.complete";
-        frames.push(frame);
-        if complete {
-            return frames;
-        }
-    }
+    next_json_with_timeout(socket, Duration::from_secs(20)).await
 }
 
 async fn through_terminal_work(socket: &mut Socket, work_id: &str) -> Vec<Value> {
@@ -1502,23 +1357,6 @@ fn assert_live_contract(frames: &[Value], work_id: &str, final_answer: &str, too
     let encoded = serde_json::to_string(frames).unwrap();
     assert!(!encoded.contains(FIXTURE_CONTENT.trim()));
     assert!(!encoded.contains("credential_canary=absent"));
-}
-
-fn assert_durable_cursor_contract(frames: &[Value]) {
-    let durable: Vec<&Value> = frames
-        .iter()
-        .filter(|frame| frame["delivery_kind"] == "durable")
-        .collect();
-    let cursors: Vec<u64> = durable
-        .iter()
-        .map(|frame| frame["cursor"].as_u64().unwrap())
-        .collect();
-    assert!(cursors.windows(2).all(|pair| pair[0] < pair[1]));
-    let event_ids: BTreeSet<&str> = durable
-        .iter()
-        .map(|frame| frame["event_id"].as_str().unwrap())
-        .collect();
-    assert_eq!(event_ids.len(), durable.len());
 }
 
 fn assert_reconnect_cursor_contract(
