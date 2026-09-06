@@ -30,17 +30,17 @@ default_target = "stage25_openai"
 
 [[models.targets]]
 id = "stage25_openai"
-config_version = 1
+config_version = 2
 enabled = true
 provider = "openai"
-provider_model_id = "gpt-4.1-2025-04-14"
+provider_model_id = "gpt-5.6-luna"
 endpoint = "https://api.openai.com/v1"
 credential = "openai_stage25"
 token_estimator = "conservative_v1"
-context_window_tokens = 1047576
-max_output_tokens = 32768
+context_window_tokens = 1050000
+max_output_tokens = 128000
 requested_output_tokens = 1024
-reasoning_continuation = false
+reasoning_continuation = true
 
 [models.targets.capabilities]
 text_input = true
@@ -49,7 +49,7 @@ custom_tool_calling = true
 streaming = true
 ordered_output_items = true
 structured_output = false
-reasoning_continuation = false
+reasoning_continuation = true
 
 [model_gateway]
 max_attempts_per_invocation = 3

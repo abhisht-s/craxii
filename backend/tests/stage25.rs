@@ -18,11 +18,16 @@ use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use craxii_server::bootstrap::config;
+use craxii_server::application::model_selection::{
+    ModelSelectionErrorKind, ModelSelectionPolicy, ModelSelectionReason, ModelTargetSnapshot,
+};
+use craxii_server::bootstrap::config::{self, ModelProvider as ConfigModelProvider};
 use craxii_server::bootstrap::credential::load_credentials;
-use craxii_server::domain::UtcTimestamp;
+use craxii_server::domain::model::RequiredModelCapabilities;
+use craxii_server::domain::{ModelTargetId, TokenCount, UtcTimestamp};
 use craxii_server::ports::model_provider::ProviderErrorKind;
 use serde_json::{Value, json};
 use sqlx::{Connection as _, Row as _};
@@ -39,14 +44,17 @@ const CANONICAL_PROMPT: &str = "Inspect your machine and tell me what OS, CPU ar
 const FOLLOW_UP: &str = "What Git version did you find?";
 const PROVIDER: &str = "openai";
 const MODEL_TARGET: &str = "stage25_openai";
-const MODEL: &str = "gpt-4.1-2025-04-14";
+const MODEL: &str = "gpt-5.6-luna";
 const ENDPOINT: &str = "https://api.openai.com/v1";
-const CONTEXT_WINDOW: u64 = 1_047_576;
-const MAX_OUTPUT: u64 = 32_768;
+const TARGET_CONFIGURATION_VERSION: u64 = 2;
+const TOKEN_ESTIMATOR: &str = "conservative_v1";
+const CONTEXT_WINDOW: u64 = 1_050_000;
+const MAX_OUTPUT: u64 = 128_000;
 const REQUESTED_OUTPUT: u64 = 1_024;
 const CREDENTIAL_ID: &str = "openai_stage25";
 const CREDENTIAL_DIRECTORY: &str = "/Users/abhisht/.config/craxii/credentials";
 const CREDENTIAL_PATH: &str = "/Users/abhisht/.config/craxii/credentials/openai_stage25";
+const REQUIRED_MODEL_ENVIRONMENT: &str = "CRAXII_STAGE25_REQUIRED_MODEL";
 const TEMPLATE: &str = include_str!("fixtures/config/stage25-openai-headless.toml.template");
 const LIVE_WAIT: Duration = Duration::from_secs(6 * 60);
 const STARTUP_WAIT: Duration = Duration::from_secs(30);
@@ -66,7 +74,7 @@ const FORBIDDEN_EVIDENCE_MARKERS: [&[u8]; 5] = [
 ];
 
 #[test]
-fn stage25_configuration_freezes_the_audited_nonreasoning_target() {
+fn stage25_luna_only_preflight() {
     let rendered = render_config(
         "127.0.0.1:38025",
         Path::new("/tmp/craxii-stage25-config-test/state"),
@@ -74,23 +82,122 @@ fn stage25_configuration_freezes_the_audited_nonreasoning_target() {
         Path::new("/tmp/craxii-stage25-config-test/workspace"),
     );
     let parsed = config::parse(&rendered).expect("Stage 25 template must validate");
+    let runner_required_model =
+        std::env::var(REQUIRED_MODEL_ENVIRONMENT).unwrap_or_else(|_| MODEL.to_owned());
+    validate_stage25_runtime_config(&parsed, &runner_required_model)
+        .expect("Stage 25 must resolve to the sole Luna target");
     assert_eq!(parsed.configuration_version(), 1);
-    assert_eq!(parsed.models().default_target(), MODEL_TARGET);
-    assert_eq!(parsed.models().targets().len(), 1);
     let target = &parsed.models().targets()[0];
-    assert!(target.enabled());
-    assert_eq!(target.id(), MODEL_TARGET);
-    assert_eq!(target.provider_model_id(), MODEL);
-    assert_eq!(target.endpoint().as_str(), ENDPOINT);
-    assert_eq!(target.credential().as_str(), CREDENTIAL_ID);
-    assert_eq!(target.context_window_tokens(), CONTEXT_WINDOW);
-    assert_eq!(target.max_output_tokens(), MAX_OUTPUT);
-    assert_eq!(target.requested_output_tokens(), REQUESTED_OUTPUT);
-    assert!(!target.reasoning_continuation_required());
-    assert!(!target.capabilities().reasoning_continuation());
+    assert!(target.reasoning_continuation_required());
+    assert!(target.capabilities().reasoning_continuation());
+}
+
+#[test]
+fn stage25_luna_only_guard_rejects_other_models_fallbacks_and_deterministic_providers() {
+    let rendered = render_config(
+        "127.0.0.1:38025",
+        Path::new("/tmp/craxii-stage25-model-guard/state"),
+        Path::new("/tmp/craxii-stage25-model-guard/artifacts"),
+        Path::new("/tmp/craxii-stage25-model-guard/workspace"),
+    );
+    let luna = config::parse(&rendered).unwrap();
     assert_eq!(
-        parsed.credentials().source().local_directory(),
-        Some(Path::new(CREDENTIAL_DIRECTORY))
+        validate_stage25_runtime_config(&luna, "gpt-5.6-sol"),
+        Err("runner model is not Luna")
+    );
+
+    let other_model = config::parse(&rendered.replace(MODEL, "gpt-5.6-sol")).unwrap();
+    assert_eq!(
+        validate_stage25_runtime_config(&other_model, MODEL),
+        Err("configured provider model is not Luna")
+    );
+
+    let with_fallback = config::parse(&rendered.replacen(
+        "\n[model_gateway]\n",
+        &format!("{}\n[model_gateway]\n", fallback_target()),
+        1,
+    ))
+    .unwrap();
+    assert_eq!(
+        validate_stage25_runtime_config(&with_fallback, MODEL),
+        Err("Stage 25 must contain exactly one model target")
+    );
+
+    let fallback_selected = config::parse(
+        &rendered
+            .replacen(
+                "default_target = \"stage25_openai\"",
+                "default_target = \"stage25_fallback\"",
+                1,
+            )
+            .replacen(
+                "\n[model_gateway]\n",
+                &format!("{}\n[model_gateway]\n", fallback_target()),
+                1,
+            ),
+    )
+    .unwrap();
+    assert_eq!(
+        validate_stage25_runtime_config(&fallback_selected, MODEL),
+        Err("configured default target is not Stage 25")
+    );
+
+    assert!(
+        config::parse(&rendered.replacen("provider = \"openai\"", "provider = \"scripted\"", 1,))
+            .is_err(),
+        "deterministic providers must fail configuration validation"
+    );
+}
+
+#[test]
+fn stage25_model_selection_resolves_only_the_luna_target() {
+    let parsed = config::parse(&render_config(
+        "127.0.0.1:38025",
+        Path::new("/tmp/craxii-stage25-selection/state"),
+        Path::new("/tmp/craxii-stage25-selection/artifacts"),
+        Path::new("/tmp/craxii-stage25-selection/workspace"),
+    ))
+    .unwrap();
+    let snapshot = Arc::new(ModelTargetSnapshot::from_validated_config(parsed.models()).unwrap());
+    let policy = ModelSelectionPolicy::new(Arc::clone(&snapshot));
+    let selection = policy
+        .select(
+            None,
+            RequiredModelCapabilities {
+                text_input: true,
+                text_output: true,
+                custom_tool_calling: true,
+                streaming: true,
+                ordered_output_items: true,
+                structured_output: false,
+                reasoning_continuation: true,
+                required_output_tokens: TokenCount::try_new(1_024).unwrap(),
+            },
+        )
+        .unwrap();
+    assert_eq!(selection.reason(), ModelSelectionReason::ConfiguredDefault);
+    assert_eq!(selection.considered_target_ids().len(), 1);
+    assert_eq!(selection.considered_target_ids()[0].as_str(), MODEL_TARGET);
+    assert_eq!(
+        selection
+            .selected_target()
+            .reference()
+            .provider_model_id()
+            .as_str(),
+        MODEL
+    );
+    assert_eq!(
+        selection.target_configuration_version().get(),
+        i64::try_from(TARGET_CONFIGURATION_VERSION).unwrap()
+    );
+
+    let other = ModelTargetId::try_new("stage25_fallback").unwrap();
+    assert_eq!(
+        policy
+            .select(Some(&other), selection.required_capabilities(),)
+            .unwrap_err()
+            .kind(),
+        ModelSelectionErrorKind::ExplicitTargetMissing
     );
 }
 
@@ -99,10 +206,13 @@ fn stage25_wrapper_is_opt_in_and_has_no_raw_key_interface() {
     let source = include_str!("../../scripts/verify-stage25-openai-headless");
     for required in [
         "CRAXII_STAGE25_LIVE",
+        REQUIRED_MODEL_ENVIRONMENT,
+        MODEL,
         CREDENTIAL_DIRECTORY,
         CREDENTIAL_PATH,
         "--ignored",
         "--exact",
+        "stage25_luna_only_preflight",
         "live_openai_headless_canonical_restart_follow_up",
     ] {
         assert!(source.contains(required), "wrapper omitted {required}");
@@ -223,6 +333,17 @@ async fn live_openai_headless_canonical_restart_follow_up() {
             "raw provider-key environment variables are forbidden"
         );
     }
+    let runner_required_model = std::env::var(REQUIRED_MODEL_ENVIRONMENT)
+        .expect("the Stage 25 wrapper must freeze its required model");
+    assert_eq!(runner_required_model, MODEL);
+    let preflight = config::parse(&render_config(
+        "127.0.0.1:38025",
+        Path::new("/tmp/craxii-stage25-preflight/state"),
+        Path::new("/tmp/craxii-stage25-preflight/artifacts"),
+        Path::new("/tmp/craxii-stage25-preflight/workspace"),
+    ))
+    .expect("parse Stage 25 preflight configuration");
+    assert_stage25_runtime_config(&preflight, &runner_required_model);
 
     let report_path = required_report_path();
     let credential_patterns = live_credential_preflight();
@@ -238,7 +359,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     );
     write_new(&config_path, rendered.as_bytes(), 0o600);
     let validated = config::load(&config_path).expect("load rendered Stage 25 configuration");
-    assert_stage25_runtime_config(&validated);
+    assert_stage25_runtime_config(&validated, &runner_required_model);
     let configuration_fingerprint = validated.fingerprint().as_str().to_owned();
     let facts = MachineFacts::capture(&scenario.root.join("workspace"));
     assert_eq!(
@@ -414,13 +535,14 @@ async fn live_openai_headless_canonical_restart_follow_up() {
             "configuration_version": 1,
             "fingerprint": configuration_fingerprint,
             "model_target": MODEL_TARGET,
+            "target_configuration_version": TARGET_CONFIGURATION_VERSION,
             "provider": PROVIDER,
             "provider_model_id": MODEL,
             "endpoint": ENDPOINT,
             "context_window_tokens": CONTEXT_WINDOW,
             "max_output_tokens": MAX_OUTPUT,
             "requested_output_tokens": REQUESTED_OUTPUT,
-            "reasoning_continuation": false
+            "reasoning_continuation": true
         },
         "credential": {
             "source": "local_directory",
@@ -501,26 +623,107 @@ fn render_config(authority: &str, state: &Path, artifacts: &Path, workspace: &Pa
         )
 }
 
-fn assert_stage25_runtime_config(config: &config::ValidatedConfig) {
-    assert_eq!(config.models().default_target(), MODEL_TARGET);
-    let target = config
-        .models()
-        .targets()
-        .iter()
-        .find(|target| target.enabled())
-        .expect("enabled Stage 25 target");
-    assert_eq!(target.id(), MODEL_TARGET);
-    assert_eq!(target.provider_model_id(), MODEL);
-    assert_eq!(target.endpoint().as_str(), ENDPOINT);
-    assert_eq!(target.context_window_tokens(), CONTEXT_WINDOW);
-    assert_eq!(target.max_output_tokens(), MAX_OUTPUT);
-    assert_eq!(target.requested_output_tokens(), REQUESTED_OUTPUT);
-    assert!(!target.reasoning_continuation_required());
-    assert_eq!(target.credential().as_str(), CREDENTIAL_ID);
-    assert_eq!(
-        config.credentials().source().local_directory(),
-        Some(Path::new(CREDENTIAL_DIRECTORY))
-    );
+fn fallback_target() -> &'static str {
+    r#"
+[[models.targets]]
+id = "stage25_fallback"
+config_version = 1
+enabled = true
+provider = "openai"
+provider_model_id = "gpt-5.6-sol"
+endpoint = "https://api.openai.com/v1"
+credential = "openai_stage25"
+token_estimator = "conservative_v1"
+context_window_tokens = 1050000
+max_output_tokens = 128000
+requested_output_tokens = 1024
+reasoning_continuation = true
+
+[models.targets.capabilities]
+text_input = true
+text_output = true
+custom_tool_calling = true
+streaming = true
+ordered_output_items = true
+structured_output = false
+reasoning_continuation = true
+"#
+}
+
+fn validate_stage25_runtime_config(
+    config: &config::ValidatedConfig,
+    runner_required_model: &str,
+) -> Result<(), &'static str> {
+    if runner_required_model != MODEL {
+        return Err("runner model is not Luna");
+    }
+    if config.models().default_target() != MODEL_TARGET {
+        return Err("configured default target is not Stage 25");
+    }
+    if config.models().targets().len() != 1 {
+        return Err("Stage 25 must contain exactly one model target");
+    }
+    let target = &config.models().targets()[0];
+    if !target.enabled() {
+        return Err("Stage 25 Luna target is disabled");
+    }
+    if target.id() != MODEL_TARGET {
+        return Err("configured target is not Stage 25");
+    }
+    if target.provider() != ConfigModelProvider::OpenAi {
+        return Err("configured provider is not OpenAI");
+    }
+    if target.provider_model_id() != MODEL {
+        return Err("configured provider model is not Luna");
+    }
+    if target.config_version() != TARGET_CONFIGURATION_VERSION {
+        return Err("unexpected target configuration version");
+    }
+    if target.endpoint().as_str() != ENDPOINT {
+        return Err("unexpected OpenAI endpoint");
+    }
+    if target.credential().as_str() != CREDENTIAL_ID {
+        return Err("unexpected credential identifier");
+    }
+    if target.token_estimator() != TOKEN_ESTIMATOR {
+        return Err("unexpected token estimator");
+    }
+    if target.context_window_tokens() != CONTEXT_WINDOW {
+        return Err("unexpected Luna context window");
+    }
+    if target.max_output_tokens() != MAX_OUTPUT {
+        return Err("unexpected Luna maximum output tokens");
+    }
+    if target.requested_output_tokens() != REQUESTED_OUTPUT {
+        return Err("unexpected Stage 25 output budget");
+    }
+    if !target.reasoning_continuation_required() {
+        return Err("Luna stateless reasoning continuation is disabled");
+    }
+    let capabilities = target.capabilities();
+    if !capabilities.text_input()
+        || !capabilities.text_output()
+        || !capabilities.custom_tool_calling()
+        || !capabilities.streaming()
+        || !capabilities.ordered_output_items()
+        || capabilities.structured_output()
+        || !capabilities.reasoning_continuation()
+    {
+        return Err("unexpected effective Luna capability snapshot");
+    }
+    let declared = config.credentials().declared();
+    if declared.len() != 1 || declared[0].as_str() != CREDENTIAL_ID {
+        return Err("unexpected credential declaration");
+    }
+    if config.credentials().source().local_directory() != Some(Path::new(CREDENTIAL_DIRECTORY)) {
+        return Err("unexpected credential directory");
+    }
+    Ok(())
+}
+
+fn assert_stage25_runtime_config(config: &config::ValidatedConfig, runner_required_model: &str) {
+    validate_stage25_runtime_config(config, runner_required_model)
+        .expect("Stage 25 Luna-only runtime configuration");
 }
 
 fn provider_failure_view(kind: ProviderErrorKind) -> Value {
@@ -1096,6 +1299,12 @@ async fn inspect_first_turn(
             .as_u64()
             .is_some_and(|count| count > 0)
     }));
+    assert!(invocations.iter().any(|value| {
+        value["tool_call_count"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+            && value["provider_reasoning_continuation_captured"] == true
+    }));
 
     let tool_rows = sqlx::query(
         "SELECT tool_execution_id, source_model_invocation_id, agent_step_no, tool_name, state, \
@@ -1174,6 +1383,19 @@ async fn inspect_first_turn(
             "final model context omitted a persisted tool result"
         );
     }
+    let continuation_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM context_manifest_sources \
+         WHERE context_manifest_id = ? AND source_kind = 'provider_native_continuation' \
+           AND item_class = 'provider_opaque_continuation'",
+    )
+    .bind(final_invocation["context_manifest_id"].as_str().unwrap())
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert!(
+        continuation_sources > 0,
+        "final Luna invocation did not replay stateless reasoning continuation"
+    );
     let cause: String = sqlx::query_scalar(
         "SELECT cause.event_type FROM journal_events assistant \
          JOIN journal_events cause ON cause.event_id = assistant.causation_event_id \
@@ -1228,6 +1450,8 @@ async fn inspect_first_turn(
         "tool_execution_count": tool_ids.len(),
         "tool_execution_ids": tool_ids,
         "source_model_invocation_ids": source_model_ids,
+        "stateless_reasoning_continuation_captured": true,
+        "stateless_reasoning_continuation_replayed": true,
         "workstation_output_matches_independent_facts": true,
         "final_answer_downstream_of_tool_results": true,
         "final_model_invocation_id": final_invocation_id
@@ -1338,6 +1562,7 @@ async fn model_evidence(connection: &mut sqlx::SqliteConnection, work_id: &str) 
                 m.input_tokens, m.cached_input_tokens, m.output_tokens, m.reasoning_tokens, \
                 m.total_tokens, m.tool_call_count, m.provider_error_kind, \
                 m.provider_outcome_certainty, m.billing_ambiguity, \
+                m.normalized_output_json, \
                 c.context_window_tokens, c.reserved_output_tokens \
          FROM model_invocations m JOIN context_manifests c \
            ON c.context_manifest_id = m.context_manifest_id \
@@ -1402,7 +1627,19 @@ fn model_row_evidence(row: &sqlx::sqlite::SqliteRow) -> Value {
     }
     let provider_options: String = row.get("provider_options_json");
     let provider_options: Value = serde_json::from_str(&provider_options).unwrap();
-    assert_eq!(provider_options["reasoning_continuation"], false);
+    assert_eq!(provider_options["reasoning_continuation"], true);
+    let normalized_output: Option<String> = row.get("normalized_output_json");
+    let provider_reasoning_continuation_captured = normalized_output
+        .as_deref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value["items"].as_array().cloned())
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item["kind"] == "provider_opaque"
+                    && item["provider_id"] == PROVIDER
+                    && item["item_type"] == "openai.reasoning_items.v1"
+            })
+        });
     assert_eq!(
         row.get::<i64, _>("context_window_tokens"),
         CONTEXT_WINDOW as i64
@@ -1436,7 +1673,8 @@ fn model_row_evidence(row: &sqlx::sqlite::SqliteRow) -> Value {
         "provider_id": row.get::<String, _>("provider_id"),
         "provider_model_id": row.get::<String, _>("provider_model_id"),
         "target_configuration_version": row.get::<i64, _>("target_configuration_version"),
-        "reasoning_continuation": false,
+        "reasoning_continuation": true,
+        "provider_reasoning_continuation_captured": provider_reasoning_continuation_captured,
         "context_window_tokens": row.get::<i64, _>("context_window_tokens"),
         "reserved_output_tokens": row.get::<i64, _>("reserved_output_tokens"),
         "state": state,
@@ -1469,7 +1707,10 @@ fn assert_provider_identity(invocations: &[Value]) {
         assert_eq!(invocation["provider_id"], PROVIDER);
         assert_eq!(invocation["provider_model_id"], MODEL);
         assert_eq!(invocation["model_target_id"], MODEL_TARGET);
-        assert_eq!(invocation["target_configuration_version"], 1);
+        assert_eq!(
+            invocation["target_configuration_version"],
+            TARGET_CONFIGURATION_VERSION
+        );
     }
 }
 

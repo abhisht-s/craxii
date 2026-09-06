@@ -1245,7 +1245,15 @@ impl OpenAiStream {
             == Some(expected_status)
             && response_echo_controls_match(response)
             && response.get("error").is_none_or(Value::is_null);
-        if !response_id_matches || !controls_match {
+        let served_model_matches = response.get("model").and_then(Value::as_str)
+            == Some(
+                self.request
+                    .target()
+                    .reference()
+                    .provider_model_id()
+                    .as_str(),
+            );
+        if !response_id_matches || !controls_match || !served_model_matches {
             return self.defer_terminal_error(ProviderErrorKind::MalformedResponse, false);
         }
         if requested_stop == ModelStopReason::IncompleteProviderLimit {

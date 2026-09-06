@@ -407,6 +407,30 @@ async fn contradictory_terminal_echo_retains_reported_usage_then_fails_closed() 
 }
 
 #[tokio::test]
+async fn served_model_substitution_fails_closed() {
+    let server = FixtureServer::start(
+        StatusCode::OK,
+        text_response_sse().replace("fixture-openai-model", "gpt-5.6-sol"),
+    )
+    .await;
+    let (provider, clock) = provider();
+    let error = invoke_all(
+        &provider,
+        request(&server.endpoint(), false, vec![user("exact model")]),
+        control(&clock, Duration::from_secs(1)),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::MalformedResponse);
+    assert_eq!(
+        error.certainty(),
+        ProviderOutcomeCertainty::SemanticOutputObserved
+    );
+    assert_eq!(server.calls(), 1);
+    server.stop();
+}
+
+#[tokio::test]
 async fn failed_terminal_retains_usage_and_returns_a_classified_error() {
     let server = FixtureServer::start(StatusCode::OK, failed_response_sse()).await;
     let (provider, clock) = provider();
@@ -473,6 +497,90 @@ async fn encrypted_reasoning_continuation_round_trips_as_provider_guarded_input(
     assert_eq!(body["input"][0]["type"], "reasoning");
     assert_eq!(body["input"][0]["id"], "rs_fixture_1");
     assert_eq!(body["input"][0]["encrypted_content"], "encrypted-fixture");
+    server.stop();
+}
+
+#[tokio::test]
+async fn luna_stateless_reasoning_replays_before_the_tool_call_and_output() {
+    const LUNA: &str = "gpt-5.6-luna";
+    let reasoning = json!({
+        "id": "rs_luna_1",
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [],
+        "encrypted_content": "encrypted-luna-fixture"
+    });
+    let tool_call = json!({
+        "id": "fc_luna_1",
+        "type": "function_call",
+        "status": "completed",
+        "call_id": "call_luna_1",
+        "name": "read_file",
+        "arguments": "{\"path\":\"Cargo.toml\"}"
+    });
+    let response = sse(vec![
+        created(0, "resp_luna_1"),
+        item_added(
+            1,
+            0,
+            json!({"id":"rs_luna_1","type":"reasoning","status":"in_progress","summary":[]}),
+        ),
+        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":reasoning.clone()}),
+        item_added(
+            3,
+            1,
+            json!({"id":"fc_luna_1","type":"function_call","status":"in_progress","call_id":"call_luna_1","name":"read_file","arguments":""}),
+        ),
+        json!({"type":"response.function_call_arguments.delta","sequence_number":4,"output_index":1,"item_id":"fc_luna_1","delta":"{\"path\":\"Cargo.toml\"}"}),
+        json!({"type":"response.function_call_arguments.done","sequence_number":5,"output_index":1,"item_id":"fc_luna_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}),
+        json!({"type":"response.output_item.done","sequence_number":6,"output_index":1,"item":tool_call.clone()}),
+        json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_luna_1","status":"completed","model":LUNA,"output":[reasoning,tool_call],"usage":{"input_tokens":11,"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}}}),
+    ]);
+    let server = FixtureServer::start(StatusCode::OK, response).await;
+    let (provider, clock) = provider();
+    let events = invoke_all(
+        &provider,
+        request_for_model(&server.endpoint(), LUNA, true, vec![user("inspect")]),
+        control(&clock, Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(server.capture().body["model"], LUNA);
+    let ModelStreamEvent::Completed(response) = events.last().unwrap() else {
+        panic!("terminal Luna tool response")
+    };
+    assert_eq!(response.stop_reason(), ModelStopReason::ToolContinuation);
+    let continuation = response.provider_continuation().unwrap().clone();
+
+    let call_id = ModelToolCallId::try_new("call_luna_1").unwrap();
+    let replay = request_for_model(
+        "http://127.0.0.1:9/v1",
+        LUNA,
+        true,
+        vec![
+            ModelInputItem::ProviderOpaqueContinuation(continuation),
+            ModelInputItem::ToolCall(
+                CanonicalModelToolCall::try_new(
+                    call_id.clone(),
+                    "read_file",
+                    r#"{"path":"Cargo.toml"}"#,
+                )
+                .unwrap(),
+            ),
+            ModelInputItem::tool_result(call_id, json!({"result_kind":"success"})).unwrap(),
+        ],
+    );
+    let body: Value = serde_json::from_slice(&encode_request(&replay).unwrap()).unwrap();
+    assert_eq!(body["model"], LUNA);
+    assert_eq!(body["store"], false);
+    assert!(body.get("include").is_none());
+    assert_eq!(body["input"][0]["type"], "reasoning");
+    assert_eq!(
+        body["input"][0]["encrypted_content"],
+        "encrypted-luna-fixture"
+    );
+    assert_eq!(body["input"][1]["type"], "function_call");
+    assert_eq!(body["input"][2]["type"], "function_call_output");
     server.stop();
 }
 
@@ -914,7 +1022,16 @@ async fn invoke_all(
 }
 
 fn request(endpoint: &str, reasoning: bool, input: Vec<ModelInputItem>) -> ModelRequest {
-    let target = target(endpoint, reasoning);
+    request_for_model(endpoint, "fixture-openai-model", reasoning, input)
+}
+
+fn request_for_model(
+    endpoint: &str,
+    model: &str,
+    reasoning: bool,
+    input: Vec<ModelInputItem>,
+) -> ModelRequest {
+    let target = target_for_model(endpoint, model, reasoning);
     ModelRequest::try_new(ModelRequestInput {
         logical_invocation_id: LogicalInvocationId::generate(),
         target,
@@ -947,6 +1064,10 @@ fn request(endpoint: &str, reasoning: bool, input: Vec<ModelInputItem>) -> Model
 }
 
 fn target(endpoint: &str, reasoning: bool) -> ModelTarget {
+    target_for_model(endpoint, "fixture-openai-model", reasoning)
+}
+
+fn target_for_model(endpoint: &str, model: &str, reasoning: bool) -> ModelTarget {
     let capabilities = ModelCapabilitySnapshot::new(ModelCapabilitySnapshotInput {
         text_input: true,
         text_output: true,
@@ -962,7 +1083,7 @@ fn target(endpoint: &str, reasoning: bool) -> ModelTarget {
         reference: ProviderModelReference::new(
             ModelTargetId::try_new("fixture").unwrap(),
             ProviderId::try_new(OPENAI_PROVIDER_ID).unwrap(),
-            ProviderModelId::try_new("fixture-openai-model").unwrap(),
+            ProviderModelId::try_new(model).unwrap(),
             TargetConfigurationVersion::try_new(1).unwrap(),
             capabilities,
         ),

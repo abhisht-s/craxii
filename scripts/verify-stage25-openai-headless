@@ -22,6 +22,14 @@ for raw_key_name in OPENAI_API_KEY OPENAI_KEY CRAXII_OPENAI_API_KEY CRAXII_STAGE
   fi
 done
 
+required_model="gpt-5.6-luna"
+if ! CRAXII_STAGE25_REQUIRED_MODEL="${required_model}" \
+  cargo test --locked -p craxii-server --test stage25 \
+    stage25_luna_only_preflight -- --exact; then
+  echo "STAGE_25_OPENAI_HEADLESS: LUNA_ONLY_PREFLIGHT_FAILED" >&2
+  exit 2
+fi
+
 credential_directory="/Users/abhisht/.config/craxii/credentials"
 # Expected raw secret file: /Users/abhisht/.config/craxii/credentials/openai_stage25
 credential_path="${credential_directory}/openai_stage25"
@@ -57,7 +65,8 @@ report_directory="$(mktemp -d "${TMPDIR:-/tmp}/craxii-stage25-report.XXXXXX")"
 chmod 700 "${report_directory}"
 export CRAXII_STAGE25_REPORT_PATH="${report_directory}/stage25-acceptance.json"
 
-if cargo test --locked -p craxii-server --test stage25 \
+if CRAXII_STAGE25_REQUIRED_MODEL="${required_model}" \
+  cargo test --locked -p craxii-server --test stage25 \
   live_openai_headless_canonical_restart_follow_up -- --ignored --exact --nocapture; then
   echo "STAGE_25_OPENAI_HEADLESS: PASS"
   echo "STAGE_25_ACCEPTANCE_REPORT: ${CRAXII_STAGE25_REPORT_PATH}"

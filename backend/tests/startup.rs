@@ -275,7 +275,39 @@ fn missing_provider_credential_remains_live_unready() {
 }
 
 #[test]
-fn unsupported_initial_native_continuation_fails_before_runtime_side_effects() {
+fn configured_luna_reasoning_continuation_becomes_ready_without_a_network_probe() {
+    let contents = LOCAL
+        .replacen("fixture-primary-model", "gpt-5.6-luna", 1)
+        .replacen(
+            "reasoning_continuation = false",
+            "reasoning_continuation = true",
+            2,
+        );
+    let config = TempConfig::new(&contents);
+    let mut child = spawn(config.path());
+    let mut ready = false;
+    let startup_deadline = Instant::now() + STARTUP_POLL_TIMEOUT;
+    while Instant::now() < startup_deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if readiness_status(&config.authority) == Some(200) {
+            ready = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = terminate_and_wait(child);
+    assert!(
+        ready,
+        "reasoning-capable composition did not become ready: {}",
+        text(&output.stderr)
+    );
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+}
+
+#[test]
+fn non_luna_native_reasoning_continuation_fails_before_runtime_side_effects() {
     let config = TempConfig::new(&LOCAL.replacen(
         "reasoning_continuation = false",
         "reasoning_continuation = true",

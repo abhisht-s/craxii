@@ -54,6 +54,8 @@ use crate::ports::state_store::{
 use crate::ports::workstation::Workstation;
 use crate::ports::workstation_preparation::WorkstationPreparation;
 
+const OPENAI_STATELESS_REASONING_MODEL_ID: &str = "gpt-5.6-luna";
+
 pub async fn run_from_env() -> Result<RunningBootstrap, StartupError> {
     let arguments: Vec<_> = std::env::args_os().collect();
 
@@ -116,9 +118,12 @@ pub async fn run(
             provider
                 .capabilities(target)
                 .map_err(|_| StartupError::ProviderComposition)?;
+            let reasoning_continuation = target.reference().capabilities().reasoning_continuation()
+                || target.provider_native_options().reasoning_continuation();
             if target.reference().capabilities().structured_output()
-                || target.reference().capabilities().reasoning_continuation()
-                || target.provider_native_options().reasoning_continuation()
+                || (reasoning_continuation
+                    && target.reference().provider_model_id().as_str()
+                        != OPENAI_STATELESS_REASONING_MODEL_ID)
                 || target.estimator() != default_target.estimator()
             {
                 return Err(StartupError::ProviderComposition);
