@@ -847,6 +847,43 @@ async fn begin_requesting_model(fixture: &Fixture) -> BegunModel {
     begin_model(fixture, false).await
 }
 
+async fn begin_streaming_model_without_output(fixture: &Fixture) -> BegunModel {
+    let mut model = begin_requesting_model(fixture).await;
+    let streaming_event_id = JournalEventId::generate();
+    fixture
+        .store
+        .mark_model_streaming(MarkModelStreamingRequest {
+            expected_work: WorkExpectation {
+                work_id: fixture.work_id,
+                state: WorkState::WaitingOnModel,
+                version: ProjectionVersion::try_new(3).unwrap(),
+                runtime_owner: Some(fixture.runtime_id),
+                current_attempt: CurrentWorkAttempt::Model(model.invocation_id),
+                cancellation_reason: None,
+            },
+            expected_model: ModelExpectation {
+                model_invocation_id: model.invocation_id,
+                state: ModelInvocationState::Requesting,
+            },
+            observation: ModelStreamingObservation {
+                first_byte_at: T2.parse().unwrap(),
+                first_output_at: None,
+                provider_request_id: Some("request-1".to_owned()),
+                provider_response_id: Some("response-1".to_owned()),
+                draft_exposed: false,
+            },
+            event: EventIntent {
+                event_id: streaming_event_id,
+                correlation_id: fixture.correlation_id,
+                causation_event_id: Some(model.streaming_event_id),
+            },
+        })
+        .await
+        .unwrap();
+    model.streaming_event_id = streaming_event_id;
+    model
+}
+
 async fn begin_model(fixture: &Fixture, stream: bool) -> BegunModel {
     let invocation_id = ModelInvocationId::generate();
     let logical_id = LogicalInvocationId::generate();
@@ -1081,12 +1118,140 @@ fn model_completion_request(
     }
 }
 
+fn model_unknown_request(
+    fixture: &Fixture,
+    model: &BegunModel,
+    provider_error_kind: crate::ports::model_provider::ProviderErrorKind,
+) -> FinishModelInvocationRequest {
+    let mut request = model_completion_request(fixture, model, Vec::new(), None);
+    request.outcome.state = ModelInvocationState::ProviderOutcomeUnknown;
+    request.outcome.response_sha256 = None;
+    request.outcome.normalized_output = None;
+    request.outcome.first_output_at = None;
+    request.outcome.usage = None;
+    request.outcome.usage_status = crate::ports::model_provider::ModelUsageStatus::Unavailable;
+    request.outcome.provider_error_kind = Some(provider_error_kind);
+    request.outcome.provider_outcome_certainty =
+        crate::ports::model_provider::ProviderOutcomeCertainty::ProviderOutcomeUnknown;
+    request.outcome.billing_ambiguity = true;
+    request.outcome.stop_reason = None;
+    request.outcome.tool_call_count = None;
+    request.outcome.normalized_error =
+        Some(NormalizedError::provider(Certainty::OutcomeUnknown, None));
+    request.work_next = WorkLifecycleSnapshot::try_new(WorkLifecycleSnapshotInput {
+        work_id: fixture.work_id,
+        state: WorkState::Interrupted,
+        projection_version: ProjectionVersion::try_new(4).unwrap(),
+        runtime_owner: None,
+        current_attempt: CurrentWorkAttempt::None,
+        cancellation_reason: None,
+        terminal_reason: Some(WorkTerminalReason::Interruption(
+            WorkInterruptionReason::ProviderOutcomeUnknown,
+        )),
+    })
+    .unwrap();
+    request
+}
+
+#[tokio::test]
+async fn sqlite_requires_ambiguous_protocol_errors_to_use_the_canonical_unknown_kind() {
+    let rejected_fixture = fixture().await;
+    let model = begin_streaming_model_without_output(&rejected_fixture).await;
+    let error = rejected_fixture
+        .store
+        .finish_model_invocation(model_unknown_request(
+            &rejected_fixture,
+            &model,
+            crate::ports::model_provider::ProviderErrorKind::UnsupportedResponseItem,
+        ))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), StateStoreErrorKind::InternalInvariant);
+    rejected_fixture.guard.shutdown().await;
+
+    let accepted_fixture = fixture().await;
+    let model = begin_streaming_model_without_output(&accepted_fixture).await;
+    accepted_fixture
+        .store
+        .finish_model_invocation(model_unknown_request(
+            &accepted_fixture,
+            &model,
+            crate::ports::model_provider::ProviderErrorKind::ProviderOutcomeUnknown,
+        ))
+        .await
+        .unwrap();
+    let mut connection = accepted_fixture.guard.runtime().acquire().await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, first_byte_at, first_output_at, completed_at, usage_status, \
+         provider_error_kind, provider_outcome_certainty, billing_ambiguity \
+         FROM model_invocations WHERE model_invocation_id = ?",
+    )
+    .bind(model.invocation_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "provider_outcome_unknown");
+    assert_eq!(row.get::<String, _>("first_byte_at"), T2);
+    assert_eq!(row.get::<Option<String>, _>("first_output_at"), None);
+    assert_eq!(row.get::<String, _>("completed_at"), T3);
+    assert_eq!(row.get::<String, _>("usage_status"), "unavailable");
+    assert_eq!(
+        row.get::<String, _>("provider_error_kind"),
+        "provider_outcome_unknown"
+    );
+    assert_eq!(
+        row.get::<String, _>("provider_outcome_certainty"),
+        "outcome_unknown"
+    );
+    assert_eq!(row.get::<i64, _>("billing_ambiguity"), 1);
+    drop(connection);
+    accepted_fixture.guard.shutdown().await;
+}
+
 async fn complete_model(fixture: &Fixture, model: &BegunModel) {
     fixture
         .store
         .finish_model_invocation(model_completion_request(fixture, model, Vec::new(), None))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn provider_opaque_model_artifact_is_valid_restart_evidence() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    let artifact_id = ArtifactId::generate();
+    let bytes = b"opaque-provider-continuation";
+    let artifact = finalized_artifact(
+        &fixture,
+        artifact_id,
+        ArtifactProducer::Model(model.invocation_id),
+        bytes,
+        bytes.len() as u64,
+        "provider-opaque-01.bin",
+    );
+    let mut request = model_completion_request(&fixture, &model, vec![artifact], None);
+    request.outcome.normalized_output = Some(NormalizedModelOutput {
+        items: vec![NormalizedModelOutputItem::ProviderOpaque {
+            provider_id: ProviderId::try_new("openai").unwrap(),
+            item_type: "openai.reasoning_items.v1".to_owned(),
+            sha256: Sha256Digest::hash_bytes(bytes),
+            artifact_id,
+        }],
+    });
+    fixture
+        .store
+        .finish_model_invocation(request)
+        .await
+        .unwrap();
+
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    fixture.guard.shutdown().await;
 }
 
 fn retry_model_request(

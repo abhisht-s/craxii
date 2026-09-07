@@ -39,7 +39,7 @@ credential = "openai_stage25"
 token_estimator = "conservative_v1"
 context_window_tokens = 1050000
 max_output_tokens = 128000
-requested_output_tokens = 1024
+requested_output_tokens = 8192
 reasoning_continuation = true
 
 [models.targets.capabilities]

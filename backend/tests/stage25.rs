@@ -29,15 +29,17 @@ use craxii_server::bootstrap::credential::load_credentials;
 use craxii_server::domain::model::RequiredModelCapabilities;
 use craxii_server::domain::{ModelTargetId, TokenCount, UtcTimestamp};
 use craxii_server::ports::model_provider::ProviderErrorKind;
+use futures_util::{SinkExt as _, StreamExt as _};
 use serde_json::{Value, json};
 use sqlx::{Connection as _, Row as _};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
-
-use headless_client::{
-    HeadlessClient, assert_durable_cursor_contract, next_json_with_timeout,
-    signal_owned_process_group, through_sync,
+use tokio_tungstenite::tungstenite::{
+    Message,
+    protocol::{CloseFrame, frame::coding::CloseCode},
 };
+
+use headless_client::{HeadlessClient, assert_durable_cursor_contract, signal_owned_process_group};
 use stage18_harness::MachineFacts;
 
 const CANONICAL_PROMPT: &str = "Inspect your machine and tell me what OS, CPU architecture, current directory, and Git version you have.";
@@ -50,7 +52,7 @@ const TARGET_CONFIGURATION_VERSION: u64 = 2;
 const TOKEN_ESTIMATOR: &str = "conservative_v1";
 const CONTEXT_WINDOW: u64 = 1_050_000;
 const MAX_OUTPUT: u64 = 128_000;
-const REQUESTED_OUTPUT: u64 = 1_024;
+const REQUESTED_OUTPUT: u64 = 8_192;
 const CREDENTIAL_ID: &str = "openai_stage25";
 const CREDENTIAL_DIRECTORY: &str = "/Users/abhisht/.config/craxii/credentials";
 const CREDENTIAL_PATH: &str = "/Users/abhisht/.config/craxii/credentials/openai_stage25";
@@ -171,7 +173,10 @@ fn stage25_model_selection_resolves_only_the_luna_target() {
                 ordered_output_items: true,
                 structured_output: false,
                 reasoning_continuation: true,
-                required_output_tokens: TokenCount::try_new(1_024).unwrap(),
+                required_output_tokens: TokenCount::try_new(
+                    i64::try_from(REQUESTED_OUTPUT).unwrap(),
+                )
+                .unwrap(),
             },
         )
         .unwrap();
@@ -280,8 +285,17 @@ fn credential_rules_and_secret_scan_fail_closed_without_disclosing_a_canary() {
     write_new(&evidence.join("unsafe.bin"), canary, 0o600);
     let error = scan_paths(&[evidence], &patterns).unwrap_err();
     let rendered_error = format!("{error:?}");
-    assert_eq!(rendered_error, "SecretDetected");
+    assert_eq!(rendered_error, "ExactCredentialDetected");
     assert!(!rendered_error.contains(std::str::from_utf8(canary).unwrap()));
+    let report = redacted_failure_report("non_live", "work.failed", None, Err(error));
+    assert_eq!(
+        report["secret_scan"]["exact_credential_bytes_absent"],
+        false
+    );
+    assert_eq!(
+        report["secret_scan"]["error_class"],
+        "exact_credential_detected"
+    );
 
     fs::set_permissions(&credential, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(
@@ -296,6 +310,40 @@ fn credential_rules_and_secret_scan_fail_closed_without_disclosing_a_canary() {
         )
         .is_err()
     );
+}
+
+#[tokio::test]
+async fn synthetic_credential_is_absent_from_stage25_scenario_persistence_and_evidence() {
+    let root = TemporaryRoot::new("craxii-stage25-nonlive-");
+    let credential = b"sk-stage25-synthetic-persistence-canary";
+    let credential_directory = root.path().join("credentials");
+    fs::create_dir(&credential_directory).unwrap();
+    fs::set_permissions(&credential_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    write_new(&credential_directory.join(CREDENTIAL_ID), credential, 0o600);
+
+    let mut scenario = LiveScenario::new();
+    scenario.prepare();
+    let authority = available_authority();
+    let config_path = scenario.root.join("stage25.toml");
+    let rendered = render_config(
+        &authority,
+        &scenario.root.join("state"),
+        &scenario.root.join("artifacts"),
+        &scenario.root.join("workspace"),
+    )
+    .replace(CREDENTIAL_DIRECTORY, credential_directory.to_str().unwrap());
+    write_new(&config_path, rendered.as_bytes(), 0o600);
+    scenario.set_phase("synthetic_credential_nonlive_startup");
+    scenario.spawn(&config_path, "credential-nonlive");
+    wait_ready(&authority, scenario.child_mut()).await;
+    scan_paths(&[scenario.root.clone()], &[credential.to_vec()])
+        .expect("credential absent while synthetic Stage 25 SQLite WAL and telemetry are live");
+    let child = scenario.take_child();
+    let status = stop_and_reap(child, 15).await;
+    assert!(status.success());
+    scan_paths(&[scenario.root.clone()], &[credential.to_vec()])
+        .expect("credential absent from stopped synthetic Stage 25 scenario");
+    scenario.finish();
 }
 
 #[test]
@@ -317,10 +365,106 @@ fn provider_failures_have_redacted_nonlive_acceptance_views() {
         assert!(!encoded.contains("Authorization"));
         assert!(!encoded.contains("Bearer"));
         assert!(!encoded.contains("sk-"));
-        let report = redacted_failure_report("non_live", "work.failed", Some(kind.code()), true);
+        let report = redacted_failure_report("non_live", "work.failed", Some(kind.code()), Ok(1));
         assert_eq!(report["failure"]["code"], kind.code());
         assert_eq!(report["status"], "failed");
     }
+}
+
+#[test]
+fn live_scenario_preserves_failure_evidence_but_cleans_success() {
+    let successful = LiveScenario::new();
+    let successful_root = successful.root.clone();
+    successful.prepare();
+    successful.finish();
+    assert!(!successful_root.exists());
+
+    let mut failed_root = None;
+    let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut failed = LiveScenario::new();
+        failed.prepare();
+        failed.set_phase("diagnostic_preservation_test");
+        failed_root = Some(failed.root.clone());
+        panic!("synthetic Stage 25 diagnostic failure");
+    }));
+    assert!(failure.is_err());
+    let failed_root = failed_root.expect("failed scenario path");
+    assert!(failed_root.exists());
+    fs::remove_dir_all(failed_root).unwrap();
+}
+
+#[tokio::test]
+async fn websocket_close_before_terminal_is_a_redacted_failure_result() {
+    const CANARY: &str = "sk-stage25-synthetic-close-reason";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::Away,
+                reason: CANARY.into(),
+            })))
+            .await
+            .unwrap();
+    });
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("ws://{address}"))
+        .await
+        .unwrap();
+
+    let error = through_terminal_work(&mut socket, "synthetic-work")
+        .await
+        .unwrap_err();
+    assert_eq!(error, LiveWebSocketError::CloseFrame);
+    let report = redacted_failure_report(
+        "first_turn_wait_terminal",
+        error.report_event(),
+        None,
+        Ok(0),
+    );
+    assert_eq!(report["terminal_event"], "headless.websocket_close");
+    let encoded = serde_json::to_string(&report).unwrap();
+    assert!(!encoded.contains("Authorization: Bearer"));
+    assert!(!encoded.contains("sk-"));
+
+    let root = TemporaryRoot::new("craxii-stage25-nonlive-");
+    let report_path = root.path().join("failure.json");
+    persist_live_failure_report(
+        &report_path,
+        root.path(),
+        &root.path().join("unneeded.sqlite3"),
+        "first_turn_wait_terminal",
+        error.report_event(),
+        None,
+        &[CANARY.as_bytes().to_vec()],
+    )
+    .await;
+    let persisted = fs::read(&report_path).unwrap();
+    assert!(
+        !persisted
+            .windows(CANARY.len())
+            .any(|bytes| bytes == CANARY.as_bytes())
+    );
+    assert_eq!(fs::metadata(report_path).unwrap().mode() & 0o777, 0o600);
+    server.await.unwrap();
+}
+
+#[test]
+fn incomplete_secret_scan_never_claims_the_credential_was_detected() {
+    let root = TemporaryRoot::new("craxii-stage25-nonlive-");
+    let missing = root.path().join("disappeared-wal");
+    let scan = scan_paths(&[missing], &[b"synthetic-secret".to_vec()]);
+    assert_eq!(scan, Err(SecretScanError::Storage));
+
+    let report = redacted_failure_report("non_live", "work.failed", None, scan);
+    assert_eq!(report["secret_scan"]["passed"], false);
+    assert_eq!(report["secret_scan"]["status"], "incomplete");
+    assert_eq!(
+        report["secret_scan"]["exact_credential_bytes_absent"],
+        Value::Null
+    );
+    assert_eq!(report["secret_scan"]["error_class"], "storage");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -369,6 +513,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
 
     // Initialize the clean durable store with the production binary. This startup performs no
     // provider invocation and is stopped before offline device provisioning.
+    scenario.set_phase("initialize_startup");
     scenario.spawn(&config_path, "initialize");
     wait_ready(&authority, scenario.child_mut()).await;
     let initializer = scenario.take_child();
@@ -384,22 +529,56 @@ async fn live_openai_headless_canonical_restart_follow_up() {
         durable_identity.conversation_id.clone(),
     );
 
+    scenario.set_phase("first_startup");
     scenario.spawn(&config_path, "first");
     wait_ready(&authority, scenario.child_mut()).await;
     let first_pid = scenario.child_mut().id();
     let first_runtime = runtime_for_pid(&database, first_pid).await;
     assert_recovery_preceded_readiness(&database, &first_runtime).await;
 
+    scenario.set_phase("first_initial_sync");
     let mut first_socket = client.websocket(0).await;
-    let initial_frames = through_sync(&mut first_socket).await;
+    let initial_frames = match through_live_sync(&mut first_socket).await {
+        Ok(frames) => frames,
+        Err(error) => {
+            scenario.observe_websocket_failure(error);
+            write_live_failure_report(
+                &report_path,
+                &scenario.root,
+                &database,
+                scenario.phase,
+                error.report_event(),
+                None,
+                &credential_patterns,
+            )
+            .await;
+        }
+    };
     assert_durable_cursor_contract(&initial_frames);
+    scenario.set_phase("first_turn_submission");
     let first_command_id = fresh_client_id();
     let first_acceptance = client.submit(CANONICAL_PROMPT, &first_command_id).await;
     assert_eq!(first_acceptance.status, 202);
     let first_work_id = required_string(&first_acceptance.body, "work_id");
     let first_message_id = required_string(&first_acceptance.body, "message_id");
+    scenario.set_phase("first_turn_wait_terminal");
     let (first_frames, first_terminal) =
-        through_terminal_work(&mut first_socket, &first_work_id).await;
+        match through_terminal_work(&mut first_socket, &first_work_id).await {
+            Ok(result) => result,
+            Err(error) => {
+                scenario.observe_websocket_failure(error);
+                write_live_failure_report(
+                    &report_path,
+                    &scenario.root,
+                    &database,
+                    scenario.phase,
+                    error.report_event(),
+                    Some(&first_work_id),
+                    &credential_patterns,
+                )
+                .await;
+            }
+        };
     if first_terminal != "work.completed" {
         write_live_failure_report(
             &report_path,
@@ -407,7 +586,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
             &database,
             "first_turn",
             &first_terminal,
-            &first_work_id,
+            Some(&first_work_id),
             &credential_patterns,
         )
         .await;
@@ -417,6 +596,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     assert_machine_answer(&first_answer, &facts);
     let first_assistant_id = committed_message_id(&first_frames, &first_work_id);
 
+    scenario.set_phase("first_turn_evidence");
     let first_bootstrap = client.bootstrap().await;
     assert_eq!(first_bootstrap.status, 200);
     let saved_cursor = first_bootstrap.body["snapshot_cursor"]
@@ -436,10 +616,12 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     scan_paths(std::slice::from_ref(&scenario.root), &credential_patterns)
         .expect("credential absent from live first-process evidence");
 
+    scenario.set_phase("intentional_first_restart");
     let first_child = scenario.take_child();
     let killed = stop_and_reap(first_child, 9).await;
     assert_eq!(killed.signal(), Some(9));
 
+    scenario.set_phase("second_startup");
     scenario.spawn(&config_path, "second");
     wait_ready(&authority, scenario.child_mut()).await;
     let second_pid = scenario.child_mut().id();
@@ -449,8 +631,24 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     assert_recovery_preceded_readiness(&database, &second_runtime).await;
     assert_eq!(load_identity(&database).await, durable_identity);
 
+    scenario.set_phase("second_reconnect_sync");
     let mut second_socket = client.websocket(saved_cursor).await;
-    let reconnect_frames = through_sync(&mut second_socket).await;
+    let reconnect_frames = match through_live_sync(&mut second_socket).await {
+        Ok(frames) => frames,
+        Err(error) => {
+            scenario.observe_websocket_failure(error);
+            write_live_failure_report(
+                &report_path,
+                &scenario.root,
+                &database,
+                scenario.phase,
+                error.report_event(),
+                None,
+                &credential_patterns,
+            )
+            .await;
+        }
+    };
     assert_durable_cursor_contract(&reconnect_frames);
     assert!(
         reconnect_frames
@@ -462,6 +660,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     assert_eq!(recovered_bootstrap.status, 200);
     assert_bootstrap_identity(&recovered_bootstrap.body, &durable_identity);
 
+    scenario.set_phase("follow_up_submission");
     let follow_command_id = fresh_client_id();
     let follow_acceptance = client.submit(FOLLOW_UP, &follow_command_id).await;
     assert_eq!(follow_acceptance.status, 202);
@@ -469,8 +668,24 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     let follow_message_id = required_string(&follow_acceptance.body, "message_id");
     assert_ne!(first_work_id, follow_work_id);
     assert_ne!(first_message_id, follow_message_id);
+    scenario.set_phase("follow_up_wait_terminal");
     let (follow_frames, follow_terminal) =
-        through_terminal_work(&mut second_socket, &follow_work_id).await;
+        match through_terminal_work(&mut second_socket, &follow_work_id).await {
+            Ok(result) => result,
+            Err(error) => {
+                scenario.observe_websocket_failure(error);
+                write_live_failure_report(
+                    &report_path,
+                    &scenario.root,
+                    &database,
+                    scenario.phase,
+                    error.report_event(),
+                    Some(&follow_work_id),
+                    &credential_patterns,
+                )
+                .await;
+            }
+        };
     if follow_terminal != "work.completed" {
         write_live_failure_report(
             &report_path,
@@ -478,7 +693,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
             &database,
             "follow_up",
             &follow_terminal,
-            &follow_work_id,
+            Some(&follow_work_id),
             &credential_patterns,
         )
         .await;
@@ -493,6 +708,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
         ) && frame["work_id"] == follow_work_id
     }));
 
+    scenario.set_phase("follow_up_evidence");
     let follow_evidence = inspect_follow_up(
         &database,
         &follow_work_id,
@@ -509,8 +725,24 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     assert!(final_cursor > saved_cursor);
     second_socket.close(None).await.unwrap();
 
+    scenario.set_phase("full_replay_sync");
     let mut replay_socket = client.websocket(0).await;
-    let replay_frames = through_sync(&mut replay_socket).await;
+    let replay_frames = match through_live_sync(&mut replay_socket).await {
+        Ok(frames) => frames,
+        Err(error) => {
+            scenario.observe_websocket_failure(error);
+            write_live_failure_report(
+                &report_path,
+                &scenario.root,
+                &database,
+                scenario.phase,
+                error.report_event(),
+                None,
+                &credential_patterns,
+            )
+            .await;
+        }
+    };
     assert_durable_cursor_contract(&replay_frames);
     assert!(replay_frames.iter().any(|frame| {
         frame["event_type"] == "work.completed" && frame["work_id"] == first_work_id
@@ -520,6 +752,7 @@ async fn live_openai_headless_canonical_restart_follow_up() {
     }));
     replay_socket.close(None).await.unwrap();
 
+    scenario.set_phase("final_shutdown_and_report");
     scan_paths(std::slice::from_ref(&scenario.root), &credential_patterns)
         .expect("credential absent while SQLite WAL and telemetry are live");
     let second_child = scenario.take_child();
@@ -603,10 +836,14 @@ async fn live_openai_headless_canonical_restart_follow_up() {
             "files_scanned": scanned_files,
             "exact_credential_bytes_absent": true,
             "authorization_header_absent": true
+        },
+        "evidence": {
+            "scenario_path": scenario.root,
+            "scenario_preserved": true
         }
     });
     write_redacted_report(&report_path, &report, &credential_patterns);
-    scenario.finish();
+    scenario.preserve();
 }
 
 fn render_config(authority: &str, state: &Path, artifacts: &Path, workspace: &Path) -> String {
@@ -745,7 +982,7 @@ fn redacted_failure_report(
     phase: &str,
     terminal_event: &str,
     code: Option<&str>,
-    secret_scan_passed: bool,
+    secret_scan: Result<usize, SecretScanError>,
 ) -> Value {
     let retryable = code.is_some_and(|code| {
         matches!(
@@ -769,11 +1006,53 @@ fn redacted_failure_report(
             "provider_message": null,
             "authorization": "[REDACTED]"
         },
-        "secret_scan": {
-            "passed": secret_scan_passed,
-            "exact_credential_bytes_absent": secret_scan_passed
-        }
+        "secret_scan": secret_scan_report(&secret_scan)
     })
+}
+
+fn secret_scan_report(scan: &Result<usize, SecretScanError>) -> Value {
+    match scan {
+        Ok(files_scanned) => json!({
+            "passed": true,
+            "status": "complete",
+            "files_scanned": files_scanned,
+            "exact_credential_bytes_absent": true,
+            "forbidden_evidence_markers_absent": true,
+            "error_class": null
+        }),
+        Err(SecretScanError::ExactCredentialDetected) => json!({
+            "passed": false,
+            "status": "detected",
+            "files_scanned": null,
+            "exact_credential_bytes_absent": false,
+            "forbidden_evidence_markers_absent": null,
+            "error_class": "exact_credential_detected"
+        }),
+        Err(SecretScanError::ForbiddenEvidenceMarkerDetected) => json!({
+            "passed": false,
+            "status": "detected",
+            "files_scanned": null,
+            "exact_credential_bytes_absent": null,
+            "forbidden_evidence_markers_absent": false,
+            "error_class": "forbidden_evidence_marker_detected"
+        }),
+        Err(SecretScanError::Storage) => json!({
+            "passed": false,
+            "status": "incomplete",
+            "files_scanned": null,
+            "exact_credential_bytes_absent": null,
+            "forbidden_evidence_markers_absent": null,
+            "error_class": "storage"
+        }),
+        Err(SecretScanError::UnsafePath) => json!({
+            "passed": false,
+            "status": "incomplete",
+            "files_scanned": null,
+            "exact_credential_bytes_absent": null,
+            "forbidden_evidence_markers_absent": null,
+            "error_class": "unsafe_path"
+        }),
+    }
 }
 
 async fn write_live_failure_report(
@@ -782,11 +1061,49 @@ async fn write_live_failure_report(
     database: &Path,
     phase: &str,
     terminal_event: &str,
-    work_id: &str,
+    work_id: Option<&str>,
     credential_patterns: &[Vec<u8>],
 ) -> ! {
-    let mut connection = connect_read_only(database).await;
-    let code: Option<String> = sqlx::query_scalar(
+    persist_live_failure_report(
+        report_path,
+        root,
+        database,
+        phase,
+        terminal_event,
+        work_id,
+        credential_patterns,
+    )
+    .await;
+    panic!("Stage 25 live work failed; see the redacted acceptance report")
+}
+
+async fn persist_live_failure_report(
+    report_path: &Path,
+    root: &Path,
+    database: &Path,
+    phase: &str,
+    terminal_event: &str,
+    work_id: Option<&str>,
+    credential_patterns: &[Vec<u8>],
+) {
+    let code = provider_failure_code(database, work_id).await;
+    let secret_scan = scan_paths(&[root.to_path_buf()], credential_patterns);
+    let mut report = redacted_failure_report(phase, terminal_event, code.as_deref(), secret_scan);
+    report["evidence"] = json!({
+        "scenario_path": root,
+        "backend_stdout_stderr_preserved": true,
+        "contents_included": false
+    });
+    write_redacted_report(report_path, &report, credential_patterns);
+}
+
+async fn provider_failure_code(database: &Path, work_id: Option<&str>) -> Option<String> {
+    let work_id = work_id?;
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database)
+        .read_only(true);
+    let mut connection = sqlx::SqliteConnection::connect_with(&options).await.ok()?;
+    let code = sqlx::query_scalar(
         "SELECT provider_error_kind FROM model_invocations \
          WHERE work_id = ? AND provider_error_kind IS NOT NULL \
          ORDER BY agent_step_no DESC, attempt_no DESC LIMIT 1",
@@ -798,16 +1115,13 @@ async fn write_live_failure_report(
     .flatten()
     .flatten();
     let _ = connection.close().await;
-    let secret_scan_passed = scan_paths(&[root.to_path_buf()], credential_patterns).is_ok();
-    let report =
-        redacted_failure_report(phase, terminal_event, code.as_deref(), secret_scan_passed);
-    write_redacted_report(report_path, &report, credential_patterns);
-    panic!("Stage 25 live work failed; see the redacted acceptance report")
+    code
 }
 
 #[derive(Debug, Eq, PartialEq)]
 enum SecretScanError {
-    SecretDetected,
+    ExactCredentialDetected,
+    ForbiddenEvidenceMarkerDetected,
     Storage,
     UnsafePath,
 }
@@ -835,10 +1149,16 @@ fn scan_paths(paths: &[PathBuf], patterns: &[Vec<u8>]) -> Result<usize, SecretSc
         if patterns
             .iter()
             .map(Vec::as_slice)
-            .chain(FORBIDDEN_EVIDENCE_MARKERS)
             .any(|pattern| bytes.windows(pattern.len()).any(|window| window == pattern))
         {
-            return Err(SecretScanError::SecretDetected);
+            return Err(SecretScanError::ExactCredentialDetected);
+        }
+        if FORBIDDEN_EVIDENCE_MARKERS.iter().any(|pattern| {
+            bytes
+                .windows(pattern.len())
+                .any(|window| window == *pattern)
+        }) {
+            return Err(SecretScanError::ForbiddenEvidenceMarkerDetected);
         }
     }
     Ok(scanned)
@@ -893,6 +1213,8 @@ struct LiveScenario {
     root: PathBuf,
     child: Option<Child>,
     cleanup: bool,
+    phase: &'static str,
+    websocket_close_observed: bool,
 }
 
 impl LiveScenario {
@@ -905,6 +1227,8 @@ impl LiveScenario {
             )),
             child: None,
             cleanup: true,
+            phase: "scenario_setup",
+            websocket_close_observed: false,
         }
     }
 
@@ -951,20 +1275,57 @@ impl LiveScenario {
         self.child.take().expect("active Stage 25 backend")
     }
 
+    fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn observe_websocket_failure(&mut self, error: LiveWebSocketError) {
+        self.websocket_close_observed = error == LiveWebSocketError::CloseFrame;
+    }
+
     fn finish(mut self) {
         assert!(self.child.is_none());
         fs::remove_dir_all(&self.root).unwrap();
+        self.cleanup = false;
+    }
+
+    fn preserve(mut self) {
+        assert!(self.child.is_none());
         self.cleanup = false;
     }
 }
 
 impl Drop for LiveScenario {
     fn drop(&mut self) {
+        let mut backend_status = None;
+        let mut cleanup_signal_sent = false;
         if let Some(mut child) = self.child.take() {
-            let _ = signal_owned_process_group(&child, 9);
-            let _ = child.wait();
+            backend_status = child.try_wait().ok().flatten();
+            if std::thread::panicking() && self.websocket_close_observed {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while backend_status.is_none() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                    backend_status = child.try_wait().ok().flatten();
+                }
+            }
+            if backend_status.is_none() {
+                cleanup_signal_sent = true;
+                let _ = signal_owned_process_group(&child, 9);
+                backend_status = child.wait().ok();
+            }
         }
-        if self.cleanup
+        if std::thread::panicking() {
+            eprintln!("STAGE_25_FAILURE_PHASE: {}", self.phase);
+            if let Some(status) = backend_status {
+                let source = if cleanup_signal_sent {
+                    "harness_cleanup"
+                } else {
+                    "backend"
+                };
+                eprintln!("STAGE_25_BACKEND_EXIT: {source} {status}");
+            }
+            eprintln!("STAGE_25_SCENARIO_EVIDENCE: {}", self.root.display());
+        } else if self.cleanup
             && self
                 .root
                 .file_name()
@@ -1123,10 +1484,10 @@ fn fresh_client_id() -> String {
 async fn through_terminal_work(
     socket: &mut headless_client::Socket,
     work_id: &str,
-) -> (Vec<Value>, String) {
+) -> Result<(Vec<Value>, String), LiveWebSocketError> {
     let mut frames = Vec::new();
     loop {
-        let frame = next_json_with_timeout(socket, LIVE_WAIT).await;
+        let frame = next_live_json(socket, LIVE_WAIT).await?;
         let terminal = matches!(
             frame["event_type"].as_str(),
             Some("work.completed" | "work.failed" | "work.cancelled" | "work.interrupted")
@@ -1134,7 +1495,71 @@ async fn through_terminal_work(
         let event_type = frame["event_type"].as_str().unwrap_or_default().to_owned();
         frames.push(frame);
         if terminal {
-            return (frames, event_type);
+            return Ok((frames, event_type));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LiveWebSocketError {
+    Timeout,
+    StreamClosed,
+    Transport,
+    CloseFrame,
+    UnexpectedFrame,
+    InvalidJson,
+}
+
+impl LiveWebSocketError {
+    const fn report_event(self) -> &'static str {
+        match self {
+            Self::Timeout => "headless.websocket_timeout",
+            Self::StreamClosed => "headless.websocket_stream_closed",
+            Self::Transport => "headless.websocket_transport_error",
+            Self::CloseFrame => "headless.websocket_close",
+            Self::UnexpectedFrame => "headless.websocket_unexpected_frame",
+            Self::InvalidJson => "headless.websocket_invalid_json",
+        }
+    }
+}
+
+async fn next_live_json(
+    socket: &mut headless_client::Socket,
+    timeout: Duration,
+) -> Result<Value, LiveWebSocketError> {
+    loop {
+        let message = tokio::time::timeout(timeout, socket.next())
+            .await
+            .map_err(|_| LiveWebSocketError::Timeout)?
+            .ok_or(LiveWebSocketError::StreamClosed)?
+            .map_err(|_| LiveWebSocketError::Transport)?;
+        match message {
+            Message::Text(text) => {
+                return serde_json::from_str(&text).map_err(|_| LiveWebSocketError::InvalidJson);
+            }
+            Message::Ping(bytes) => socket
+                .send(Message::Pong(bytes))
+                .await
+                .map_err(|_| LiveWebSocketError::Transport)?,
+            Message::Pong(_) => {}
+            Message::Close(_) => return Err(LiveWebSocketError::CloseFrame),
+            Message::Binary(_) | Message::Frame(_) => {
+                return Err(LiveWebSocketError::UnexpectedFrame);
+            }
+        }
+    }
+}
+
+async fn through_live_sync(
+    socket: &mut headless_client::Socket,
+) -> Result<Vec<Value>, LiveWebSocketError> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = next_live_json(socket, Duration::from_secs(20)).await?;
+        let complete = frame["event_type"] == "sync.complete";
+        frames.push(frame);
+        if complete {
+            return Ok(frames);
         }
     }
 }
@@ -1406,8 +1831,9 @@ async fn inspect_first_turn(
     .await
     .unwrap();
     assert_eq!(cause, "model.invocation_completed");
-    let cause_actor: String = sqlx::query_scalar(
-        "SELECT cause.actor_id FROM journal_events assistant \
+    let cause_model_invocation_id: String = sqlx::query_scalar(
+        "SELECT json_extract(cause.payload_json, '$.model_invocation_id') \
+         FROM journal_events assistant \
          JOIN journal_events cause ON cause.event_id = assistant.causation_event_id \
          WHERE assistant.event_type = 'assistant.message_committed' AND assistant.work_id = ?",
     )
@@ -1415,7 +1841,7 @@ async fn inspect_first_turn(
     .fetch_one(&mut connection)
     .await
     .unwrap();
-    assert_eq!(cause_actor, final_invocation_id);
+    assert_eq!(cause_model_invocation_id, final_invocation_id);
 
     let assistant_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM messages WHERE message_id = ? AND produced_by_work_id = ? AND role = 'assistant'",
@@ -1541,10 +1967,16 @@ async fn manifest_source_count(
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM context_manifest_sources s \
          JOIN model_invocations m ON m.context_manifest_id = s.context_manifest_id \
-         WHERE m.work_id = ? AND s.source_record_kind = ? AND s.source_record_id = ?",
+         WHERE m.work_id = ? AND s.source_record_kind = ? \
+           AND (s.source_record_id = ? OR \
+                (? = 'model_invocation' AND \
+                 substr(s.source_record_id, 1, length(?) + 1) = ? || ':'))",
     )
     .bind(work_id)
     .bind(kind)
+    .bind(id)
+    .bind(kind)
+    .bind(id)
     .bind(id)
     .fetch_one(&mut *connection)
     .await
@@ -1627,7 +2059,15 @@ fn model_row_evidence(row: &sqlx::sqlite::SqliteRow) -> Value {
     }
     let provider_options: String = row.get("provider_options_json");
     let provider_options: Value = serde_json::from_str(&provider_options).unwrap();
-    assert_eq!(provider_options["reasoning_continuation"], true);
+    assert!(
+        provider_options["options"]
+            .as_array()
+            .is_some_and(|options| options.iter().any(|option| {
+                option["key"] == "reasoning_continuation"
+                    && option["value"]["kind"] == "boolean"
+                    && option["value"]["value"] == true
+            }))
+    );
     let normalized_output: Option<String> = row.get("normalized_output_json");
     let provider_reasoning_continuation_captured = normalized_output
         .as_deref()

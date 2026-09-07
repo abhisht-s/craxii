@@ -37,7 +37,7 @@ use crate::ports::state_store::{
 /// Defensive complete canonical provider-neutral request limit. Equality is allowed.
 pub const MAX_CANONICAL_MODEL_REQUEST_BYTES: u64 = 16_777_216;
 /// Fixed V0 instruction template version.
-pub const V0_INSTRUCTION_VERSION: &str = "craxii-v0-instructions-v1";
+pub const V0_INSTRUCTION_VERSION: &str = "craxii-v0-instructions-v2";
 /// Fixed V0 assembler implementation version.
 pub const V0_CONTEXT_ASSEMBLER_VERSION: &str = "causal-context-assembler-v1";
 /// Fixed V0 mandatory full-history policy version.
@@ -45,7 +45,7 @@ pub const V0_CONTEXT_POLICY_VERSION: &str = "mandatory-causal-history-v1";
 
 const SYSTEM_INSTRUCTION: &str =
     "You are Craxii. Use only the supplied durable context and report uncertainty honestly.";
-const DEVELOPER_INSTRUCTION: &str = "Preserve causal order, use tools only through their definitions, and never assume an unknown tool outcome is safe to repeat.";
+const DEVELOPER_INSTRUCTION: &str = "Preserve causal order, use tools only through their definitions, ground every requested current-machine fact in tool results before answering, and never assume an unknown tool outcome is safe to repeat.";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContextAssemblyVersions {

@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/Users/abhisht/.cargo/bin:${PATH:-/usr/bin:/bin}"
+cd "${repository_root}"
+
+if [[ "$#" -ne 0 ]]; then
+  echo "STAGE_26_NATIVE_LOCAL: ARGUMENTS_FORBIDDEN" >&2
+  exit 2
+fi
+if [[ "${CRAXII_STAGE26_LIVE:-}" != "1" ]]; then
+  echo "STAGE_26_NATIVE_LOCAL: LIVE_OPT_IN_REQUIRED" >&2
+  exit 2
+fi
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "STAGE_26_NATIVE_LOCAL: MACOS_REQUIRED" >&2
+  exit 2
+fi
+for name in \
+  OPENAI_API_KEY OPENAI_KEY CRAXII_OPENAI_API_KEY CRAXII_STAGE25_OPENAI_API_KEY \
+  CRAXII_STAGE22_UI_SMOKE CRAXII_STAGE21_UI_SMOKE CRAXII_STAGE21_INTEGRATION \
+  CRAXII_STAGE22_INTEGRATION; do
+  if printenv "${name}" >/dev/null 2>&1; then
+    echo "STAGE_26_NATIVE_LOCAL: FORBIDDEN_ENVIRONMENT_${name}" >&2
+    exit 2
+  fi
+done
+for command in cargo swift xcodebuild python3 rg strings security; do
+  if ! command -v "${command}" >/dev/null 2>&1; then
+    echo "STAGE_26_NATIVE_LOCAL: MISSING_${command}" >&2
+    exit 127
+  fi
+done
+
+console_user="$(stat -f '%Su' /dev/console)"
+if [[ "${console_user}" != "$(id -un)" ]] || ! pgrep -x WindowServer >/dev/null 2>&1; then
+  echo "STAGE_26_NATIVE_LOCAL: UNLOCKED_GRAPHICAL_SESSION_REQUIRED" >&2
+  exit 3
+fi
+session_state="$(ioreg -n Root -d1 2>/dev/null || true)"
+if rg -q 'CGSSessionScreenIsLocked[^=]*= ?Yes' <<<"${session_state}"; then
+  echo "STAGE_26_NATIVE_LOCAL: UNLOCK_THE_MAC_AND_RERUN" >&2
+  exit 3
+fi
+
+umask 077
+report_root="$(mktemp -d "${TMPDIR:-/tmp}/craxii-stage26.XXXXXX")"
+chmod 700 "${report_root}"
+derived_data="${report_root}/derived-data"
+mkdir -m 700 "${derived_data}"
+architecture="$(uname -m)"
+destination="platform=macOS,arch=${architecture}"
+acceptance_report="${report_root}/stage26-acceptance.json"
+verification_report="${report_root}/stage26-independent-verification.json"
+cancellation_report="${report_root}/stage26-cancellation.json"
+cancellation_xcresult="${report_root}/stage26-cancellation.xcresult"
+live_xcresult="${report_root}/stage26-live.xcresult"
+required_model="gpt-5.6-luna"
+
+echo "Stage 26 Luna-only production configuration preflight"
+CRAXII_STAGE25_REQUIRED_MODEL="${required_model}" \
+  cargo test --locked -p craxii-server --test stage25 \
+    stage25_luna_only_preflight -- --exact
+
+echo "Stage 26 focused Swift transport, projection, presentation, and adapter tests"
+swift test --package-path clients/macos/CraxiiClient
+
+echo "Stage 26 locked backend binaries and deterministic cancellation test compile"
+cargo build --locked -p craxii-server --bins
+cargo test --locked -p craxii-server --test stage26 --no-run
+
+echo "Stage 26 one-time Debug app/XCUI build-for-testing"
+xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Debug \
+  -destination "${destination}" \
+  -derivedDataPath "${derived_data}" \
+  -only-testing:CraxiiTests \
+  -only-testing:CraxiiUITests \
+  -quiet \
+  build-for-testing
+debug_app="${derived_data}/Build/Products/Debug/Craxii.app"
+if [[ ! -d "${debug_app}" ]]; then
+  echo "STAGE_26_NATIVE_LOCAL: DEBUG_APP_MISSING" >&2
+  exit 1
+fi
+
+echo "Stage 26 native app unit tests without rebuilding"
+xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Debug \
+  -destination "${destination}" \
+  -derivedDataPath "${derived_data}" \
+  -resultBundlePath "${report_root}/stage26-native-unit.xcresult" \
+  -only-testing:CraxiiTests \
+  -quiet \
+  test-without-building
+
+echo "Stage 26 Release fixture/string isolation"
+if xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Release \
+  -destination "${destination}" \
+  -derivedDataPath "${derived_data}" \
+  -showBuildSettings | rg -q 'SWIFT_ACTIVE_COMPILATION_CONDITIONS = .*CRAXII_UI_TEST_FIXTURES'; then
+  echo "STAGE_26_NATIVE_LOCAL: RELEASE_FIXTURE_CONDITION_PRESENT" >&2
+  exit 1
+fi
+xcodebuild \
+  -project clients/macos/Craxii.xcodeproj \
+  -scheme Craxii \
+  -configuration Release \
+  -destination "${destination}" \
+  -derivedDataPath "${derived_data}" \
+  -quiet \
+  build
+release_executable="${derived_data}/Build/Products/Release/Craxii.app/Contents/MacOS/Craxii"
+if strings -a "${release_executable}" | rg -q \
+  'CRAXII_STAGE(21|22)_UI_SMOKE|CRAXII_STAGE26_(LIVE|CANCELLATION|STATE_DIR)|Stage 22 smoke message|configureConversationSmokeState'; then
+  echo "STAGE_26_NATIVE_LOCAL: RELEASE_FIXTURE_OR_HARNESS_STRING_PRESENT" >&2
+  exit 1
+fi
+
+git diff --check
+
+echo "Stage 26 no-spend deterministic native cancellation smoke"
+if ! CRAXII_STAGE26_CANCELLATION=1 \
+  CRAXII_STAGE26_REPOSITORY="${repository_root}" \
+  CRAXII_STAGE26_DERIVED_DATA="${derived_data}" \
+  CRAXII_STAGE26_ARCH="${architecture}" \
+  CRAXII_STAGE26_CANCELLATION_REPORT_PATH="${cancellation_report}" \
+  CRAXII_STAGE26_CANCELLATION_XCRESULT_PATH="${cancellation_xcresult}" \
+  cargo test --locked -p craxii-server --test stage26 \
+    deterministic_native_cancellation_smoke -- --ignored --exact --nocapture; then
+  echo "STAGE_26_NATIVE_LOCAL: DETERMINISTIC_CANCELLATION_FAILED" >&2
+  echo "STAGE_26_EVIDENCE_ROOT: ${report_root}" >&2
+  exit 1
+fi
+
+echo "Stage 26 one-shot spend-bearing real Luna native acceptance"
+if ! python3 scripts/support/stage26_native_live.py \
+  --repository "${repository_root}" \
+  --server "${repository_root}/target/debug/craxii-server" \
+  --admin "${repository_root}/target/debug/craxii-admin" \
+  --template "${repository_root}/backend/tests/fixtures/config/stage25-openai-headless.toml.template" \
+  --derived "${derived_data}" \
+  --evidence "${report_root}/live-evidence" \
+  --report "${acceptance_report}" \
+  --xcresult "${live_xcresult}" \
+  --cancellation-report "${cancellation_report}" \
+  --verifier "${repository_root}/scripts/support/stage26_verify.py" \
+  --verification "${verification_report}"; then
+  echo "STAGE_26_NATIVE_LOCAL: LIVE_ACCEPTANCE_FAILED" >&2
+  echo "STAGE_26_EVIDENCE_ROOT: ${report_root}" >&2
+  exit 1
+fi
+
+echo "Stage 26 consolidated repository gate"
+if ! scripts/verify >"${report_root}/consolidated-repository-gate.log" 2>&1; then
+  echo "STAGE_26_NATIVE_LOCAL: CONSOLIDATED_REPOSITORY_GATE_FAILED" >&2
+  echo "STAGE_26_EVIDENCE_ROOT: ${report_root}" >&2
+  exit 1
+fi
+python3 scripts/support/stage26_finalize.py "${acceptance_report}"
+
+echo "STAGE_26_NATIVE_LOCAL: PASS"
+echo "STAGE_26_ACCEPTANCE_REPORT: ${acceptance_report}"
+echo "STAGE_26_INDEPENDENT_VERIFICATION: ${verification_report}"
+echo "STAGE_26_EVIDENCE_ROOT: ${report_root}"

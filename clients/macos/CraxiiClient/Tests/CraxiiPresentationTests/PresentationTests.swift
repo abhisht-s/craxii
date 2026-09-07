@@ -61,6 +61,8 @@ private func work(
 @Test func setupConnectingReconnectOfflineAuthenticationAndFatalStatesStayDistinct() {
     #expect(ConversationPresenter.present(snapshot: snapshot(credential: .required)).gate == .setup)
     #expect(ConversationPresenter.present(
+        snapshot: snapshot(state: .disconnected, projection: nil)).gate == .setup)
+    #expect(ConversationPresenter.present(
         snapshot: snapshot(state: .bootstrapping, projection: nil)).gate == .connecting)
     #expect(ConversationPresenter.present(
         snapshot: snapshot(state: .reconnecting)).banner?.kind == .reconnecting)

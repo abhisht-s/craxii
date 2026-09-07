@@ -140,6 +140,8 @@ public enum ConversationPresenter {
         } else if !endpointConfigured || snapshot.credentialStatus == .required
             || snapshot.credentialStatus == .malformed {
             gate = .setup
+        } else if !usable && snapshot.connectionState == .disconnected {
+            gate = .setup
         } else if !usable {
             gate = .connecting
         } else {

@@ -144,6 +144,20 @@ impl SqliteStateStore {
     async fn verify_consistency(
         &self,
     ) -> Result<ApplicationConsistencyReceipt, SqliteAdapterError> {
+        macro_rules! consistency_step {
+            ($stage:literal, $result:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        tracing::error!(
+                            event_name = "application_consistency_check_failed",
+                            validation_stage = $stage,
+                        );
+                        return Err(error);
+                    }
+                }
+            };
+        }
         let mut transaction = self
             .runtime
             .inner
@@ -159,8 +173,12 @@ impl SqliteStateStore {
         let events = event_rows
             .iter()
             .map(decode_event_row)
-            .collect::<Result<Vec<_>, _>>()?;
-        let projected = project(&events).map_err(|_| inconsistent())?;
+            .collect::<Result<Vec<_>, _>>();
+        let events = consistency_step!("journal_event_decode", events);
+        let projected = consistency_step!(
+            "journal_projection",
+            project(&events).map_err(|_| inconsistent())
+        );
 
         let head_rows = sqlx::query("SELECT stream_id, last_stream_seq FROM stream_heads")
             .fetch_all(&mut *transaction)
@@ -175,6 +193,10 @@ impl SqliteStateStore {
             let sequence = crate::domain::StreamSeq::try_new(row.try_get("last_stream_seq")?)
                 .map_err(|_| inconsistent())?;
             if heads.insert(stream, sequence).is_some() {
+                tracing::error!(
+                    event_name = "application_consistency_check_failed",
+                    validation_stage = "stream_head_duplicate",
+                );
                 return Err(inconsistent());
             }
         }
@@ -183,22 +205,46 @@ impl SqliteStateStore {
             replay_heads.insert(event.stream_id, event.stream_seq);
         }
         if heads != replay_heads {
+            tracing::error!(
+                event_name = "application_consistency_check_failed",
+                validation_stage = "stream_head_replay",
+            );
             return Err(inconsistent());
         }
 
-        validate_exact_root_counts(&mut transaction).await?;
-        let root = load_root_snapshot(&mut transaction).await?;
-        compare_root_projection(&root, &projected, &events)?;
-        compare_message_projection(&mut transaction, &projected).await?;
-        compare_work_projection(&mut transaction, &projected).await?;
-        compare_work_inputs(&mut transaction, &projected).await?;
-        let stage8_invariants =
-            super::stage8::verify_stage8_consistency(&mut transaction, &projected, &events).await?;
-        let stage9_invariants =
-            super::stage9::verify_stage9_consistency(&mut transaction, &events).await?;
-        let stage10_invariants =
-            super::stage10::verify_stage10_consistency(&mut transaction, &projected, &events)
-                .await?;
+        consistency_step!(
+            "root_counts",
+            validate_exact_root_counts(&mut transaction).await
+        );
+        let root = consistency_step!("root_snapshot", load_root_snapshot(&mut transaction).await);
+        consistency_step!(
+            "root_projection",
+            compare_root_projection(&root, &projected, &events)
+        );
+        consistency_step!(
+            "message_projection",
+            compare_message_projection(&mut transaction, &projected).await
+        );
+        consistency_step!(
+            "work_projection",
+            compare_work_projection(&mut transaction, &projected).await
+        );
+        consistency_step!(
+            "work_inputs",
+            compare_work_inputs(&mut transaction, &projected).await
+        );
+        let stage8_invariants = consistency_step!(
+            "stage8",
+            super::stage8::verify_stage8_consistency(&mut transaction, &projected, &events).await
+        );
+        let stage9_invariants = consistency_step!(
+            "stage9",
+            super::stage9::verify_stage9_consistency(&mut transaction, &events).await
+        );
+        let stage10_invariants = consistency_step!(
+            "stage10",
+            super::stage10::verify_stage10_consistency(&mut transaction, &projected, &events).await
+        );
 
         let journal_head = events.last().map(|event| event.journal_offset);
         transaction

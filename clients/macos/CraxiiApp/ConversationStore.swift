@@ -84,7 +84,8 @@ final class ConversationStore {
             if let injectedSession {
                 session = injectedSession
             } else {
-                let stateStore = try AtomicFileStateStore()
+                let stateStore = try AtomicFileStateStore(
+                    directory: Self.stage26StateDirectory)
                 let persisted = try? await stateStore.load()
                 let generator = UUIDv7Generator()
                 let profile: BackendProfile
@@ -313,5 +314,17 @@ final class ConversationStore {
         #else
         false
         #endif
+    }
+
+    private static var stage26StateDirectory: URL? {
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        let active = environment["CRAXII_STAGE26_LIVE"] == "1"
+            || environment["CRAXII_STAGE26_CANCELLATION"] == "1"
+        if active, let path = environment["CRAXII_STAGE26_STATE_DIR"], path.hasPrefix("/") {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        #endif
+        return nil
     }
 }

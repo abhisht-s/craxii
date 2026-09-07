@@ -45,6 +45,35 @@ fn conflict() -> SqliteAdapterError {
     SqliteAdapterError::new(SqliteFailureKind::StateConflict)
 }
 
+const fn sqlite_failure_kind_name(kind: SqliteFailureKind) -> &'static str {
+    match kind {
+        SqliteFailureKind::UnsafeStatePath => "unsafe_state_path",
+        SqliteFailureKind::UnsupportedFilesystem => "unsupported_filesystem",
+        SqliteFailureKind::AlreadyOwned => "already_owned",
+        SqliteFailureKind::Storage => "storage",
+        SqliteFailureKind::BusyOrLocked => "busy_or_locked",
+        SqliteFailureKind::Corrupt => "corrupt",
+        SqliteFailureKind::NewerSchema => "newer_schema",
+        SqliteFailureKind::InconsistentSchema => "inconsistent_schema",
+        SqliteFailureKind::StateConflict => "state_conflict",
+        SqliteFailureKind::IdempotencyConflict => "idempotency_conflict",
+        SqliteFailureKind::TargetNotFound => "target_not_found",
+        SqliteFailureKind::InternalInvariant => "internal_invariant",
+    }
+}
+
+const fn port_failure_kind_name(kind: SqliteFailureKind) -> &'static str {
+    match kind {
+        SqliteFailureKind::StateConflict => "state_conflict",
+        SqliteFailureKind::IdempotencyConflict => "idempotency_conflict",
+        SqliteFailureKind::TargetNotFound => "target_not_found",
+        SqliteFailureKind::InternalInvariant | SqliteFailureKind::InconsistentSchema => {
+            "internal_invariant"
+        }
+        _ => "storage",
+    }
+}
+
 async fn load_owned_work_state(
     store: &SqliteStateStore,
     request: LoadOwnedWorkRequest,
@@ -1405,6 +1434,42 @@ async fn mark_model_streaming(
 
 type ValidatedModelTerminal = (Option<String>, Option<[i64; 5]>, Option<String>);
 
+fn invalid_model_terminal(
+    request: &FinishModelInvocationRequest,
+    invariant: &'static str,
+) -> SqliteAdapterError {
+    tracing::warn!(
+        event_name = "state_store_invariant_failed",
+        operation = "finish_model_invocation",
+        work_id = %request.expected_work.work_id,
+        model_invocation_id = %request.expected_model.model_invocation_id,
+        state_store_error_kind = "internal_invariant",
+        invariant,
+        expected_model_state = request.expected_model.state.as_str(),
+        intended_model_state = request.outcome.state.as_str(),
+        first_byte_present = request.outcome.first_byte_at.is_some(),
+        first_output_present = request.outcome.first_output_at.is_some(),
+        provider_request_id_present = request.outcome.provider_request_id.is_some(),
+        provider_response_id_present = request.outcome.provider_response_id.is_some(),
+        usage_status = request.outcome.usage_status.as_str(),
+        usage_present = request.outcome.usage.is_some(),
+        normalized_output_present = request.outcome.normalized_output.is_some(),
+        normalized_output_item_count = request
+            .outcome
+            .normalized_output
+            .as_ref()
+            .map(|output| u64::try_from(output.items.len()).unwrap_or(u64::MAX)),
+        prepared_artifact_count = u64::try_from(request.artifacts.len()).unwrap_or(u64::MAX),
+        provider_error_kind = request
+            .outcome
+            .provider_error_kind
+            .map(crate::ports::model_provider::ProviderErrorKind::code),
+        provider_outcome_certainty = request.outcome.provider_outcome_certainty.as_str(),
+        billing_ambiguity = request.outcome.billing_ambiguity,
+    );
+    invalid()
+}
+
 fn validate_model_terminal(
     request: &FinishModelInvocationRequest,
 ) -> Result<ValidatedModelTerminal, SqliteAdapterError> {
@@ -1425,7 +1490,7 @@ fn validate_model_terminal(
                 WorkState::Cancelled | WorkState::Interrupted
             ))
     {
-        return Err(invalid());
+        return Err(invalid_model_terminal(request, "lifecycle_transition"));
     }
     for value in [
         outcome.provider_request_id.as_deref(),
@@ -1436,7 +1501,10 @@ fn validate_model_terminal(
     .flatten()
     {
         if value.is_empty() || value.len() > 255 || value.trim() != value {
-            return Err(invalid());
+            return Err(invalid_model_terminal(
+                request,
+                "provider_evidence_identifier",
+            ));
         }
     }
     if outcome
@@ -1447,7 +1515,10 @@ fn validate_model_terminal(
             .tool_call_count
             .is_some_and(|value| value > i64::MAX as u64)
     {
-        return Err(invalid());
+        return Err(invalid_model_terminal(
+            request,
+            "stop_reason_or_tool_count_bounds",
+        ));
     }
     let (output_json, usage) = match outcome.state {
         ModelInvocationState::Completed => {
@@ -1469,9 +1540,15 @@ fn validate_model_terminal(
                         crate::ports::model_provider::ModelUsageStatus::Unavailable
                     }
             {
-                return Err(invalid());
+                return Err(invalid_model_terminal(
+                    request,
+                    "completed_terminal_evidence",
+                ));
             }
-            let output = outcome.normalized_output.as_ref().ok_or_else(invalid)?;
+            let output = outcome
+                .normalized_output
+                .as_ref()
+                .ok_or_else(|| invalid_model_terminal(request, "completed_output_missing"))?;
             let tool_calls = u64::try_from(
                 output
                     .items
@@ -1484,13 +1561,24 @@ fn validate_model_terminal(
                     })
                     .count(),
             )
-            .map_err(|_| invalid())?;
+            .map_err(|_| invalid_model_terminal(request, "completed_tool_count_overflow"))?;
             if outcome.tool_call_count != Some(tool_calls) {
-                return Err(invalid());
+                return Err(invalid_model_terminal(
+                    request,
+                    "completed_tool_count_mismatch",
+                ));
             }
             (
-                Some(encode_normalized_output(output)?),
-                outcome.usage.map(encode_model_usage).transpose()?,
+                Some(
+                    encode_normalized_output(output).map_err(|_| {
+                        invalid_model_terminal(request, "completed_output_encoding")
+                    })?,
+                ),
+                outcome
+                    .usage
+                    .map(encode_model_usage)
+                    .transpose()
+                    .map_err(|_| invalid_model_terminal(request, "completed_usage_encoding"))?,
             )
         }
         ModelInvocationState::Failed
@@ -1510,10 +1598,12 @@ fn validate_model_terminal(
                         crate::ports::model_provider::ModelUsageStatus::Unavailable
                     }
             {
-                return Err(invalid());
+                return Err(invalid_model_terminal(request, "failed_terminal_evidence"));
             }
             let certainty = outcome.provider_outcome_certainty;
-            let kind = outcome.provider_error_kind.ok_or_else(invalid)?;
+            let kind = outcome.provider_error_kind.ok_or_else(|| {
+                invalid_model_terminal(request, "failed_provider_error_kind_missing")
+            })?;
             let evidence_valid = match outcome.state {
                 ModelInvocationState::Failed => {
                     matches!(
@@ -1548,12 +1638,12 @@ fn validate_model_terminal(
                 _ => false,
             };
             if !evidence_valid {
-                return Err(invalid());
+                return Err(invalid_model_terminal(request, "terminal_outcome_evidence"));
             }
             (None, None)
         }
         ModelInvocationState::Requesting | ModelInvocationState::Streaming => {
-            return Err(invalid());
+            return Err(invalid_model_terminal(request, "terminal_state_required"));
         }
     };
     let error = outcome
@@ -1562,9 +1652,13 @@ fn validate_model_terminal(
         .map(|value| {
             let unknown = outcome.state == ModelInvocationState::ProviderOutcomeUnknown;
             if (value.certainty().as_str() == "outcome_unknown") != unknown {
-                return Err(invalid());
+                return Err(invalid_model_terminal(
+                    request,
+                    "normalized_error_certainty",
+                ));
             }
             encode_attempt_error(value, unknown)
+                .map_err(|_| invalid_model_terminal(request, "normalized_error_encoding"))
         })
         .transpose()?;
     let provider_usage = if outcome.state == ModelInvocationState::Completed {
@@ -1573,7 +1667,8 @@ fn validate_model_terminal(
         outcome
             .usage
             .map(encode_provider_reported_usage)
-            .transpose()?
+            .transpose()
+            .map_err(|_| invalid_model_terminal(request, "provider_usage_encoding"))?
     };
     Ok((output_json.or(error), usage, provider_usage))
 }
@@ -2872,13 +2967,17 @@ pub(super) async fn verify_stage8_consistency(
                     "SELECT COUNT(*) FROM model_invocations WHERE model_invocation_id = ? \
                      AND work_id = ? AND (request_artifact_id = ? OR response_artifact_id = ? \
                      OR EXISTS (SELECT 1 FROM context_manifests WHERE work_id = ? \
-                     AND rendered_request_artifact_id = ?))",
+                     AND rendered_request_artifact_id = ?) \
+                     OR EXISTS (SELECT 1 FROM json_each(normalized_output_json, '$.items') item \
+                     WHERE json_extract(item.value, '$.kind') = 'provider_opaque' \
+                     AND json_extract(item.value, '$.artifact_id') = ?))",
                 )
                 .bind(&producer_id)
                 .bind(work_id.to_string())
                 .bind(artifact_id.to_string())
                 .bind(artifact_id.to_string())
                 .bind(work_id.to_string())
+                .bind(artifact_id.to_string())
                 .bind(artifact_id.to_string())
                 .fetch_one(&mut *connection)
                 .await
@@ -3522,7 +3621,25 @@ impl ModelStateStore for SqliteStateStore {
         &self,
         request: FinishModelInvocationRequest,
     ) -> StateStoreFuture<'_, CommitReceipt> {
-        Box::pin(async move { finish_model(self, request).await.map_err(map_port_error) })
+        Box::pin(async move {
+            let work_id = request.expected_work.work_id;
+            let model_invocation_id = request.expected_model.model_invocation_id;
+            match finish_model(self, request).await {
+                Ok(receipt) => Ok(receipt),
+                Err(error) => {
+                    tracing::warn!(
+                        event_name = "state_store_operation_failed",
+                        operation = "finish_model_invocation",
+                        work_id = %work_id,
+                        model_invocation_id = %model_invocation_id,
+                        state_store_error_kind = port_failure_kind_name(error.kind()),
+                        sqlite_failure_kind = sqlite_failure_kind_name(error.kind()),
+                        sqlite_code = error.sqlite_code(),
+                    );
+                    Err(map_port_error(error))
+                }
+            }
+        })
     }
 
     fn terminalize_owned_work(

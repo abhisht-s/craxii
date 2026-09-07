@@ -24,8 +24,10 @@ struct SetupView: View {
             }
             HStack {
                 Button("Apply Endpoint") { Task { await store.applyEndpoint() } }
+                    .accessibilityIdentifier("setup.apply-endpoint")
                 Button("Save Credential") { Task { await store.installCredential() } }
                     .disabled(store.credentialInput.isEmpty)
+                    .accessibilityIdentifier("setup.save-credential")
                 if store.presentation.gate == .configurationMismatch {
                     Button("Reset Disposable State", role: .destructive) {
                         Task { await store.reset() }
@@ -34,6 +36,7 @@ struct SetupView: View {
                 Spacer()
                 Button("Connect") { Task { await store.connect() } }
                     .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("setup.connect")
             }
         }
         .padding(32)
@@ -78,6 +81,7 @@ struct DiagnosticView: View {
                 TextField("Endpoint", text: $store.endpoint)
                     .accessibilityIdentifier("setup.endpoint")
                 Button("Apply Endpoint") { Task { await store.applyEndpoint() } }
+                    .accessibilityIdentifier("setup.apply-endpoint")
             }
             Section("Device Credential") {
                 LabeledContent("Status", value: store.snapshot.credentialStatus.rawValue)
@@ -85,6 +89,7 @@ struct DiagnosticView: View {
                     .accessibilityIdentifier("setup.credential")
                 HStack {
                     Button("Save Credential") { Task { await store.installCredential() } }
+                        .accessibilityIdentifier("setup.save-credential")
                     Button("Delete Credential", role: .destructive) {
                         Task { await store.deleteCredential() }
                     }
@@ -94,6 +99,7 @@ struct DiagnosticView: View {
                 LabeledContent("State", value: store.snapshot.connectionState.rawValue)
                 HStack {
                     Button("Connect / Retry") { Task { await store.connect() } }
+                        .accessibilityIdentifier("setup.connect")
                     Button("Reset Disposable State", role: .destructive) {
                         Task { await store.reset() }
                     }

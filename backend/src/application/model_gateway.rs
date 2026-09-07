@@ -40,7 +40,8 @@ use crate::ports::state_store::{
     ModelStateStore, ModelStreamingObservation, ModelTerminalOutcome,
     ModelUsage as StoredModelUsage, NormalizedModelOutput, NormalizedModelOutputItem,
     PreparedArtifact, PreparedModelInvocation, ProviderOption, ProviderOptionValue,
-    RequiredModelCapabilities as StoredRequiredModelCapabilities, StateStoreError, WorkExpectation,
+    RequiredModelCapabilities as StoredRequiredModelCapabilities, StateStoreError,
+    StateStoreErrorKind, WorkExpectation,
 };
 
 const MAX_STREAM_EVENTS: usize = 4_096;
@@ -1327,30 +1328,33 @@ impl ModelGateway {
             draft_exposed,
             normalized_error: None,
         };
+        let finish_request = FinishModelInvocationRequest {
+            expected_work: WorkExpectation::for_snapshot(&invocation.work),
+            expected_model: ModelExpectation {
+                model_invocation_id: attempt_id,
+                state: model_state,
+            },
+            outcome,
+            artifacts,
+            work_next: resumed,
+            model_event: EventIntent {
+                event_id: model_event,
+                correlation_id: invocation.correlation_id,
+                causation_event_id: Some(cause),
+            },
+            work_event: EventIntent {
+                event_id: work_event,
+                correlation_id: invocation.correlation_id,
+                causation_event_id: Some(model_event),
+            },
+        };
+        observe_model_finish_intent(attempt_id, &finish_request, None);
         if let Err(error) = self
             .state_store
-            .finish_model_invocation(FinishModelInvocationRequest {
-                expected_work: WorkExpectation::for_snapshot(&invocation.work),
-                expected_model: ModelExpectation {
-                    model_invocation_id: attempt_id,
-                    state: model_state,
-                },
-                outcome,
-                artifacts,
-                work_next: resumed,
-                model_event: EventIntent {
-                    event_id: model_event,
-                    correlation_id: invocation.correlation_id,
-                    causation_event_id: Some(cause),
-                },
-                work_event: EventIntent {
-                    event_id: work_event,
-                    correlation_id: invocation.correlation_id,
-                    causation_event_id: Some(model_event),
-                },
-            })
+            .finish_model_invocation(finish_request)
             .await
         {
+            observe_model_finish_failure(attempt_id, error);
             return PhysicalAttemptResult::Infrastructure(error.into());
         }
         #[cfg(feature = "test-failpoints")]
@@ -1511,6 +1515,11 @@ impl ModelGateway {
         } else {
             error.normalized()
         };
+        let persisted_error_kind = if ambiguous {
+            ProviderErrorKind::ProviderOutcomeUnknown
+        } else {
+            error.kind()
+        };
         let outcome = ModelTerminalOutcome {
             state: terminal_state,
             response_sha256: None,
@@ -1527,7 +1536,7 @@ impl ModelGateway {
             } else {
                 ModelUsageStatus::Unavailable
             },
-            provider_error_kind: Some(error.kind()),
+            provider_error_kind: Some(persisted_error_kind),
             provider_outcome_certainty: certainty,
             billing_ambiguity: ambiguous,
             stop_reason: None,
@@ -1535,30 +1544,33 @@ impl ModelGateway {
             draft_exposed,
             normalized_error: Some(normalized_error),
         };
+        let finish_request = FinishModelInvocationRequest {
+            expected_work: WorkExpectation::for_snapshot(&invocation.work),
+            expected_model: ModelExpectation {
+                model_invocation_id: attempt_id,
+                state: model_state,
+            },
+            outcome,
+            artifacts: Vec::new(),
+            work_next,
+            model_event: EventIntent {
+                event_id: model_event,
+                correlation_id: invocation.correlation_id,
+                causation_event_id: Some(cause),
+            },
+            work_event: EventIntent {
+                event_id: work_event,
+                correlation_id: invocation.correlation_id,
+                causation_event_id: Some(model_event),
+            },
+        };
+        observe_model_finish_intent(attempt_id, &finish_request, Some(error.kind()));
         if let Err(error) = self
             .state_store
-            .finish_model_invocation(FinishModelInvocationRequest {
-                expected_work: WorkExpectation::for_snapshot(&invocation.work),
-                expected_model: ModelExpectation {
-                    model_invocation_id: attempt_id,
-                    state: model_state,
-                },
-                outcome,
-                artifacts: Vec::new(),
-                work_next,
-                model_event: EventIntent {
-                    event_id: model_event,
-                    correlation_id: invocation.correlation_id,
-                    causation_event_id: Some(cause),
-                },
-                work_event: EventIntent {
-                    event_id: work_event,
-                    correlation_id: invocation.correlation_id,
-                    causation_event_id: Some(model_event),
-                },
-            })
+            .finish_model_invocation(finish_request)
             .await
         {
+            observe_model_finish_failure(attempt_id, error);
             return PhysicalAttemptResult::Infrastructure(error.into());
         }
         let attempt = DurableModelAttempt {
@@ -1773,6 +1785,107 @@ impl ModelGateway {
             .and_then(|value| {
                 UtcTimestamp::from_offset_datetime(value).map_err(|_| ModelGatewayError::Clock)
             })
+    }
+}
+
+fn observe_model_finish_intent(
+    attempt_id: ModelInvocationId,
+    request: &FinishModelInvocationRequest,
+    source_provider_error_kind: Option<ProviderErrorKind>,
+) {
+    let outcome = &request.outcome;
+    let first_byte_at = outcome.first_byte_at.map(|value| value.to_string());
+    let first_output_at = outcome.first_output_at.map(|value| value.to_string());
+    let completed_at = outcome.completed_at.to_string();
+    let provider_request_id_length = outcome.provider_request_id.as_ref().map(String::len);
+    let provider_response_id_length = outcome.provider_response_id.as_ref().map(String::len);
+    let provider_ids_equal = outcome
+        .provider_request_id
+        .as_ref()
+        .zip(outcome.provider_response_id.as_ref())
+        .map(|(request_id, response_id)| request_id == response_id);
+    let mut text_item_count = 0_u64;
+    let mut reasoning_item_count = 0_u64;
+    let mut tool_item_count = 0_u64;
+    let mut structured_item_count = 0_u64;
+    let mut refusal_item_count = 0_u64;
+    let mut opaque_item_count = 0_u64;
+    let mut unknown_item_count = 0_u64;
+    if let Some(output) = outcome.normalized_output.as_ref() {
+        for item in &output.items {
+            match item {
+                NormalizedModelOutputItem::Text { .. } => text_item_count += 1,
+                NormalizedModelOutputItem::ReasoningSummary { .. } => reasoning_item_count += 1,
+                NormalizedModelOutputItem::ToolCall { .. } => tool_item_count += 1,
+                NormalizedModelOutputItem::StructuredData { .. } => structured_item_count += 1,
+                NormalizedModelOutputItem::Refusal { .. } => refusal_item_count += 1,
+                NormalizedModelOutputItem::ProviderOpaque { .. } => opaque_item_count += 1,
+                NormalizedModelOutputItem::UnknownProviderItem { .. } => unknown_item_count += 1,
+            }
+        }
+    }
+    let normalized_output_item_count = text_item_count
+        + reasoning_item_count
+        + tool_item_count
+        + structured_item_count
+        + refusal_item_count
+        + opaque_item_count
+        + unknown_item_count;
+    let usage = outcome.usage;
+    tracing::info!(
+        event_name = "model_state_store_finish_intent",
+        operation = "finish_model_invocation",
+        model_invocation_id = %attempt_id,
+        expected_model_state = request.expected_model.state.as_str(),
+        intended_model_state = outcome.state.as_str(),
+        stop_reason = outcome.stop_reason.as_deref(),
+        first_byte_at = first_byte_at.as_deref(),
+        first_output_at = first_output_at.as_deref(),
+        completed_at = completed_at.as_str(),
+        provider_request_id_present = outcome.provider_request_id.is_some(),
+        provider_request_id_length,
+        provider_response_id_present = outcome.provider_response_id.is_some(),
+        provider_response_id_length,
+        provider_ids_equal,
+        usage_status = outcome.usage_status.as_str(),
+        input_tokens = usage.map(|value| value.input_tokens),
+        cached_input_tokens = usage.map(|value| value.cached_input_tokens),
+        output_tokens = usage.map(|value| value.output_tokens),
+        reasoning_tokens = usage.map(|value| value.reasoning_tokens),
+        total_tokens = usage.map(|value| value.total_tokens),
+        normalized_output_item_count,
+        text_item_count,
+        reasoning_item_count,
+        tool_item_count,
+        structured_item_count,
+        refusal_item_count,
+        opaque_item_count,
+        unknown_item_count,
+        prepared_artifact_count = u64::try_from(request.artifacts.len()).unwrap_or(u64::MAX),
+        source_provider_error_kind = source_provider_error_kind.map(ProviderErrorKind::code),
+        provider_error_kind = outcome.provider_error_kind.map(ProviderErrorKind::code),
+        provider_outcome_certainty = outcome.provider_outcome_certainty.as_str(),
+        billing_ambiguity = outcome.billing_ambiguity,
+        draft_exposed = outcome.draft_exposed,
+    );
+}
+
+fn observe_model_finish_failure(attempt_id: ModelInvocationId, error: StateStoreError) {
+    tracing::warn!(
+        event_name = "model_state_store_finish_failed",
+        operation = "finish_model_invocation",
+        model_invocation_id = %attempt_id,
+        state_store_error_kind = state_store_error_kind(error.kind()),
+    );
+}
+
+const fn state_store_error_kind(kind: StateStoreErrorKind) -> &'static str {
+    match kind {
+        StateStoreErrorKind::Storage => "storage",
+        StateStoreErrorKind::StateConflict => "state_conflict",
+        StateStoreErrorKind::InternalInvariant => "internal_invariant",
+        StateStoreErrorKind::IdempotencyConflict => "idempotency_conflict",
+        StateStoreErrorKind::TargetNotFound => "target_not_found",
     }
 }
 
@@ -2551,6 +2664,8 @@ mod tests {
         request_sha256: Sha256Digest,
         retry: Option<ProviderRetryEvidence>,
         terminal_state: Option<ModelInvocationState>,
+        provider_error_kind: Option<ProviderErrorKind>,
+        provider_outcome_certainty: Option<ProviderOutcomeCertainty>,
         usage_status: Option<ModelUsageStatus>,
         draft_exposed: Option<bool>,
     }
@@ -2558,9 +2673,17 @@ mod tests {
     #[derive(Default)]
     struct FakeGatewayStore {
         attempts: Mutex<Vec<AttemptEvidence>>,
+        reject_invalid_unknown_outcome: bool,
     }
 
     impl FakeGatewayStore {
+        fn with_strict_unknown_outcome_contract() -> Self {
+            Self {
+                attempts: Mutex::new(Vec::new()),
+                reject_invalid_unknown_outcome: true,
+            }
+        }
+
         fn attempts(&self) -> Vec<AttemptEvidence> {
             self.attempts
                 .lock()
@@ -2597,6 +2720,8 @@ mod tests {
                         request_sha256: request.invocation.request_sha256,
                         retry: request.invocation.retry_evidence,
                         terminal_state: None,
+                        provider_error_kind: None,
+                        provider_outcome_certainty: None,
                         usage_status: None,
                         draft_exposed: None,
                     });
@@ -2616,6 +2741,22 @@ mod tests {
             request: FinishModelInvocationRequest,
         ) -> StateStoreFuture<'_, CommitReceipt> {
             Box::pin(async move {
+                if self.reject_invalid_unknown_outcome
+                    && request.outcome.state == ModelInvocationState::ProviderOutcomeUnknown
+                    && (!matches!(
+                        request.outcome.provider_error_kind,
+                        Some(
+                            ProviderErrorKind::TransportAfterPossibleProcessing
+                                | ProviderErrorKind::TimeoutAfterOutput
+                                | ProviderErrorKind::Cancelled
+                                | ProviderErrorKind::ProviderOutcomeUnknown
+                        )
+                    ) || request.outcome.provider_outcome_certainty
+                        != ProviderOutcomeCertainty::ProviderOutcomeUnknown
+                        || !request.outcome.billing_ambiguity)
+                {
+                    return Err(StateStoreError::new(StateStoreErrorKind::InternalInvariant));
+                }
                 let mut attempts = self
                     .attempts
                     .lock()
@@ -2624,6 +2765,9 @@ mod tests {
                     .last_mut()
                     .ok_or_else(|| StateStoreError::new(StateStoreErrorKind::InternalInvariant))?;
                 attempt.terminal_state = Some(request.outcome.state);
+                attempt.provider_error_kind = request.outcome.provider_error_kind;
+                attempt.provider_outcome_certainty =
+                    Some(request.outcome.provider_outcome_certainty);
                 attempt.usage_status = Some(request.outcome.usage_status);
                 attempt.draft_exposed = Some(request.outcome.draft_exposed);
                 Ok(Self::receipt())
@@ -3182,6 +3326,56 @@ mod tests {
         assert_eq!(
             store.attempts()[0].terminal_state,
             Some(ModelInvocationState::Completed)
+        );
+    }
+
+    #[tokio::test]
+    async fn ambiguous_protocol_failure_persists_canonical_unknown_outcome() {
+        let fixture = gateway_fixture();
+        let provider = Arc::new(ScriptedProvider::with_clock(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![program(
+                &fixture,
+                1,
+                1,
+                vec![
+                    ScriptedStep::emit(ModelStreamEvent::ResponseStarted {
+                        target: fixture.target.identity(),
+                        provider_request_id: Some(
+                            ProviderEvidenceId::try_new("request-1").unwrap(),
+                        ),
+                        provider_response_id: Some(
+                            ProviderEvidenceId::try_new("response-1").unwrap(),
+                        ),
+                    }),
+                    ScriptedStep::Fail(ProviderError::new(
+                        ProviderErrorKind::UnsupportedResponseItem,
+                        ProviderOutcomeCertainty::ProviderOutcomeUnknown,
+                    )),
+                ],
+            )],
+            fixture.clock.clone(),
+        ));
+        let store = Arc::new(FakeGatewayStore::with_strict_unknown_outcome_contract());
+        let gateway = build_gateway(store.clone(), provider, fixture.clock.clone());
+        let (_, receiver) = tokio::sync::watch::channel(false);
+
+        let result = gateway.invoke(invocation(fixture, receiver)).await.unwrap();
+
+        assert!(matches!(result, DurableModelOutcome::Interrupted { .. }));
+        let attempts = store.attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].terminal_state,
+            Some(ModelInvocationState::ProviderOutcomeUnknown)
+        );
+        assert_eq!(
+            attempts[0].provider_error_kind,
+            Some(ProviderErrorKind::ProviderOutcomeUnknown)
+        );
+        assert_eq!(
+            attempts[0].provider_outcome_certainty,
+            Some(ProviderOutcomeCertainty::ProviderOutcomeUnknown)
         );
     }
 

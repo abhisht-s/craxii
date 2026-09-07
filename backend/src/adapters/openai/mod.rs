@@ -275,6 +275,11 @@ fn encode_request(request: &ModelRequest) -> Result<Vec<u8>, ProviderError> {
         },
         parallel_tool_calls: false,
         store: false,
+        include: request
+            .target()
+            .provider_native_options()
+            .reasoning_continuation()
+            .then_some(&["reasoning.encrypted_content"]),
         stream: true,
         truncation: "disabled",
         max_output_tokens: u64::try_from(request.requested_output_limit().get())
@@ -358,6 +363,30 @@ fn evidence_message(value: Value) -> Result<Value, ProviderError> {
                 .map_err(|_| not_sent(ProviderErrorKind::InvalidRequest))?,
         }],
     }))
+}
+
+fn completed_item_matches_done(kind: &str, completed: &Value, done: &Value) -> bool {
+    let stable_fields: &[&str] = match kind {
+        "message" => &["id", "type", "role", "content", "phase"],
+        "function_call" => &["id", "type", "call_id", "name", "arguments"],
+        "reasoning" => &["id", "type"],
+        _ => return false,
+    };
+    stable_fields.iter().all(|field| {
+        optional_snapshot_field(completed, field) == optional_snapshot_field(done, field)
+    }) && optional_status_is_valid(completed, kind)
+}
+
+fn optional_snapshot_field<'a>(item: &'a Value, field: &str) -> Option<&'a Value> {
+    item.get(field)
+        .filter(|value| !value.is_null() && value.as_array().is_none_or(|items| !items.is_empty()))
+}
+
+fn optional_status_is_valid(item: &Value, kind: &str) -> bool {
+    match item.get("status").filter(|status| !status.is_null()) {
+        None => kind != "message",
+        Some(status) => matches!(status.as_str(), Some("completed" | "incomplete")),
+    }
 }
 
 fn validate_reasoning_continuation_item(item: &Value) -> Result<(), ProviderError> {
@@ -793,6 +822,7 @@ impl OpenAiStream {
             }
             _ => return Err(self.stream_error(ProviderErrorKind::MalformedResponse)),
         }
+        observe_openai_stream_event(self, event_type, sequence, &value);
         match event_type {
             "response.created" => self.response_created(&value),
             "response.queued" => self.response_progress(&value, "queued"),
@@ -1149,9 +1179,7 @@ impl OpenAiStream {
             .tool_calls
             .get(&ordinal)
             .ok_or_else(|| self.stream_error(ProviderErrorKind::MalformedResponse))?;
-        if accumulator.arguments != required_str(event, "arguments", self)?
-            || accumulator.name.as_str() != required_str(event, "name", self)?
-        {
+        if accumulator.arguments != required_str(event, "arguments", self)? {
             return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
         }
         Ok(())
@@ -1176,11 +1204,21 @@ impl OpenAiStream {
         if self.done_items.insert(ordinal, item.clone()).is_some() {
             return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
         }
-        let item_status = required_str(item, "status", self)?;
-        if !matches!(item_status, "completed" | "incomplete")
-            || kind == "function_call" && item_status != "completed"
-        {
-            return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
+        let item_status = item.get("status").and_then(Value::as_str);
+        match kind {
+            "reasoning"
+                if item_status
+                    .is_some_and(|status| !matches!(status, "completed" | "incomplete")) =>
+            {
+                return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
+            }
+            "function_call" if item_status != Some("completed") => {
+                return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
+            }
+            "message" if !matches!(item_status, Some("completed" | "incomplete")) => {
+                return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
+            }
+            _ => {}
         }
         if kind == "function_call" {
             let final_arguments = required_str(item, "arguments", self)?;
@@ -1422,7 +1460,6 @@ impl OpenAiStream {
                 .map_err(|_| self.stream_error(ProviderErrorKind::OutputTooLarge))?;
             if self.item_ids.get(&ordinal).map(String::as_str)
                 != Some(required_str(item, "id", self)?)
-                || self.done_items.get(&ordinal) != Some(item)
             {
                 return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
             }
@@ -1430,6 +1467,33 @@ impl OpenAiStream {
             if self.item_kinds.get(&ordinal).map(String::as_str) != Some(item_kind) {
                 return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
             }
+            let done_item = self
+                .done_items
+                .get(&ordinal)
+                .ok_or_else(|| self.stream_error(ProviderErrorKind::MalformedResponse))?;
+            if !completed_item_matches_done(item_kind, item, done_item) {
+                tracing::info!(
+                    event_name = "openai_terminal_validation_failed",
+                    validation_stage = "output_item_cross_event_consistency",
+                    item_type = safe_openai_output_item_type(item_kind),
+                );
+                return Err(self.stream_error(ProviderErrorKind::MalformedResponse));
+            }
+            let reasoning_item = if item_kind == "reasoning" {
+                let mut authoritative = done_item.clone();
+                if authoritative
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .is_none()
+                    && let Some(encrypted) = item.get("encrypted_content").and_then(Value::as_str)
+                {
+                    authoritative["encrypted_content"] = Value::String(encrypted.to_owned());
+                }
+                Some(authoritative)
+            } else {
+                None
+            };
+            let item = reasoning_item.as_ref().unwrap_or(item);
             match item_kind {
                 "message" => {
                     let content = item
@@ -1710,6 +1774,169 @@ fn response_echo_controls_match(response: &Value) -> bool {
             .get("previous_response_id")
             .is_none_or(Value::is_null)
         && response.get("conversation").is_none_or(Value::is_null)
+}
+
+fn observe_openai_stream_event(
+    stream: &OpenAiStream,
+    event_type: &str,
+    sequence_number: u64,
+    event: &Value,
+) {
+    let response = event.get("response");
+    let response_id = response
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str);
+    let provider_response_id_matches = response_id
+        .zip(stream.provider_response_id.as_ref())
+        .map(|(observed, expected)| observed == expected.as_str());
+    let served_model_matches = response
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .map(|model| {
+            model
+                == stream
+                    .request
+                    .target()
+                    .reference()
+                    .provider_model_id()
+                    .as_str()
+        });
+    let output = response
+        .and_then(|value| value.get("output"))
+        .and_then(Value::as_array);
+    let mut message_count = 0_u64;
+    let mut reasoning_count = 0_u64;
+    let mut function_call_count = 0_u64;
+    let mut unknown_output_item_count = 0_u64;
+    if let Some(items) = output {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => message_count += 1,
+                Some("reasoning") => reasoning_count += 1,
+                Some("function_call") => function_call_count += 1,
+                _ => unknown_output_item_count += 1,
+            }
+        }
+    }
+    let terminal_output_item_count =
+        output.map(|items| u64::try_from(items.len()).unwrap_or(u64::MAX));
+    let incomplete_reason = if event_type == "response.incomplete" {
+        Some(safe_openai_incomplete_reason(
+            response
+                .and_then(|value| value.pointer("/incomplete_details/reason"))
+                .and_then(Value::as_str),
+        ))
+    } else {
+        None
+    };
+    let usage_status = response.map_or("not_observed", |value| {
+        if value.get("usage").is_some_and(|usage| !usage.is_null()) {
+            "reported"
+        } else {
+            "unavailable"
+        }
+    });
+    let item_type = event
+        .get("item")
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .map(safe_openai_output_item_type);
+    let output_index = event.get("output_index").and_then(Value::as_u64);
+    let response_status = response
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(safe_openai_response_status);
+    let served_model_present = response
+        .and_then(|value| value.get("model"))
+        .and_then(Value::as_str)
+        .is_some();
+    tracing::info!(
+        event_name = "openai_stream_event_observed",
+        provider = "openai",
+        event_type = safe_openai_event_type(event_type),
+        sequence_number,
+        output_index,
+        item_type,
+        response_status,
+        provider_response_id_present = response_id.is_some(),
+        provider_response_id_matches,
+        served_model_present,
+        served_model_matches,
+        usage_status,
+        incomplete_reason,
+        terminal_output_item_count,
+        terminal_message_count = output.map(|_| message_count),
+        terminal_reasoning_count = output.map(|_| reasoning_count),
+        terminal_function_call_count = output.map(|_| function_call_count),
+        terminal_unknown_output_item_count = output.map(|_| unknown_output_item_count),
+        observed_output_item_added_count =
+            u64::try_from(stream.item_kinds.len()).unwrap_or(u64::MAX),
+        observed_output_item_done_count =
+            u64::try_from(stream.done_items.len()).unwrap_or(u64::MAX),
+        semantic_output_observed = stream.semantic_output,
+        response_echo_controls_match = response.map(response_echo_controls_match),
+    );
+}
+
+fn safe_openai_response_status(status: &str) -> &'static str {
+    match status {
+        "queued" => "queued",
+        "in_progress" => "in_progress",
+        "completed" => "completed",
+        "incomplete" => "incomplete",
+        "failed" => "failed",
+        "cancelled" => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn safe_openai_output_item_type(item_type: &str) -> &'static str {
+    match item_type {
+        "message" => "message",
+        "reasoning" => "reasoning",
+        "function_call" => "function_call",
+        _ => "unknown",
+    }
+}
+
+fn safe_openai_incomplete_reason(reason: Option<&str>) -> &'static str {
+    match reason {
+        Some("max_output_tokens") => "max_output_tokens",
+        Some("max_tokens") => "max_tokens",
+        Some("content_filter") => "content_filter",
+        Some(_) => "other",
+        None => "missing",
+    }
+}
+
+fn safe_openai_event_type(event_type: &str) -> &'static str {
+    match event_type {
+        "response.created" => "response.created",
+        "response.queued" => "response.queued",
+        "response.in_progress" => "response.in_progress",
+        "response.output_item.added" => "response.output_item.added",
+        "response.output_text.delta" => "response.output_text.delta",
+        "response.output_text.done" => "response.output_text.done",
+        "response.refusal.delta" => "response.refusal.delta",
+        "response.refusal.done" => "response.refusal.done",
+        "response.reasoning_summary_text.delta" => "response.reasoning_summary_text.delta",
+        "response.reasoning_summary_text.done" => "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.added" => "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done" => "response.reasoning_summary_part.done",
+        "response.content_part.added" => "response.content_part.added",
+        "response.content_part.done" => "response.content_part.done",
+        "response.output_text.annotation.added" => "response.output_text.annotation.added",
+        "response.reasoning_text.delta" => "response.reasoning_text.delta",
+        "response.reasoning_text.done" => "response.reasoning_text.done",
+        "response.function_call_arguments.delta" => "response.function_call_arguments.delta",
+        "response.function_call_arguments.done" => "response.function_call_arguments.done",
+        "response.output_item.done" => "response.output_item.done",
+        "response.completed" => "response.completed",
+        "response.incomplete" => "response.incomplete",
+        "response.failed" => "response.failed",
+        "error" => "error",
+        _ => "unknown",
+    }
 }
 
 fn ordinal(event: &Value, stream: &OpenAiStream) -> Result<u32, ProviderError> {

@@ -242,6 +242,7 @@ private struct TranscriptRowView: View {
                 if !row.text.isEmpty {
                     Text(row.text)
                         .textSelection(.enabled)
+                        .accessibilityIdentifier("transcript.content.\(row.id)")
                 }
                 if !row.refusal.isEmpty {
                     Text(row.refusal)
@@ -271,7 +272,7 @@ private struct TranscriptRowView: View {
                 }
             }
             .frame(maxWidth: 620, alignment: row.role == .user ? .trailing : .leading)
-            .accessibilityElement(children: .combine)
+            .accessibilityElement(children: .contain)
             .accessibilityIdentifier("transcript.row.\(row.id)")
             .accessibilityLabel(accessibilityLabel)
             .accessibilityValue(
@@ -351,6 +352,7 @@ private struct WorkCardView: View {
         .background(.thinMaterial)
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("work.row.\(work.id)")
         .accessibilityLabel("Work \(work.ordinal), \(work.title)")
     }
 

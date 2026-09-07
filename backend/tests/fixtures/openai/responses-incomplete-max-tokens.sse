@@ -1,0 +1,6 @@
+event: response.created
+data: {"type":"response.created","sequence_number":0,"response":{"id":"resp_incomplete_limit_variant_1","status":"in_progress","output":[]}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":1,"response":{"id":"resp_incomplete_limit_variant_1","status":"incomplete","incomplete_details":{"reason":"max_tokens"},"model":"fixture-openai-model","output":[],"usage":null}}
+

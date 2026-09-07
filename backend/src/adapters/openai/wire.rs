@@ -10,6 +10,8 @@ pub(super) struct ResponsesRequest<'a> {
     pub(super) tool_choice: &'static str,
     pub(super) parallel_tool_calls: bool,
     pub(super) store: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) include: Option<&'static [&'static str]>,
     pub(super) stream: bool,
     pub(super) truncation: &'static str,
     pub(super) max_output_tokens: u64,

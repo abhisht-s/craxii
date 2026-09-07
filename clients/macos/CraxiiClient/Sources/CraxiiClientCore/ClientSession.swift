@@ -603,6 +603,15 @@ public actor ClientSession {
                   sync.throughCursor >= projection.lastAppliedCursor else {
                 throw ClientError.projectionInvariant
             }
+            var completedProjection = projection
+            var completedState = persisted
+            completedProjection.lastAppliedCursor = max(
+                completedProjection.lastAppliedCursor, sync.throughCursor)
+            completedState.lastAppliedCursor = completedProjection.lastAppliedCursor
+            try await localStore.save(completedState)
+            guard generation == self.generation, connectionState == .replaying else { return }
+            projection = completedProjection
+            persisted = completedState
             connectionState = .live
             reconnectAttempt = 0
             unknownEventRecoveryPending = false

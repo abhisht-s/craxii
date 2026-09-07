@@ -24,6 +24,53 @@ use crate::ports::model_provider::{
 const SENTINEL: &str = "stage19-secret-sentinel-never-log";
 
 #[test]
+fn stream_diagnostic_classifiers_never_echo_untrusted_provider_labels() {
+    assert_eq!(safe_openai_event_type(SENTINEL), "unknown");
+    assert_eq!(safe_openai_output_item_type(SENTINEL), "unknown");
+    assert_eq!(safe_openai_response_status(SENTINEL), "unknown");
+    assert_eq!(safe_openai_incomplete_reason(Some(SENTINEL)), "other");
+    assert_eq!(
+        safe_openai_event_type("response.incomplete"),
+        "response.incomplete"
+    );
+    assert_eq!(safe_openai_output_item_type("reasoning"), "reasoning");
+}
+
+#[tokio::test]
+async fn content_free_incomplete_limit_variant_has_no_semantic_output_before_protocol_error() {
+    let server = FixtureServer::start(
+        StatusCode::OK,
+        include_str!("../../../tests/fixtures/openai/responses-incomplete-max-tokens.sse")
+            .to_owned(),
+    )
+    .await;
+    let (provider, clock) = provider();
+    let mut stream = provider
+        .invoke_stream(invocation(
+            request(&server.endpoint(), false, vec![user("limit")]),
+            control(&clock, Duration::from_secs(1)),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        stream.next_event().await.unwrap(),
+        Some(ModelStreamEvent::ResponseStarted { .. })
+    ));
+    assert!(matches!(
+        stream.next_event().await.unwrap(),
+        Some(ModelStreamEvent::UsageUnavailable)
+    ));
+    let error = stream.next_event().await.unwrap_err();
+    assert_eq!(error.kind(), ProviderErrorKind::UnsupportedResponseItem);
+    assert_eq!(
+        error.certainty(),
+        ProviderOutcomeCertainty::ProviderOutcomeUnknown
+    );
+    server.stop();
+}
+
+#[test]
 fn fragmented_multiline_sse_is_reassembled_with_crlf_support() {
     let mut decoder = SseDecoder::new();
     decoder.push(b"event: response.created\r\nda").unwrap();
@@ -61,7 +108,7 @@ fn request_translation_is_stateless_ordered_and_custom_tool_only() {
     assert_eq!(body["truncation"], "disabled");
     assert_eq!(body["stream"], true);
     assert_eq!(body["max_output_tokens"], 4096);
-    assert!(body.get("include").is_none());
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert!(body.get("conversation").is_none());
     assert!(body.get("previous_response_id").is_none());
     assert!(body.get("background").is_none());
@@ -506,9 +553,7 @@ async fn luna_stateless_reasoning_replays_before_the_tool_call_and_output() {
     let reasoning = json!({
         "id": "rs_luna_1",
         "type": "reasoning",
-        "status": "completed",
-        "summary": [],
-        "encrypted_content": "encrypted-luna-fixture"
+        "summary": []
     });
     let tool_call = json!({
         "id": "fc_luna_1",
@@ -518,6 +563,13 @@ async fn luna_stateless_reasoning_replays_before_the_tool_call_and_output() {
         "name": "read_file",
         "arguments": "{\"path\":\"Cargo.toml\"}"
     });
+    let mut terminal_reasoning = reasoning.clone();
+    terminal_reasoning["status"] = json!("completed");
+    terminal_reasoning["encrypted_content"] = json!("encrypted-luna-fixture");
+    terminal_reasoning["content"] =
+        json!([{"type":"reasoning_text","text":"terminal-only optional snapshot"}]);
+    let mut terminal_tool_call = tool_call.clone();
+    terminal_tool_call.as_object_mut().unwrap().remove("status");
     let response = sse(vec![
         created(0, "resp_luna_1"),
         item_added(
@@ -532,9 +584,9 @@ async fn luna_stateless_reasoning_replays_before_the_tool_call_and_output() {
             json!({"id":"fc_luna_1","type":"function_call","status":"in_progress","call_id":"call_luna_1","name":"read_file","arguments":""}),
         ),
         json!({"type":"response.function_call_arguments.delta","sequence_number":4,"output_index":1,"item_id":"fc_luna_1","delta":"{\"path\":\"Cargo.toml\"}"}),
-        json!({"type":"response.function_call_arguments.done","sequence_number":5,"output_index":1,"item_id":"fc_luna_1","name":"read_file","arguments":"{\"path\":\"Cargo.toml\"}"}),
+        json!({"type":"response.function_call_arguments.done","sequence_number":5,"output_index":1,"item_id":"fc_luna_1","arguments":"{\"path\":\"Cargo.toml\"}"}),
         json!({"type":"response.output_item.done","sequence_number":6,"output_index":1,"item":tool_call.clone()}),
-        json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_luna_1","status":"completed","model":LUNA,"output":[reasoning,tool_call],"usage":{"input_tokens":11,"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}}}),
+        json!({"type":"response.completed","sequence_number":7,"response":{"id":"resp_luna_1","status":"completed","model":LUNA,"output":[terminal_reasoning,terminal_tool_call],"usage":{"input_tokens":11,"output_tokens":7,"output_tokens_details":{"reasoning_tokens":2},"total_tokens":18}}}),
     ]);
     let server = FixtureServer::start(StatusCode::OK, response).await;
     let (provider, clock) = provider();
@@ -573,7 +625,7 @@ async fn luna_stateless_reasoning_replays_before_the_tool_call_and_output() {
     let body: Value = serde_json::from_slice(&encode_request(&replay).unwrap()).unwrap();
     assert_eq!(body["model"], LUNA);
     assert_eq!(body["store"], false);
-    assert!(body.get("include").is_none());
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["input"][0]["type"], "reasoning");
     assert_eq!(
         body["input"][0]["encrypted_content"],

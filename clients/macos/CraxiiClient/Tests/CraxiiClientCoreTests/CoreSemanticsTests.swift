@@ -292,14 +292,17 @@ private actor FakeConnection: EventStreamConnection {
 private actor FakeOpener: EventStreamOpening {
     var connections: [FakeConnection]
     var opens = 0
+    var urls: [URL] = []
     var failAfterConnections = false
     init(_ connections: [FakeConnection]) { self.connections = connections }
     func open(url: URL, authorization: BearerToken) throws -> any EventStreamConnection {
         opens += 1
+        urls.append(url)
         if !connections.isEmpty { return connections.removeFirst() }
         throw ClientError.serverUnavailable
     }
     func count() -> Int { opens }
+    func capturedURLs() -> [URL] { urls }
 }
 
 private actor SuspendedOpener: EventStreamOpening {
@@ -417,6 +420,120 @@ private func eventually(_ predicate: @escaping @Sendable () async -> Bool) async
         await Task.yield()
     }
     return false
+}
+
+private func replayCursor(in url: URL) -> String? {
+    URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+        .first(where: { $0.name == "after" })?.value
+}
+
+@Test func internalOnlyReplayGapAdvancesAndPersistsHighWaterCursor() async throws {
+    let connection = FakeConnection()
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([]), sleeper: NoSleep())
+
+    await session.start()
+    await connection.feed(.frame(try syncData(cursor: 11)))
+
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    #expect(await session.currentSnapshot().projection.lastAppliedCursor.rawValue == 11)
+    #expect(await local.state.lastAppliedCursor.rawValue == 11)
+    await session.shutdown()
+}
+
+@Test func reconnectRequestsStrictlyAfterPersistedReplayHighWaterCursor() async throws {
+    let first = FakeConnection()
+    let second = FakeConnection()
+    let opener = FakeOpener([first, second])
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]), streams: opener,
+        identifiers: FixedIDs([]), sleeper: NoSleep(), jitter: ZeroJitter())
+
+    await session.start()
+    await first.feed(.frame(try syncData(cursor: 12)))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    await first.feed(.failure(.serverUnavailable))
+    #expect(await eventually { await opener.count() == 2 })
+    let urls = await opener.capturedURLs()
+    #expect(urls.count == 2)
+    #expect(replayCursor(in: urls[0]) == "4")
+    #expect(replayCursor(in: urls[1]) == "12")
+    #expect(await local.state.lastAppliedCursor.rawValue == 12)
+    await session.shutdown()
+}
+
+@Test func replayCompletionCannotRegressCursor() async throws {
+    let first = FakeConnection()
+    let second = FakeConnection()
+    let opener = FakeOpener([first, second])
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]), streams: opener,
+        identifiers: FixedIDs([]), sleeper: NoSleep(), jitter: ZeroJitter())
+
+    await session.start()
+    await first.feed(.frame(try syncData(cursor: 12)))
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    await first.feed(.failure(.serverUnavailable))
+    #expect(await eventually { await opener.count() == 2 })
+    await second.feed(.frame(try syncData(cursor: 11)))
+    #expect(await eventually { await second.isClosed() })
+    #expect(await session.currentSnapshot().connectionState != .live)
+    #expect(await session.currentSnapshot().projection.lastAppliedCursor.rawValue == 12)
+    #expect(await local.state.lastAppliedCursor.rawValue == 12)
+    await session.shutdown()
+}
+
+@Test func invalidReplayCompletionDoesNotAdvanceCursor() async throws {
+    let connection = FakeConnection()
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([]),
+        sleeper: NoSleep(), jitter: ZeroJitter())
+
+    await session.start()
+    await connection.feed(.frame(try syncData(cursor: 3)))
+    #expect(await eventually { await connection.isClosed() })
+    #expect(await session.currentSnapshot().connectionState != .live)
+    #expect(await session.currentSnapshot().projection.lastAppliedCursor.rawValue == 4)
+    #expect(await local.state.lastAppliedCursor.rawValue == 4)
+    await session.shutdown()
+}
+
+@Test func publicReplayStillAppliesAndDeduplicatesBeforeHighWaterCompletion() async throws {
+    let connection = FakeConnection()
+    let local = FakeLocalStore()
+    let session = ClientSession(
+        profile: profile, allowDebugLocalhostHTTP: true,
+        credentialStore: FakeCredentialStore(), localStore: local,
+        http: FakeHTTP([.response(try bootstrapResponse())]),
+        streams: FakeOpener([connection]), identifiers: FixedIDs([]), sleeper: NoSleep())
+    let started = try #require(durableEvents().last)
+
+    await session.start()
+    await connection.feed(.frame(try JSONEncoder().encode(started)))
+    await connection.feed(.frame(try JSONEncoder().encode(started)))
+    await connection.feed(.frame(try syncData(cursor: 10)))
+
+    #expect(await eventually { await session.currentSnapshot().connectionState == .live })
+    let snapshot = await session.currentSnapshot()
+    #expect(snapshot.projection.lastAppliedCursor.rawValue == 10)
+    #expect(snapshot.projection.works.count == 1)
+    #expect(snapshot.projection.works[0].state == .running)
+    #expect(await local.state.lastAppliedCursor.rawValue == 10)
+    await session.shutdown()
 }
 
 private func durableFrame(
