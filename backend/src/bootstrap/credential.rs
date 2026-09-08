@@ -145,7 +145,7 @@ pub fn load_credentials<'a>(
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if metadata.mode() & 0o077 != 0
+            if !credential_file_mode_is_safe(source, metadata.mode())
                 || metadata.nlink() != 1
                 || metadata.uid() != directory_metadata.uid()
             {
@@ -180,7 +180,7 @@ pub fn load_credentials<'a>(
             use std::os::unix::fs::MetadataExt;
             if opened.dev() != metadata.dev()
                 || opened.ino() != metadata.ino()
-                || opened.mode() & 0o077 != 0
+                || !credential_file_mode_is_safe(source, opened.mode())
                 || opened.nlink() != 1
                 || opened.uid() != directory_metadata.uid()
             {
@@ -210,15 +210,28 @@ pub fn load_credentials<'a>(
     Ok(loaded)
 }
 
+#[cfg(unix)]
+fn credential_file_mode_is_safe(source: &CredentialSourceConfig, mode: u32) -> bool {
+    let disallowed_permissions = match source {
+        CredentialSourceConfig::LocalDirectory { .. } => 0o077,
+        // systemd exposes credentials to non-root system services as protected, read-only files.
+        // Ubuntu 24.04 systemd uses 0440 here, so group-read is the sole non-owner bit allowed.
+        CredentialSourceConfig::Systemd => 0o037,
+    };
+    mode & disallowed_permissions == 0
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     use super::*;
 
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    static ENVIRONMENT: Mutex<()> = Mutex::new(());
 
     fn root() -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -228,6 +241,49 @@ mod tests {
         ));
         fs::create_dir(&path).unwrap();
         path
+    }
+
+    struct EnvironmentVariableGuard {
+        original: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvironmentVariableGuard {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let lock = ENVIRONMENT
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let original = std::env::var_os(name);
+            // SAFETY: this test-only guard serializes every environment mutation in this module
+            // and restores the original value before releasing the lock.
+            unsafe { std::env::set_var(name, value) };
+            Self {
+                original: vec![(name, original)],
+                _lock: lock,
+            }
+        }
+
+        fn set_additional(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+            assert!(self.original.iter().all(|(existing, _)| *existing != name));
+            self.original.push((name, std::env::var_os(name)));
+            // SAFETY: this guard holds the serialized test-only environment lock.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+
+    impl Drop for EnvironmentVariableGuard {
+        fn drop(&mut self) {
+            // SAFETY: the same serialized test-only guard still owns the mutation here.
+            unsafe {
+                for (name, original) in self.original.iter().rev() {
+                    if let Some(original) = original {
+                        std::env::set_var(name, original);
+                    } else {
+                        std::env::remove_var(name);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -247,6 +303,43 @@ mod tests {
         let secret = loaded.get("openai_primary").unwrap();
         assert_eq!(secret.expose_secret(), "sentinel-api-key");
         assert_eq!(format!("{secret:?}"), "[REDACTED]");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn systemd_runtime_directory_loads_exact_name_and_rejects_unsafe_fallbacks() {
+        let directory = root();
+        let credential = directory.join("openai_provider");
+        fs::write(&credential, "systemd-synthetic-provider-key\n").unwrap();
+        fs::set_permissions(&credential, fs::Permissions::from_mode(0o440)).unwrap();
+        let reference = CredentialRef::new("openai_provider".to_owned());
+
+        let mut _environment =
+            EnvironmentVariableGuard::set(SYSTEMD_CREDENTIAL_DIRECTORY_ENV, &directory);
+        _environment.set_additional("OPENAI_API_KEY", "unsafe-environment-fallback-canary");
+        let loaded = load_credentials(&CredentialSourceConfig::Systemd, [&reference]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded.get("openai_provider").unwrap().expose_secret(),
+            "systemd-synthetic-provider-key"
+        );
+
+        assert_eq!(
+            load_credentials(
+                &CredentialSourceConfig::LocalDirectory {
+                    directory: directory.clone(),
+                },
+                [&reference],
+            )
+            .unwrap_err()
+            .kind(),
+            CredentialLoadErrorKind::UnsafeFile
+        );
+
+        fs::remove_file(&credential).unwrap();
+        let error = load_credentials(&CredentialSourceConfig::Systemd, [&reference]).unwrap_err();
+        assert_eq!(error.kind(), CredentialLoadErrorKind::Missing);
+        assert_eq!(error.to_string(), "provider credential unavailable");
         fs::remove_dir_all(directory).unwrap();
     }
 

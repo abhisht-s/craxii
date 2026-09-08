@@ -90,6 +90,24 @@ fn ec2_shaped_config_emits_parseable_json_startup_evidence() {
 }
 
 #[test]
+fn systemd_runtime_credential_shape_starts_with_exact_configured_name() {
+    let config = TempConfig::new_systemd(EC2);
+    let credential_directory = config.root.join("credentials");
+    let credential = credential_directory.join("openai_provider");
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o440)).unwrap();
+
+    let output = run_with_systemd_credentials(
+        &["--config", config.path().to_str().unwrap()],
+        &credential_directory,
+    );
+
+    assert!(output.status.success(), "stderr: {}", text(&output.stderr));
+    assert!(output.stderr.is_empty());
+    assert!(text(&output.stdout).contains("\"event_name\":\"startup\""));
+    assert!(!text(&output.stdout).contains(SECRET_SENTINEL));
+}
+
+#[test]
 fn error_filter_suppresses_startup_info_without_failing_startup() {
     let config = TempConfig::new(&LOCAL.replace("filter = \"info\"", "filter = \"error\""));
     let output = run(&["--config", config.path().to_str().unwrap()]);
@@ -324,8 +342,23 @@ fn non_luna_native_reasoning_continuation_fails_before_runtime_side_effects() {
 }
 
 fn run(arguments: &[&str]) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_craxii-server"));
+    command.env_remove("CREDENTIALS_DIRECTORY");
+    run_command(command, arguments)
+}
+
+fn run_with_systemd_credentials(arguments: &[&str], credential_directory: &Path) -> Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_craxii-server"));
+    command
+        .env("CREDENTIALS_DIRECTORY", credential_directory)
+        // A production systemd credential source must never fall back to an environment secret.
+        .env("OPENAI_API_KEY", SECRET_SENTINEL);
+    run_command(command, arguments)
+}
+
+fn run_command(mut command: Command, arguments: &[&str]) -> Output {
     let authority = configured_authority(arguments);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_craxii-server"))
+    let mut child = command
         .args(arguments)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -444,14 +477,25 @@ impl TempConfig {
     fn new(contents: &str) -> Self {
         let serial_guard = startup_test_guard();
         let authority = available_loopback_authority();
-        Self::new_locked(contents, &authority, serial_guard)
+        Self::new_locked(contents, &authority, serial_guard, true)
+    }
+
+    fn new_systemd(contents: &str) -> Self {
+        let serial_guard = startup_test_guard();
+        let authority = available_loopback_authority();
+        Self::new_locked(contents, &authority, serial_guard, false)
     }
 
     fn new_with_authority(contents: &str, authority: &str) -> Self {
-        Self::new_locked(contents, authority, startup_test_guard())
+        Self::new_locked(contents, authority, startup_test_guard(), true)
     }
 
-    fn new_locked(contents: &str, authority: &str, serial_guard: MutexGuard<'static, ()>) -> Self {
+    fn new_locked(
+        contents: &str,
+        authority: &str,
+        serial_guard: MutexGuard<'static, ()>,
+        rewrite_systemd_credential_source: bool,
+    ) -> Self {
         let root = temporary_root();
         fs::create_dir(&root).unwrap();
         let state_root = root.join("state");
@@ -475,20 +519,21 @@ impl TempConfig {
                 "public_base_url = \"http://127.0.0.1:8080\"",
                 &format!("public_base_url = \"http://{authority}\""),
             );
-        let contents = if contents.contains("source = \"systemd\"") {
-            contents.replace(
-                "source = \"systemd\"",
-                &format!(
-                    "source = \"local_directory\"\ndirectory = \"{}\"",
-                    credential_root.to_str().unwrap()
-                ),
-            )
-        } else {
-            contents.replace(
-                "directory = \"/tmp/craxii-dev/credentials\"",
-                &format!("directory = \"{}\"", credential_root.to_str().unwrap()),
-            )
-        };
+        let contents =
+            if rewrite_systemd_credential_source && contents.contains("source = \"systemd\"") {
+                contents.replace(
+                    "source = \"systemd\"",
+                    &format!(
+                        "source = \"local_directory\"\ndirectory = \"{}\"",
+                        credential_root.to_str().unwrap()
+                    ),
+                )
+            } else {
+                contents.replace(
+                    "directory = \"/tmp/craxii-dev/credentials\"",
+                    &format!("directory = \"{}\"", credential_root.to_str().unwrap()),
+                )
+            };
         let contents = match contents
             .lines()
             .find(|line| line.starts_with("state_root = "))
