@@ -2,7 +2,7 @@
 Description=Craxii backend
 Wants=network-online.target
 After=network-online.target local-fs.target
-RequiresMountsFor=/var/lib/craxii /srv/craxii/workspaces /opt/craxii/current /etc/craxii
+RequiresMountsFor=/srv/craxii-data /var/lib/craxii /srv/craxii/workspaces /home/craxii /opt/craxii/current /etc/craxii
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -28,6 +28,10 @@ LimitNPROC=16384
 # The trusted backend needs only signal authority across the workstation UID boundary. The fixed
 # launcher clears this capability before executing model-controlled code.
 AmbientCapabilities=CAP_KILL
+# The SSM instance role belongs to host administration. Prevent the backend and every delegated
+# model-workstation descendant cgroup from reaching either EC2 Instance Metadata Service address.
+IPAddressDeny=169.254.169.254
+IPAddressDeny=fd00:ec2::254
 
 [Install]
 WantedBy=multi-user.target

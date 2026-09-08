@@ -1,4 +1,4 @@
-# NON-DEPLOYABLE until every __REQUIRED_*__ value is replaced and reviewed.
+# Stage 27 production configuration. The provider credential is supplied only by systemd.
 configuration_version = 1
 failpoint_mode = "disabled"
 
@@ -33,7 +33,7 @@ id = "stage27-openai"
 config_version = 1
 enabled = true
 provider = "openai"
-provider_model_id = "__REQUIRED_MODEL_ID__"
+provider_model_id = "gpt-5.6-luna"
 endpoint = "https://api.openai.com/v1"
 credential = "openai_provider"
 token_estimator = "conservative_v1"
