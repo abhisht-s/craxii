@@ -76,9 +76,12 @@ if [[ -e "${release_directory}" ]]; then
   exit 1
 fi
 install -d -o root -g root -m 0755 "${release_directory}"
-install -o root -g root -m 0555 "${source_directory}/craxii-server" "${release_directory}/craxii-server"
-install -o root -g root -m 0555 "${source_directory}/craxii-admin" "${release_directory}/craxii-admin"
-install -o root -g root -m 0555 "${source_directory}/craxii-workstation-reader" "${release_directory}/craxii-workstation-reader"
+# Trusted service/operator binaries are executable only by root and the trusted backend group.
+# The adjacent reader must remain executable after the launcher drops to `craxii`, but execute-only
+# mode prevents model-controlled work from reading or copying its trusted image.
+install -o root -g craxii-server -m 0550 "${source_directory}/craxii-server" "${release_directory}/craxii-server"
+install -o root -g craxii-server -m 0550 "${source_directory}/craxii-admin" "${release_directory}/craxii-admin"
+install -o root -g root -m 0111 "${source_directory}/craxii-workstation-reader" "${release_directory}/craxii-workstation-reader"
 install -o root -g craxii-server -m 4750 "${source_directory}/craxii-workstation-launcher" "${release_directory}/craxii-workstation-launcher"
 
 for binary in craxii-server craxii-admin craxii-workstation-launcher craxii-workstation-reader; do

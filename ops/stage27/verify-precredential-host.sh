@@ -19,6 +19,7 @@ readonly asset_directory
 readonly launcher=/opt/craxii/current/craxii-workstation-launcher
 readonly reader=/opt/craxii/current/craxii-workstation-reader
 readonly trusted_binary=/opt/craxii/current/craxii-server
+readonly trusted_admin=/opt/craxii/current/craxii-admin
 readonly config=/etc/craxii/config.toml
 readonly credential_directory=/etc/craxii/credentials
 readonly provider_credential=${credential_directory}/openai_provider
@@ -108,8 +109,9 @@ build_git() {
 [[ "$(stat -c '%U:%G:%a' /opt/craxii)" == root:root:755 ]]
 [[ "$(stat -c '%U:%G:%a' "${launcher}")" == root:craxii-server:4750 ]]
 [[ "$(stat -c '%U:%G:%a:%h' "${launcher}")" == root:craxii-server:4750:1 ]]
-[[ "$(stat -c '%U:%G:%a' "${reader}")" == root:root:555 ]]
-[[ "$(stat -c '%U:%G:%a' "${trusted_binary}")" == root:root:555 ]]
+[[ "$(stat -c '%U:%G:%a' "${reader}")" == root:root:111 ]]
+[[ "$(stat -c '%U:%G:%a' "${trusted_binary}")" == root:craxii-server:550 ]]
+[[ "$(stat -c '%U:%G:%a' "${trusted_admin}")" == root:craxii-server:550 ]]
 [[ "$(stat -c '%U:%G:%a' /etc/craxii)" == root:craxii-server:750 ]]
 [[ "$(stat -c '%U:%G:%a' "${config}")" == root:craxii-server:640 ]]
 [[ "$(stat -c '%U:%G:%a' "${credential_directory}")" == craxii-server:craxii-server:700 ]]
@@ -202,7 +204,8 @@ backend_pid="${observed_backend_pid}"
 
 shell_probe=$(printf '%q ' \
   "${synthetic_credential}" "${config}" "${synthetic_state}" \
-  "${trusted_binary}" "${launcher}" "${synthetic_workspace}" "${observed_backend_pid}")
+  "${trusted_binary}" "${trusted_admin}" "${reader}" "${launcher}" \
+  "${synthetic_workspace}" "${observed_backend_pid}")
 shell_probe="set -- ${shell_probe}; \
 test \"\$(id -un)\" = craxii; test \"\$(id -gn)\" = craxii; \
 grep -Eq '^Groups:[[:space:]]*$' /proc/self/status; \
@@ -223,10 +226,13 @@ test -z \"\${AWS_WEB_IDENTITY_TOKEN_FILE-}\"; \
 test -z \"\${AWS_CONTAINER_CREDENTIALS_RELATIVE_URI-}\"; \
 ! cat \"\$1\" >/dev/null 2>&1; ! cat \"\$2\" >/dev/null 2>&1; \
 ! cat \"\$3\" >/dev/null 2>&1; \
-! /bin/bash --noprofile --norc -c \"printf x >>'\$4'\" 2>/dev/null; \
-! \"\$5\" shell x y true >/dev/null 2>&1; \
-! cat /proc/\"\$7\"/environ >/dev/null 2>&1; \
-test ! -e /proc/self/fd/9; printf changed >\"\$6\"; \
+! cat \"\$4\" >/dev/null 2>&1; ! cat \"\$5\" >/dev/null 2>&1; \
+! cat \"\$6\" >/dev/null 2>&1; ! cat \"\$7\" >/dev/null 2>&1; \
+! \"\$4\" --config \"\$2\" >/dev/null 2>&1; \
+! \"\$5\" --config \"\$2\" preflight >/dev/null 2>&1; \
+! \"\$7\" shell x y true >/dev/null 2>&1; \
+! cat /proc/\"\$9\"/environ >/dev/null 2>&1; \
+test ! -e /proc/self/fd/9; printf changed >\"\$8\"; \
 if command -v sudo >/dev/null; then ! sudo -n /bin/true >/dev/null 2>&1; fi; \
 test \"\$(id -u)\" != 0; printf stage27-shell-ok"
 

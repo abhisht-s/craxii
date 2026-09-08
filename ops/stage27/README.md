@@ -18,6 +18,11 @@ The production contract is:
 - backend state, config, credentials, and releases: inaccessible for write/read as appropriate to
   `craxii`.
 
+The trusted server and offline-admin binaries are `root:craxii-server` mode `0550`. The fixed
+reader is `root:root` mode `0111`: it remains executable after the launcher drops identity, but its
+image is not readable by model-controlled work. The setuid launcher remains
+`root:craxii-server` mode `4750` and rejects every caller except the real `craxii-server` UID.
+
 The trusted service retains only `CAP_KILL` so its existing TERM/KILL cancellation sequence can
 cross the workstation UID boundary. The launcher clears all capabilities before the model command
 starts. The systemd unit denies both EC2 Instance Metadata Service addresses for the service cgroup
