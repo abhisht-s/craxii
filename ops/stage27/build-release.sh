@@ -30,7 +30,7 @@ if [[ ! -d "${source_directory}/.git" ]]; then
   runuser -u craxii-build -- /usr/bin/env -i \
     HOME=/var/lib/craxii-build \
     PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    git clone --no-checkout "${repository}" "${source_directory}"
+    git clone "${repository}" "${source_directory}"
 fi
 
 [[ "$(build_git remote get-url origin)" == "${repository}" ]] ||
