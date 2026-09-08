@@ -247,6 +247,13 @@ impl ConfigFingerprint {
             config.shell.administrative_enabled,
         );
         canonical.bool(
+            "shell.has_user_switch_launcher",
+            config.shell.user_switch_launcher.is_some(),
+        );
+        if let Some(launcher) = &config.shell.user_switch_launcher {
+            canonical.path("shell.user_switch_launcher", launcher);
+        }
+        canonical.bool(
             "shell.has_delegated_cgroup_root",
             config.shell.delegated_cgroup_root.is_some(),
         );

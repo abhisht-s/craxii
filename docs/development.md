@@ -38,6 +38,11 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 
 Tests marked `ignored` are explicit environment or capability checks, not part of a routine `cargo test` result. Invoke them only through their documented wrapper or exact test command.
 
+The Stage 13 Ubuntu target wrapper exercises broad sudo/Docker/service capabilities only on a
+credential-free disposable host. It requires `CRAXII_STAGE13_CREDENTIAL_FREE_DISPOSABLE=1` and
+refuses `craxii-server.service`. Production Linux boundary assets and their synthetic pre-credential
+host verifier live under `ops/stage27/`.
+
 ## Swift and macOS workflow
 
 The Swift package provides protocol, client-core, Apple-adapter, and integration-probe targets:

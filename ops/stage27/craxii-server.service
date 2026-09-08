@@ -1,0 +1,33 @@
+[Unit]
+Description=Craxii backend
+Wants=network-online.target
+After=network-online.target local-fs.target
+RequiresMountsFor=/var/lib/craxii /srv/craxii/workspaces /opt/craxii/current /etc/craxii
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=craxii-server
+Group=craxii-server
+WorkingDirectory=/var/lib/craxii
+ExecStartPre=/usr/bin/mkdir -p /sys/fs/cgroup/system.slice/craxii-server.service/craxii-executions
+ExecStart=/opt/craxii/current/craxii-server --config /etc/craxii/config.toml
+LoadCredential=openai_provider:/etc/craxii/credentials/openai_provider
+Restart=on-failure
+RestartSec=2s
+KillSignal=SIGTERM
+KillMode=control-group
+TimeoutStopSec=30s
+UMask=0077
+Delegate=yes
+RuntimeDirectory=craxii
+RuntimeDirectoryMode=0700
+LimitNOFILE=65536
+LimitNPROC=16384
+# The trusted backend needs only signal authority across the workstation UID boundary. The fixed
+# launcher clears this capability before executing model-controlled code.
+AmbientCapabilities=CAP_KILL
+
+[Install]
+WantedBy=multi-user.target

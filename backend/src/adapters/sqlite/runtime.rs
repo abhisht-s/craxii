@@ -672,6 +672,7 @@ const fn is_supported_linux_filesystem(magic: i64) -> bool {
     )
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn is_supported_macos_filesystem(name: &str) -> bool {
     name.eq_ignore_ascii_case("apfs") || name.eq_ignore_ascii_case("hfs")
 }

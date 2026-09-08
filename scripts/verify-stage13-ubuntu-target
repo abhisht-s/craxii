@@ -18,6 +18,7 @@ verify_no_execution_residue() {
 }
 
 require_target() {
+  test "${CRAXII_STAGE13_CREDENTIAL_FREE_DISPOSABLE:-}" = "1"
   test "$(uname -m)" = "x86_64"
   grep -qx 'ID=ubuntu' /etc/os-release
   grep -qx 'VERSION_ID="24.04"' /etc/os-release
@@ -28,12 +29,17 @@ require_target() {
   test -x /usr/bin/systemctl
   test -x "${cargo_executable}"
   test -n "${CRAXII_STAGE13_SYSTEMD_UNIT:-}"
+  test "${CRAXII_STAGE13_SYSTEMD_UNIT}" != "craxii-server.service"
   test -n "${CRAXII_STAGE13_CGROUP_ROOT:-}"
   test -d "${CRAXII_STAGE13_CGROUP_ROOT}"
   test -f "${CRAXII_STAGE13_CGROUP_ROOT}/cgroup.controllers"
   test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=User --value)" = "craxii"
   test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=Delegate --value)" = "yes"
   test "$(systemctl show "${CRAXII_STAGE13_SYSTEMD_UNIT}" --property=KillMode --value)" = "control-group"
+  test -z "${OPENAI_API_KEY:-}"
+  test -z "${AWS_ACCESS_KEY_ID:-}"
+  test -z "${AWS_SECRET_ACCESS_KEY:-}"
+  sudo -n /usr/bin/test ! -e /etc/craxii/credentials/openai_provider
   sudo -n /usr/bin/env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/id -u | grep -qx '0'
 }
 

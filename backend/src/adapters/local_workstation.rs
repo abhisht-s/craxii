@@ -12,6 +12,8 @@ use tracing::Instrument;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 #[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt as _;
+#[cfg(target_os = "linux")]
 use std::path::Component;
 
 use time::OffsetDateTime;
@@ -54,6 +56,8 @@ pub struct LocalWorkstationOptions {
     pub read_hard_limit: u64,
     pub artifact_store: Arc<dyn ArtifactStore>,
     pub administrative_enabled: bool,
+    pub user_switch_launcher: Option<PathBuf>,
+    pub credential_free_direct_execution: bool,
     pub delegated_cgroup_root: Option<PathBuf>,
     pub clock: Arc<dyn Clock>,
 }
@@ -67,6 +71,7 @@ pub struct LocalWorkstation {
     logical_workspace_root: LogicalPathReference,
     resolved_workspace_root: PathBuf,
     read_hard_limit: u64,
+    user_switch_launcher: Option<PathBuf>,
     capabilities: WorkstationCapabilities,
     clock: Arc<dyn Clock>,
     execution: Arc<ExecutionRuntime>,
@@ -87,6 +92,8 @@ impl LocalWorkstation {
             read_hard_limit,
             artifact_store,
             administrative_enabled,
+            user_switch_launcher,
+            credential_free_direct_execution,
             delegated_cgroup_root,
             clock,
         } = options;
@@ -120,8 +127,17 @@ impl LocalWorkstation {
         let support = observe_execution_support(
             Path::new(default_shell.canonical()),
             administrative_enabled,
+            user_switch_launcher.as_deref(),
+            Some(&resolved_workspace_root),
+            credential_free_direct_execution,
             delegated_cgroup_root.as_deref(),
         );
+        #[cfg(target_os = "linux")]
+        if !credential_free_direct_execution && support.user_switch_launcher.is_none() {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
         let capabilities = stage13_capabilities(
             workstation.workstation_id(),
             workstation.generation(),
@@ -130,11 +146,13 @@ impl LocalWorkstation {
             default_shell,
             support.clone(),
         )?;
+        let active_user_switch_launcher = support.user_switch_launcher.clone();
         let execution = ExecutionRuntime::new(
             artifact_store,
             Arc::clone(&clock),
             ExecutionRuntimeConfig {
                 shell: PathBuf::from(capabilities.default_shell().canonical()),
+                user_switch_launcher: active_user_switch_launcher.clone(),
                 administrative_capable: support.administrative,
                 cgroup_root: support.cgroup_root,
             },
@@ -147,6 +165,7 @@ impl LocalWorkstation {
             logical_workspace_root: workspace.logical_root().clone(),
             resolved_workspace_root,
             read_hard_limit,
+            user_switch_launcher: active_user_switch_launcher,
             capabilities,
             clock,
             execution,
@@ -248,6 +267,9 @@ impl LocalWorkstation {
             return Err(WorkstationError::new(WorkstationErrorKind::Timeout));
         }
         let target = self.resolve_existing_path(&request.path)?;
+        if self.user_switch_launcher.is_some() {
+            return self.read_via_user_switch_launcher(request, target);
+        }
         if self.deadline_expired(request.deadline) {
             return Err(WorkstationError::new(WorkstationErrorKind::Timeout));
         }
@@ -349,6 +371,110 @@ impl LocalWorkstation {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    fn read_via_user_switch_launcher(
+        &self,
+        request: FileReadRequest,
+        target: ResolvedTarget,
+    ) -> Result<FileReadResult, WorkstationError> {
+        let launcher = self
+            .user_switch_launcher
+            .as_ref()
+            .ok_or_else(|| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        if self.deadline_expired(request.deadline) {
+            return Err(WorkstationError::new(WorkstationErrorKind::Timeout));
+        }
+        let metadata = std::fs::symlink_metadata(&target.physical_path).map_err(map_path_error)?;
+        ensure_regular_file(&metadata)?;
+        let initial = MetadataSnapshot::capture(&metadata);
+        if initial.len > request.max_bytes {
+            let length = CanonicalByteCount::try_new(initial.len).map_err(|_| {
+                WorkstationError::new(WorkstationErrorKind::InternalWorkstationError)
+            })?;
+            return Err(WorkstationError::with_file_evidence(
+                WorkstationErrorKind::FileTooLarge,
+                length,
+                None,
+            ));
+        }
+
+        let mut command = std::process::Command::new(launcher);
+        command
+            .env_clear()
+            .arg("read-file")
+            .arg(&target.physical_path)
+            .arg(request.max_bytes.to_string())
+            .arg(metadata.dev().to_string())
+            .arg(metadata.ino().to_string())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let inherited_fds = open_file_descriptors();
+        // SAFETY: the child hook only applies FD_CLOEXEC through async-signal-safe fcntl calls.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &inherited_fds {
+                    let flags = nix::libc::fcntl(*fd, nix::libc::F_GETFD);
+                    if flags != -1 {
+                        let _ = nix::libc::fcntl(
+                            *fd,
+                            nix::libc::F_SETFD,
+                            flags | nix::libc::FD_CLOEXEC,
+                        );
+                    }
+                }
+                Ok(())
+            });
+        }
+        let output = command
+            .output()
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::IoError))?;
+        if self.deadline_expired(request.deadline) {
+            return Err(WorkstationError::new(WorkstationErrorKind::Timeout));
+        }
+        if !output.status.success() {
+            return Err(map_reader_exit(output.status.code(), &output.stderr));
+        }
+        if !output.stderr.is_empty() || output.stdout.len() as u64 != initial.len {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::ChangedDuringRead,
+            ));
+        }
+        let byte_length = CanonicalByteCount::try_new(output.stdout.len() as u64)
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::InternalWorkstationError))?;
+        let sha256 = Sha256Digest::hash_bytes(&output.stdout);
+        let text = String::from_utf8(output.stdout).map_err(|_| {
+            WorkstationError::with_file_evidence(
+                WorkstationErrorKind::BinaryContent,
+                byte_length,
+                Some(sha256),
+            )
+        })?;
+        Ok(FileReadResult {
+            operation_id: request.operation_id,
+            requested_path: request.path,
+            resolved_path: target.evidence,
+            file_type: WorkstationFileType::Regular,
+            byte_length,
+            modified_at: initial.modified_at,
+            encoding: FileEncoding::Utf8,
+            sha256,
+            text,
+            truncated: false,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn read_via_user_switch_launcher(
+        &self,
+        _request: FileReadRequest,
+        _target: ResolvedTarget,
+    ) -> Result<FileReadResult, WorkstationError> {
+        Err(WorkstationError::new(
+            WorkstationErrorKind::UnsupportedCapability,
+        ))
+    }
+
     fn prepare_committed_execution_cwd(
         &self,
         request: &ExecutionRequest,
@@ -445,7 +571,7 @@ impl LocalWorkstation {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn with_execution_shell(mut self, shell: PathBuf) -> Self {
         Arc::get_mut(&mut self.execution)
             .expect("test construction has one execution-runtime owner")
@@ -453,14 +579,14 @@ impl LocalWorkstation {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn set_leader_observer(&mut self, observer: Arc<dyn execution::LeaderObserver>) {
         Arc::get_mut(&mut self.execution)
             .expect("test construction has one execution-runtime owner")
             .set_leader_observer_for_test(observer);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     fn with_execution_gate(
         self,
         point: execution::ExecutionTestPoint,
@@ -745,6 +871,7 @@ pub(crate) struct LocalExecutionSupport {
     pub(crate) administrative: bool,
     pub(crate) process_group: bool,
     pub(crate) cgroup: bool,
+    user_switch_launcher: Option<PathBuf>,
     cgroup_root: Option<PathBuf>,
 }
 
@@ -752,6 +879,9 @@ pub(crate) struct LocalExecutionSupport {
 pub(crate) fn observe_execution_support(
     shell: &Path,
     administrative_enabled: bool,
+    user_switch_launcher: Option<&Path>,
+    user_switch_probe_cwd: Option<&Path>,
+    credential_free_direct_execution: bool,
     delegated_cgroup_root: Option<&Path>,
 ) -> LocalExecutionSupport {
     #[cfg(unix)]
@@ -771,14 +901,21 @@ pub(crate) fn observe_execution_support(
         });
     let cgroup_root = execution::probe_cgroup_root(delegated_cgroup_root);
     let cgroup = cgroup_root.is_some();
-    let foreground = shell_available && (cfg!(target_os = "macos") || cgroup);
-    let administrative =
-        foreground && execution::probe_admin(administrative_enabled, cgroup_root.as_deref());
+    let user_switch_launcher =
+        execution::probe_user_switch_launcher(user_switch_launcher, user_switch_probe_cwd);
+    let foreground = shell_available
+        && (cfg!(target_os = "macos")
+            || (cgroup && (user_switch_launcher.is_some() || credential_free_direct_execution)));
+    let administrative = foreground
+        && user_switch_launcher.is_none()
+        && credential_free_direct_execution
+        && execution::probe_admin(administrative_enabled, cgroup_root.as_deref());
     LocalExecutionSupport {
         foreground,
         administrative,
         process_group: foreground,
         cgroup,
+        user_switch_launcher,
         cgroup_root,
     }
 }
@@ -838,6 +975,45 @@ pub(crate) fn stage13_capabilities(
 struct ResolvedTarget {
     physical_path: PathBuf,
     evidence: ResolvedPathEvidence,
+}
+
+#[cfg(target_os = "linux")]
+fn map_reader_exit(code: Option<i32>, stderr: &[u8]) -> WorkstationError {
+    match code {
+        Some(65) => WorkstationError::new(WorkstationErrorKind::InvalidPath),
+        Some(66) => WorkstationError::new(WorkstationErrorKind::NotFound),
+        Some(67) => WorkstationError::new(WorkstationErrorKind::PermissionDenied),
+        Some(68) => std::str::from_utf8(stderr)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .and_then(|value| CanonicalByteCount::try_new(value).ok())
+            .map_or_else(
+                || WorkstationError::new(WorkstationErrorKind::FileTooLarge),
+                |length| {
+                    WorkstationError::with_file_evidence(
+                        WorkstationErrorKind::FileTooLarge,
+                        length,
+                        None,
+                    )
+                },
+            ),
+        Some(69) => WorkstationError::new(WorkstationErrorKind::ChangedDuringRead),
+        _ => WorkstationError::new(WorkstationErrorKind::IoError),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_file_descriptors() -> Vec<i32> {
+    let mut descriptors: Vec<_> = std::fs::read_dir("/proc/self/fd")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|descriptor| *descriptor > 2)
+        .collect();
+    descriptors.sort_unstable();
+    descriptors.dedup();
+    descriptors
 }
 
 #[cfg(unix)]
@@ -925,10 +1101,10 @@ fn is_recognized_pseudo_filesystem(path: &Path) -> bool {
     {
         let mut components = path.components();
         let _root = components.next();
-        return matches!(
+        matches!(
             components.next(),
             Some(Component::Normal(component)) if component == "proc" || component == "sys"
-        );
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -994,12 +1170,18 @@ enum ReadHookPoint {
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd as _;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
     use std::path::Path;
     #[cfg(target_os = "macos")]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    #[cfg(target_os = "macos")]
+    use std::time::Instant;
 
     use nix::sys::signal::kill;
     use nix::sys::stat::Mode;
@@ -1007,18 +1189,22 @@ mod tests {
 
     use super::*;
     use crate::adapters::artifacts::LocalArtifactStore;
+    #[cfg(target_os = "macos")]
+    use crate::domain::Certainty;
     use crate::domain::{
-        Certainty, CraxiiId, ExecutionId, HostingProvider, MonotonicDuration, OperationId,
-        PrivilegeMode, WorkspaceIdentityInput, WorkstationIdentityInput,
+        CraxiiId, ExecutionId, HostingProvider, MonotonicDuration, OperationId, PrivilegeMode,
+        WorkspaceIdentityInput, WorkstationIdentityInput,
     };
     use crate::ports::clock::{MonotonicInstant, TestClock};
+    #[cfg(target_os = "macos")]
+    use crate::ports::workstation::HARD_EXECUTION_COMMAND_MAX_BYTES;
     use crate::ports::workstation::{
         DEFAULT_FILE_READ_MAX_BYTES, ExecutionCancellationState, ExecutionCapturePolicy,
         ExecutionCleanupPolicy, ExecutionResultKind, ExecutionStdinPolicy,
-        HARD_EXECUTION_COMMAND_MAX_BYTES,
     };
 
     const AT: &str = "2026-08-29T01:02:03.456789Z";
+    #[cfg(target_os = "macos")]
     static ENVIRONMENT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn prepared_cwd_evidence(
@@ -1058,7 +1244,11 @@ mod tests {
                 succeeded && {
                     // SAFETY: successful `fstat` initialized the complete `stat` value.
                     let observed = unsafe { observed.assume_init() };
-                    observed.st_dev as u64 == expected.dev() && observed.st_ino == expected.ino()
+                    #[cfg(target_os = "linux")]
+                    let same_device = observed.st_dev == expected.dev();
+                    #[cfg(not(target_os = "linux"))]
+                    let same_device = observed.st_dev as u64 == expected.dev();
+                    same_device && observed.st_ino == expected.ino()
                 }
             })
             .count()
@@ -1114,6 +1304,7 @@ mod tests {
         _root: TestRoot,
         workspace_root: PathBuf,
         workstation: LocalWorkstation,
+        #[cfg(target_os = "macos")]
         artifact_store: Arc<LocalArtifactStore>,
         clock: Arc<TestClock>,
     }
@@ -1131,6 +1322,24 @@ mod tests {
             read_hard_limit: u64,
             logical_root: &str,
             administrative_enabled: bool,
+            delegated_cgroup_root: Option<PathBuf>,
+        ) -> Self {
+            Self::with_execution_policy(
+                read_hard_limit,
+                logical_root,
+                administrative_enabled,
+                None,
+                true,
+                delegated_cgroup_root,
+            )
+        }
+
+        fn with_execution_policy(
+            read_hard_limit: u64,
+            logical_root: &str,
+            administrative_enabled: bool,
+            user_switch_launcher: Option<PathBuf>,
+            credential_free_direct_execution: bool,
             delegated_cgroup_root: Option<PathBuf>,
         ) -> Self {
             let root = TestRoot::new();
@@ -1178,6 +1387,8 @@ mod tests {
                     read_hard_limit,
                     artifact_store: artifact_store.clone(),
                     administrative_enabled,
+                    user_switch_launcher,
+                    credential_free_direct_execution,
                     delegated_cgroup_root,
                     clock: clock.clone(),
                 },
@@ -1187,6 +1398,7 @@ mod tests {
                 _root: root,
                 workspace_root,
                 workstation,
+                #[cfg(target_os = "macos")]
                 artifact_store,
                 clock,
             }
@@ -3175,6 +3387,241 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[ignore = "requires the fixed setuid launcher, two Linux identities, and delegated cgroup v2"]
+    async fn linux_stage27_user_switch_isolates_identity_files_fds_and_process_lifecycle() {
+        let launcher = PathBuf::from(std::env::var("CRAXII_STAGE27_USER_SWITCH_LAUNCHER").unwrap());
+        let cgroup_root = PathBuf::from(std::env::var("CRAXII_STAGE27_CGROUP_ROOT").unwrap());
+        let protected_credential =
+            PathBuf::from(std::env::var("CRAXII_STAGE27_PROTECTED_CREDENTIAL").unwrap());
+        let protected_config =
+            PathBuf::from(std::env::var("CRAXII_STAGE27_PROTECTED_CONFIG").unwrap());
+        let protected_state =
+            PathBuf::from(std::env::var("CRAXII_STAGE27_PROTECTED_STATE").unwrap());
+        let trusted_binary = PathBuf::from(std::env::var("CRAXII_STAGE27_TRUSTED_BINARY").unwrap());
+        for path in [
+            &launcher,
+            &cgroup_root,
+            &protected_credential,
+            &protected_config,
+            &protected_state,
+            &trusted_binary,
+        ] {
+            assert!(path.is_absolute());
+            assert!(!path.to_string_lossy().contains('\''));
+        }
+
+        let fixture = Fixture::with_execution_policy(
+            HARD_FILE_READ_MAX_BYTES,
+            "/srv/craxii/workspaces/primary",
+            false,
+            Some(launcher),
+            false,
+            Some(cgroup_root.clone()),
+        );
+        fs::set_permissions(
+            fixture.workspace_root.join("cwd"),
+            fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let flags = fixture.workstation.capabilities_snapshot().flags();
+        assert!(flags.foreground_execute());
+        assert!(flags.process_group_cleanup());
+        assert!(flags.cgroup_cleanup());
+        assert!(flags.privilege_user());
+        assert!(!flags.privilege_administrative());
+        let backend_status = fs::read_to_string("/proc/self/status").unwrap();
+        let backend_capabilities = backend_status
+            .lines()
+            .find_map(|line| line.strip_prefix("CapEff:\t"))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .unwrap();
+        const CAP_KILL_BIT: u32 = 5;
+        assert_ne!(backend_capabilities & (1_u64 << CAP_KILL_BIT), 0);
+
+        let target_uid = String::from_utf8(
+            std::process::Command::new("/usr/bin/id")
+                .args(["-u", "craxii"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let target_gid = String::from_utf8(
+            std::process::Command::new("/usr/bin/id")
+                .args(["-g", "craxii"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let inherited_secret = File::open(&protected_state).unwrap();
+        let inherited_fd = inherited_secret.as_raw_fd();
+        // SAFETY: this test owns the descriptor for its duration and restores CLOEXEC below.
+        let old_fd_flags = unsafe { nix::libc::fcntl(inherited_fd, nix::libc::F_GETFD) };
+        assert_ne!(old_fd_flags, -1);
+        // SAFETY: the valid descriptor remains owned by `inherited_secret`.
+        assert_ne!(
+            unsafe {
+                nix::libc::fcntl(
+                    inherited_fd,
+                    nix::libc::F_SETFD,
+                    old_fd_flags & !nix::libc::FD_CLOEXEC,
+                )
+            },
+            -1
+        );
+
+        let backend_pid = std::process::id();
+        let result = fixture
+            .execute(format!(
+                concat!(
+                    "test \"$(id -u)\" = '{}'; ",
+                    "test \"$(id -g)\" = '{}'; ",
+                    "test \"$(id -un)\" = craxii; test \"$(id -gn)\" = craxii; ",
+                    "grep -Eq '^Groups:[[:space:]]*$' /proc/self/status; ",
+                    "grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status; ",
+                    "grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status; ",
+                    "grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status; ",
+                    "test \"$HOME\" = /home/craxii; test \"$USER\" = craxii; ",
+                    "test \"$LOGNAME\" = craxii; test \"$SHELL\" = /bin/bash; ",
+                    "test \"$LANG\" = C.UTF-8; ",
+                    "test \"$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ",
+                    "test -n \"$CRAXII_WORK_ID\"; test -n \"$CRAXII_WORKSPACE_ID\"; ",
+                    "test -z \"${{OPENAI_API_KEY-}}\"; ",
+                    "test -z \"${{CREDENTIALS_DIRECTORY-}}\"; ",
+                    "test -z \"${{AWS_ACCESS_KEY_ID-}}\"; ",
+                    "test -z \"${{AWS_SECRET_ACCESS_KEY-}}\"; ",
+                    "test -z \"${{AWS_SESSION_TOKEN-}}\"; ",
+                    "test -z \"${{CRAXII_BACKEND_CANARY-}}\"; ",
+                    "test -z \"${{CRAXII_BACKEND_AUTH_CANARY-}}\"; ",
+                    "test -z \"${{SSM_ENVIRONMENT_CANARY-}}\"; ",
+                    "test ! -e /proc/self/fd/{}; ",
+                    "! cat '{}' >/dev/null 2>&1; ! cat '{}' >/dev/null 2>&1; ",
+                    "! cat '{}' >/dev/null 2>&1; ",
+                    "! cat /proc/{}/environ >/dev/null 2>&1; ",
+                    "! /bin/bash --noprofile --norc -c \"printf x >>'{}'\" 2>/dev/null; ",
+                    "printf workstation-ok > normal-file; printf identity-isolated"
+                ),
+                target_uid.trim(),
+                target_gid.trim(),
+                inherited_fd,
+                protected_credential.display(),
+                protected_config.display(),
+                protected_state.display(),
+                backend_pid,
+                trusted_binary.display(),
+            ))
+            .await;
+        // SAFETY: restore the descriptor state before the owned file closes.
+        assert_ne!(
+            unsafe { nix::libc::fcntl(inherited_fd, nix::libc::F_SETFD, old_fd_flags) },
+            -1
+        );
+        assert_eq!(result.result_kind, ExecutionResultKind::Exited);
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.as_ref().unwrap().projection,
+            "identity-isolated"
+        );
+        assert!(result.stderr.as_ref().unwrap().projection.is_empty());
+        assert!(result.cleanup.confirmed());
+        assert_eq!(
+            fs::read_to_string(fixture.workspace_root.join("cwd/normal-file")).unwrap(),
+            "workstation-ok"
+        );
+        assert_eq!(
+            fixture
+                .read_relative("cwd/normal-file", DEFAULT_FILE_READ_MAX_BYTES)
+                .await
+                .unwrap()
+                .text,
+            "workstation-ok"
+        );
+        assert_eq!(
+            fixture
+                .workstation
+                .read_file(fixture.request(
+                    LogicalPathReference::absolute(protected_state.to_str().unwrap()).unwrap(),
+                    DEFAULT_FILE_READ_MAX_BYTES,
+                ))
+                .await
+                .unwrap_err()
+                .kind(),
+            WorkstationErrorKind::PermissionDenied
+        );
+
+        let mut admin = fixture.execution_request("id -u");
+        admin.effective_privilege = PrivilegeMode::Administrative;
+        assert_eq!(
+            fixture.workstation.execute(admin).await.unwrap_err().kind(),
+            WorkstationErrorKind::UnsupportedCapability
+        );
+
+        let background = fixture
+            .execute("/usr/bin/setsid /bin/sleep 60 & printf '%s' \"$!\"")
+            .await;
+        assert_eq!(background.result_kind, ExecutionResultKind::Exited);
+        assert!(background.cleanup.confirmed());
+        let background_pid: i32 = background
+            .stdout
+            .as_ref()
+            .unwrap()
+            .projection
+            .parse()
+            .unwrap();
+        assert_eq!(
+            kill(Pid::from_raw(background_pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+
+        let started = fixture.workspace_root.join("cwd/cancellation-started");
+        let term_observed = fixture
+            .workspace_root
+            .join("cwd/cancellation-term-observed");
+        let cancellation_request = fixture.execution_request(format!(
+            "trap 'printf term >\"{}\"; exit 0' TERM; printf started >'{}'; while :; do /bin/sleep 1; done",
+            term_observed.display(),
+            started.display(),
+        ));
+        let execution_id = cancellation_request.execution_id;
+        let workstation = fixture.workstation.clone();
+        let running =
+            tokio::spawn(async move { workstation.execute(cancellation_request).await.unwrap() });
+        wait_for_path(&started).await;
+        let cancellation = fixture
+            .workstation
+            .cancel_execution(ExecutionCancellationRequest {
+                operation_id: OperationId::generate(),
+                execution_id,
+                workstation_id: fixture.workstation.workstation_id(),
+                expected_generation: fixture.workstation.generation(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(cancellation.state, ExecutionCancellationState::Confirmed);
+        let cancelled = running.await.unwrap();
+        assert_eq!(cancelled.result_kind, ExecutionResultKind::Cancelled);
+        assert!(cancelled.cleanup.confirmed());
+        assert_eq!(fs::read_to_string(term_observed).unwrap(), "term");
+
+        let mut timeout = fixture.execution_request("trap '' TERM; exec /bin/sleep 60");
+        timeout.timeout = MonotonicDuration::from_millis(50);
+        timeout.deadline = MonotonicInstant::from_elapsed(Duration::from_secs(12));
+        let timed_out = fixture.workstation.execute(timeout).await.unwrap();
+        assert_eq!(timed_out.result_kind, ExecutionResultKind::TimedOut);
+        assert!(timed_out.timed_out);
+        assert!(timed_out.cleanup.confirmed());
+
+        let residual: Vec<_> = fs::read_dir(cgroup_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("01"))
+            .collect();
+        assert!(residual.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     #[ignore = "requires the deferred Ubuntu 24.04 x86-64 systemd target"]
     async fn linux_target_ubuntu_nonroot_systemd_cgroup_git_and_service_contract() {
         assert_eq!(std::env::consts::ARCH, "x86_64");
@@ -3214,7 +3661,17 @@ mod tests {
                 .any(|line| line == "KillMode=control-group")
         );
         let root = PathBuf::from(std::env::var("CRAXII_STAGE13_CGROUP_ROOT").unwrap());
-        assert!(observe_execution_support(Path::new("/bin/bash"), false, Some(&root)).cgroup);
+        assert!(
+            observe_execution_support(
+                Path::new("/bin/bash"),
+                false,
+                None,
+                None,
+                true,
+                Some(&root),
+            )
+                .cgroup
+        );
     }
 
     #[cfg(target_os = "linux")]

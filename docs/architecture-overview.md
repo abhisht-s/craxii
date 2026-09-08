@@ -55,7 +55,11 @@ Context assembly reads canonical conversation and prior model/tool evidence, app
 
 The current tool registry exposes `read_file` and `run_shell`. Inputs are closed, typed, and size-bounded before dispatch. The local-workstation adapter resolves logical paths against the configured workspace, performs bounded reads, and runs foreground processes with explicit timeouts, output capture, artifact overflow handling, cancellation, and recovery observations.
 
-Child processes receive a clean environment; configured inherited variables are currently forbidden. Administrative execution is separately configured and capability-probed on supported Linux hosts. It is disabled in the local development fixture.
+Child processes receive a clean environment; configured inherited variables are currently
+forbidden. On the production Linux shape, the backend runs as `craxii-server` and a fixed privileged
+launcher drops shell and file-reader operations to `craxii` with no supplementary groups or
+retained capabilities. Credential-bearing systemd configuration requires that launcher and cannot
+enable administrative execution. The macOS development path remains a direct same-user path.
 
 ## HTTP and WebSocket roles
 

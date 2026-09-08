@@ -25,7 +25,7 @@ The safe, complete local example is `backend/tests/fixtures/config/valid/local.t
 | `limits.agent` | Work duration, model-step/attempt, tool-call, output-item, and tool-argument limits. |
 | `limits.tools` | File-read, command, timeout, output-capture, inline-result, and stream-projection limits. |
 | `limits.protocol` | Durable WebSocket payload and user-message limits, bounded by compiled protocol maxima. |
-| `shell` | Absolute executable, clean child environment, no inherited variables, optional administrative execution, and optional delegated cgroup root. |
+| `shell` | Absolute executable, clean child environment, no inherited variables, optional fixed Linux user-switch launcher, administrative policy, and optional delegated cgroup root. |
 | `device_auth` | The implemented source is provisioned credentials stored in SQLite. |
 | `tracing` | `pretty` or `json` format and a validated filter. |
 | `shutdown` | Grace-period duration. |
@@ -52,7 +52,16 @@ install -m 600 /dev/null /tmp/craxii-dev/credentials/openai_primary
 
 Enter the credential through a secure local mechanism that does not commit it or expose it in shell history. The server wraps loaded values in redacting types and does not accept provider keys directly from the TOML file.
 
-With `source = "systemd"`, credentials are read from `/run/credentials/craxii` using the same logical references.
+With `source = "systemd"`, credentials are read from the absolute directory supplied by systemd in
+`CREDENTIALS_DIRECTORY`, using the same logical references. This mode requires a configured
+`user_switch_launcher` and rejects administrative execution. The launcher path must be absolute,
+normalized, and end in `craxii-workstation-launcher`.
+
+On a production Linux runtime, startup enables workstation execution only after verifying that the
+launcher is a root-owned, single-link, mode-`4750` binary in a root-owned non-writable release path,
+that its group matches the backend service group, and that the adjacent bounded reader is also
+root-owned and non-writable. The launcher performs a noninteractive identity probe before the
+workstation capability is advertised.
 
 ## Client endpoints
 

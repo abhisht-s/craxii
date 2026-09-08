@@ -96,6 +96,7 @@ impl ValidatedConfig {
             ..data
         };
         validate_cross_field_limits(&data)?;
+        validate_linux_security_boundary(&data)?;
 
         data.models
             .targets
@@ -588,6 +589,7 @@ pub struct ShellConfig {
     pub(super) environment_policy: ShellEnvironmentPolicy,
     pub(super) inherited_variables: Vec<String>,
     pub(super) administrative_enabled: bool,
+    pub(super) user_switch_launcher: Option<PathBuf>,
     pub(super) delegated_cgroup_root: Option<PathBuf>,
 }
 
@@ -599,6 +601,10 @@ impl fmt::Debug for ShellConfig {
             .field("environment_policy", &self.environment_policy)
             .field("inherited_variable_count", &self.inherited_variables.len())
             .field("administrative_enabled", &self.administrative_enabled)
+            .field(
+                "has_user_switch_launcher",
+                &self.user_switch_launcher.is_some(),
+            )
             .field(
                 "has_delegated_cgroup_root",
                 &self.delegated_cgroup_root.is_some(),
@@ -622,6 +628,10 @@ impl ShellConfig {
 
     pub fn administrative_enabled(&self) -> bool {
         self.administrative_enabled
+    }
+
+    pub fn user_switch_launcher(&self) -> Option<&Path> {
+        self.user_switch_launcher.as_deref()
     }
 
     pub fn delegated_cgroup_root(&self) -> Option<&Path> {
@@ -1367,6 +1377,22 @@ fn validate_cross_field_limits(config: &ConfigData) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_linux_security_boundary(config: &ConfigData) -> Result<(), ConfigError> {
+    if config.shell.user_switch_launcher.is_some() && config.shell.administrative_enabled {
+        return Err(ConfigError::InvalidShell {
+            reason: "user_switch_launcher and administrative_enabled cannot coexist",
+        });
+    }
+    if matches!(config.credentials.source, CredentialSourceConfig::Systemd)
+        && config.shell.user_switch_launcher.is_none()
+    {
+        return Err(ConfigError::InvalidShell {
+            reason: "systemd credential source requires user_switch_launcher",
+        });
+    }
+    Ok(())
+}
+
 fn validate_shell(raw: RawShell) -> Result<ShellConfig, ConfigError> {
     if raw.executable != "/bin/bash" {
         return Err(ConfigError::InvalidShell {
@@ -1384,6 +1410,19 @@ fn validate_shell(raw: RawShell) -> Result<ShellConfig, ConfigError> {
     if !raw.inherited_variables.is_empty() {
         return Err(ConfigError::InvalidShell {
             reason: "V0 inherited_variables must be empty",
+        });
+    }
+    let user_switch_launcher = raw.user_switch_launcher.map(PathBuf::from);
+    if user_switch_launcher.as_deref().is_some_and(|launcher| {
+        !launcher.is_absolute()
+            || launcher.file_name().and_then(|name| name.to_str())
+                != Some("craxii-workstation-launcher")
+            || launcher
+                .components()
+                .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    }) {
+        return Err(ConfigError::InvalidShell {
+            reason: "user_switch_launcher must be an absolute normalized path ending in craxii-workstation-launcher",
         });
     }
     let delegated_cgroup_root = raw.delegated_cgroup_root.map(PathBuf::from);
@@ -1405,6 +1444,7 @@ fn validate_shell(raw: RawShell) -> Result<ShellConfig, ConfigError> {
         environment_policy,
         inherited_variables: raw.inherited_variables,
         administrative_enabled: raw.administrative_enabled,
+        user_switch_launcher,
         delegated_cgroup_root,
     })
 }

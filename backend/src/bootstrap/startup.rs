@@ -217,6 +217,8 @@ pub async fn run(
                 read_hard_limit: config.limits().tools().read_file_max_bytes(),
                 artifact_store: workstation_artifacts,
                 administrative_enabled: config.shell().administrative_enabled(),
+                user_switch_launcher: config.shell().user_switch_launcher().map(Path::to_owned),
+                credential_free_direct_execution: false,
                 delegated_cgroup_root: config.shell().delegated_cgroup_root().map(Path::to_owned),
                 clock: workstation_clock,
             },
@@ -531,8 +533,9 @@ fn bootstrap_observation(
         .to_str()
         .ok_or(StartupError::Configuration)?
         .to_owned();
-    let workspace_root = std::fs::canonicalize(config.paths().primary_workspace_root())
-        .map_err(|_| StartupError::WorkstationLifecycle)?
+    let resolved_workspace_root = std::fs::canonicalize(config.paths().primary_workspace_root())
+        .map_err(|_| StartupError::WorkstationLifecycle)?;
+    let workspace_root = resolved_workspace_root
         .to_str()
         .ok_or(StartupError::Configuration)?
         .to_owned();
@@ -547,6 +550,9 @@ fn bootstrap_observation(
     let execution = observe_execution_support(
         config.shell().executable(),
         config.shell().administrative_enabled(),
+        config.shell().user_switch_launcher(),
+        Some(&resolved_workspace_root),
+        false,
         config.shell().delegated_cgroup_root(),
     );
     Ok(BootstrapObservation {

@@ -53,6 +53,7 @@ pub(super) struct ExecutionCwd {
 #[derive(Clone)]
 pub(super) struct ExecutionRuntimeConfig {
     pub(super) shell: PathBuf,
+    pub(super) user_switch_launcher: Option<PathBuf>,
     pub(super) administrative_capable: bool,
     pub(super) cgroup_root: Option<PathBuf>,
 }
@@ -287,17 +288,17 @@ impl ExecutionRuntime {
         lock(&self.lifecycle_events).clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn set_shell_for_test(&mut self, shell: PathBuf) {
         self.config.shell = shell;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn set_leader_observer_for_test(&mut self, observer: Arc<dyn LeaderObserver>) {
         self.leader_observer = observer;
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub(super) fn set_execution_gate_for_test(
         &self,
         point: ExecutionTestPoint,
@@ -664,7 +665,7 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
         Err(kind) => return spawn_failure_result(&request, resolved_cwd, kind),
     };
 
-    let mut command = build_command(&runtime.config.shell, &request);
+    let mut command = build_command(&runtime.config, &request);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1066,8 +1067,18 @@ fn finalize_empty(
     })
 }
 
-fn build_command(shell: &Path, request: &ExecutionRequest) -> Command {
-    let mut command = if request.effective_privilege == PrivilegeMode::Administrative {
+fn build_command(config: &ExecutionRuntimeConfig, request: &ExecutionRequest) -> Command {
+    let shell = &config.shell;
+    let mut command = if let Some(launcher) = &config.user_switch_launcher {
+        let mut command = Command::new(launcher);
+        command.env_clear();
+        command
+            .arg("shell")
+            .arg(request.work_id.to_string())
+            .arg(request.workspace_id.to_string())
+            .arg(&request.command);
+        return command;
+    } else if request.effective_privilege == PrivilegeMode::Administrative {
         let mut command = Command::new(SUDO_PATH);
         command.env_clear();
         command.arg("-n").arg(ENV_PATH).arg("-i");
@@ -1405,6 +1416,7 @@ fn owned_descendants_quiescent(
     }
     #[cfg(target_os = "linux")]
     {
+        let _ = process_group;
         cgroup.is_some_and(ExecutionCgroup::is_empty)
     }
     #[cfg(target_os = "macos")]
@@ -1746,6 +1758,91 @@ pub(super) fn probe_cgroup_root(configured_root: Option<&Path>) -> Option<PathBu
     }
 }
 
+pub(super) fn probe_user_switch_launcher(
+    configured: Option<&Path>,
+    probe_cwd: Option<&Path>,
+) -> Option<PathBuf> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (configured, probe_cwd);
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let configured = configured?;
+        let probe_cwd = probe_cwd?;
+        if !configured.is_absolute()
+            || configured.file_name().and_then(|value| value.to_str())
+                != Some("craxii-workstation-launcher")
+        {
+            return None;
+        }
+        let canonical = std::fs::canonicalize(configured).ok()?;
+        let metadata = std::fs::metadata(&canonical).ok()?;
+        let reader = canonical.parent()?.join("craxii-workstation-reader");
+        let reader_metadata = std::fs::symlink_metadata(&reader).ok()?;
+        let current_gid = unsafe { nix::libc::getegid() };
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.gid() != current_gid
+            || metadata.nlink() != 1
+            || metadata.permissions().mode() & 0o7777 != 0o4750
+            || !reader_metadata.is_file()
+            || reader_metadata.uid() != 0
+            || reader_metadata.gid() != 0
+            || reader_metadata.nlink() != 1
+            || reader_metadata.permissions().mode() & 0o022 != 0
+            || reader_metadata.permissions().mode() & 0o111 == 0
+            || !trusted_root_owned_ancestors(&canonical)
+        {
+            return None;
+        }
+
+        let output = std::process::Command::new(&canonical)
+            .env_clear()
+            .args([
+                "shell",
+                "00000000-0000-7000-8000-000000000000",
+                "00000000-0000-7000-8000-000000000000",
+                concat!(
+                    "test \"$(/usr/bin/id -u)\" != 0 && ",
+                    "test \"$(/usr/bin/id -un)\" = craxii && ",
+                    "test \"$(/usr/bin/id -gn)\" = craxii && ",
+                    "/usr/bin/grep -Eq '^Groups:[[:space:]]*$' /proc/self/status && ",
+                    "/usr/bin/grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && ",
+                    "/usr/bin/grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status && ",
+                    "/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status && ",
+                    "test \"$HOME\" = /home/craxii && test \"$USER\" = craxii && ",
+                    "test \"$LOGNAME\" = craxii && test \"$SHELL\" = /bin/bash && ",
+                    "test \"$LANG\" = C.UTF-8 && ",
+                    "test \"$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && ",
+                    "test -n \"$CRAXII_WORK_ID\" && test -n \"$CRAXII_WORKSPACE_ID\" && ",
+                    "test -z \"${OPENAI_API_KEY-}\" && ",
+                    "test -z \"${AWS_SECRET_ACCESS_KEY-}\" && printf ready"
+                ),
+            ])
+            .current_dir(probe_cwd)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?;
+        (output.status.success() && output.stdout == b"ready" && output.stderr.is_empty())
+            .then_some(canonical)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_root_owned_ancestors(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    path.ancestors().skip(1).all(|ancestor| {
+        std::fs::metadata(ancestor).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.uid() == 0 && metadata.permissions().mode() & 0o022 == 0
+        })
+    })
+}
+
 pub(super) fn probe_admin(administrative_enabled: bool, cgroup_root: Option<&Path>) -> bool {
     #[cfg(not(target_os = "linux"))]
     {
@@ -1962,12 +2059,43 @@ mod tests {
             ]
         );
 
-        let command = build_command(Path::new(BASH_PATH), &request);
+        let config = ExecutionRuntimeConfig {
+            shell: PathBuf::from(BASH_PATH),
+            user_switch_launcher: None,
+            administrative_capable: false,
+            cgroup_root: None,
+        };
+        let command = build_command(&config, &request);
         assert_eq!(command.as_std().get_program(), BASH_PATH);
         assert_eq!(
             command.as_std().get_args().collect::<Vec<_>>(),
             ["--noprofile", "--norc", "-o", "pipefail", "-c", "true"]
         );
         assert_eq!(command.as_std().get_envs().count(), 8);
+
+        let launcher = PathBuf::from("/opt/craxii/current/craxii-workstation-launcher");
+        let config = ExecutionRuntimeConfig {
+            shell: PathBuf::from(BASH_PATH),
+            user_switch_launcher: Some(launcher.clone()),
+            administrative_capable: false,
+            cgroup_root: None,
+        };
+        let command = build_command(&config, &request);
+        assert_eq!(command.as_std().get_program(), launcher);
+        let launcher_args: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            launcher_args,
+            [
+                "shell",
+                request.work_id.to_string().as_str(),
+                request.workspace_id.to_string().as_str(),
+                "true",
+            ]
+        );
+        assert_eq!(command.as_std().get_envs().count(), 0);
     }
 }

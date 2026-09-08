@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::bootstrap::secret::SecretString;
 
-const SYSTEMD_CREDENTIAL_DIRECTORY: &str = "/run/credentials/craxii";
+const SYSTEMD_CREDENTIAL_DIRECTORY_ENV: &str = "CREDENTIALS_DIRECTORY";
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 
 #[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
@@ -98,9 +98,16 @@ pub fn load_credentials<'a>(
     source: &CredentialSourceConfig,
     references: impl IntoIterator<Item = &'a CredentialRef>,
 ) -> Result<BTreeMap<String, SecretString>, CredentialLoadError> {
+    let systemd_directory;
     let directory = match source {
         CredentialSourceConfig::LocalDirectory { directory } => directory.as_path(),
-        CredentialSourceConfig::Systemd => Path::new(SYSTEMD_CREDENTIAL_DIRECTORY),
+        CredentialSourceConfig::Systemd => {
+            systemd_directory = std::env::var_os(SYSTEMD_CREDENTIAL_DIRECTORY_ENV)
+                .map(PathBuf::from)
+                .filter(|path| path.is_absolute())
+                .ok_or(CredentialLoadError(CredentialLoadErrorKind::Missing))?;
+            systemd_directory.as_path()
+        }
     };
     let directory_metadata = std::fs::symlink_metadata(directory).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {

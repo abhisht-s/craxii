@@ -2176,6 +2176,8 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
                 read_hard_limit: HARD_FILE_READ_MAX_BYTES,
                 artifact_store: workstation_artifacts,
                 administrative_enabled: false,
+                user_switch_launcher: None,
+                credential_free_direct_execution: true,
                 delegated_cgroup_root: None,
                 clock: workstation_clock,
             },

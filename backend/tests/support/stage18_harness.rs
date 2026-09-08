@@ -921,6 +921,8 @@ impl Stage18Harness {
                     read_hard_limit: HARD_FILE_READ_MAX_BYTES,
                     artifact_store: workstation_artifacts,
                     administrative_enabled: false,
+                    user_switch_launcher: None,
+                    credential_free_direct_execution: true,
                     delegated_cgroup_root: None,
                     clock: workstation_clock,
                 },

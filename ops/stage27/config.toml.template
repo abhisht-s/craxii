@@ -1,10 +1,10 @@
-# NON-DEPLOYABLE: shape evidence only; all hostnames and model values are fixtures.
+# NON-DEPLOYABLE until every __REQUIRED_*__ value is replaced and reviewed.
 configuration_version = 1
 failpoint_mode = "disabled"
 
 [server]
 bind_address = "127.0.0.1:8080"
-public_base_url = "https://craxii.example.invalid/"
+public_base_url = "http://127.0.0.1:8080"
 
 [paths]
 state_root = "/var/lib/craxii"
@@ -26,15 +26,15 @@ source = "systemd"
 declared = ["openai_provider"]
 
 [models]
-default_target = "fixture-openai"
+default_target = "stage27-openai"
 
 [[models.targets]]
-id = "fixture-openai"
+id = "stage27-openai"
 config_version = 1
 enabled = true
 provider = "openai"
-provider_model_id = "fixture-ec2-model"
-endpoint = "https://api.openai.example.invalid/v1"
+provider_model_id = "__REQUIRED_MODEL_ID__"
+endpoint = "https://api.openai.com/v1"
 credential = "openai_provider"
 token_estimator = "conservative_v1"
 context_window_tokens = 128000

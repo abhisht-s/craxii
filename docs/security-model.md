@@ -20,9 +20,23 @@ Message and cancellation requests carry client-generated UUIDv7 identities. The 
 
 Models do not call the operating system directly. The agent loop can request only registered tools. Inputs are schema-validated, size-bounded, subject to authority evaluation, persisted around dispatch, and executed through the workstation port.
 
-The local workstation confines relative paths to the configured primary workspace and applies explicit file-read limits. Foreground shell commands run through a configured absolute shell with a clean child environment, no inherited variables, bounded command length, bounded time, bounded captured output, cancellation, and artifact handling. Administrative execution is separately configured and capability checked; it is off in the local fixture.
+The local workstation confines relative paths to the configured primary workspace and applies explicit file-read limits. Foreground shell commands run through a configured absolute shell with a clean child environment, no inherited variables, bounded command length, bounded time, bounded captured output, cancellation, and artifact handling.
 
-This boundary reduces accidental authority but is not a general-purpose sandbox. A user-mode shell process has the permissions of the Craxii server account, and a deliberately enabled administrative path carries greater risk. Run Craxii under a dedicated, least-privileged account and workspace when evaluating it.
+The production Linux contract separates the trusted `craxii-server` service identity from the
+model-controlled `craxii` workstation identity. A fixed root-owned launcher, executable only by the
+service identity, clears supplementary groups, drops all real/effective/saved user and group IDs,
+clears capabilities, sets `no_new_privs`, closes unrelated descriptors, and executes only the fixed
+shell or bounded-reader operation. Model-facing file reads use the same dropped identity. The
+credential-bearing systemd configuration rejects administrative execution; `craxii` must not have
+sudo, Docker-socket, or trusted-service control.
+
+The trusted backend service retains `CAP_KILL` only so TERM/KILL supervision continues to work
+across the UID boundary. The launcher clears effective, permitted, inheritable, and ambient
+capabilities before model-controlled code begins.
+
+This is a same-kernel non-root boundary, not a multi-tenant sandbox or protection against host root.
+The older broad administrative suite is limited to an explicitly credential-free disposable test
+host and is not a production service contract.
 
 ## Durable truth and ambiguous outcomes
 
@@ -40,7 +54,9 @@ Normal backend traces and native `os.Logger` diagnostics intentionally exclude c
 
 The offline evidence commands read canonical state and artifact integrity metadata but produce deterministic, versioned, redacted, noncanonical reports. They do not expose journal payload bodies, normalized model output, tool output, environment, or content. Deeper content inspection requires direct, separately authorized local access to the sensitive SQLite/artifact stores; copy only the minimum necessary material and redact it before sharing.
 
-The backend does not terminate production TLS itself in the documented local flow. Any non-loopback deployment would require an independently reviewed TLS, host, process-isolation, persistence, credential, monitoring, and recovery design; no such deployment is claimed here.
+The backend does not terminate production TLS itself in the documented local flow. The checked-in
+Stage 27 assets prepare only the local Linux user/process/filesystem boundary and do not claim a
+deployed or externally reachable service.
 
 ## Current limitations
 

@@ -154,7 +154,11 @@ fn ec2_shape_fixture_loads_but_remains_loopback_and_non_secret() {
         config.credentials().source(),
         CredentialSourceConfig::Systemd
     ));
-    assert!(config.shell().administrative_enabled());
+    assert!(!config.shell().administrative_enabled());
+    assert_eq!(
+        config.shell().user_switch_launcher(),
+        Some(Path::new("/opt/craxii/current/craxii-workstation-launcher"))
+    );
     assert_eq!(config.tracing().format(), TracingFormat::Json);
 }
 
@@ -223,7 +227,7 @@ fn local_fixture_fingerprint_is_an_exact_stable_sha256() {
     assert_eq!(parsed.fingerprint(), loaded.fingerprint());
     assert_eq!(
         parsed.fingerprint().as_str(),
-        "sha256:42807d1a850e124ea56b577d2be653e72663d3e8b8a5303c2f615dee747509cf"
+        "sha256:96dcfb08f029db04cfb9ade5f4a3f366a7ed6418d9486eee6e5650db233be777"
     );
 }
 
@@ -504,6 +508,42 @@ fn credential_source_shapes_are_enforced_without_loading_secrets() {
         invalid(&unknown_source),
         ConfigError::InvalidCredentialSource { .. }
     ));
+}
+
+#[test]
+fn credential_bearing_systemd_shape_requires_the_fixed_non_admin_launcher_contract() {
+    let missing_launcher = EC2_SHAPE.replace(
+        "user_switch_launcher = \"/opt/craxii/current/craxii-workstation-launcher\"\n",
+        "",
+    );
+    assert!(matches!(
+        invalid(&missing_launcher),
+        ConfigError::InvalidShell { .. }
+    ));
+
+    let admin_enabled = EC2_SHAPE.replace(
+        "administrative_enabled = false",
+        "administrative_enabled = true",
+    );
+    assert!(matches!(
+        invalid(&admin_enabled),
+        ConfigError::InvalidShell { .. }
+    ));
+
+    for unsafe_launcher in [
+        "relative/craxii-workstation-launcher",
+        "/opt/craxii/current/other-launcher",
+        "/opt/craxii/../tmp/craxii-workstation-launcher",
+    ] {
+        let candidate = EC2_SHAPE.replace(
+            "/opt/craxii/current/craxii-workstation-launcher",
+            unsafe_launcher,
+        );
+        assert!(matches!(
+            invalid(&candidate),
+            ConfigError::InvalidShell { .. }
+        ));
+    }
 }
 
 #[test]

@@ -181,6 +181,8 @@ pub(super) struct RawShell {
     pub(super) inherited_variables: Vec<String>,
     pub(super) administrative_enabled: bool,
     #[serde(default)]
+    pub(super) user_switch_launcher: Option<String>,
+    #[serde(default)]
     pub(super) delegated_cgroup_root: Option<String>,
 }
 
