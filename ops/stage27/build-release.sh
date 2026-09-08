@@ -37,7 +37,8 @@ fi
   fail "build checkout has an unexpected origin"
 [[ -z "$(build_git status --porcelain=v1 --untracked-files=normal)" ]] ||
   fail "build checkout is dirty"
-build_git fetch --force --no-tags origin main
+build_git fetch --force --no-tags origin \
+  +refs/heads/main:refs/remotes/origin/main
 build_git merge-base --is-ancestor "${commit}" origin/main ||
   fail "requested commit is not reachable from GitHub origin/main"
 build_git checkout --detach "${commit}"
