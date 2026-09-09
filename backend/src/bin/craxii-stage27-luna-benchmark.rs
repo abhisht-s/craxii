@@ -29,6 +29,7 @@ const PROVIDER: &str = "openai";
 const MODEL: &str = "gpt-5.6-luna";
 const WORKSPACE: &str = "/srv/craxii/workspaces/primary";
 const STATE_ROOT: &str = "/var/lib/craxii";
+const PUBLIC_BASE_URL: &str = "http://127.0.0.1:8080/";
 const PUBLIC_URL: &str = "http://127.0.0.1:8080";
 const PROMPT: &str = "Inspect your machine and tell me what OS, CPU architecture, current directory, and Git version you have.";
 const TERMINAL_STATES: &[&str] = &["completed", "failed", "cancelled", "interrupted"];
@@ -342,7 +343,7 @@ async fn preflight() -> Result<Preflight> {
 }
 
 fn validate_configuration(configuration: &config::ValidatedConfig) -> Result<()> {
-    if configuration.server().public_base_url().as_str() != PUBLIC_URL
+    if configuration.server().public_base_url().as_str() != PUBLIC_BASE_URL
         || configuration.server().bind_address().to_string() != "127.0.0.1:8080"
         || configuration.paths().state_root() != Path::new(STATE_ROOT)
         || configuration.paths().primary_workspace_root() != Path::new(WORKSPACE)
@@ -1227,6 +1228,19 @@ mod tests {
             PROMPT,
             "Inspect your machine and tell me what OS, CPU architecture, current directory, and Git version you have."
         );
+    }
+
+    #[test]
+    fn canonical_production_configuration_satisfies_runner_contract() {
+        let configuration =
+            config::parse(include_str!("../../../ops/stage27/config.toml.template"))
+                .expect("canonical Stage 27 production configuration must parse");
+
+        assert_eq!(
+            configuration.server().public_base_url().as_str(),
+            PUBLIC_BASE_URL
+        );
+        assert!(validate_configuration(&configuration).is_ok());
     }
 
     #[test]
