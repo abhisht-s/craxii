@@ -256,9 +256,12 @@ run_live_test() {
   local server_uid server_gid
   server_uid="$(id -u craxii-server)"
   server_gid="$(id -g craxii-server)"
+  # The verifier must survive the service restart from outside its cgroup. It uses CAP_SYS_ADMIN
+  # for its pre-exec child to cross into the delegated subtree; the fixed launcher clears every
+  # capability before the model-controlled Bash command starts.
   /usr/bin/setpriv \
     --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
-    --inh-caps=+kill --ambient-caps=+kill \
+    --inh-caps=+kill,+sys_admin --ambient-caps=+kill,+sys_admin \
     /usr/bin/env -i \
     HOME=/var/lib/craxii \
     USER=craxii-server \

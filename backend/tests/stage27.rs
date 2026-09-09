@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use craxii_server::domain::{ClientCommandId, ClientMessageId, WorkId};
+use craxii_server::domain::{ClientCommandId, ClientMessageId, ModelToolCallId, WorkId};
 use serde_json::json;
 use sqlx::{Connection as _, Row as _};
 use stage18_harness::{
@@ -31,14 +31,20 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     let root = Stage18Root::new("stage27-live-cancellation");
     root.allow_disposable_workstation_identity();
     let workspace = root.workspace();
+    let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+    let ordinary_call = ModelToolCallId::try_new("stage27-ordinary-shell").unwrap();
     let plans = [
         ProgramPlan::Tools(vec![ToolPlan::new(
-            "stage27-ordinary-shell",
+            ordinary_call.as_str(),
             "run_shell",
             json!({
-                "command": "/bin/sleep 0.1 & wait; printf '%s:%s' \"$(/usr/bin/id -un)\" \"$(/usr/bin/id -gn)\" > ordinary-execution-identity"
+                "command": "umask 022; /bin/sleep 0.1 & wait && /usr/bin/grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && printf '%s:%s\\n%s\\n' \"$(/usr/bin/id -un)\" \"$(/usr/bin/id -gn)\" \"$(/usr/bin/pwd -P)\" | /usr/bin/tee ordinary-execution-identity"
             }),
         )]),
+        ProgramPlan::Answer {
+            text: "ordinary Linux workload completed".to_owned(),
+            require_tool_result: Some(ordinary_call),
+        },
         ProgramPlan::Tools(vec![ToolPlan::new(
             "stage27-cancel-shell",
             "run_shell",
@@ -63,9 +69,86 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
 
     let ordinary_work = submit(&harness, "run disposable ordinary Linux workload").await;
     assert_eq!(harness.wait_terminal(ordinary_work).await, "completed");
+    let expected_ordinary_output = format!("craxii:craxii\n{}\n", canonical_workspace.display());
+    let mut connection = read_only(&harness.root.database()).await;
+    let ordinary_tools = sqlx::query(
+        "SELECT state, requested_cwd, resolved_cwd, effective_privilege, exit_code, signal, \
+         timed_out, cancelled, cleanup_confirmed, result_json, stdout_observed_bytes, \
+         stdout_captured_bytes, stdout_returned_inline_bytes, stderr_observed_bytes, \
+         stderr_captured_bytes, stderr_returned_inline_bytes \
+         FROM tool_executions WHERE work_id = ?",
+    )
+    .bind(ordinary_work.to_string())
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(ordinary_tools.len(), 1);
+    let ordinary_tool = &ordinary_tools[0];
+    assert_eq!(ordinary_tool.get::<String, _>("state"), "completed");
+    assert_eq!(
+        ordinary_tool.get::<String, _>("requested_cwd"),
+        canonical_workspace.to_str().unwrap()
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<String>, _>("resolved_cwd"),
+        Some(canonical_workspace.to_str().unwrap().to_owned())
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<String>, _>("effective_privilege"),
+        Some("user".to_owned())
+    );
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("exit_code"), Some(0));
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("signal"), None);
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("timed_out"), Some(0));
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("cancelled"), Some(0));
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("cleanup_confirmed"),
+        Some(1)
+    );
+    let expected_stdout_bytes = i64::try_from(expected_ordinary_output.len()).unwrap();
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stdout_observed_bytes"),
+        Some(expected_stdout_bytes)
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stdout_captured_bytes"),
+        Some(expected_stdout_bytes)
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stdout_returned_inline_bytes"),
+        Some(expected_stdout_bytes)
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stderr_observed_bytes"),
+        Some(0)
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stderr_captured_bytes"),
+        Some(0)
+    );
+    assert_eq!(
+        ordinary_tool.get::<Option<i64>, _>("stderr_returned_inline_bytes"),
+        Some(0)
+    );
+    let result: serde_json::Value = serde_json::from_str(
+        &ordinary_tool
+            .get::<Option<String>, _>("result_json")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["result_kind"], "success");
+    let fields = result["fields"].as_array().unwrap();
+    let stdout = fields.iter().find_map(|field| {
+        let pair = field.as_array()?;
+        (pair.first()?.as_str()? == "stdout_0001")
+            .then(|| pair.get(1)?.as_str())
+            .flatten()
+    });
+    assert_eq!(stdout, Some(expected_ordinary_output.as_str()));
+    connection.close().await.unwrap();
     assert_eq!(
         fs::read_to_string(workspace.join("ordinary-execution-identity")).unwrap(),
-        "craxii:craxii"
+        expected_ordinary_output
     );
     wait_for_empty_execution_cgroups(&cgroup_root).await;
 
@@ -121,7 +204,7 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
         .parse::<u32>()
         .unwrap();
     assert!(!Path::new(&format!("/proc/{descendant}")).exists());
-    assert_eq!(harness.provider.invocation_count(), 3);
+    assert_eq!(harness.provider.invocation_count(), 4);
     wait_for_empty_execution_cgroups(&cgroup_root).await;
 
     let root = harness.shutdown().await;
@@ -212,6 +295,16 @@ fn require_live_host() {
         .and_then(|value| u64::from_str_radix(value, 16).ok())
         .unwrap();
     assert_ne!(cap_eff & (1_u64 << 5), 0, "CAP_KILL is required");
+    assert_ne!(
+        cap_eff & (1_u64 << 21),
+        0,
+        "CAP_SYS_ADMIN is required by the credential-free verifier to migrate only its child across the cgroup delegation boundary"
+    );
+    let cgroup = fs::read_to_string("/proc/self/cgroup").unwrap();
+    assert!(
+        !cgroup.contains("/system.slice/craxii-server.service"),
+        "the verifier must remain outside the service cgroup"
+    );
     for forbidden in [
         "OPENAI_API_KEY",
         "CREDENTIALS_DIRECTORY",
