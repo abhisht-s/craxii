@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "test-failpoints")]
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(feature = "test-failpoints")]
@@ -4073,8 +4075,36 @@ async fn stage14_crash_window_child() {
     let workspace_root = root.join("workspace");
     let cwd = workspace_root.join("cwd");
     fs::create_dir_all(&cwd).unwrap();
+    // Linux intentionally refuses foreground execution without both the fixed identity launcher
+    // and a delegated cgroup. The Stage 27 host gate supplies that production execution boundary.
+    let live_linux_execution = cfg!(target_os = "linux")
+        && matches!(
+            hook.as_str(),
+            "after_tool_process_spawn" | "after_tool_process_exit_before_outcome_commit"
+        );
+    let (user_switch_launcher, delegated_cgroup_root) = if live_linux_execution {
+        assert_eq!(
+            std::env::var("CRAXII_STAGE27_LIVE_HOST").as_deref(),
+            Ok("1")
+        );
+        (
+            Some(PathBuf::from(
+                std::env::var_os("CRAXII_STAGE27_USER_SWITCH_LAUNCHER").unwrap(),
+            )),
+            Some(PathBuf::from(
+                std::env::var_os("CRAXII_STAGE27_CGROUP_ROOT").unwrap(),
+            )),
+        )
+    } else {
+        (None, None)
+    };
     fs::write(workspace_root.join("small.txt"), b"small\n").unwrap();
     fs::write(workspace_root.join("large.txt"), vec![b'x'; 40_000]).unwrap();
+    if live_linux_execution {
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o711)).unwrap();
+        fs::set_permissions(&workspace_root, fs::Permissions::from_mode(0o711)).unwrap();
+        fs::set_permissions(&cwd, fs::Permissions::from_mode(0o733)).unwrap();
+    }
 
     let snapshot = fixture.store.load_bootstrap_snapshot().await.unwrap();
     let call_workspace = WorkspaceIdentity::try_new(WorkspaceIdentityInput {
@@ -4103,9 +4133,9 @@ async fn stage14_crash_window_child() {
                 read_hard_limit: HARD_FILE_READ_MAX_BYTES,
                 artifact_store: workstation_artifacts,
                 administrative_enabled: false,
-                user_switch_launcher: None,
-                credential_free_direct_execution: true,
-                delegated_cgroup_root: None,
+                user_switch_launcher,
+                credential_free_direct_execution: !live_linux_execution,
+                delegated_cgroup_root,
                 clock: workstation_clock,
             },
         )
@@ -4159,8 +4189,8 @@ async fn stage14_crash_window_child() {
         .unwrap();
         JournalEventId::parse_canonical(&id).unwrap()
     };
-    let side_effect = root.join("machine-side-effect.marker");
-    let terminal = root.join("terminal-observed.marker");
+    let side_effect = cwd.join("machine-side-effect.marker");
+    let terminal = cwd.join("terminal-observed.marker");
     let (tool_name, raw_arguments) = match hook.as_str() {
         "after_tool_requested_commit" | "after_tool_dispatch_intent_commit" => (
             "read_file",
@@ -4235,11 +4265,39 @@ fn stage14_side_effect_count(path: &Path) -> usize {
 async fn wait_for_stage14_shell_completion(path: &Path) {
     tokio::time::timeout(Duration::from_secs(5), async {
         while !path.is_file() {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("spawned crash-window shell did not terminate");
+    .expect("spawned crash-window shell did not report completion");
+}
+
+#[cfg(all(feature = "test-failpoints", target_os = "linux"))]
+async fn remove_empty_stage14_execution_cgroup(root: &Path, execution_id: ExecutionId) {
+    // The execution ID names the kernel-owned containment object, so cleanup confirmation does
+    // not depend on a reusable PID captured after the original backend process has died.
+    let execution_cgroup = root.join(execution_id.to_string());
+    assert!(
+        execution_cgroup.is_dir(),
+        "crashed execution cgroup was not created"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let populated = fs::read_to_string(execution_cgroup.join("cgroup.events"))
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("populated "))
+                .unwrap()
+                == "1";
+            if !populated {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("spawned crash-window cgroup did not become empty");
+    fs::remove_dir(&execution_cgroup).expect("remove empty crash-window execution cgroup");
 }
 
 #[cfg(feature = "test-failpoints")]
@@ -4260,9 +4318,12 @@ async fn verify_stage14_crash_window(hook: &str) {
         .env("CRAXII_STAGE14_CRASH_HOOK", hook)
         .output()
         .unwrap();
-    assert!(
-        !output.status.success(),
-        "crash child unexpectedly survived"
+    assert_eq!(
+        output.status.signal(),
+        Some(nix::libc::SIGABRT),
+        "crash child did not abort at the selected failpoint; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
     );
     assert!(
         root_path.join("db/craxii.sqlite3").is_file(),
@@ -4271,8 +4332,8 @@ async fn verify_stage14_crash_window(hook: &str) {
         String::from_utf8_lossy(&output.stderr),
     );
 
-    let side_effect = root_path.join("machine-side-effect.marker");
-    let terminal_marker = root_path.join("terminal-observed.marker");
+    let side_effect = root_path.join("workspace/cwd/machine-side-effect.marker");
+    let terminal_marker = root_path.join("workspace/cwd/terminal-observed.marker");
     if matches!(
         hook,
         "after_tool_process_spawn" | "after_tool_process_exit_before_outcome_commit"
@@ -4294,7 +4355,7 @@ async fn verify_stage14_crash_window(hook: &str) {
     let artifact_store = LocalArtifactStore::initialize(&root.path().join("artifacts")).unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
     let row = sqlx::query(
-        "SELECT t.tool_execution_id, t.runtime_instance_id, t.work_id, t.state, \
+        "SELECT t.tool_execution_id, t.execution_id, t.runtime_instance_id, t.work_id, t.state, \
          w.craxii_id, w.conversation_id, w.workspace_id, w.correlation_id, \
          r.workstation_id FROM tool_executions t \
          JOIN work_items w ON w.work_id = t.work_id \
@@ -4305,6 +4366,8 @@ async fn verify_stage14_crash_window(hook: &str) {
     .unwrap();
     let tool_id =
         ToolExecutionId::parse_canonical(&row.get::<String, _>("tool_execution_id")).unwrap();
+    #[cfg(target_os = "linux")]
+    let execution_id = ExecutionId::parse_canonical(&row.get::<String, _>("execution_id")).unwrap();
     let old_runtime =
         RuntimeInstanceId::parse_canonical(&row.get::<String, _>("runtime_instance_id")).unwrap();
     let work_id = WorkId::parse_canonical(&row.get::<String, _>("work_id")).unwrap();
@@ -4373,6 +4436,12 @@ async fn verify_stage14_crash_window(hook: &str) {
         0
     );
     drop(connection);
+
+    #[cfg(target_os = "linux")]
+    if hook == "after_tool_process_spawn" {
+        let cgroup_root = PathBuf::from(std::env::var_os("CRAXII_STAGE27_CGROUP_ROOT").unwrap());
+        remove_empty_stage14_execution_cgroup(&cgroup_root, execution_id).await;
+    }
 
     assert_eq!(
         terminal_marker.is_file(),

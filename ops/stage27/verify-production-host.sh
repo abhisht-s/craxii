@@ -185,8 +185,10 @@ verify_source_delta_is_test_only() {
   source_commit="$(build_git rev-parse HEAD)"
   [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]] || fail "controlled source revision is invalid"
   if [[ "${source_commit}" != "${deployment_commit}" ]]; then
+    # The Stage 8 test module is cfg(test) at its module boundary and cannot affect release builds.
     if build_git diff --quiet "${deployment_commit}..${source_commit}" -- \
-      Cargo.toml Cargo.lock backend/Cargo.toml backend/build.rs backend/migrations backend/src; then
+      Cargo.toml Cargo.lock backend/Cargo.toml backend/build.rs backend/migrations backend/src \
+      ':(exclude)backend/src/adapters/sqlite/stage8_tests.rs'; then
       :
     else
       fail "verification checkout changes production Rust sources relative to deployed release"
@@ -199,12 +201,12 @@ compile_host_tests() {
   local cargo_json="${runtime_directory}/cargo-test-artifacts.jsonl"
   run_build test --locked --features test-failpoints -p craxii-server \
     --lib --test stage27 --no-run --message-format=json >"${cargo_json}"
-  test_binary="$(/usr/bin/python3 - "${cargo_json}" <<'PY'
+  mapfile -t test_binaries < <(/usr/bin/python3 - "${cargo_json}" <<'PY'
 import json
 import pathlib
 import sys
 
-executables = []
+executables = {"live": [], "unit": []}
 for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
     try:
         record = json.loads(line)
@@ -212,17 +214,34 @@ for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
         continue
     target = record.get("target", {})
     executable = record.get("executable")
-    if record.get("reason") == "compiler-artifact" and target.get("name") == "stage27" and executable:
-        executables.append(executable)
-if len(executables) != 1:
-    raise SystemExit("expected exactly one Stage 27 integration test executable")
-print(executables[0])
+    if record.get("reason") != "compiler-artifact" or not executable:
+        continue
+    if target.get("name") == "stage27" and target.get("kind") == ["test"]:
+        executables["live"].append(executable)
+    if (
+        target.get("name") == "craxii_server"
+        and target.get("kind") == ["lib"]
+        and record.get("profile", {}).get("test") is True
+    ):
+        executables["unit"].append(executable)
+if any(len(paths) != 1 for paths in executables.values()):
+    raise SystemExit("expected exactly one Stage 27 integration and library test executable")
+print(executables["live"][0])
+print(executables["unit"][0])
 PY
-)"
+)
+  [[ "${#test_binaries[@]}" -eq 2 ]] || fail "compiled Stage 27 test executables are ambiguous"
+  test_binary="${test_binaries[0]}"
+  unit_test_binary="${test_binaries[1]}"
   [[ -f "${test_binary}" && -x "${test_binary}" ]] || fail "compiled Stage 27 test binary is absent"
+  [[ -f "${unit_test_binary}" && -x "${unit_test_binary}" ]] ||
+    fail "compiled library test binary is absent"
   installed_test="${runtime_directory}/stage27-live-host-test"
+  installed_unit_test="${runtime_directory}/stage27-library-test"
   install -o root -g craxii-server -m 0550 "${test_binary}" "${installed_test}"
+  install -o root -g craxii-server -m 0550 "${unit_test_binary}" "${installed_unit_test}"
   readonly installed_test
+  readonly installed_unit_test
 }
 
 run_unit_test() {
@@ -252,6 +271,28 @@ run_live_test() {
     "${installed_test}" --ignored --exact "${test_name}" --nocapture
 }
 
+run_live_unit_test() {
+  local test_name="$1"
+  local server_uid server_gid
+  server_uid="$(id -u craxii-server)"
+  server_gid="$(id -g craxii-server)"
+  (
+    printf '0\n' >"${cgroup_root}/cgroup.procs"
+    exec /usr/bin/setpriv \
+      --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
+      --inh-caps=+kill --ambient-caps=+kill \
+      /usr/bin/env -i \
+      HOME=/var/lib/craxii \
+      USER=craxii-server \
+      LOGNAME=craxii-server \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      CRAXII_STAGE27_LIVE_HOST=1 \
+      CRAXII_STAGE27_USER_SWITCH_LAUNCHER="${launcher}" \
+      CRAXII_STAGE27_CGROUP_ROOT="${cgroup_root}" \
+      "${installed_unit_test}" --exact "${test_name}" --nocapture
+  )
+}
+
 run_pre_reboot() {
   [[ ! -e "${pre_reboot_evidence}" && ! -L "${pre_reboot_evidence}" ]] ||
     fail "pre-reboot evidence already exists; preserve and review it instead of overwriting"
@@ -269,7 +310,7 @@ run_pre_reboot() {
   compile_host_tests
   run_unit_test \
     adapters::sqlite::stage10_tests::process_loss_between_recovery_units_is_idempotent_on_the_next_startup
-  run_unit_test \
+  run_live_unit_test \
     adapters::sqlite::stage8_tests::crash_after_tool_process_spawn_records_one_side_effect
   run_unit_test \
     application::tool_execution_service::tests::cleanup_ambiguity_and_handler_panic_commit_outcome_unknown_without_redispatch
