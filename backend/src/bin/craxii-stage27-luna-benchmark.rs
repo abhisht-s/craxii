@@ -152,6 +152,18 @@ struct Receipt {
     duplicate: bool,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMessageReceipt {
+    version: u64,
+    conversation_id: String,
+    message_id: String,
+    work_id: String,
+    work_ordinal: u64,
+    work_state: String,
+    committed_cursor: u64,
+}
+
 #[derive(Debug)]
 struct HostFacts {
     os: String,
@@ -243,9 +255,13 @@ async fn run_submission(attempt: &mut Attempt) -> Result<VerificationReport> {
                 "submission_transport_ambiguous" | "submission_response_ambiguous"
             ) =>
         {
-            recover_durable_receipt(&preflight.database, client_message_id)
-                .await?
-                .ok_or(error)?
+            recover_durable_receipt(
+                &preflight.database,
+                &preflight.conversation_id,
+                client_message_id,
+            )
+            .await?
+            .ok_or(error)?
         }
         Err(error) => return Err(error),
     };
@@ -288,7 +304,12 @@ async fn run_existing_verification(attempt: &mut Attempt) -> Result<Verification
     let preflight = preflight(DurableStateExpectation::ExistingCanonical).await?;
     let facts = host_facts()?;
     health_ready().await?;
-    let receipt = load_existing_receipt(&preflight.database, client_message_id).await?;
+    let receipt = load_existing_receipt(
+        &preflight.database,
+        &preflight.conversation_id,
+        client_message_id,
+    )
+    .await?;
     validate_receipt(&receipt)?;
     if receipt.work_id != EXISTING_WORK_ID {
         return Err(RunnerError::new("existing_work_identity_mismatch"));
@@ -661,6 +682,7 @@ async fn submit(
 
 async fn recover_durable_receipt(
     database: &Path,
+    conversation_id: &str,
     client_message_id: Uuid,
 ) -> Result<Option<Receipt>> {
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -680,9 +702,8 @@ async fn recover_durable_receipt(
             .map_err(|_| RunnerError::new("database_close_failed"))?;
         match values.as_slice() {
             [value] => {
-                return serde_json::from_str(value)
-                    .map(Some)
-                    .map_err(|_| RunnerError::new("durable_receipt_invalid"));
+                return decode_durable_receipt(value, conversation_id, "durable_receipt_invalid")
+                    .map(Some);
             }
             [] if Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(250)).await;
@@ -693,7 +714,11 @@ async fn recover_durable_receipt(
     }
 }
 
-async fn load_existing_receipt(database: &Path, client_message_id: Uuid) -> Result<Receipt> {
+async fn load_existing_receipt(
+    database: &Path,
+    conversation_id: &str,
+    client_message_id: Uuid,
+) -> Result<Receipt> {
     let mut connection = connect(database).await?;
     let values: Vec<String> = sqlx::query_scalar(
         "SELECT response_json FROM client_commands \
@@ -711,7 +736,30 @@ async fn load_existing_receipt(database: &Path, client_message_id: Uuid) -> Resu
         [value] => value,
         _ => return Err(RunnerError::new("existing_receipt_cardinality_invalid")),
     };
-    serde_json::from_str(value).map_err(|_| RunnerError::new("existing_receipt_invalid"))
+    decode_durable_receipt(value, conversation_id, "existing_receipt_invalid")
+}
+
+fn decode_durable_receipt(
+    value: &str,
+    conversation_id: &str,
+    error_code: &'static str,
+) -> Result<Receipt> {
+    let stored: StoredMessageReceipt =
+        serde_json::from_str(value).map_err(|_| RunnerError::new(error_code))?;
+    if stored.conversation_id != conversation_id {
+        return Err(RunnerError::new(error_code));
+    }
+    let receipt = Receipt {
+        protocol_version: stored.version,
+        message_id: stored.message_id,
+        work_id: stored.work_id,
+        work_state: stored.work_state,
+        conversation_work_ordinal: stored.work_ordinal,
+        committed_cursor: stored.committed_cursor,
+        duplicate: false,
+    };
+    validate_receipt(&receipt).map_err(|_| RunnerError::new(error_code))?;
+    Ok(receipt)
 }
 
 async fn load_existing_runtime(preflight: &Preflight, work_id: &str) -> Result<EvidenceRuntime> {
@@ -831,7 +879,13 @@ async fn verify(
     }
     verify_work(&mut connection, preflight, receipt).await?;
     let assistant = verify_messages(&mut connection, preflight, receipt, client_message_id).await?;
-    verify_command(&mut connection, receipt, client_message_id).await?;
+    verify_command(
+        &mut connection,
+        &preflight.conversation_id,
+        receipt,
+        client_message_id,
+    )
+    .await?;
     let (model_attempt_count, final_step, final_context, final_text) =
         verify_models(&mut connection, runtime, &receipt.work_id).await?;
     if final_text != assistant {
@@ -963,6 +1017,7 @@ async fn verify_messages(
 
 async fn verify_command(
     connection: &mut SqliteConnection,
+    conversation_id: &str,
     receipt: &Receipt,
     client_message_id: Uuid,
 ) -> Result<()> {
@@ -974,14 +1029,19 @@ async fn verify_command(
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| RunnerError::new("client_command_evidence_invalid"))?;
-    let stored: Receipt = serde_json::from_str(&row.get::<String, _>("response_json"))
-        .map_err(|_| RunnerError::new("client_command_response_invalid"))?;
+    let stored = decode_durable_receipt(
+        &row.get::<String, _>("response_json"),
+        conversation_id,
+        "client_command_response_invalid",
+    )?;
     if row.get::<String, _>("command_type") != "message"
         || row.get::<i64, _>("response_http_status") != 202
         || row.get::<i64, _>("committed_cursor") != receipt.committed_cursor as i64
         || stored.message_id != receipt.message_id
         || stored.work_id != receipt.work_id
-        || stored.duplicate
+        || stored.work_state != receipt.work_state
+        || stored.conversation_work_ordinal != receipt.conversation_work_ordinal
+        || stored.committed_cursor != receipt.committed_cursor
     {
         return Err(RunnerError::new("client_command_evidence_mismatch"));
     }
@@ -1522,6 +1582,37 @@ mod tests {
         assert_eq!(
             parse_mode(&wrong_work).unwrap_err().code,
             "runner_arguments_invalid"
+        );
+    }
+
+    #[test]
+    fn durable_message_receipt_uses_the_internal_persistence_schema() {
+        let encoded = format!(
+            r#"{{"version":1,"conversation_id":"conversation","message_id":"{EXISTING_CLIENT_MESSAGE_ID}","work_id":"{EXISTING_WORK_ID}","work_ordinal":1,"work_state":"queued","committed_cursor":7}}"#,
+        );
+
+        let receipt = decode_durable_receipt(&encoded, "conversation", "invalid").unwrap();
+
+        assert_eq!(receipt.protocol_version, 1);
+        assert_eq!(receipt.message_id, EXISTING_CLIENT_MESSAGE_ID);
+        assert_eq!(receipt.work_id, EXISTING_WORK_ID);
+        assert_eq!(receipt.work_state, "queued");
+        assert_eq!(receipt.conversation_work_ordinal, 1);
+        assert_eq!(receipt.committed_cursor, 7);
+        assert!(!receipt.duplicate);
+    }
+
+    #[test]
+    fn durable_message_receipt_rejects_the_wrong_conversation() {
+        let encoded = format!(
+            r#"{{"version":1,"conversation_id":"conversation","message_id":"{EXISTING_CLIENT_MESSAGE_ID}","work_id":"{EXISTING_WORK_ID}","work_ordinal":1,"work_state":"queued","committed_cursor":7}}"#,
+        );
+
+        assert_eq!(
+            decode_durable_receipt(&encoded, "other", "invalid")
+                .unwrap_err()
+                .code,
+            "invalid"
         );
     }
 
