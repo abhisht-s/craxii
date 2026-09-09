@@ -64,6 +64,41 @@ human may run it in the browser terminal. It reads without echo, does not use an
 environment variable, refuses overwrite, and installs the systemd credential source as
 `craxii-server:craxii-server` mode `0600`. Running that script is outside the precredential run.
 
+`verify-production-host.sh` owns the final production-like Stage 27 restart/reboot gate. Its
+`--pre-reboot` mode creates two fixed non-secret persistence sentinels, captures a read-only
+canonical-state snapshot, runs focused recovery/ambiguity checks with a scripted provider, runs a
+real Linux cancellation through the installed privilege-drop launcher and delegated execution
+cgroup, and coordinates one normal systemd service restart while both an owned execution and an
+outside control process are alive. It then writes a redacted JSON evidence bundle and restart
+comparison under `/srv/craxii-data/stage27-evidence`. It never reads or hashes the provider
+credential; the credential check is limited to file metadata and a negative model-child access
+probe. It never invokes a real provider.
+
+The same script's `--post-reboot` mode is intentionally run only after the human reboot boundary.
+It verifies automatic systemd startup, a changed Linux boot/runtime identity, graceful closure of
+the pre-reboot runtime, unchanged canonical identity/state/sentinels/artifacts/release, restored
+mount topology, recovery evidence before readiness, an empty execution cgroup, loopback-only
+operation, and the unchanged credential access boundary. Evidence files are create-once and are
+never overwritten.
+
+Run the production gate from the controlled source checkout with the deployed release commit and
+data-filesystem UUID as explicit arguments:
+
+```sh
+sudo /bin/bash /var/lib/craxii-build/source/ops/stage27/verify-production-host.sh \
+  --pre-reboot <deployed-40-character-commit> <data-filesystem-uuid>
+```
+
+After a human reboots the instance through the AWS Console and Session Manager becomes available:
+
+```sh
+sudo /bin/bash /var/lib/craxii-build/source/ops/stage27/verify-production-host.sh \
+  --post-reboot <deployed-40-character-commit> <data-filesystem-uuid>
+```
+
+Neither mode calls AWS APIs, accepts a bearer/provider secret, changes the immutable release, or
+performs the EC2 reboot.
+
 The older `scripts/verify-stage13-ubuntu-target` suite remains a separate privileged host-capability
 test. It now requires `CRAXII_STAGE13_CREDENTIAL_FREE_DISPOSABLE=1` and refuses the production
 `craxii-server.service` unit.

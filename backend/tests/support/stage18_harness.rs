@@ -126,6 +126,19 @@ impl Stage18Root {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn allow_disposable_workstation_identity(&self) {
+        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o711))
+            .expect("make disposable harness root searchable");
+        fs::set_permissions(&self.workspace(), fs::Permissions::from_mode(0o777))
+            .expect("share disposable harness workspace with workstation identity");
+        fs::set_permissions(
+            self.workspace().join("machine-note.txt"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .expect("share disposable harness fixture with workstation identity");
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -806,7 +819,7 @@ impl Stage18Harness {
         provider_programs: Vec<ScriptedProgram>,
         estimator_mode: EstimatorMode,
     ) -> Result<Self, String> {
-        Self::start_inner(root, provider_programs, estimator_mode, None).await
+        Self::start_inner(root, provider_programs, estimator_mode, None, None).await
     }
 
     pub async fn start_with_provider(
@@ -814,7 +827,25 @@ impl Stage18Harness {
         provider: Arc<dyn ModelProvider>,
         estimator_mode: EstimatorMode,
     ) -> Result<Self, String> {
-        Self::start_inner(root, Vec::new(), estimator_mode, Some(provider)).await
+        Self::start_inner(root, Vec::new(), estimator_mode, Some(provider), None).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub async fn start_with_linux_workstation(
+        root: Stage18Root,
+        provider_programs: Vec<ScriptedProgram>,
+        estimator_mode: EstimatorMode,
+        launcher: PathBuf,
+        delegated_cgroup_root: PathBuf,
+    ) -> Result<Self, String> {
+        Self::start_inner(
+            root,
+            provider_programs,
+            estimator_mode,
+            None,
+            Some((launcher, delegated_cgroup_root)),
+        )
+        .await
     }
 
     async fn start_inner(
@@ -822,6 +853,7 @@ impl Stage18Harness {
         provider_programs: Vec<ScriptedProgram>,
         estimator_mode: EstimatorMode,
         provider_override: Option<Arc<dyn ModelProvider>>,
+        linux_workstation: Option<(PathBuf, PathBuf)>,
     ) -> Result<Self, String> {
         let state_root = root.state_root();
         let workspace = root.workspace();
@@ -846,7 +878,7 @@ impl Stage18Harness {
                 conversation_created_event_id: JournalEventId::generate(),
                 correlation_id: CorrelationId::generate(),
                 created_at: T0.parse().unwrap(),
-                observation: observation(&workspace),
+                observation: observation(&workspace, linux_workstation.is_some()),
             })
             .await
             .map_err(|error| error.to_string())?
@@ -911,6 +943,10 @@ impl Stage18Harness {
             .map_err(|error| error.to_string())?;
         let workstation_clock: Arc<dyn Clock> = clock.clone();
         let workstation_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let (user_switch_launcher, credential_free_direct_execution, delegated_cgroup_root) =
+            linux_workstation.map_or((None, true, None), |(launcher, cgroup_root)| {
+                (Some(launcher), false, Some(cgroup_root))
+            });
         let local_workstation = Arc::new(
             LocalWorkstation::new(
                 &snapshot.workstation,
@@ -921,9 +957,9 @@ impl Stage18Harness {
                     read_hard_limit: HARD_FILE_READ_MAX_BYTES,
                     artifact_store: workstation_artifacts,
                     administrative_enabled: false,
-                    user_switch_launcher: None,
-                    credential_free_direct_execution: true,
-                    delegated_cgroup_root: None,
+                    user_switch_launcher,
+                    credential_free_direct_execution,
+                    delegated_cgroup_root,
                     clock: workstation_clock,
                 },
             )
@@ -1445,7 +1481,7 @@ impl HttpResponse {
     }
 }
 
-fn observation(workspace: &Path) -> BootstrapObservation {
+fn observation(workspace: &Path, cgroup_cleanup: bool) -> BootstrapObservation {
     let workspace = fs::canonicalize(workspace).unwrap();
     let workspace = workspace.to_str().unwrap().to_owned();
     BootstrapObservation {
@@ -1460,7 +1496,7 @@ fn observation(workspace: &Path) -> BootstrapObservation {
             foreground_execute: true,
             privilege_administrative: false,
             process_group_cleanup: true,
-            cgroup_cleanup: false,
+            cgroup_cleanup,
         },
     }
 }

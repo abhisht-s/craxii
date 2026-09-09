@@ -51,7 +51,8 @@
       "enabled_features": [
         "fs",
         "process",
-        "signal"
+        "signal",
+        "term"
       ],
       "default_features": false,
       "optional": false,
