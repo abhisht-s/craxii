@@ -73,6 +73,9 @@ build_git() {
 }
 
 run_build() {
+  (( $# > 0 )) || fail "Cargo subcommand is required"
+  local cargo_subcommand="$1"
+  shift
   runuser -u craxii-build -- /usr/bin/env -i \
     HOME=/var/lib/craxii-build \
     CARGO_HOME=/var/lib/craxii-build/cargo \
@@ -80,7 +83,8 @@ run_build() {
     CARGO_TARGET_DIR="${target_directory}" \
     CARGO_BUILD_JOBS=2 \
     PATH=/var/lib/craxii-build/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    "${cargo}" +1.98.0 --manifest-path "${checkout}/Cargo.toml" "$@"
+    "${cargo}" +1.98.0 "${cargo_subcommand}" \
+    --manifest-path "${checkout}/Cargo.toml" "$@"
 }
 
 wait_for_path() {

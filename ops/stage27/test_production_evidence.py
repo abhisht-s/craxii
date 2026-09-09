@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused tests for the Stage 27 evidence comparison contract."""
+"""Focused tests for the Stage 27 evidence and production-host gate."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ import unittest
 
 
 HELPER = pathlib.Path(__file__).with_name("production-evidence.py")
+VERIFIER = pathlib.Path(__file__).with_name("verify-production-host.sh")
 SPEC = importlib.util.spec_from_file_location("stage27_production_evidence", HELPER)
 assert SPEC is not None and SPEC.loader is not None
 evidence = importlib.util.module_from_spec(SPEC)
@@ -133,6 +134,22 @@ class EvidenceComparisonTests(unittest.TestCase):
                     evidence.validate_workspace_sentinel_acl(
                         "craxii", "craxii", "0640", value
                     )
+
+    def test_run_build_places_manifest_after_required_cargo_subcommand(self) -> None:
+        source = VERIFIER.read_text(encoding="utf-8")
+        start = source.index("run_build() {")
+        end = source.index("\n}\n", start)
+        run_build = source[start:end]
+        self.assertIn('local cargo_subcommand="$1"', run_build)
+        command = '"${cargo}" +1.98.0 "${cargo_subcommand}"'
+        manifest = '--manifest-path "${checkout}/Cargo.toml" "$@"'
+        self.assertIn(command, run_build)
+        self.assertIn(manifest, run_build)
+        self.assertLess(run_build.index(command), run_build.index(manifest))
+        self.assertNotIn(
+            '"${cargo}" +1.98.0 --manifest-path',
+            run_build,
+        )
 
 
 if __name__ == "__main__":
