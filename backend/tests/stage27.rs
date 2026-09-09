@@ -74,9 +74,7 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     let follower = submit(&harness, "following work must remain runnable").await;
     wait_for_work_state(&harness, follower, "queued").await;
 
-    let response = harness
-        .cancel_work(cancelled_work, ClientCommandId::generate())
-        .await;
+    let response = harness.cancel_work(cancelled_work, command_id()).await;
     assert!(matches!(response.status, 200 | 202));
     assert_eq!(harness.wait_terminal(cancelled_work).await, "cancelled");
     assert_eq!(harness.wait_terminal(follower).await, "completed");
@@ -241,15 +239,21 @@ fn required_new_marker(name: &str) -> PathBuf {
 }
 
 async fn submit(harness: &Stage18Harness, message: &str) -> WorkId {
-    let response = harness
-        .submit_message(message, ClientMessageId::generate())
-        .await;
+    let response = harness.submit_message(message, client_id()).await;
     assert_eq!(response.status, 202);
     response.json()["work_id"]
         .as_str()
         .unwrap()
         .parse()
         .unwrap()
+}
+
+fn client_id() -> ClientMessageId {
+    ClientMessageId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string()).unwrap()
+}
+
+fn command_id() -> ClientCommandId {
+    ClientCommandId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string()).unwrap()
 }
 
 async fn wait_for_work_state(harness: &Stage18Harness, work: WorkId, expected: &str) {
