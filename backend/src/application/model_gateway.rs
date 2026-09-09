@@ -3014,6 +3014,7 @@ mod tests {
                 target_id: fixture.target.reference().model_target_id().clone(),
                 request_sha256: Some(fixture.context.request().canonical_sha256()),
                 fixture_key: None,
+                required_user_message_sha256: None,
                 required_prior_tool_result: None,
                 invocation_ordinal: ordinal,
                 attempt: ProviderAttempt::try_new(attempt).unwrap(),

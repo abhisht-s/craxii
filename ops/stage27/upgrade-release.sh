@@ -17,6 +17,7 @@ readonly source_directory=/var/lib/craxii-build/target/release
 readonly release_directory="/opt/craxii/releases/${release_version}"
 readonly current=/opt/craxii/current
 readonly service=craxii-server.service
+readonly asset_directory="${checkout}/ops/stage27"
 
 build_git() {
   runuser -u craxii-build -- /usr/bin/env -i \
@@ -29,6 +30,7 @@ build_git() {
   fail "build checkout does not match the requested commit"
 [[ -z "$(build_git status --porcelain=v1 --untracked-files=normal)" ]] ||
   fail "build checkout is dirty"
+"${asset_directory}/verify-release-manifest.sh" "${source_directory}" "${commit}" >/dev/null
 [[ -L "${current}" ]] || fail "active release symlink is absent"
 previous_release="$(readlink -f "${current}")"
 [[ "${previous_release}" == /opt/craxii/releases/* ]] ||
@@ -61,15 +63,43 @@ install -o root -g root -m 0111 \
 install -o root -g craxii-server -m 4750 \
   "${source_directory}/craxii-workstation-launcher" \
   "${release_directory}/craxii-workstation-launcher"
+install -o root -g root -m 0444 \
+  "${source_directory}/.craxii-stage27-build-manifest" \
+  "${release_directory}/.craxii-stage27-build-manifest"
+
+for binary in \
+  craxii-server craxii-admin craxii-stage27-luna-benchmark \
+  craxii-workstation-launcher craxii-workstation-reader; do
+  [[ "$(sha256sum "${source_directory}/${binary}" | cut -d' ' -f1)" \
+      == "$(sha256sum "${release_directory}/${binary}" | cut -d' ' -f1)" ]] ||
+    fail "installed release digest mismatch: ${binary}"
+done
+"${asset_directory}/verify-release-manifest.sh" \
+  "${release_directory}" "${commit}" >/dev/null
 
 systemctl stop "${service}"
 systemctl is-active --quiet "${service}" &&
   fail "service remained active after the deployment stop"
+install -o root -g craxii-server -m 0640 \
+  "${asset_directory}/config.toml.template" /etc/craxii/config.toml
+install -o root -g root -m 0644 \
+  "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service
+systemctl daemon-reload
 temporary_link="/opt/craxii/.current-${release_version}-$$"
 ln -s "releases/${release_version}" "${temporary_link}"
 mv -Tf "${temporary_link}" "${current}"
 systemctl start "${service}"
 systemctl is-active --quiet "${service}" || fail "updated service did not become active"
+ready=0
+for _ in {1..600}; do
+  if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    --connect-timeout 1 --max-time 2 http://127.0.0.1:8080/health/ready || true)" == 200 ]]; then
+    ready=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "${ready}" -eq 1 ]] || fail "updated service did not become ready"
 main_pid="$(systemctl show "${service}" --property MainPID --value)"
 [[ "${main_pid}" =~ ^[1-9][0-9]*$ ]] || fail "updated service MainPID is invalid"
 [[ "$(readlink -f "/proc/${main_pid}/exe")" == "${release_directory}/craxii-server" ]] ||

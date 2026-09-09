@@ -70,6 +70,22 @@ for binary in \
   [[ -f "${target_directory}/release/${binary}" && -x "${target_directory}/release/${binary}" ]] ||
     fail "release binary is absent: ${binary}"
 done
+manifest="${target_directory}/release/.craxii-stage27-build-manifest"
+temporary_manifest="${target_directory}/release/.craxii-stage27-build-manifest.$$"
+{
+  printf 'commit=%s\n' "${commit}"
+  (
+    cd "${target_directory}/release"
+    sha256sum \
+      craxii-server craxii-admin craxii-stage27-luna-benchmark \
+      craxii-workstation-launcher craxii-workstation-reader
+  )
+} >"${temporary_manifest}"
+chown root:root "${temporary_manifest}"
+chmod 0444 "${temporary_manifest}"
+mv -f "${temporary_manifest}" "${manifest}"
+"${source_directory}/ops/stage27/verify-release-manifest.sh" \
+  "${target_directory}/release" "${commit}" >/dev/null
 echo "Stage 27 immutable source checkout and release build passed for ${commit}."
 printf 'STAGE27_RELEASE_SOURCE=%s\n' "${target_directory}/release"
 printf 'STAGE27_RELEASE_VERSION=0.0.1-%s\n' "${commit:0:12}"

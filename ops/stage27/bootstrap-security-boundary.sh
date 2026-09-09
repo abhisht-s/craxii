@@ -31,6 +31,13 @@ for binary in \
   craxii-workstation-launcher craxii-workstation-reader; do
   [[ -f "${source_directory}/${binary}" && -x "${source_directory}/${binary}" ]]
 done
+if [[ "${release_version}" =~ ^0\.0\.1-([0-9a-f]{12})$ ]]; then
+  release_revision="${BASH_REMATCH[1]}"
+  "${asset_directory}/verify-release-manifest.sh" \
+    "${source_directory}" "${release_revision}" >/dev/null
+else
+  fail "release version does not carry the required build revision"
+fi
 "${asset_directory}/bootstrap-data-volume.sh" --verify-only
 [[ ! -e /etc/craxii/credentials/openai_provider ]] ||
   fail "provider credential already exists; precredential bootstrap refused"
@@ -86,6 +93,11 @@ install -o root -g craxii-server -m 0550 "${source_directory}/craxii-admin" "${r
 install -o root -g craxii-server -m 0550 "${source_directory}/craxii-stage27-luna-benchmark" "${release_directory}/craxii-stage27-luna-benchmark"
 install -o root -g root -m 0111 "${source_directory}/craxii-workstation-reader" "${release_directory}/craxii-workstation-reader"
 install -o root -g craxii-server -m 4750 "${source_directory}/craxii-workstation-launcher" "${release_directory}/craxii-workstation-launcher"
+install -o root -g root -m 0444 \
+  "${source_directory}/.craxii-stage27-build-manifest" \
+  "${release_directory}/.craxii-stage27-build-manifest"
+"${asset_directory}/verify-release-manifest.sh" \
+  "${release_directory}" "${release_revision}" >/dev/null
 
 for binary in \
   craxii-server craxii-admin craxii-stage27-luna-benchmark \

@@ -258,7 +258,7 @@ async fn migration_three_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2"
+        "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e"
     );
     assert_eq!(
         v1_schema_fingerprint(),
@@ -591,7 +591,7 @@ async fn work_input_constraints_and_private_causal_validation_fail_closed() {
 }
 
 #[tokio::test]
-async fn valid_version_one_database_migrates_to_version_four_and_reopens() {
+async fn valid_version_one_database_migrates_to_version_five_and_reopens() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -628,7 +628,7 @@ async fn valid_version_one_database_migrates_to_version_four_and_reopens() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        4
+        5
     );
     drop(connection);
     guard.shutdown().await;

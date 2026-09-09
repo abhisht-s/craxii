@@ -63,7 +63,7 @@ const PROVIDER_ID: &str = "stage18-scripted";
 const TARGET_ID: &str = "stage18-primary";
 const ESTIMATOR_ID: &str = "stage18_fixed";
 const SHELL: &str = "/bin/bash";
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const T0: &str = "2026-09-01T00:00:00.000000Z";
 const REQUESTED_OUTPUT_TOKENS: i64 = 512;
 
@@ -309,6 +309,24 @@ pub fn programs(plans: &[ProgramPlan]) -> Vec<ScriptedProgram> {
         .collect()
 }
 
+/// Binds every queued program to the work input it is intended to serve. This prevents a failed,
+/// cancelled, or unexpectedly continuing agent loop from consuming the next work item's plan.
+pub fn programs_for_user_messages(
+    plans: &[ProgramPlan],
+    user_messages: &[&str],
+) -> Vec<ScriptedProgram> {
+    assert_eq!(plans.len(), user_messages.len());
+    programs(plans)
+        .into_iter()
+        .zip(user_messages)
+        .map(|(mut program, message)| {
+            program.expectation.required_user_message_sha256 =
+                Some(Sha256Digest::hash_bytes(message.as_bytes()));
+            program
+        })
+        .collect()
+}
+
 pub fn retry_programs(final_text: &str, attempts: u32) -> Vec<ScriptedProgram> {
     assert!((2..=3).contains(&attempts));
     let target = target();
@@ -549,6 +567,7 @@ fn program(
                     target_id: target.reference().model_target_id().clone(),
                     request_sha256: None,
                     fixture_key: None,
+                    required_user_message_sha256: None,
                     required_prior_tool_result: None,
                     invocation_ordinal,
                     attempt,
@@ -577,6 +596,7 @@ fn program(
             target_id: target.reference().model_target_id().clone(),
             request_sha256: None,
             fixture_key: None,
+            required_user_message_sha256: None,
             required_prior_tool_result,
             invocation_ordinal,
             attempt,

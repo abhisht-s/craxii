@@ -43,6 +43,7 @@ runtime_directory="/run/craxii-stage27-gate-$$"
 readonly runtime_directory
 control_pid=""
 live_test_pid=""
+declare -a check_failures=()
 
 cleanup() {
   if [[ -n "${live_test_pid}" ]]; then
@@ -61,8 +62,14 @@ trap cleanup EXIT
 
 [[ -x "${evidence_helper}" ]] || fail "Stage 27 evidence helper is absent or not executable"
 [[ -x "${asset_directory}/bootstrap-data-volume.sh" ]] || fail "data-volume verifier is absent"
-"${asset_directory}/bootstrap-data-volume.sh" --verify-only
-install -d -o root -g root -m 0700 "${evidence_directory}"
+if [[ -e "${evidence_directory}" || -L "${evidence_directory}" ]]; then
+  [[ -d "${evidence_directory}" && ! -L "${evidence_directory}" ]] ||
+    fail "persistent evidence directory is unsafe"
+  [[ "$(stat -c '%U:%G:%a' "${evidence_directory}")" == root:root:700 ]] ||
+    fail "persistent evidence directory metadata mismatch"
+else
+  install -d -o root -g root -m 0700 "${evidence_directory}"
+fi
 install -d -o craxii-server -g craxii-server -m 0700 "${runtime_directory}"
 
 build_git() {
@@ -117,6 +124,57 @@ snapshot() {
     --data-uuid "${data_uuid}" \
     --output "${output}" \
     "$@"
+}
+
+run_independent_check() {
+  local name="$1"
+  shift
+  local status
+  printf 'STAGE27_CHECK_START=%s\n' "${name}"
+  set +e
+  (
+    set -e
+    "$@"
+  )
+  status=$?
+  set -e
+  if [[ "${status}" -eq 0 ]]; then
+    printf 'STAGE27_CHECK=%s:PASS\n' "${name}"
+  else
+    printf 'STAGE27_CHECK=%s:FAIL:status=%s\n' "${name}" "${status}" >&2
+    check_failures+=("${name}:${status}")
+  fi
+}
+
+require_independent_checks_passed() {
+  if [[ "${#check_failures[@]}" -eq 0 ]]; then
+    printf 'STAGE27_INDEPENDENT_CHECKS=PASS\n'
+    return 0
+  fi
+  printf 'STAGE27_INDEPENDENT_CHECKS=FAIL count=%s\n' "${#check_failures[@]}" >&2
+  printf 'STAGE27_FAILED_CHECK=%s\n' "${check_failures[@]}" >&2
+  return 1
+}
+
+verify_deployed_assets() {
+  cmp -s "${asset_directory}/config.toml.template" /etc/craxii/config.toml ||
+    fail "deployed config differs from the audited template"
+  cmp -s "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service ||
+    fail "deployed systemd unit differs from the audited unit"
+  [[ -z "$(systemctl show "${service}" --property DropInPaths --value)" ]] ||
+    fail "unexpected systemd drop-in changes production composition"
+  "${asset_directory}/verify-release-manifest.sh" \
+    "$(readlink -f /opt/craxii/current)" "${deployment_commit}" >/dev/null
+  /usr/bin/systemd-analyze verify /etc/systemd/system/craxii-server.service
+}
+
+require_execution_cgroup_clean() {
+  [[ -d "${cgroup_root}" ]] || fail "delegated execution cgroup root is absent"
+  [[ -z "$(find "${cgroup_root}" -mindepth 1 -type d -print -quit)" ]] ||
+    fail "execution cgroup directory residue blocks further live checks"
+  [[ -z "$(find "${cgroup_root}" -mindepth 1 -name cgroup.procs -type f \
+    -exec awk 'NF { print; exit }' {} +)" ]] ||
+    fail "execution cgroup process residue blocks further live checks"
 }
 
 print_summary() {
@@ -177,23 +235,16 @@ prepare_sentinels() {
     fail "evidence sentinel metadata mismatch"
 }
 
-verify_source_delta_is_test_only() {
+verify_source_matches_deployment() {
+  local source_commit
   [[ -d "${checkout}/.git" ]] || fail "controlled source checkout is absent"
   [[ -x "${cargo}" ]] || fail "controlled Rust toolchain is absent"
   [[ -z "$(build_git status --porcelain=v1 --untracked-files=normal)" ]] ||
     fail "controlled source checkout is dirty"
   source_commit="$(build_git rev-parse HEAD)"
   [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]] || fail "controlled source revision is invalid"
-  if [[ "${source_commit}" != "${deployment_commit}" ]]; then
-    # The Stage 8 test module is cfg(test) at its module boundary and cannot affect release builds.
-    if build_git diff --quiet "${deployment_commit}..${source_commit}" -- \
-      Cargo.toml Cargo.lock backend/Cargo.toml backend/build.rs backend/migrations backend/src \
-      ':(exclude)backend/src/adapters/sqlite/stage8_tests.rs'; then
-      :
-    else
-      fail "verification checkout changes production Rust sources relative to deployed release"
-    fi
-  fi
+  [[ "${source_commit}" == "${deployment_commit}" ]] ||
+    fail "verification checkout must exactly match the deployed release commit"
   [[ -f "${checkout}/backend/tests/stage27.rs" ]] || fail "Stage 27 live-host test is absent"
 }
 
@@ -259,19 +310,25 @@ run_live_test() {
   # The verifier must survive the service restart from outside its cgroup. It uses CAP_SYS_ADMIN
   # for its pre-exec child to cross into the delegated subtree; the fixed launcher clears every
   # capability before the model-controlled Bash command starts.
-  /usr/bin/setpriv \
-    --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
-    --inh-caps=+kill,+sys_admin --ambient-caps=+kill,+sys_admin \
-    /usr/bin/env -i \
-    HOME=/var/lib/craxii \
-    USER=craxii-server \
-    LOGNAME=craxii-server \
-    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    CRAXII_STAGE27_LIVE_HOST=1 \
-    CRAXII_STAGE27_USER_SWITCH_LAUNCHER="${launcher}" \
-    CRAXII_STAGE27_CGROUP_ROOT="${cgroup_root}" \
-    "$@" \
-    "${installed_test}" --ignored --exact "${test_name}" --nocapture
+  (
+    cd /var/lib/craxii
+    umask 077
+    exec /usr/bin/prlimit --nofile=65536:65536 --nproc=16384:16384 --core=0:0 \
+      /usr/bin/setpriv \
+      --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
+      --inh-caps=+kill,+sys_admin --ambient-caps=+kill,+sys_admin \
+      /usr/bin/env -i \
+      HOME=/var/lib/craxii \
+      USER=craxii-server \
+      LOGNAME=craxii-server \
+      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+      CRAXII_STAGE27_LIVE_HOST=1 \
+      CRAXII_STAGE27_DEPLOYMENT_COMMIT="${deployment_commit}" \
+      CRAXII_STAGE27_USER_SWITCH_LAUNCHER="${launcher}" \
+      CRAXII_STAGE27_CGROUP_ROOT="${cgroup_root}" \
+      "$@" \
+      "${installed_test}" --ignored --exact "${test_name}" --nocapture
+  )
 }
 
 run_live_unit_test() {
@@ -280,8 +337,11 @@ run_live_unit_test() {
   server_uid="$(id -u craxii-server)"
   server_gid="$(id -g craxii-server)"
   (
+    cd /var/lib/craxii
+    umask 077
     printf '0\n' >"${cgroup_root}/cgroup.procs"
-    exec /usr/bin/setpriv \
+    exec /usr/bin/prlimit --nofile=65536:65536 --nproc=16384:16384 --core=0:0 \
+      /usr/bin/setpriv \
       --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
       --inh-caps=+kill --ambient-caps=+kill \
       /usr/bin/env -i \
@@ -301,23 +361,40 @@ run_pre_reboot() {
     fail "pre-reboot evidence already exists; preserve and review it instead of overwriting"
   [[ ! -e "${restart_comparison}" && ! -L "${restart_comparison}" ]] ||
     fail "restart comparison already exists; preserve and review it instead of overwriting"
+  run_independent_check storage-layout "${asset_directory}/bootstrap-data-volume.sh" --verify-only
+  run_independent_check deployed-assets verify_deployed_assets
+  run_independent_check service-active systemctl is-active --quiet "${service}"
+  run_independent_check service-enabled systemctl is-enabled --quiet "${service}"
+  run_independent_check service-ready wait_ready
+  run_independent_check source-parity verify_source_matches_deployment
+  require_independent_checks_passed || fail "read-only preflight reported independent failures"
+
   prepare_sentinels
-  systemctl is-active --quiet "${service}" || fail "service is not active"
-  systemctl is-enabled --quiet "${service}" || fail "service is not enabled"
-  wait_ready
 
   before_restart="${runtime_directory}/before-restart.json"
   snapshot before-service-restart "${before_restart}"
 
-  verify_source_delta_is_test_only
   compile_host_tests
-  run_unit_test \
+  run_independent_check recovery-idempotency run_unit_test \
     adapters::sqlite::stage10_tests::process_loss_between_recovery_units_is_idempotent_on_the_next_startup
-  run_live_unit_test \
+  run_independent_check crash-after-spawn run_live_unit_test \
     adapters::sqlite::stage8_tests::crash_after_tool_process_spawn_records_one_side_effect
-  run_unit_test \
+  run_independent_check post-crash-cgroup-clean require_execution_cgroup_clean
+  [[ "${check_failures[-1]-}" != post-crash-cgroup-clean:* ]] ||
+    fail "unsafe cgroup residue prevents further tests"
+  run_independent_check outcome-unknown-no-redispatch run_unit_test \
     application::tool_execution_service::tests::cleanup_ambiguity_and_handler_panic_commit_outcome_unknown_without_redispatch
-  run_live_test live_linux_cancellation_cleans_process_tree_and_preserves_follower
+  run_independent_check linux-terminal-outcome-matrix run_live_test \
+    live_linux_terminal_outcome_matrix_is_canonical
+  run_independent_check post-outcome-matrix-cgroup-clean require_execution_cgroup_clean
+  [[ "${check_failures[-1]-}" != post-outcome-matrix-cgroup-clean:* ]] ||
+    fail "unsafe cgroup residue prevents further tests"
+  run_independent_check linux-cancellation run_live_test \
+    live_linux_cancellation_cleans_process_tree_and_preserves_follower
+  run_independent_check post-cancellation-cgroup-clean require_execution_cgroup_clean
+  [[ "${check_failures[-1]-}" != post-cancellation-cgroup-clean:* ]] ||
+    fail "unsafe cgroup residue prevents service restart validation"
+  require_independent_checks_passed || fail "isolated checks reported consolidated failures"
 
   control_uid="$(id -u ssm-user)"
   control_gid="$(id -g ssm-user)"
@@ -358,7 +435,9 @@ run_pre_reboot() {
     --validation D.outcome-unknown-no-redispatch \
     --validation E.real-linux-cancellation \
     --validation F.graceful-service-restart \
-    --validation G.pre-reboot-evidence
+    --validation G.pre-reboot-evidence \
+    --validation H.terminal-outcome-matrix \
+    --validation I.production-composition
   "${evidence_helper}" compare \
     --mode restart \
     --before "${before_restart}" \
@@ -377,8 +456,11 @@ run_post_reboot() {
     fail "post-reboot evidence already exists; preserve and review it instead of overwriting"
   [[ ! -e "${reboot_comparison}" && ! -L "${reboot_comparison}" ]] ||
     fail "reboot comparison already exists; preserve and review it instead of overwriting"
-  systemctl is-enabled --quiet "${service}" || fail "service is not enabled after reboot"
-  wait_ready
+  run_independent_check post-reboot-storage "${asset_directory}/bootstrap-data-volume.sh" --verify-only
+  run_independent_check post-reboot-assets verify_deployed_assets
+  run_independent_check post-reboot-enabled systemctl is-enabled --quiet "${service}"
+  run_independent_check post-reboot-ready wait_ready
+  require_independent_checks_passed || fail "post-reboot read-only checks reported independent failures"
   snapshot post-reboot "${post_reboot_evidence}" \
     --validation post-reboot.persistence \
     --validation post-reboot.systemd-auto-start \

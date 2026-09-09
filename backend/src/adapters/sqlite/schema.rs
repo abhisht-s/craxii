@@ -3,7 +3,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 4;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 5;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
 pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
@@ -13,6 +13,9 @@ pub(super) const EVIDENCE_MIGRATION_DESCRIPTION: &str = "context model tool arti
 pub(super) const MODEL_ATTEMPT_EVIDENCE_MIGRATION_VERSION: i64 = 4;
 pub(super) const MODEL_ATTEMPT_EVIDENCE_MIGRATION_DESCRIPTION: &str =
     "model attempt outcome evidence";
+pub(super) const TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION: i64 = 5;
+pub(super) const TOOL_TERMINAL_EVIDENCE_MIGRATION_DESCRIPTION: &str =
+    "tool terminal outcome evidence";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -156,8 +159,10 @@ const V2_SCHEMA_FINGERPRINT: &str =
     "391d9bfb54cf771de1815a3bf54ee4d7d16f1b877acf629cf783ca12dbd37d4d";
 const V3_SCHEMA_FINGERPRINT: &str =
     "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3";
-const CURRENT_SCHEMA_FINGERPRINT: &str =
+const V4_SCHEMA_FINGERPRINT: &str =
     "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2";
+const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseDisposition {
@@ -266,6 +271,16 @@ pub(super) async fn classify_schema(
         Some(MODEL_ATTEMPT_EVIDENCE_MIGRATION_VERSION) => {
             if migrations.len() != 4
                 || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
+                || !schema_matches(connection, PRODUCT_TABLES, V4_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::MigratedUninitialized)
+            }
+        }
+        Some(TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION) => {
+            if migrations.len() != 5
+                || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
                 || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
             {
                 Ok(DatabaseDisposition::Inconsistent)
@@ -329,6 +344,10 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
         (
             MODEL_ATTEMPT_EVIDENCE_MIGRATION_VERSION,
             MODEL_ATTEMPT_EVIDENCE_MIGRATION_DESCRIPTION,
+        ),
+        (
+            TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION,
+            TOOL_TERMINAL_EVIDENCE_MIGRATION_DESCRIPTION,
         ),
     ];
     if embedded_contracts.iter().any(|(version, description)| {

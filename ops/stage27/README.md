@@ -45,14 +45,20 @@ one-shot `craxii-stage27-luna-benchmark` operator binary. It validates the activ
 runtime, reads the retained device bearer only from a hidden `/dev/tty` prompt, submits the exact
 canonical prompt once, and verifies the resulting Luna/model/tool/host evidence without reading the
 provider credential or retaining raw model content.
+The build also writes a commit-bound SHA-256 manifest; bootstrap and upgrade refuse binaries that
+do not match it, preventing a clean checkout from lending identity to stale target output.
 
 `bootstrap-security-boundary.sh` requires an already-built release and verified data layout. It
 installs users, permissions, binaries, the unit, and the non-secret production config, but leaves
 the unit stopped and disabled and does not create a provider credential.
 
 `upgrade-release.sh` is the post-provisioning immutable-release path. It requires an exact clean
-build checkout, installs a new five-binary release without reading or replacing configuration or
-credentials, atomically advances `/opt/craxii/current`, and performs one normal service restart.
+build checkout and matching build manifest, installs a new five-binary release plus the audited
+non-secret config/unit (never the credential), atomically advances `/opt/craxii/current`, performs
+one normal service restart, and requires readiness before success.
+Schema V5 is forward-only: once the new binary applies it, the V4 release is not a valid rollback
+target. The upgrade therefore fails closed and requires fix-forward if post-migration readiness
+does not succeed; it never restores an older binary over a newer database.
 
 `verify-precredential-host.sh` is the real-host precredential check. It verifies Ubuntu/CPU/cgroup,
 UUID/fstab/bind mounts, the controlled toolchain and exact source revision, users/modes/ACLs,
@@ -67,12 +73,13 @@ environment variable, refuses overwrite, and installs the systemd credential sou
 `verify-production-host.sh` owns the final production-like Stage 27 restart/reboot gate. Its
 `--pre-reboot` mode creates two fixed non-secret persistence sentinels, captures a read-only
 canonical-state snapshot, runs focused recovery/ambiguity checks with a scripted provider, runs a
-real Linux cancellation through the installed privilege-drop launcher and delegated execution
-cgroup, and coordinates one normal systemd service restart while both an owned execution and an
+real Linux terminal-outcome matrix and cancellation through the installed privilege-drop launcher
+and delegated execution cgroup, and coordinates one normal systemd service restart while both an owned execution and an
 outside control process are alive. It then writes a redacted JSON evidence bundle and restart
 comparison under `/srv/craxii-data/stage27-evidence`. It never reads or hashes the provider
 credential; the credential check is limited to file metadata and a negative model-child access
-probe. It never invokes a real provider.
+probe. Independent read-only and isolated checks accumulate a consolidated result; cgroup residue
+and stateful transition failures still stop immediately. It never invokes a real provider.
 
 The same script's `--post-reboot` mode is intentionally run only after the human reboot boundary.
 It verifies automatic systemd startup, a changed Linux boot/runtime identity, graceful closure of

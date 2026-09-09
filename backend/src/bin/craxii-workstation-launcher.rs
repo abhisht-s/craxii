@@ -239,6 +239,7 @@ mod linux {
         {
             return Err(());
         }
+        clear_capability_bounding_set()?;
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
             return Err(());
         }
@@ -293,6 +294,31 @@ mod linux {
             )
         };
         (result == 0).then_some(()).ok_or(())
+    }
+
+    fn clear_capability_bounding_set() -> Result<(), ()> {
+        let last_capability = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+            .map_err(|_| ())?
+            .trim()
+            .parse::<libc::c_ulong>()
+            .map_err(|_| ())?;
+        for capability in 0..=last_capability {
+            let present = unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) };
+            if present < 0 {
+                return Err(());
+            }
+            if present == 1
+                && unsafe { libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) } != 0
+            {
+                return Err(());
+            }
+        }
+        for capability in 0..=last_capability {
+            if unsafe { libc::prctl(libc::PR_CAPBSET_READ, capability, 0, 0, 0) } != 0 {
+                return Err(());
+            }
+        }
+        Ok(())
     }
 
     fn mark_unrelated_descriptors_close_on_exec() -> Result<(), ()> {

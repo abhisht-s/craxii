@@ -2802,7 +2802,7 @@ async fn assert_persistence_contract(
 ) -> PersistedSummary {
     let data = &export["data"];
     let preflight = &data["preflight"];
-    assert_eq!(preflight["schema_version"], 4);
+    assert_eq!(preflight["schema_version"], 5);
     assert_eq!(preflight["database_disposition"], "current");
     assert_eq!(preflight["work_count"], 2);
     assert_eq!(preflight["runtime_count"], 2);
@@ -3168,7 +3168,7 @@ async fn assert_sqlite_contract(database: &Path) {
             .iter()
             .map(|row| (row.get::<i64, _>("version"), row.get::<bool, _>("success")))
             .collect::<Vec<_>>(),
-        [(1, true), (2, true), (3, true), (4, true)]
+        [(1, true), (2, true), (3, true), (4, true), (5, true)]
     );
     let mut migration_files: Vec<String> =
         fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
@@ -3183,6 +3183,7 @@ async fn assert_sqlite_contract(database: &Path) {
             "0002_journal_and_work_inputs.sql",
             "0003_context_model_tool_artifacts.sql",
             "0004_model_attempt_outcome_evidence.sql",
+            "0005_tool_terminal_outcome_evidence.sql",
         ]
     );
 }

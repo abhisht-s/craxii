@@ -25,9 +25,14 @@ RuntimeDirectory=craxii
 RuntimeDirectoryMode=0700
 LimitNOFILE=65536
 LimitNPROC=16384
+# The backend holds provider material in memory; never make that memory a core-dump artifact.
+LimitCORE=0
 # The trusted backend needs only signal authority across the workstation UID boundary. The fixed
 # launcher clears this capability before executing model-controlled code.
 AmbientCapabilities=CAP_KILL
+# A setuid-root launcher needs these three transition capabilities, but no unrelated capability is
+# available to either the backend or launcher. The launcher drops the entire child bounding set.
+CapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP
 # The SSM instance role belongs to host administration. Prevent the backend and every delegated
 # model-workstation descendant cgroup from reaching either EC2 Instance Metadata Service address.
 IPAddressDeny=169.254.169.254

@@ -11,10 +11,12 @@ use craxii_server::domain::{ClientCommandId, ClientMessageId, ModelToolCallId, W
 use serde_json::json;
 use sqlx::{Connection as _, Row as _};
 use stage18_harness::{
-    EstimatorMode, ProgramPlan, Stage18Harness, Stage18Root, ToolPlan, programs, query_string,
+    EstimatorMode, ProgramPlan, Stage18Harness, Stage18Root, ToolPlan, programs_for_user_messages,
+    query_string,
 };
 
 const LIVE_HOST_ENV: &str = "CRAXII_STAGE27_LIVE_HOST";
+const DEPLOYMENT_COMMIT_ENV: &str = "CRAXII_STAGE27_DEPLOYMENT_COMMIT";
 const LAUNCHER_ENV: &str = "CRAXII_STAGE27_USER_SWITCH_LAUNCHER";
 const CGROUP_ROOT_ENV: &str = "CRAXII_STAGE27_CGROUP_ROOT";
 const RESTART_READY_ENV: &str = "CRAXII_STAGE27_RESTART_READY";
@@ -32,13 +34,16 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     root.allow_disposable_workstation_identity();
     let workspace = root.workspace();
     let canonical_workspace = fs::canonicalize(&workspace).unwrap();
+    let ordinary_message = "run disposable ordinary Linux workload";
+    let cancellation_message = "start disposable cancellation workload";
+    let follower_message = "following work must remain runnable";
     let ordinary_call = ModelToolCallId::try_new("stage27-ordinary-shell").unwrap();
     let plans = [
         ProgramPlan::Tools(vec![ToolPlan::new(
             ordinary_call.as_str(),
             "run_shell",
             json!({
-                "command": "umask 022; /bin/sleep 0.1 & wait && /usr/bin/grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && printf '%s:%s\\n%s\\n' \"$(/usr/bin/id -un)\" \"$(/usr/bin/id -gn)\" \"$(/usr/bin/pwd -P)\" | /usr/bin/tee ordinary-execution-identity"
+                "command": "test \"$(umask)\" = 0077; test \"$(ulimit -n)\" = 65536; test \"$(ulimit -u)\" = 16384; test \"$(ulimit -c)\" = 0; set -- $(/usr/bin/ps -o pid= -o pgid= -o sid= -p $$); test \"$1\" = \"$2\"; test \"$1\" = \"$3\"; /usr/bin/grep -Eq '^Groups:[[:space:]]*$' /proc/self/status; for field in CapInh CapPrm CapEff CapBnd CapAmb; do /usr/bin/grep -Eq \"^${field}:[[:space:]]*0+$\" /proc/self/status; done; /usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status; /usr/bin/grep -Eq '^0::/system.slice/craxii-server.service/craxii-executions/[0-9a-f-]+$' /proc/self/cgroup; test \"$HOME:$USER:$LOGNAME\" = /home/craxii:craxii:craxii; test ! -r /run/credentials/craxii-server.service/openai_provider; for fd in /proc/self/fd/*; do case \"${fd##*/}\" in 0|1|2) ;; *) test ! -e \"$fd\" || exit 1 ;; esac; done; for name in CREDENTIALS_DIRECTORY OPENAI_API_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE AWS_WEB_IDENTITY_TOKEN_FILE AWS_CONTAINER_CREDENTIALS_RELATIVE_URI AWS_CONTAINER_CREDENTIALS_FULL_URI; do test -z \"${!name-}\"; done; test -x /usr/bin/curl; ! /usr/bin/curl --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 2 http://169.254.169.254/ >/dev/null 2>&1; ! /usr/bin/curl --noproxy '*' --silent --show-error --connect-timeout 1 --max-time 2 'http://[fd00:ec2::254]/' >/dev/null 2>&1; umask 022; /bin/sleep 0.1 & wait && printf '%s:%s\\n%s\\n' \"$(/usr/bin/id -un)\" \"$(/usr/bin/id -gn)\" \"$(/usr/bin/pwd -P)\" | /usr/bin/tee ordinary-execution-identity"
             }),
         )]),
         ProgramPlan::Answer {
@@ -59,7 +64,15 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     ];
     let harness = Stage18Harness::start_with_linux_workstation(
         root,
-        programs(&plans),
+        programs_for_user_messages(
+            &plans,
+            &[
+                ordinary_message,
+                ordinary_message,
+                cancellation_message,
+                follower_message,
+            ],
+        ),
         EstimatorMode::Normal,
         launcher,
         cgroup_root.clone(),
@@ -67,7 +80,7 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     .await
     .expect("start Stage 27 Linux cancellation harness");
 
-    let ordinary_work = submit(&harness, "run disposable ordinary Linux workload").await;
+    let ordinary_work = submit(&harness, ordinary_message).await;
     assert_eq!(harness.wait_terminal(ordinary_work).await, "completed");
     let expected_ordinary_output = format!("craxii:craxii\n{}\n", canonical_workspace.display());
     let mut connection = read_only(&harness.root.database()).await;
@@ -152,9 +165,9 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     );
     wait_for_empty_execution_cgroups(&cgroup_root).await;
 
-    let cancelled_work = submit(&harness, "start disposable cancellation workload").await;
+    let cancelled_work = submit(&harness, cancellation_message).await;
     wait_for_path(&workspace.join("cancellation-started")).await;
-    let follower = submit(&harness, "following work must remain runnable").await;
+    let follower = submit(&harness, follower_message).await;
     wait_for_work_state(&harness, follower, "queued").await;
 
     let response = harness.cancel_work(cancelled_work, command_id()).await;
@@ -205,8 +218,121 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
         .unwrap();
     assert!(!Path::new(&format!("/proc/{descendant}")).exists());
     assert_eq!(harness.provider.invocation_count(), 4);
+    assert_eq!(harness.provider.remaining_programs(), 0);
     wait_for_empty_execution_cgroups(&cgroup_root).await;
 
+    let root = harness.shutdown().await;
+    assert_execution_cgroups_empty(&cgroup_root);
+    root.remove();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the production Stage 27 identities, launcher, and delegated service cgroup"]
+async fn live_linux_terminal_outcome_matrix_is_canonical() {
+    require_live_host();
+    let launcher = required_path(LAUNCHER_ENV);
+    let cgroup_root = required_path(CGROUP_ROOT_ENV);
+    assert_execution_cgroups_empty(&cgroup_root);
+    let root = Stage18Root::new("stage27-live-outcome-matrix");
+    root.allow_disposable_workstation_identity();
+    let messages = [
+        "run disposable nonzero workload",
+        "run disposable signal workload",
+        "run disposable timeout workload",
+    ];
+    let call_ids = ["stage27-nonzero", "stage27-signal", "stage27-timeout"];
+    let plans = [
+        ProgramPlan::Tools(vec![ToolPlan::new(
+            call_ids[0],
+            "run_shell",
+            json!({"command": "exit 23"}),
+        )]),
+        ProgramPlan::Answer {
+            text: "nonzero evidence observed".to_owned(),
+            require_tool_result: Some(ModelToolCallId::try_new(call_ids[0]).unwrap()),
+        },
+        ProgramPlan::Tools(vec![ToolPlan::new(
+            call_ids[1],
+            "run_shell",
+            json!({"command": "kill -TERM $$"}),
+        )]),
+        ProgramPlan::Answer {
+            text: "signal evidence observed".to_owned(),
+            require_tool_result: Some(ModelToolCallId::try_new(call_ids[1]).unwrap()),
+        },
+        ProgramPlan::Tools(vec![ToolPlan::new(
+            call_ids[2],
+            "run_shell",
+            json!({"command": "/bin/sleep 300", "timeout_seconds": 1}),
+        )]),
+        ProgramPlan::Answer {
+            text: "timeout evidence observed".to_owned(),
+            require_tool_result: Some(ModelToolCallId::try_new(call_ids[2]).unwrap()),
+        },
+    ];
+    let harness = Stage18Harness::start_with_linux_workstation(
+        root,
+        programs_for_user_messages(
+            &plans,
+            &[
+                messages[0],
+                messages[0],
+                messages[1],
+                messages[1],
+                messages[2],
+                messages[2],
+            ],
+        ),
+        EstimatorMode::Normal,
+        launcher,
+        cgroup_root.clone(),
+    )
+    .await
+    .expect("start Stage 27 terminal outcome harness");
+
+    let expected = [
+        ("process_exit", Some(23_i64), None, Some(0_i64), Some(0_i64)),
+        (
+            "signal_termination",
+            None,
+            Some(15_i64),
+            Some(0_i64),
+            Some(0_i64),
+        ),
+        ("timeout", None, None, Some(1_i64), Some(0_i64)),
+    ];
+    for (message, expected) in messages.into_iter().zip(expected) {
+        let work = submit(&harness, message).await;
+        assert_eq!(harness.wait_terminal(work).await, "completed");
+        let mut connection = read_only(&harness.root.database()).await;
+        let row = sqlx::query(
+            "SELECT state, dispatch_intent_at, started_at, completed_at, exit_code, signal, \
+             timed_out, cancelled, cleanup_confirmed, result_json \
+             FROM tool_executions WHERE work_id = ?",
+        )
+        .bind(work.to_string())
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<String, _>("state"), "completed");
+        assert!(row.get::<Option<String>, _>("dispatch_intent_at").is_some());
+        assert!(row.get::<Option<String>, _>("started_at").is_some());
+        assert!(row.get::<Option<String>, _>("completed_at").is_some());
+        assert_eq!(row.get::<Option<i64>, _>("exit_code"), expected.1);
+        if expected.0 != "timeout" {
+            assert_eq!(row.get::<Option<i64>, _>("signal"), expected.2);
+        }
+        assert_eq!(row.get::<Option<i64>, _>("timed_out"), expected.3);
+        assert_eq!(row.get::<Option<i64>, _>("cancelled"), expected.4);
+        assert_eq!(row.get::<Option<i64>, _>("cleanup_confirmed"), Some(1));
+        let result: serde_json::Value =
+            serde_json::from_str(&row.get::<Option<String>, _>("result_json").unwrap()).unwrap();
+        assert_eq!(result["result_kind"], expected.0);
+        connection.close().await.unwrap();
+        wait_for_empty_execution_cgroups(&cgroup_root).await;
+    }
+    assert_eq!(harness.provider.invocation_count(), 6);
+    assert_eq!(harness.provider.remaining_programs(), 0);
     let root = harness.shutdown().await;
     assert_execution_cgroups_empty(&cgroup_root);
     root.remove();
@@ -225,6 +351,7 @@ async fn live_systemd_restart_kills_delegated_execution_but_not_verifier() {
     let root = Stage18Root::new("stage27-systemd-restart");
     root.allow_disposable_workstation_identity();
     let workspace = root.workspace();
+    let restart_message = "start disposable service-cgroup workload";
     let plans = [
         ProgramPlan::Tools(vec![ToolPlan::new(
             "stage27-restart-shell",
@@ -240,37 +367,38 @@ async fn live_systemd_restart_kills_delegated_execution_but_not_verifier() {
     ];
     let harness = Stage18Harness::start_with_linux_workstation(
         root,
-        programs(&plans),
+        programs_for_user_messages(&plans, &[restart_message, restart_message]),
         EstimatorMode::Normal,
         launcher,
         cgroup_root.clone(),
     )
     .await
     .expect("start Stage 27 systemd restart harness");
-    let work = submit(&harness, "start disposable service-cgroup workload").await;
+    let work = submit(&harness, restart_message).await;
     wait_for_path(&workspace.join("restart-execution-started")).await;
     fs::write(&ready, b"ready\n").unwrap();
     wait_for_path_with_timeout(&done, Duration::from_secs(90)).await;
 
-    let state = harness.wait_terminal(work).await;
-    assert!(matches!(
-        state.as_str(),
-        "completed" | "failed" | "interrupted"
-    ));
+    assert_eq!(harness.wait_terminal(work).await, "completed");
     let mut connection = read_only(&harness.root.database()).await;
     let tool = sqlx::query(
-        "SELECT state, signal, cleanup_confirmed FROM tool_executions WHERE work_id = ?",
+        "SELECT state, signal, timed_out, cancelled, cleanup_confirmed, result_json \
+         FROM tool_executions WHERE work_id = ?",
     )
     .bind(work.to_string())
     .fetch_one(&mut connection)
     .await
     .unwrap();
-    assert!(matches!(
-        tool.get::<String, _>("state").as_str(),
-        "completed" | "outcome_unknown"
-    ));
+    assert_eq!(tool.get::<String, _>("state"), "completed");
     assert_eq!(tool.get::<Option<i64>, _>("signal"), Some(15));
+    assert_eq!(tool.get::<Option<i64>, _>("timed_out"), Some(0));
+    assert_eq!(tool.get::<Option<i64>, _>("cancelled"), Some(0));
     assert_eq!(tool.get::<Option<i64>, _>("cleanup_confirmed"), Some(1));
+    let result: serde_json::Value =
+        serde_json::from_str(&tool.get::<Option<String>, _>("result_json").unwrap()).unwrap();
+    assert_eq!(result["result_kind"], "signal_termination");
+    assert_eq!(harness.provider.invocation_count(), 2);
+    assert_eq!(harness.provider.remaining_programs(), 0);
     connection.close().await.unwrap();
 
     let descendant = fs::read_to_string(workspace.join("restart-descendant.pid"))
@@ -286,6 +414,20 @@ async fn live_systemd_restart_kills_delegated_execution_but_not_verifier() {
 
 fn require_live_host() {
     assert_eq!(std::env::var(LIVE_HOST_ENV).as_deref(), Ok("1"));
+    let deployment_commit = std::env::var(DEPLOYMENT_COMMIT_ENV)
+        .expect("Stage 27 deployed commit must be passed to the live test");
+    assert_eq!(deployment_commit.len(), 40);
+    assert!(
+        deployment_commit
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert_eq!(
+        env!("CRAXII_GIT_REVISION"),
+        deployment_commit,
+        "the compiled live test must come from the deployed release commit"
+    );
+    assert_eq!(env!("CRAXII_GIT_DIRTY"), "false");
     assert_eq!(std::env::consts::ARCH, "x86_64");
     assert_ne!(unsafe { nix::libc::geteuid() }, 0);
     let status = fs::read_to_string("/proc/self/status").unwrap();

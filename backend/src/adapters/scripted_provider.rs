@@ -84,6 +84,8 @@ pub struct ScriptExpectation {
     pub target_id: ModelTargetId,
     pub request_sha256: Option<Sha256Digest>,
     pub fixture_key: Option<String>,
+    /// Optional redacted binding to one exact user-message part in the invocation context.
+    pub required_user_message_sha256: Option<Sha256Digest>,
     pub required_prior_tool_result: Option<ModelToolCallId>,
     pub invocation_ordinal: u64,
     pub attempt: ProviderAttempt,
@@ -366,6 +368,12 @@ impl ModelProvider for ScriptedProvider {
                 || program.expectation.fixture_key != invocation.fixture_key
                 || program
                     .expectation
+                    .required_user_message_sha256
+                    .is_some_and(|required| {
+                        !request_has_user_message(&invocation.request, required)
+                    })
+                || program
+                    .expectation
                     .required_prior_tool_result
                     .as_ref()
                     .is_some_and(|required| !request_has_tool_result(&invocation.request, required))
@@ -523,6 +531,20 @@ fn request_has_tool_result(request: &ModelRequest, required: &ModelToolCallId) -
         matches!(
             item,
             ModelInputItem::ToolResult { call_id, .. } if call_id == required
+        )
+    })
+}
+
+fn request_has_user_message(request: &ModelRequest, required: Sha256Digest) -> bool {
+    request.ordered_input_items().iter().any(|item| {
+        matches!(
+            item,
+            ModelInputItem::Message {
+                role: crate::domain::ModelInputRole::User,
+                content_parts,
+            } if content_parts
+                .iter()
+                .any(|part| Sha256Digest::hash_bytes(part.as_str().as_bytes()) == required)
         )
     })
 }
@@ -756,6 +778,7 @@ mod tests {
             target_id: request.target().reference().model_target_id().clone(),
             request_sha256: Some(request.canonical_sha256()),
             fixture_key: None,
+            required_user_message_sha256: None,
             required_prior_tool_result: None,
             invocation_ordinal: 1,
             attempt: ProviderAttempt::try_new(1).unwrap(),
@@ -1501,6 +1524,34 @@ mod tests {
         };
         assert_eq!(error.kind(), ProviderErrorKind::ScriptMismatch);
         assert_eq!(provider.invocation_count(), 1);
+        assert_eq!(
+            provider.captures()[0].terminal(),
+            Some(ScriptedTerminalCapture::ScriptMismatch)
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_user_message_binding_prevents_cross_work_program_consumption() {
+        let request = request(vec![]);
+        let mut expected = expectation(&request);
+        expected.request_sha256 = None;
+        expected.required_user_message_sha256 =
+            Some(Sha256Digest::hash_bytes(b"a different work input"));
+        let provider = ScriptedProvider::new(
+            ProviderId::try_new("fixture").unwrap(),
+            vec![ScriptedProgram {
+                expectation: expected,
+                steps: vec![],
+            }],
+        );
+        let error = match provider
+            .invoke_stream(invocation(request, ProviderCancellationToken::new()))
+            .await
+        {
+            Ok(_) => panic!("a program for another work must fail before returning a stream"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::ScriptMismatch);
         assert_eq!(
             provider.captures()[0].terminal(),
             Some(ScriptedTerminalCapture::ScriptMismatch)

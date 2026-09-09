@@ -901,8 +901,11 @@ pub(crate) fn observe_execution_support(
         });
     let cgroup_root = execution::probe_cgroup_root(delegated_cgroup_root);
     let cgroup = cgroup_root.is_some();
-    let user_switch_launcher =
-        execution::probe_user_switch_launcher(user_switch_launcher, user_switch_probe_cwd);
+    let user_switch_launcher = execution::probe_user_switch_launcher(
+        user_switch_launcher,
+        user_switch_probe_cwd,
+        cgroup_root.as_deref(),
+    );
     let foreground = shell_available
         && (cfg!(target_os = "macos")
             || (cgroup && (user_switch_launcher.is_some() || credential_free_direct_execution)));

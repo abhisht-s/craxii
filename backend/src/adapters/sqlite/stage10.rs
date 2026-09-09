@@ -542,7 +542,7 @@ async fn create_runtime(
     let evidence = &request.evidence;
     let linux_boot_id = evidence.linux_boot_id().ok_or_else(invariant)?;
     let process_id = evidence.diagnostic_pid().ok_or_else(invariant)?;
-    if evidence.schema_version().get() != 4 {
+    if evidence.schema_version().get() != 5 {
         return Err(invariant());
     }
     let mut transaction =

@@ -1761,10 +1761,11 @@ pub(super) fn probe_cgroup_root(configured_root: Option<&Path>) -> Option<PathBu
 pub(super) fn probe_user_switch_launcher(
     configured: Option<&Path>,
     probe_cwd: Option<&Path>,
+    cgroup_root: Option<&Path>,
 ) -> Option<PathBuf> {
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (configured, probe_cwd);
+        let _ = (configured, probe_cwd, cgroup_root);
         None
     }
     #[cfg(target_os = "linux")]
@@ -1800,36 +1801,96 @@ pub(super) fn probe_user_switch_launcher(
             return None;
         }
 
-        let output = std::process::Command::new(&canonical)
+        let execution_id = ExecutionId::generate();
+        let cgroup = ExecutionCgroup::create(cgroup_root, execution_id).ok()??;
+        let procs = cgroup.procs_cstring.clone();
+
+        let probe_command = user_switch_launcher_probe_command(execution_id);
+        let mut command = std::process::Command::new(&canonical);
+        command
             .env_clear()
             .args([
                 "shell",
                 "00000000-0000-7000-8000-000000000000",
                 "00000000-0000-7000-8000-000000000000",
-                concat!(
-                    "test \"$(/usr/bin/id -u)\" != 0 && ",
-                    "test \"$(/usr/bin/id -un)\" = craxii && ",
-                    "test \"$(/usr/bin/id -gn)\" = craxii && ",
-                    "/usr/bin/grep -Eq '^Groups:[[:space:]]*$' /proc/self/status && ",
-                    "/usr/bin/grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && ",
-                    "/usr/bin/grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status && ",
-                    "/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status && ",
-                    "test \"$HOME\" = /home/craxii && test \"$USER\" = craxii && ",
-                    "test \"$LOGNAME\" = craxii && test \"$SHELL\" = /bin/bash && ",
-                    "test \"$LANG\" = C.UTF-8 && ",
-                    "test \"$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && ",
-                    "test -n \"$CRAXII_WORK_ID\" && test -n \"$CRAXII_WORKSPACE_ID\" && ",
-                    "test -z \"${OPENAI_API_KEY-}\" && ",
-                    "test -z \"${AWS_SECRET_ACCESS_KEY-}\" && printf ready"
-                ),
             ])
+            .arg(probe_command)
             .current_dir(probe_cwd)
             .stdin(Stdio::null())
-            .output()
-            .ok()?;
-        (output.status.success() && output.stdout == b"ready" && output.stderr.is_empty())
-            .then_some(canonical)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // SAFETY: this is the same pre-exec cgroup attachment and session creation used for a real
+        // LocalWorkstation launch, using an already prepared cgroup.procs pathname.
+        unsafe {
+            command.pre_exec(move || {
+                if nix::libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let fd =
+                    nix::libc::open(procs.as_ptr(), nix::libc::O_WRONLY | nix::libc::O_CLOEXEC);
+                if fd == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let attached = nix::libc::write(fd, b"0\n".as_ptr().cast(), 2) == 2;
+                let closed = nix::libc::close(fd) == 0;
+                if !attached || !closed {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().ok();
+        let cleanup = cgroup.cleanup_after_spawn_failure();
+        output
+            .filter(|output| {
+                output.status.success()
+                    && output.stdout == b"ready"
+                    && output.stderr.is_empty()
+                    && cleanup.confirmed()
+            })
+            .map(|_| canonical)
     }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn user_switch_launcher_probe_command(execution_id: ExecutionId) -> String {
+    format!(
+        concat!(
+            "test \"$(/usr/bin/id -u)\" != 0 && ",
+            "test \"$(/usr/bin/id -un)\" = craxii && ",
+            "test \"$(/usr/bin/id -gn)\" = craxii && ",
+            "set -- $(/usr/bin/ps -o pid= -o pgid= -o sid= -p $$) && ",
+            "test \"$1\" = \"$2\" && test \"$1\" = \"$3\" && ",
+            "/usr/bin/grep -Eq '^Groups:[[:space:]]*$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^CapInh:[[:space:]]*0+$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^CapPrm:[[:space:]]*0+$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^CapBnd:[[:space:]]*0+$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status && ",
+            "/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status && ",
+            "/usr/bin/grep -Fq '/{}' /proc/self/cgroup && ",
+            "test \"$(umask)\" = 0077 && test \"$(ulimit -n)\" = 65536 && ",
+            "test \"$(ulimit -u)\" = 16384 && test \"$(ulimit -c)\" = 0 && ",
+            "test \"$HOME\" = /home/craxii && test \"$USER\" = craxii && ",
+            "test \"$LOGNAME\" = craxii && test \"$SHELL\" = /bin/bash && ",
+            "test \"$LANG\" = C.UTF-8 && ",
+            "test \"$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && ",
+            "test -n \"$CRAXII_WORK_ID\" && test -n \"$CRAXII_WORKSPACE_ID\" && ",
+            "test ! -r /run/credentials/craxii-server.service/openai_provider && ",
+            "for fd in /proc/self/fd/*; do case \"${{fd##*/}}\" in 0|1|2) ;; *) test ! -e \"$fd\" || exit 1 ;; esac; done && ",
+            "test -z \"${{CREDENTIALS_DIRECTORY-}}\" && ",
+            "test -z \"${{OPENAI_API_KEY-}}\" && ",
+            "test -z \"${{AWS_ACCESS_KEY_ID-}}\" && ",
+            "test -z \"${{AWS_SECRET_ACCESS_KEY-}}\" && ",
+            "test -z \"${{AWS_SESSION_TOKEN-}}\" && ",
+            "test -z \"${{AWS_PROFILE-}}\" && ",
+            "test -z \"${{AWS_SHARED_CREDENTIALS_FILE-}}\" && ",
+            "test -z \"${{AWS_WEB_IDENTITY_TOKEN_FILE-}}\" && ",
+            "test -z \"${{AWS_CONTAINER_CREDENTIALS_RELATIVE_URI-}}\" && ",
+            "test -z \"${{AWS_CONTAINER_CREDENTIALS_FULL_URI-}}\" && printf ready"
+        ),
+        execution_id
+    )
 }
 
 #[cfg(target_os = "linux")]

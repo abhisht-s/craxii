@@ -1,6 +1,6 @@
 {
   "contract_version": "craxii.stage24.evidence/v1",
-  "schema_version": 4,
+  "schema_version": 5,
   "protocol_version": 1,
   "expected": {
     "user_messages": 2,

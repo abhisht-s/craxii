@@ -61,6 +61,13 @@ STABLE_TABLES = (
     "artifacts",
     "context_manifests",
 )
+RELEASE_FILES = {
+    "craxii-server": ("root", "craxii-server", "0550"),
+    "craxii-admin": ("root", "craxii-server", "0550"),
+    "craxii-stage27-luna-benchmark": ("root", "craxii-server", "0550"),
+    "craxii-workstation-launcher": ("root", "craxii-server", "4750"),
+    "craxii-workstation-reader": ("root", "root", "0111"),
+}
 
 
 class EvidenceError(RuntimeError):
@@ -101,6 +108,22 @@ def systemd_properties() -> dict[str, str]:
         "Delegate",
         "KillMode",
         "Restart",
+        "RestartUSec",
+        "TimeoutStopUSec",
+        "UMask",
+        "LimitNOFILE",
+        "LimitNOFILESoft",
+        "LimitNPROC",
+        "LimitNPROCSoft",
+        "LimitCORE",
+        "LimitCORESoft",
+        "AmbientCapabilities",
+        "CapabilityBoundingSet",
+        "WorkingDirectory",
+        "FragmentPath",
+        "DropInPaths",
+        "Environment",
+        "KillSignal",
         "ExecMainStartTimestampMonotonic",
     ]
     output = run(
@@ -166,6 +189,43 @@ def file_record(path: pathlib.Path, *, include_hash: bool) -> dict[str, Any]:
     return record
 
 
+def release_record(path: pathlib.Path, expected_commit: str) -> dict[str, Any]:
+    manifest_path = path / ".craxii-stage27-build-manifest"
+    manifest = file_record(manifest_path, include_hash=True)
+    require(
+        (manifest["owner"], manifest["group"], manifest["mode"])
+        == ("root", "root", "0444"),
+        "installed build manifest metadata mismatch",
+    )
+    lines = manifest_path.read_text(encoding="ascii").splitlines()
+    require(len(lines) == len(RELEASE_FILES) + 1, "installed build manifest entry count mismatch")
+    require(lines[0] == f"commit={expected_commit}", "installed build manifest commit mismatch")
+    expected_entries: dict[str, str] = {}
+    for line in lines[1:]:
+        fields = line.split("  ", 1)
+        require(
+            len(fields) == 2
+            and len(fields[0]) == 64
+            and not (set(fields[0]) - set("0123456789abcdef"))
+            and fields[1] in RELEASE_FILES
+            and fields[1] not in expected_entries,
+            "installed build manifest contains an invalid entry",
+        )
+        expected_entries[fields[1]] = fields[0]
+    require(set(expected_entries) == set(RELEASE_FILES), "installed build manifest file set mismatch")
+
+    files: dict[str, dict[str, Any]] = {}
+    for name, expected_metadata in RELEASE_FILES.items():
+        record = file_record(path / name, include_hash=True)
+        require(
+            (record["owner"], record["group"], record["mode"]) == expected_metadata,
+            f"installed release metadata mismatch: {name}",
+        )
+        require(record["sha256"] == expected_entries[name], f"installed release digest mismatch: {name}")
+        files[name] = record
+    return {"manifest": manifest, "files": files}
+
+
 def parse_posix_access_acl(value: str) -> dict[str, str]:
     entries: dict[str, str] = {}
     for raw_line in value.splitlines():
@@ -201,7 +261,7 @@ def masked_permissions(permissions: str, mask: str) -> str:
 
 def permission_digit(permissions: str) -> int:
     return sum(
-        bit for permission, bit in zip(permissions, (4, 2, 1), strict=True) if permission != "-"
+        bit for permission, bit in zip(permissions, (4, 2, 1)) if permission != "-"
     )
 
 
@@ -328,7 +388,10 @@ def database_record() -> dict[str, Any]:
     connection = sqlite3.connect(uri, uri=True, timeout=5)
     connection.row_factory = sqlite3.Row
     try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
         quick_check = connection.execute("PRAGMA quick_check").fetchone()[0]
+        journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
         foreign_key_violations = connection.execute(
             "SELECT COUNT(*) FROM pragma_foreign_key_check"
         ).fetchone()[0]
@@ -392,6 +455,34 @@ def database_record() -> dict[str, Any]:
                 ).fetchone()[0]
             ),
         }
+        terminal_evidence_violations = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM tool_executions WHERE "
+                "(state <> 'completed' AND (timed_out IS NOT NULL OR cancelled IS NOT NULL)) OR "
+                "(state = 'completed' AND dispatch_intent_at IS NULL AND "
+                " (timed_out IS NOT NULL OR cancelled IS NOT NULL)) OR "
+                "(state = 'completed' AND dispatch_intent_at IS NOT NULL AND ("
+                " timed_out IS NULL OR cancelled IS NULL OR "
+                " json_extract(result_json, '$.result_kind') IS NULL OR "
+                " json_extract(result_json, '$.result_kind') NOT IN ("
+                "  'success','validation_rejection','unknown_tool','authority_denial',"
+                "  'file_error','process_exit','signal_termination','timeout','cancellation',"
+                "  'spawn_failure','cleanup_failure') OR "
+                " (json_extract(result_json, '$.result_kind') = 'timeout' AND "
+                "  (timed_out <> 1 OR cancelled <> 0)) OR "
+                " (json_extract(result_json, '$.result_kind') = 'cancellation' AND "
+                "  (timed_out <> 0 OR cancelled <> 1)) OR "
+                " (json_extract(result_json, '$.result_kind') NOT IN ('timeout','cancellation') AND "
+                "  (timed_out <> 0 OR cancelled <> 0))))"
+            ).fetchone()[0]
+        )
+        terminal_current_attempt_violations = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM work_items WHERE state IN "
+                "('completed','failed','cancelled','interrupted') AND "
+                "(current_model_invocation_id IS NOT NULL OR current_tool_execution_id IS NOT NULL)"
+            ).fetchone()[0]
+        )
         latest_artifact = connection.execute(
             "SELECT artifact_id, storage_key, sha256, captured_byte_count, retention_class, "
             "created_at FROM artifacts ORDER BY created_at DESC, artifact_id DESC LIMIT 1"
@@ -400,6 +491,8 @@ def database_record() -> dict[str, Any]:
             connection.execute("SELECT COALESCE(MAX(journal_offset), 0) FROM journal_events").fetchone()[0]
         )
     finally:
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()
 
     artifact: dict[str, Any] | None = None
@@ -421,6 +514,7 @@ def database_record() -> dict[str, Any]:
         "path": str(DATABASE),
         "file": database_file,
         "quick_check": quick_check,
+        "journal_mode": journal_mode,
         "foreign_key_violations": int(foreign_key_violations),
         "applied_schema_version": int(applied_schema),
         "craxii_id": identity[0][0],
@@ -433,6 +527,8 @@ def database_record() -> dict[str, Any]:
         "stable_counts": counts,
         "states": states,
         "ambiguity": ambiguity,
+        "terminal_evidence_violations": terminal_evidence_violations,
+        "terminal_current_attempt_violations": terminal_current_attempt_violations,
         "max_journal_offset": max_journal_offset,
         "artifact_sentinel": artifact,
     }
@@ -477,6 +573,26 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
     require(properties["Delegate"] == "yes", "service cgroup delegation is disabled")
     require(properties["KillMode"] == "control-group", "service KillMode mismatch")
     require(properties["Restart"] == "on-failure", "service restart policy mismatch")
+    require(properties["RestartUSec"] == "2s", "service restart delay mismatch")
+    require(properties["TimeoutStopUSec"] == "30s", "service stop timeout mismatch")
+    require(properties["UMask"] == "0077", "service umask mismatch")
+    require(properties["LimitNOFILE"] == "65536", "service NOFILE limit mismatch")
+    require(properties["LimitNOFILESoft"] == "65536", "service soft NOFILE limit mismatch")
+    require(properties["LimitNPROC"] == "16384", "service NPROC limit mismatch")
+    require(properties["LimitNPROCSoft"] == "16384", "service soft NPROC limit mismatch")
+    require(properties["LimitCORE"] == "0", "service core limit mismatch")
+    require(properties["LimitCORESoft"] == "0", "service soft core limit mismatch")
+    require(set(properties["AmbientCapabilities"].split()) == {"cap_kill"}, "service ambient capability mismatch")
+    require(
+        set(properties["CapabilityBoundingSet"].split())
+        == {"cap_kill", "cap_setgid", "cap_setuid", "cap_setpcap"},
+        "service capability bounding set mismatch",
+    )
+    require(properties["WorkingDirectory"] == "/var/lib/craxii", "service working directory mismatch")
+    require(properties["FragmentPath"] == "/etc/systemd/system/craxii-server.service", "service fragment path mismatch")
+    require(properties["DropInPaths"] == "", "unexpected service drop-in configuration")
+    require(properties["Environment"] == "", "unexpected explicit service environment")
+    require(properties["KillSignal"] == "15", "service termination signal mismatch")
     main_pid = int(properties["MainPID"])
     require(main_pid > 0 and pathlib.Path(f"/proc/{main_pid}").is_dir(), "service MainPID is invalid")
     process_owner = pwd.getpwuid(pathlib.Path(f"/proc/{main_pid}").stat().st_uid).pw_name
@@ -487,10 +603,60 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
     process_group = grp.getgrgid(process_gid).gr_name
     require(process_owner == "craxii-server", "backend process owner mismatch")
     require(process_group == "craxii-server", "backend process group mismatch")
+    status_fields = {
+        line.split(":", 1)[0]: line.split(":", 1)[1].strip()
+        for line in process_status.splitlines()
+        if ":" in line
+    }
+    server = pwd.getpwnam("craxii-server")
+    require(
+        [int(value) for value in status_fields["Uid"].split()] == [server.pw_uid] * 4,
+        "backend real/effective/saved/filesystem UID mismatch",
+    )
+    require(
+        [int(value) for value in status_fields["Gid"].split()] == [server.pw_gid] * 4,
+        "backend real/effective/saved/filesystem GID mismatch",
+    )
+    require(
+        set(int(value) for value in status_fields["Groups"].split()) <= {server.pw_gid},
+        "backend has an unexpected supplementary group",
+    )
+    kill_capability = 1 << 5
+    transition_bounding_set = sum(1 << capability for capability in (5, 6, 7, 8))
+    for field in ("CapInh", "CapPrm", "CapEff", "CapAmb"):
+        require(int(status_fields[field], 16) == kill_capability, f"backend {field} mismatch")
+    require(
+        int(status_fields["CapBnd"], 16) == transition_bounding_set,
+        "backend capability bounding set mismatch",
+    )
+    require(status_fields["NoNewPrivs"] == "0", "backend cannot execute the setuid launcher")
+    require(status_fields["Umask"] == "0077", "backend process umask mismatch")
+    process_cwd = str(pathlib.Path(f"/proc/{main_pid}/cwd").resolve(strict=True))
+    require(process_cwd == "/var/lib/craxii", "backend process cwd mismatch")
+    process_environment = pathlib.Path(f"/proc/{main_pid}/environ").read_bytes()
+    environment_names = sorted(
+        entry.split(b"=", 1)[0].decode("ascii")
+        for entry in process_environment.split(b"\0")
+        if entry and b"=" in entry
+    )
+    for forbidden in (
+        "OPENAI_API_KEY",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_PROFILE",
+        "AWS_SHARED_CREDENTIALS_FILE",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+    ):
+        require(forbidden not in environment_names, f"forbidden backend environment name: {forbidden}")
+    require("CREDENTIALS_DIRECTORY" in environment_names, "systemd credential directory metadata is absent")
 
     release_path = str(CURRENT.resolve(strict=True))
     expected_release = f"/opt/craxii/releases/0.0.1-{arguments.deployment_commit[:12]}"
     require(release_path == expected_release, "active release does not match deployment commit")
+    release = release_record(pathlib.Path(release_path), arguments.deployment_commit)
     executable = str(pathlib.Path(f"/proc/{main_pid}/exe").resolve(strict=True))
     require(executable == f"{expected_release}/craxii-server", "MainPID executable is not immutable release")
 
@@ -515,16 +681,22 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
 
     database = database_record()
     require(database["quick_check"] == "ok", "SQLite quick_check failed")
+    require(database["journal_mode"] == "wal", "SQLite is not in WAL mode")
     require(database["foreign_key_violations"] == 0, "SQLite foreign-key check failed")
-    require(database["applied_schema_version"] == 4, "SQLite schema version mismatch")
+    require(database["applied_schema_version"] == 5, "SQLite schema version mismatch")
+    require(database["terminal_evidence_violations"] == 0, "ambiguous terminal tool evidence exists")
+    require(database["terminal_current_attempt_violations"] == 0, "terminal work retains a current attempt")
     require(database["current_runtime"]["runtime_instance_id"], "runtime identity is absent")
     require(database["current_runtime"]["process_id"] == main_pid, "runtime PID does not match systemd")
     require(database["current_runtime"]["git_revision"] == arguments.deployment_commit, "runtime Git revision mismatch")
-    require(database["current_runtime"]["schema_version"] == 4, "runtime schema version mismatch")
+    require(database["current_runtime"]["schema_version"] == 5, "runtime schema version mismatch")
     require(database["ambiguity"]["active_work"] == 0, "active canonical work blocks safe restart/reboot")
     recovery = database["current_recovery"]["payload"]
     require(recovery.get("runtime_instance_id") == database["current_runtime"]["runtime_instance_id"], "recovery runtime mismatch")
     require(recovery.get("cleanup_unconfirmed") == 0, "startup recovery has unconfirmed cleanup")
+
+    linux_boot_id = pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    require(database["current_runtime"]["linux_boot_id"] == linux_boot_id, "runtime Linux boot ID mismatch")
 
     cgroup = cgroup_record(main_pid, properties["ControlGroup"])
     require(cgroup["leak_status"] == "clean", "execution cgroup residue is present")
@@ -532,6 +704,13 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
     workspace_sentinel = workspace_sentinel_record()
     evidence_sentinel = file_record(EVIDENCE_SENTINEL, include_hash=True)
     require(evidence_sentinel["owner"] == "root", "evidence sentinel owner mismatch")
+    final_properties = systemd_properties()
+    require(
+        final_properties["MainPID"] == properties["MainPID"]
+        and final_properties["ExecMainStartTimestampMonotonic"]
+        == properties["ExecMainStartTimestampMonotonic"],
+        "service changed while production evidence was being captured",
+    )
 
     return {
         "format": "craxii-stage27-production-evidence-v1",
@@ -541,11 +720,10 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
             "git_revision": arguments.deployment_commit,
             "release_path": release_path,
             "current_symlink": str(CURRENT),
+            "release": release,
         },
         "host": {
-            "linux_boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id")
-            .read_text(encoding="ascii")
-            .strip(),
+            "linux_boot_id": linux_boot_id,
             "architecture": os.uname().machine,
         },
         "storage": {
@@ -562,6 +740,15 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
             "owner": process_owner,
             "group": process_group,
             "executable": executable,
+            "cwd": process_cwd,
+            "status": {
+                field: status_fields[field]
+                for field in (
+                    "Uid", "Gid", "Groups", "CapInh", "CapPrm", "CapEff", "CapBnd",
+                    "CapAmb", "NoNewPrivs", "Umask"
+                )
+            },
+            "environment_names": environment_names,
         },
         "health": {"live": live, "ready": ready, "listeners": listener_addresses},
         "cgroup": cgroup,
@@ -577,9 +764,17 @@ def lookup_path(document: dict[str, Any], dotted: str) -> Any:
     return value
 
 
+def read_evidence_document(path: Any) -> dict[str, Any]:
+    if isinstance(path, pathlib.Path):
+        record = file_record(path, include_hash=False)
+        require(record["owner"] == "root", "evidence input owner mismatch")
+        require(record["mode"] == "0600", "evidence input mode mismatch")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def compare(arguments: argparse.Namespace) -> dict[str, Any]:
-    before = json.loads(arguments.before.read_text(encoding="utf-8"))
-    after = json.loads(arguments.after.read_text(encoding="utf-8"))
+    before = read_evidence_document(arguments.before)
+    after = read_evidence_document(arguments.after)
     require(before["format"] == after["format"] == "craxii-stage27-production-evidence-v1", "evidence format mismatch")
     checks: list[str] = []
 
@@ -633,6 +828,16 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         after["database"]["current_recovery"]["payload"].get("cleanup_unconfirmed") == 0,
         "post-transition recovery cleanup is unconfirmed",
     )
+    require(
+        after["database"]["max_journal_offset"] > before["database"]["max_journal_offset"],
+        "journal head did not advance across the runtime transition",
+    )
+    require(
+        before["database"]["max_journal_offset"]
+        < after["database"]["current_recovery"]["journal_offset"]
+        <= after["database"]["max_journal_offset"],
+        "new runtime recovery event is not ordered after the frozen pre-transition journal head",
+    )
     checks.extend(
         [
             "runtime-instance-changed",
@@ -642,6 +847,8 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
             "execution-cgroup-clean",
             "no-active-work",
             "recovery-cleanup-confirmed",
+            "journal-head-advanced",
+            "recovery-event-after-frozen-head",
         ]
     )
 
@@ -667,6 +874,11 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
 
 def write_new_json(path: pathlib.Path, document: dict[str, Any]) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_metadata = path.parent.lstat()
+    require(
+        stat.S_ISDIR(parent_metadata.st_mode) and not path.parent.is_symlink(),
+        f"evidence parent directory is unsafe: {path.parent}",
+    )
     require(not path.exists() and not path.is_symlink(), f"refusing to overwrite evidence: {path}")
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
@@ -677,6 +889,11 @@ def write_new_json(path: pathlib.Path, document: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     except BaseException:
         try:
             os.unlink(temporary)

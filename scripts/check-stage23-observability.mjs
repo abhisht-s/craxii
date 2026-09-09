@@ -186,9 +186,9 @@ assert(osLog.includes('Logger'), 'native diagnostics do not use os.Logger');
 
 assert(
   read('backend/src/adapters/sqlite/schema.rs').includes(
-    'pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 4;',
+    'pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 5;',
   ),
-  'Stage 23 must not change the durable schema version',
+  'Stage 23 observability checker does not recognize the current durable schema version',
 );
 assert(
   read('backend/src/protocol.rs').includes('pub const PROTOCOL_VERSION: u64 = 1;'),

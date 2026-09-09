@@ -1241,7 +1241,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_four_inventory_is_exact_and_reopen_is_idempotent() {
+    async fn migration_version_five_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
         assert_eq!(guard.disposition(), DatabaseDisposition::Current);
@@ -1275,6 +1275,137 @@ pub(super) mod tests {
         let reopened = runtime(&root, 1).await;
         assert_eq!(reopened.disposition(), DatabaseDisposition::Current);
         reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn migration_five_repairs_compatible_null_flags_and_enforces_terminal_evidence() {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true);
+        let mut connection = options.connect().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_executions (\
+                state TEXT NOT NULL, dispatch_intent_at TEXT NULL, result_json TEXT NULL, \
+                timed_out INTEGER NULL, cancelled INTEGER NULL\
+            )",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_executions VALUES \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"success\"}', NULL, NULL), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"timeout\"}', 1, NULL), \
+             ('completed', NULL, '{\"result_kind\":\"validation_rejection\"}', NULL, NULL), \
+             ('outcome_unknown', '2026-01-01T00:00:00.000000Z', NULL, NULL, NULL)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/0005_tool_terminal_outcome_evidence.sql"
+        ))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        let rows = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT timed_out, cancelled FROM tool_executions ORDER BY rowid",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (Some(0), Some(0)),
+                (Some(1), Some(0)),
+                (None, None),
+                (None, None),
+            ]
+        );
+        assert!(
+            sqlx::query("UPDATE tool_executions SET timed_out = NULL WHERE rowid = 1")
+                .execute(&mut connection)
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query("UPDATE tool_executions SET cancelled = 1 WHERE rowid = 1")
+                .execute(&mut connection)
+                .await
+                .is_err()
+        );
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_five_refuses_to_reclassify_contradictory_legacy_evidence() {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true);
+        let mut connection = options.connect().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_executions (\
+                state TEXT NOT NULL, dispatch_intent_at TEXT NULL, result_json TEXT NULL, \
+                timed_out INTEGER NULL, cancelled INTEGER NULL\
+            )",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_executions VALUES \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"success\"}', NULL, 1)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        assert!(
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0005_tool_terminal_outcome_evidence.sql"
+            ))
+            .execute(&mut connection)
+            .await
+            .is_err()
+        );
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_five_rejects_unrecognized_legacy_result_kinds() {
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true);
+        let mut connection = options.connect().await.unwrap();
+        sqlx::query(
+            "CREATE TABLE tool_executions (\
+                state TEXT NOT NULL, dispatch_intent_at TEXT NULL, result_json TEXT NULL, \
+                timed_out INTEGER NULL, cancelled INTEGER NULL\
+            )",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO tool_executions VALUES \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"invented\"}', NULL, NULL)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        assert!(
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/0005_tool_terminal_outcome_evidence.sql"
+            ))
+            .execute(&mut connection)
+            .await
+            .is_err()
+        );
+        connection.close().await.unwrap();
     }
 
     #[tokio::test]
@@ -1320,7 +1451,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 4);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 5);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1347,7 +1478,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (5, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (6, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

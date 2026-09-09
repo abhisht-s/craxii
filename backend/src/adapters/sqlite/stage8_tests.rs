@@ -142,7 +142,7 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(4).unwrap(),
+                schema_version: SchemaVersion::try_new(5).unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -586,19 +586,19 @@ async fn dispatched_success_canonicalizes_negative_terminal_observations() {
         .unwrap();
 
     let mut connection = fixture.guard.runtime().acquire().await.unwrap();
-    sqlx::query("UPDATE tool_executions SET timed_out = NULL WHERE tool_execution_id = ?")
-        .bind(tool_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-    drop(connection);
     assert!(
-        fixture
-            .store
-            .verify_application_consistency()
+        sqlx::query("UPDATE tool_executions SET timed_out = NULL WHERE tool_execution_id = ?")
+            .bind(tool_id.to_string())
+            .execute(&mut *connection)
             .await
             .is_err()
     );
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
 }
 
 async fn completed_large_read_fixture() -> (Fixture, ToolExecutionId, ArtifactId) {
@@ -2020,19 +2020,19 @@ async fn tool_result_corruption_rejects_unknown_missing_required_and_forbidden_o
     let (fixture, tool_id) = completed_tool_fixture().await;
     {
         let mut connection = fixture.guard.runtime().acquire().await.unwrap();
-        sqlx::query(
-            "UPDATE tool_executions SET result_json = \
-             '{\"version\":1,\"result_kind\":\"unknown_kind\",\"summary\":\"bad\",\"fields\":[]}' \
-             WHERE tool_execution_id = ?",
+        assert!(
+            sqlx::query(
+                "UPDATE tool_executions SET result_json = \
+                 '{\"version\":1,\"result_kind\":\"unknown_kind\",\"summary\":\"bad\",\"fields\":[]}' \
+                 WHERE tool_execution_id = ?",
+            )
+            .bind(tool_id.to_string())
+            .execute(&mut *connection)
+            .await
+            .is_err()
         )
-        .bind(tool_id.to_string())
-        .execute(&mut *connection)
-        .await
-        .unwrap();
     }
-    let root = fixture._root.path().to_owned();
     fixture.guard.shutdown().await;
-    assert!(!verified_stage8_startup(&root).await);
 
     let (fixture, tool_id) = completed_tool_fixture().await;
     {
@@ -3519,7 +3519,7 @@ async fn durable_publish_before_database_commit_reopens_as_nonfatal_orphan_witho
 }
 
 #[tokio::test]
-async fn populated_v2_migrates_through_v4_without_changing_stage7_identity_or_old_fingerprints() {
+async fn populated_v2_migrates_through_v5_without_changing_stage7_identity_or_old_fingerprints() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
     let state_store = SqliteStateStore::new(guard.runtime().clone());
@@ -3594,7 +3594,7 @@ async fn populated_v2_migrates_through_v4_without_changing_stage7_identity_or_ol
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2"
+        "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e"
     );
     migrated.shutdown().await;
 
@@ -3733,7 +3733,7 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(4).unwrap(),
+                schema_version: SchemaVersion::try_new(5).unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -3773,7 +3773,7 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(4).unwrap(),
+                schema_version: SchemaVersion::try_new(5).unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),

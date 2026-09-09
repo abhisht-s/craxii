@@ -1036,13 +1036,13 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         }
         JournalEventPayload::ArtifactRecorded(value) => value.canonical_length <= i64::MAX as u64,
         JournalEventPayload::RuntimeStarted(value) => {
-            value.schema_version.get() == 4
+            value.schema_version.get() == 5
                 && !value.linux_boot_id.as_str().is_empty()
                 && !value.binary_version.as_str().is_empty()
                 && !value.git_revision.as_str().is_empty()
         }
         JournalEventPayload::RuntimeRecoveryPerformed(value) => {
-            value.schema_version.get() == 4 && value.counts_are_persistable()
+            value.schema_version.get() == 5 && value.counts_are_persistable()
         }
         JournalEventPayload::RuntimeStopping(value) => {
             value.shutdown_reason == RuntimeShutdownReason::GracefulShutdown
@@ -1741,7 +1741,7 @@ mod tests {
                     process_id: DiagnosticPid::try_new(42).unwrap(),
                     binary_version: PackageVersion::try_new("0.0.1").unwrap(),
                     git_revision: GitRevision::try_new("test").unwrap(),
-                    schema_version: SchemaVersion::try_new(4).unwrap(),
+                    schema_version: SchemaVersion::try_new(5).unwrap(),
                     started_at: at(),
                 })
             }
@@ -1763,7 +1763,7 @@ mod tests {
                     cleanup_unconfirmed: 11,
                     recovery_duration_ms: 12,
                     binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                    schema_version: SchemaVersion::try_new(4).unwrap(),
+                    schema_version: SchemaVersion::try_new(5).unwrap(),
                     recovered_at: at(),
                 })
             }
@@ -1935,11 +1935,11 @@ mod tests {
             ),
             (
                 JournalEventKind::RuntimeStarted,
-                "4709740d4b529e3215b21877ee64c30c9d6191166e53274a503835db5b18fd8e",
+                "3571c2f91f6cf76363feb61a361e7cb0ae7b466e6132343532527582de2c0d85",
             ),
             (
                 JournalEventKind::RuntimeRecoveryPerformed,
-                "b6030f6b240a9b26b8340fc8830c81e5a8491b8598aaaf051d1e8be532822fbd",
+                "8d90e9759738029aedd19679de2731ae76a824e140bda35914e64ac104177cd1",
             ),
             (
                 JournalEventKind::RuntimeStopping,

@@ -149,6 +149,9 @@ grep -qx 'KillMode=control-group' /etc/systemd/system/craxii-server.service
 grep -qx 'Restart=on-failure' /etc/systemd/system/craxii-server.service
 grep -qx 'KillSignal=SIGTERM' /etc/systemd/system/craxii-server.service
 grep -qx 'AmbientCapabilities=CAP_KILL' /etc/systemd/system/craxii-server.service
+grep -qx 'CapabilityBoundingSet=CAP_KILL CAP_SETGID CAP_SETUID CAP_SETPCAP' \
+  /etc/systemd/system/craxii-server.service
+grep -qx 'LimitCORE=0' /etc/systemd/system/craxii-server.service
 grep -qx 'IPAddressDeny=169.254.169.254' /etc/systemd/system/craxii-server.service
 grep -qx 'IPAddressDeny=fd00:ec2::254' /etc/systemd/system/craxii-server.service
 grep -qx 'LoadCredential=openai_provider:/etc/craxii/credentials/openai_provider' \
@@ -212,8 +215,12 @@ shell_probe="set -- ${shell_probe}; \
 test \"\$(id -un)\" = craxii; test \"\$(id -gn)\" = craxii; \
 grep -Eq '^Groups:[[:space:]]*$' /proc/self/status; \
 grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status; \
+grep -Eq '^CapPrm:[[:space:]]*0+$' /proc/self/status; \
+grep -Eq '^CapInh:[[:space:]]*0+$' /proc/self/status; \
+grep -Eq '^CapBnd:[[:space:]]*0+$' /proc/self/status; \
 grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status; \
 grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status; \
+test "\$(ulimit -c)" = 0; \
 test \"\$HOME\" = /home/craxii; test \"\$USER\" = craxii; \
 test \"\$LOGNAME\" = craxii; test \"\$SHELL\" = /bin/bash; \
 test \"\$LANG\" = C.UTF-8; \
@@ -244,7 +251,7 @@ server_uid="$(id -u craxii-server)"
 server_gid="$(id -g craxii-server)"
 # Positional arguments intentionally expand in the inner shell.
 # shellcheck disable=SC2016
-shell_output=$(/usr/bin/setpriv \
+shell_output=$(/usr/bin/prlimit --core=0:0 /usr/bin/setpriv \
   --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
   --inh-caps=+kill --ambient-caps=+kill \
   /usr/bin/env -i \

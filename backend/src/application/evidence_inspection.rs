@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn stage23_rendering_is_versioned_deterministic_and_preserves_null() {
         let value = EvidencePreflight {
-            schema_version: 4,
+            schema_version: 5,
             database_disposition: "current",
             journal_head: None,
             work_count: 0,
