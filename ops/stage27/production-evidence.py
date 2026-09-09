@@ -41,6 +41,13 @@ BIND_MOUNTS = {
     "/srv/craxii/workspaces": "/workspaces",
     "/home/craxii": "/home/craxii",
 }
+WORKSPACE_SENTINEL_ACCESS_ACL = {
+    "user:": "rw-",
+    "user:craxii-server": "r-x",
+    "group:": "---",
+    "mask:": "r--",
+    "other:": "---",
+}
 STABLE_TABLES = (
     "craxii_principals",
     "workstations",
@@ -156,6 +163,90 @@ def file_record(path: pathlib.Path, *, include_hash: bool) -> dict[str, Any]:
             for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                 digest.update(chunk)
         record["sha256"] = digest.hexdigest()
+    return record
+
+
+def parse_posix_access_acl(value: str) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for raw_line in value.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        fields = line.split(":")
+        require(len(fields) == 3, "workspace sentinel ACL contains a malformed entry")
+        kind, qualifier, permissions = fields
+        require(
+            kind in {"user", "group", "mask", "other"},
+            "workspace sentinel ACL contains an unexpected entry kind",
+        )
+        require(
+            len(permissions) == 3
+            and permissions[0] in {"r", "-"}
+            and permissions[1] in {"w", "-"}
+            and permissions[2] in {"x", "-"},
+            "workspace sentinel ACL contains invalid permissions",
+        )
+        key = f"{kind}:{qualifier}"
+        require(key not in entries, "workspace sentinel ACL contains a duplicate entry")
+        entries[key] = permissions
+    return entries
+
+
+def masked_permissions(permissions: str, mask: str) -> str:
+    return "".join(
+        permission if permission != "-" and mask[index] != "-" else "-"
+        for index, permission in enumerate(permissions)
+    )
+
+
+def permission_digit(permissions: str) -> int:
+    return sum(
+        bit for permission, bit in zip(permissions, (4, 2, 1), strict=True) if permission != "-"
+    )
+
+
+def validate_workspace_sentinel_acl(
+    owner: str, group: str, mode: str, value: str
+) -> dict[str, Any]:
+    require(owner == "craxii", "workspace sentinel owner mismatch")
+    require(group == "craxii", "workspace sentinel group mismatch")
+    entries = parse_posix_access_acl(value)
+    require(
+        entries == WORKSPACE_SENTINEL_ACCESS_ACL,
+        "workspace sentinel access ACL differs from the inherited production policy",
+    )
+    effective_server = masked_permissions(
+        entries["user:craxii-server"], entries["mask:"]
+    )
+    expected_mode = "0" + "".join(
+        str(permission_digit(entries[key])) for key in ("user:", "mask:", "other:")
+    )
+    require(mode == expected_mode, "workspace sentinel mode does not reflect its access ACL")
+    require(entries["user:"] == "rw-", "workspace sentinel owner access mismatch")
+    require(effective_server == "r--", "workspace sentinel server access is not read-only")
+    require(entries["other:"] == "---", "workspace sentinel other access is not empty")
+    return {
+        "entries": entries,
+        "effective_owner": entries["user:"],
+        "effective_craxii_server": effective_server,
+        "effective_other": entries["other:"],
+        "mode": mode,
+    }
+
+
+def workspace_sentinel_record() -> dict[str, Any]:
+    record = file_record(WORKSPACE_SENTINEL, include_hash=True)
+    acl = run(
+        [
+            "/usr/bin/getfacl",
+            "--absolute-names",
+            "--omit-header",
+            str(WORKSPACE_SENTINEL),
+        ]
+    )
+    record["access_acl"] = validate_workspace_sentinel_acl(
+        record["owner"], record["group"], record["mode"], acl
+    )
     return record
 
 
@@ -438,9 +529,8 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
     cgroup = cgroup_record(main_pid, properties["ControlGroup"])
     require(cgroup["leak_status"] == "clean", "execution cgroup residue is present")
     credential = credential_record(main_pid)
-    workspace_sentinel = file_record(WORKSPACE_SENTINEL, include_hash=True)
+    workspace_sentinel = workspace_sentinel_record()
     evidence_sentinel = file_record(EVIDENCE_SENTINEL, include_hash=True)
-    require(workspace_sentinel["owner"] == "craxii", "workspace sentinel owner mismatch")
     require(evidence_sentinel["owner"] == "root", "evidence sentinel owner mismatch")
 
     return {
@@ -502,8 +592,7 @@ def compare(arguments: argparse.Namespace) -> dict[str, Any]:
         "database.states",
         "database.ambiguity",
         "database.artifact_sentinel",
-        "workspace_sentinel.sha256",
-        "workspace_sentinel.bytes",
+        "workspace_sentinel",
         "evidence_sentinel.sha256",
         "evidence_sentinel.bytes",
         "credential_boundary",
@@ -610,14 +699,18 @@ def parse_arguments() -> argparse.Namespace:
     comparison.add_argument("--before", type=pathlib.Path, required=True)
     comparison.add_argument("--after", type=pathlib.Path, required=True)
     comparison.add_argument("--output", type=pathlib.Path, required=True)
+    subcommands.add_parser("validate-workspace-sentinel")
     return parser.parse_args()
 
 
 def main() -> int:
     arguments = parse_arguments()
     try:
-        document = capture(arguments) if arguments.command == "snapshot" else compare(arguments)
-        write_new_json(arguments.output, document)
+        if arguments.command == "validate-workspace-sentinel":
+            workspace_sentinel_record()
+        else:
+            document = capture(arguments) if arguments.command == "snapshot" else compare(arguments)
+            write_new_json(arguments.output, document)
     except (EvidenceError, FileNotFoundError, json.JSONDecodeError, sqlite3.Error, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

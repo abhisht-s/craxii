@@ -156,8 +156,7 @@ prepare_sentinels() {
       'umask 077; printf "%s\n" craxii-stage27-workspace-persistence-sentinel-v1 >"$1"' \
       stage27-sentinel "${workspace_sentinel}"
   fi
-  [[ "$(stat -c '%U:%G:%a' "${workspace_sentinel}")" == craxii:craxii:600 ]] ||
-    fail "workspace sentinel metadata mismatch"
+  "${evidence_helper}" validate-workspace-sentinel
 
   if [[ -e "${evidence_sentinel}" || -L "${evidence_sentinel}" ]]; then
     [[ -f "${evidence_sentinel}" && ! -L "${evidence_sentinel}" ]] ||

@@ -16,6 +16,14 @@ assert SPEC is not None and SPEC.loader is not None
 evidence = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(evidence)
 
+OBSERVED_WORKSPACE_SENTINEL_ACL = """\
+user::rw-
+user:craxii-server:r-x          #effective:r--
+group::---
+mask::r--
+other::---
+"""
+
 
 def snapshot(runtime: str, process: int, boot: str) -> dict:
     return {
@@ -101,6 +109,30 @@ class EvidenceComparisonTests(unittest.TestCase):
         after["host"]["linux_boot_id"] = before["host"]["linux_boot_id"]
         with self.assertRaisesRegex(evidence.EvidenceError, "boot ID did not change"):
             self.compare(before, after, arguments)
+
+    def test_acl_bearing_workspace_sentinel_uses_effective_mask_permissions(self) -> None:
+        result = evidence.validate_workspace_sentinel_acl(
+            "craxii", "craxii", "0640", OBSERVED_WORKSPACE_SENTINEL_ACL
+        )
+        self.assertEqual(result["effective_owner"], "rw-")
+        self.assertEqual(result["effective_craxii_server"], "r--")
+        self.assertEqual(result["effective_other"], "---")
+        self.assertEqual(result["mode"], "0640")
+
+    def test_workspace_sentinel_acl_rejects_unexpected_access(self) -> None:
+        variants = [
+            OBSERVED_WORKSPACE_SENTINEL_ACL + "user:ssm-user:r--\n",
+            OBSERVED_WORKSPACE_SENTINEL_ACL.replace(
+                "user:craxii-server:r-x", "user:craxii-server:rwx"
+            ),
+            OBSERVED_WORKSPACE_SENTINEL_ACL.replace("other::---", "other::r--"),
+        ]
+        for value in variants:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(evidence.EvidenceError, "inherited production policy"):
+                    evidence.validate_workspace_sentinel_acl(
+                        "craxii", "craxii", "0640", value
+                    )
 
 
 if __name__ == "__main__":
