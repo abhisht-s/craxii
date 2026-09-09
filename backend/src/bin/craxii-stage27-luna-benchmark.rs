@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -33,11 +34,19 @@ const PUBLIC_BASE_URL: &str = "http://127.0.0.1:8080/";
 const PUBLIC_URL: &str = "http://127.0.0.1:8080";
 const PROMPT: &str = "Inspect your machine and tell me what OS, CPU architecture, current directory, and Git version you have.";
 const TERMINAL_STATES: &[&str] = &["completed", "failed", "cancelled", "interrupted"];
+const EXISTING_WORK_ID: &str = "01a08580-cc33-7b13-a1e8-958c4d90dfb4";
+const EXISTING_CLIENT_MESSAGE_ID: &str = "01a08580-cc21-7670-bdc6-1f55278ddb03";
+const EXISTING_WORK_GIT_REVISION: &str = "51d66096a89253b71b3d5e126117bbee60dc44eb";
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
     let mut attempt = Attempt::default();
-    match run(&mut attempt).await {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let result = match parse_mode(&arguments) {
+        Ok(mode) => run(&mut attempt, mode).await,
+        Err(error) => Err(error),
+    };
+    match result {
         Ok(report) => {
             report.print();
             ExitCode::SUCCESS
@@ -50,6 +59,8 @@ async fn main() -> ExitCode {
             }
             if attempt.request_started {
                 eprintln!("STAGE27_AUTOMATIC_RESUBMISSION=FORBIDDEN");
+            } else if attempt.verification_only {
+                eprintln!("STAGE27_AUTOMATIC_RESUBMISSION=NO");
             }
             ExitCode::FAILURE
         }
@@ -60,6 +71,7 @@ async fn main() -> ExitCode {
 struct Attempt {
     client_message_id: Option<Uuid>,
     request_started: bool,
+    verification_only: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,6 +87,18 @@ impl RunnerError {
 
 type Result<T> = std::result::Result<T, RunnerError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RunMode {
+    Submit,
+    VerifyExisting,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DurableStateExpectation {
+    Pristine,
+    ExistingCanonical,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ServiceSnapshot {
     main_pid: u32,
@@ -89,6 +113,32 @@ struct Preflight {
     database: PathBuf,
     git_revision: String,
     service: ServiceSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeStateExpectation {
+    Active,
+    GracefullyStopped,
+}
+
+struct EvidenceRuntime {
+    runtime_id: String,
+    main_pid: u32,
+    git_revision: String,
+    state: RuntimeStateExpectation,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct WorkEvidence {
+    conversation_id: String,
+    conversation_work_ordinal: i64,
+    kind: String,
+    workspace_id: String,
+    state: String,
+    runtime_instance_id: Option<String>,
+    started_at: Option<String>,
+    terminal_at: Option<String>,
+    terminal_reason_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,8 +199,29 @@ impl VerificationReport {
     }
 }
 
-async fn run(attempt: &mut Attempt) -> Result<VerificationReport> {
-    let preflight = preflight().await?;
+fn parse_mode(arguments: &[OsString]) -> Result<RunMode> {
+    match arguments {
+        [] => Ok(RunMode::Submit),
+        [mode, work_id, client_message_id]
+            if mode.to_str() == Some("--verify-existing")
+                && work_id.to_str() == Some(EXISTING_WORK_ID)
+                && client_message_id.to_str() == Some(EXISTING_CLIENT_MESSAGE_ID) =>
+        {
+            Ok(RunMode::VerifyExisting)
+        }
+        _ => Err(RunnerError::new("runner_arguments_invalid")),
+    }
+}
+
+async fn run(attempt: &mut Attempt, mode: RunMode) -> Result<VerificationReport> {
+    match mode {
+        RunMode::Submit => run_submission(attempt).await,
+        RunMode::VerifyExisting => run_existing_verification(attempt).await,
+    }
+}
+
+async fn run_submission(attempt: &mut Attempt) -> Result<VerificationReport> {
+    let preflight = preflight(DurableStateExpectation::Pristine).await?;
     let facts = host_facts()?;
     health_ready().await?;
     let bearer = read_bearer()?;
@@ -192,10 +263,41 @@ async fn run(attempt: &mut Attempt) -> Result<VerificationReport> {
         ));
     }
     health_ready().await?;
-    verify(&preflight, &receipt, client_message_id, facts).await
+    let runtime = EvidenceRuntime {
+        runtime_id: preflight.runtime_id.clone(),
+        main_pid: preflight.service.main_pid,
+        git_revision: preflight.git_revision.clone(),
+        state: RuntimeStateExpectation::Active,
+    };
+    verify(&preflight, &runtime, &receipt, client_message_id, facts).await
 }
 
-async fn preflight() -> Result<Preflight> {
+async fn run_existing_verification(attempt: &mut Attempt) -> Result<VerificationReport> {
+    let client_message_id = Uuid::parse_str(EXISTING_CLIENT_MESSAGE_ID)
+        .map_err(|_| RunnerError::new("existing_client_message_id_invalid"))?;
+    attempt.client_message_id = Some(client_message_id);
+    attempt.verification_only = true;
+    println!("STAGE27_EXISTING_WORK_VERIFICATION=YES");
+    println!("STAGE27_CLIENT_MESSAGE_ID={client_message_id}");
+    println!("STAGE27_WORK_ID={EXISTING_WORK_ID}");
+    println!("STAGE27_SUBMISSION_ATTEMPTS=0");
+    std::io::stdout()
+        .flush()
+        .map_err(|_| RunnerError::new("stdout_failure"))?;
+
+    let preflight = preflight(DurableStateExpectation::ExistingCanonical).await?;
+    let facts = host_facts()?;
+    health_ready().await?;
+    let receipt = load_existing_receipt(&preflight.database, client_message_id).await?;
+    validate_receipt(&receipt)?;
+    if receipt.work_id != EXISTING_WORK_ID {
+        return Err(RunnerError::new("existing_work_identity_mismatch"));
+    }
+    let runtime = load_existing_runtime(&preflight, &receipt.work_id).await?;
+    verify(&preflight, &runtime, &receipt, client_message_id, facts).await
+}
+
+async fn preflight(expectation: DurableStateExpectation) -> Result<Preflight> {
     let configuration = config::load(CONFIG_PATH)
         .map_err(|_| RunnerError::new("production_configuration_invalid"))?;
     validate_configuration(&configuration)?;
@@ -248,12 +350,17 @@ async fn preflight() -> Result<Preflight> {
     .await
     .map_err(|_| RunnerError::new("durable_preflight_query_failed"))?
     .ok_or_else(|| RunnerError::new("primary_conversation_invalid"))?;
-    if conversation
+    let next_work_ordinal = conversation
         .try_get::<i64, _>("next_work_ordinal")
-        .map_err(|_| RunnerError::new("primary_conversation_invalid"))?
-        != 1
-    {
-        return Err(RunnerError::new("benchmark_conversation_not_pristine"));
+        .map_err(|_| RunnerError::new("primary_conversation_invalid"))?;
+    match expectation {
+        DurableStateExpectation::Pristine if next_work_ordinal != 1 => {
+            return Err(RunnerError::new("benchmark_conversation_not_pristine"));
+        }
+        DurableStateExpectation::ExistingCanonical if next_work_ordinal != 2 => {
+            return Err(RunnerError::new("existing_conversation_ordinal_invalid"));
+        }
+        _ => {}
     }
     let workspace = sqlx::query(
         "SELECT workstation_id, logical_root, local_resolved_root FROM workspaces \
@@ -315,16 +422,18 @@ async fn preflight() -> Result<Preflight> {
     {
         return Err(RunnerError::new("active_device_cardinality_invalid"));
     }
-    for query in [
-        "SELECT COUNT(*) FROM messages",
-        "SELECT COUNT(*) FROM work_items",
-        "SELECT COUNT(*) FROM work_item_inputs",
-        "SELECT COUNT(*) FROM client_commands",
-        "SELECT COUNT(*) FROM model_invocations",
-        "SELECT COUNT(*) FROM tool_executions",
-    ] {
-        if scalar(&mut connection, query).await? != 0 {
-            return Err(RunnerError::new("benchmark_durable_state_not_pristine"));
+    if expectation == DurableStateExpectation::Pristine {
+        for query in [
+            "SELECT COUNT(*) FROM messages",
+            "SELECT COUNT(*) FROM work_items",
+            "SELECT COUNT(*) FROM work_item_inputs",
+            "SELECT COUNT(*) FROM client_commands",
+            "SELECT COUNT(*) FROM model_invocations",
+            "SELECT COUNT(*) FROM tool_executions",
+        ] {
+            if scalar(&mut connection, query).await? != 0 {
+                return Err(RunnerError::new("benchmark_durable_state_not_pristine"));
+            }
         }
     }
     connection
@@ -584,6 +693,75 @@ async fn recover_durable_receipt(
     }
 }
 
+async fn load_existing_receipt(database: &Path, client_message_id: Uuid) -> Result<Receipt> {
+    let mut connection = connect(database).await?;
+    let values: Vec<String> = sqlx::query_scalar(
+        "SELECT response_json FROM client_commands \
+         WHERE idempotency_key = ? AND command_type = 'message'",
+    )
+    .bind(client_message_id.to_string())
+    .fetch_all(&mut connection)
+    .await
+    .map_err(|_| RunnerError::new("existing_receipt_query_failed"))?;
+    connection
+        .close()
+        .await
+        .map_err(|_| RunnerError::new("database_close_failed"))?;
+    let value = match values.as_slice() {
+        [value] => value,
+        _ => return Err(RunnerError::new("existing_receipt_cardinality_invalid")),
+    };
+    serde_json::from_str(value).map_err(|_| RunnerError::new("existing_receipt_invalid"))
+}
+
+async fn load_existing_runtime(preflight: &Preflight, work_id: &str) -> Result<EvidenceRuntime> {
+    let mut connection = connect(&preflight.database).await?;
+    let runtime_ids: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT runtime_instance_id FROM journal_events \
+         WHERE work_id = ? AND event_type = 'work.started'",
+    )
+    .bind(work_id)
+    .fetch_all(&mut connection)
+    .await
+    .map_err(|_| RunnerError::new("existing_runtime_attribution_query_failed"))?;
+    let runtime_id = match runtime_ids.as_slice() {
+        [Some(runtime_id)] => runtime_id.clone(),
+        _ => return Err(RunnerError::new("existing_runtime_attribution_invalid")),
+    };
+    let rows = sqlx::query(
+        "SELECT workstation_id, process_id, git_revision FROM runtime_instances \
+         WHERE runtime_instance_id = ?",
+    )
+    .bind(&runtime_id)
+    .fetch_all(&mut connection)
+    .await
+    .map_err(|_| RunnerError::new("existing_runtime_query_failed"))?;
+    connection
+        .close()
+        .await
+        .map_err(|_| RunnerError::new("database_close_failed"))?;
+    let row = match rows.as_slice() {
+        [row] => row,
+        _ => return Err(RunnerError::new("existing_runtime_cardinality_invalid")),
+    };
+    let main_pid = u32::try_from(row.get::<i64, _>("process_id"))
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| RunnerError::new("existing_runtime_process_id_invalid"))?;
+    let git_revision = row.get::<String, _>("git_revision");
+    if row.get::<String, _>("workstation_id") != preflight.workstation_id
+        || git_revision != EXISTING_WORK_GIT_REVISION
+    {
+        return Err(RunnerError::new("existing_runtime_identity_mismatch"));
+    }
+    Ok(EvidenceRuntime {
+        runtime_id,
+        main_pid,
+        git_revision,
+        state: RuntimeStateExpectation::GracefullyStopped,
+    })
+}
+
 fn validate_receipt(receipt: &Receipt) -> Result<()> {
     if receipt.protocol_version != 1
         || receipt.work_state != "queued"
@@ -635,6 +813,7 @@ async fn wait_for_terminal(database: &Path, work_id: &str) -> Result<()> {
 
 async fn verify(
     preflight: &Preflight,
+    runtime: &EvidenceRuntime,
     receipt: &Receipt,
     client_message_id: Uuid,
     facts: HostFacts,
@@ -654,13 +833,14 @@ async fn verify(
     let assistant = verify_messages(&mut connection, preflight, receipt, client_message_id).await?;
     verify_command(&mut connection, receipt, client_message_id).await?;
     let (model_attempt_count, final_step, final_context, final_text) =
-        verify_models(&mut connection, preflight, &receipt.work_id).await?;
+        verify_models(&mut connection, runtime, &receipt.work_id).await?;
     if final_text != assistant {
         return Err(RunnerError::new("assistant_output_provenance_mismatch"));
     }
     let tool_execution_count = verify_tools(
         &mut connection,
         preflight,
+        runtime,
         &receipt.work_id,
         final_step,
         &final_context,
@@ -671,31 +851,19 @@ async fn verify(
     if !answer_contains_facts(&assistant, &facts) {
         return Err(RunnerError::new("assistant_fact_mismatch"));
     }
-    let runtime_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM runtime_instances WHERE runtime_instance_id = ? \
-         AND state = 'running' AND process_id = ? AND git_revision = ?",
-    )
-    .bind(&preflight.runtime_id)
-    .bind(i64::from(preflight.service.main_pid))
-    .bind(&preflight.git_revision)
-    .fetch_one(&mut connection)
-    .await
-    .map_err(|_| RunnerError::new("runtime_evidence_query_failed"))?;
-    if runtime_count != 1 {
-        return Err(RunnerError::new("runtime_evidence_mismatch"));
-    }
+    verify_runtime(&mut connection, preflight, runtime).await?;
     connection
         .close()
         .await
         .map_err(|_| RunnerError::new("database_close_failed"))?;
     let assistant_sha256 = hex_digest(assistant.as_bytes());
     Ok(VerificationReport {
-        main_pid: preflight.service.main_pid,
-        git_revision: preflight.git_revision.clone(),
+        main_pid: runtime.main_pid,
+        git_revision: runtime.git_revision.clone(),
         conversation_id: preflight.conversation_id.clone(),
         message_id: receipt.message_id.clone(),
         work_id: receipt.work_id.clone(),
-        runtime_id: preflight.runtime_id.clone(),
+        runtime_id: runtime.runtime_id.clone(),
         model_attempt_count,
         tool_execution_count,
         assistant_sha256,
@@ -719,25 +887,41 @@ async fn verify_work(
     .await
     .map_err(|_| RunnerError::new("work_evidence_query_failed"))?
     .ok_or_else(|| RunnerError::new("work_evidence_missing"))?;
-    if row.get::<String, _>("conversation_id") != preflight.conversation_id
-        || row.get::<i64, _>("conversation_work_ordinal") != 1
-        || row.get::<String, _>("kind") != "conversational"
-        || row.get::<String, _>("workspace_id") != preflight.workspace_id
-        || row.get::<String, _>("state") != "completed"
-        || row
-            .get::<Option<String>, _>("runtime_instance_id")
-            .as_deref()
-            != Some(preflight.runtime_id.as_str())
-        || row.get::<Option<String>, _>("started_at").is_none()
-        || row.get::<Option<String>, _>("terminal_at").is_none()
-        || row
-            .get::<Option<String>, _>("terminal_reason_code")
-            .as_deref()
-            != Some("answered")
-    {
+    let evidence = WorkEvidence {
+        conversation_id: row.get("conversation_id"),
+        conversation_work_ordinal: row.get("conversation_work_ordinal"),
+        kind: row.get("kind"),
+        workspace_id: row.get("workspace_id"),
+        state: row.get("state"),
+        runtime_instance_id: row.get("runtime_instance_id"),
+        started_at: row.get("started_at"),
+        terminal_at: row.get("terminal_at"),
+        terminal_reason_code: row.get("terminal_reason_code"),
+    };
+    if !completed_answered_work_matches(
+        &evidence,
+        &preflight.conversation_id,
+        &preflight.workspace_id,
+    ) {
         return Err(RunnerError::new("work_evidence_mismatch"));
     }
     Ok(())
+}
+
+fn completed_answered_work_matches(
+    evidence: &WorkEvidence,
+    conversation_id: &str,
+    workspace_id: &str,
+) -> bool {
+    evidence.conversation_id == conversation_id
+        && evidence.conversation_work_ordinal == 1
+        && evidence.kind == "conversational"
+        && evidence.workspace_id == workspace_id
+        && evidence.state == "completed"
+        && evidence.runtime_instance_id.is_none()
+        && evidence.started_at.is_some()
+        && evidence.terminal_at.is_some()
+        && evidence.terminal_reason_code.as_deref() == Some("answered")
 }
 
 async fn verify_messages(
@@ -806,7 +990,7 @@ async fn verify_command(
 
 async fn verify_models(
     connection: &mut SqliteConnection,
-    preflight: &Preflight,
+    runtime: &EvidenceRuntime,
     work_id: &str,
 ) -> Result<(i64, i64, String, String)> {
     let rows = sqlx::query(
@@ -832,7 +1016,7 @@ async fn verify_models(
             || row.get::<String, _>("provider_model_id") != MODEL
             || row.get::<i64, _>("target_configuration_version") != 1
             || row.get::<String, _>("selection_reason") != "configured_default"
-            || row.get::<String, _>("runtime_instance_id") != preflight.runtime_id
+            || row.get::<String, _>("runtime_instance_id") != runtime.runtime_id
             || row.get::<Option<String>, _>("completed_at").is_none()
             || row.get::<i64, _>("billing_ambiguity") != 0
             || !matches!(state.as_str(), "completed" | "failed")
@@ -889,6 +1073,7 @@ async fn verify_models(
 async fn verify_tools(
     connection: &mut SqliteConnection,
     preflight: &Preflight,
+    runtime: &EvidenceRuntime,
     work_id: &str,
     final_step: i64,
     final_context: &str,
@@ -922,7 +1107,7 @@ async fn verify_tools(
             || row
                 .get::<Option<String>, _>("provider_tool_call_id")
                 .is_none()
-            || row.get::<String, _>("runtime_instance_id") != preflight.runtime_id
+            || row.get::<String, _>("runtime_instance_id") != runtime.runtime_id
             || row.get::<String, _>("workstation_id") != preflight.workstation_id
             || row.get::<String, _>("workspace_id") != preflight.workspace_id
             || row.get::<i64, _>("agent_step_no") >= final_step
@@ -999,6 +1184,51 @@ async fn verify_tools(
         return Err(RunnerError::new("tool_fact_mismatch"));
     }
     Ok(rows.len() as i64)
+}
+
+async fn verify_runtime(
+    connection: &mut SqliteConnection,
+    preflight: &Preflight,
+    runtime: &EvidenceRuntime,
+) -> Result<()> {
+    let row = sqlx::query(
+        "SELECT workstation_id, process_id, git_revision, state, stopped_at, stop_reason \
+         FROM runtime_instances WHERE runtime_instance_id = ?",
+    )
+    .bind(&runtime.runtime_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| RunnerError::new("runtime_evidence_query_failed"))?
+    .ok_or_else(|| RunnerError::new("runtime_evidence_missing"))?;
+    if row.get::<String, _>("workstation_id") != preflight.workstation_id
+        || row.get::<i64, _>("process_id") != i64::from(runtime.main_pid)
+        || row.get::<String, _>("git_revision") != runtime.git_revision
+    {
+        return Err(RunnerError::new("runtime_evidence_mismatch"));
+    }
+    let state: String = row.get("state");
+    let stopped_at: Option<String> = row.get("stopped_at");
+    let stop_reason: Option<String> = row.get("stop_reason");
+    let valid_state = match runtime.state {
+        RuntimeStateExpectation::Active => {
+            state == "running"
+                && stopped_at.is_none()
+                && stop_reason.is_none()
+                && runtime.runtime_id == preflight.runtime_id
+                && runtime.main_pid == preflight.service.main_pid
+                && runtime.git_revision == preflight.git_revision
+        }
+        RuntimeStateExpectation::GracefullyStopped => {
+            state == "stopped"
+                && stopped_at.is_some()
+                && stop_reason.as_deref() == Some("graceful_shutdown")
+                && runtime.git_revision == EXISTING_WORK_GIT_REVISION
+        }
+    };
+    if !valid_state {
+        return Err(RunnerError::new("runtime_evidence_mismatch"));
+    }
+    Ok(())
 }
 
 async fn verify_journal(connection: &mut SqliteConnection, work_id: &str) -> Result<()> {
@@ -1222,6 +1452,20 @@ mod tests {
         }
     }
 
+    fn completed_work(runtime_instance_id: Option<&str>) -> WorkEvidence {
+        WorkEvidence {
+            conversation_id: "conversation".to_owned(),
+            conversation_work_ordinal: 1,
+            kind: "conversational".to_owned(),
+            workspace_id: "workspace".to_owned(),
+            state: "completed".to_owned(),
+            runtime_instance_id: runtime_instance_id.map(str::to_owned),
+            started_at: Some("started".to_owned()),
+            terminal_at: Some("terminal".to_owned()),
+            terminal_reason_code: Some("answered".to_owned()),
+        }
+    }
+
     #[test]
     fn exact_canonical_prompt_is_stable() {
         assert_eq!(
@@ -1241,6 +1485,44 @@ mod tests {
             PUBLIC_BASE_URL
         );
         assert!(validate_configuration(&configuration).is_ok());
+    }
+
+    #[test]
+    fn completed_answered_work_without_runtime_owner_satisfies_runner_contract() {
+        assert!(completed_answered_work_matches(
+            &completed_work(None),
+            "conversation",
+            "workspace",
+        ));
+    }
+
+    #[test]
+    fn completed_answered_work_with_runtime_owner_violates_runner_contract() {
+        assert!(!completed_answered_work_matches(
+            &completed_work(Some("runtime")),
+            "conversation",
+            "workspace",
+        ));
+    }
+
+    #[test]
+    fn existing_verification_mode_requires_the_exact_canonical_identifiers() {
+        let exact = [
+            OsString::from("--verify-existing"),
+            OsString::from(EXISTING_WORK_ID),
+            OsString::from(EXISTING_CLIENT_MESSAGE_ID),
+        ];
+        assert_eq!(parse_mode(&exact).unwrap(), RunMode::VerifyExisting);
+
+        let wrong_work = [
+            OsString::from("--verify-existing"),
+            OsString::from(EXISTING_CLIENT_MESSAGE_ID),
+            OsString::from(EXISTING_CLIENT_MESSAGE_ID),
+        ];
+        assert_eq!(
+            parse_mode(&wrong_work).unwrap_err().code,
+            "runner_arguments_invalid"
+        );
     }
 
     #[test]
