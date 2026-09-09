@@ -544,6 +544,63 @@ async fn completed_tool_fixture() -> (Fixture, ToolExecutionId) {
     (fixture, tool_id)
 }
 
+#[tokio::test]
+async fn dispatched_success_canonicalizes_negative_terminal_observations() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let (tool_id, requested_event, waiting) = request_tool(&fixture, &model, 1, 4).await;
+    let dispatch_event = dispatch_tool(&fixture, tool_id, requested_event, waiting).await;
+    let mut completion = successful_tool_completion(
+        &fixture,
+        tool_id,
+        waiting,
+        dispatch_event,
+        Vec::new(),
+        (None, None),
+        (None, None),
+    );
+    completion.outcome.timed_out = None;
+    completion.outcome.cancelled = None;
+    fixture
+        .store
+        .finish_tool_execution(completion)
+        .await
+        .unwrap();
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let row =
+        sqlx::query("SELECT timed_out, cancelled FROM tool_executions WHERE tool_execution_id = ?")
+            .bind(tool_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<Option<i64>, _>("timed_out"), Some(0));
+    assert_eq!(row.get::<Option<i64>, _>("cancelled"), Some(0));
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query("UPDATE tool_executions SET timed_out = NULL WHERE tool_execution_id = ?")
+        .bind(tool_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .is_err()
+    );
+}
+
 async fn completed_large_read_fixture() -> (Fixture, ToolExecutionId, ArtifactId) {
     let fixture = fixture().await;
     make_fixture_journal_consistent(&fixture).await;

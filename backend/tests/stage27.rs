@@ -99,8 +99,8 @@ async fn live_linux_cancellation_cleans_process_tree_and_preserves_follower() {
     );
     assert_eq!(ordinary_tool.get::<Option<i64>, _>("exit_code"), Some(0));
     assert_eq!(ordinary_tool.get::<Option<i64>, _>("signal"), None);
-    assert_ne!(ordinary_tool.get::<Option<i64>, _>("timed_out"), Some(1));
-    assert_ne!(ordinary_tool.get::<Option<i64>, _>("cancelled"), Some(1));
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("timed_out"), Some(0));
+    assert_eq!(ordinary_tool.get::<Option<i64>, _>("cancelled"), Some(0));
     assert_eq!(
         ordinary_tool.get::<Option<i64>, _>("cleanup_confirmed"),
         Some(1)

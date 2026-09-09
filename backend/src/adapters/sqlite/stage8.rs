@@ -2229,37 +2229,35 @@ fn valid_tool_result_observation(
                     | crate::domain::ToolResultClass::Cancellation
             );
     }
+    let explicitly_not_interrupted = timed_out == Some(false) && cancelled == Some(false);
     match result {
         crate::domain::ToolResultClass::Success => {
             exit_code.is_none_or(|value| value == 0)
                 && signal.is_none()
-                && timed_out != Some(true)
-                && cancelled != Some(true)
+                && explicitly_not_interrupted
         }
         crate::domain::ToolResultClass::ProcessExit => {
             exit_code.is_some_and(|value| value != 0)
                 && signal.is_none()
-                && timed_out != Some(true)
-                && cancelled != Some(true)
+                && explicitly_not_interrupted
         }
         crate::domain::ToolResultClass::SignalTermination => {
-            signal.is_some()
-                && exit_code.is_none()
-                && timed_out != Some(true)
-                && cancelled != Some(true)
+            signal.is_some() && exit_code.is_none() && explicitly_not_interrupted
         }
         crate::domain::ToolResultClass::Timeout => {
-            timed_out == Some(true) && cancelled != Some(true)
+            timed_out == Some(true) && cancelled == Some(false)
         }
-        crate::domain::ToolResultClass::Cancellation => cancelled == Some(true),
+        crate::domain::ToolResultClass::Cancellation => {
+            timed_out == Some(false) && cancelled == Some(true)
+        }
         crate::domain::ToolResultClass::SpawnFailure => {
-            !started && exit_code.is_none() && signal.is_none()
+            !started && exit_code.is_none() && signal.is_none() && explicitly_not_interrupted
         }
         crate::domain::ToolResultClass::ValidationRejection
         | crate::domain::ToolResultClass::UnknownTool
         | crate::domain::ToolResultClass::AuthorityDenial
         | crate::domain::ToolResultClass::FileError
-        | crate::domain::ToolResultClass::CleanupFailure => true,
+        | crate::domain::ToolResultClass::CleanupFailure => explicitly_not_interrupted,
     }
 }
 
@@ -2268,6 +2266,16 @@ async fn finish_tool(
     request: FinishToolExecutionRequest,
 ) -> Result<CommitReceipt, SqliteAdapterError> {
     let outcome = &request.outcome;
+    let (timed_out, cancelled) = if outcome.state == ToolExecutionState::Completed
+        && request.expected_tool.state == ToolExecutionState::Dispatching
+    {
+        (
+            Some(outcome.timed_out.unwrap_or(false)),
+            Some(outcome.cancelled.unwrap_or(false)),
+        )
+    } else {
+        (outcome.timed_out, outcome.cancelled)
+    };
     if !outcome.state.is_terminal()
         || !matches!(
             request.expected_work.state,
@@ -2330,8 +2338,8 @@ async fn finish_tool(
                 outcome.started_at.is_some(),
                 outcome.exit_code,
                 outcome.signal,
-                outcome.timed_out,
-                outcome.cancelled,
+                timed_out,
+                cancelled,
             ) {
                 return Err(invalid());
             }
@@ -2556,8 +2564,8 @@ async fn finish_tool(
     .bind(outcome.completed_at.to_string())
     .bind(outcome.exit_code)
     .bind(outcome.signal)
-    .bind(outcome.timed_out.map(i64::from))
-    .bind(outcome.cancelled.map(i64::from))
+    .bind(timed_out.map(i64::from))
+    .bind(cancelled.map(i64::from))
     .bind(outcome.cleanup_confirmed.map(i64::from))
     .bind(result_json)
     .bind(outcome.stdout_artifact_id.map(|value| value.to_string()))
