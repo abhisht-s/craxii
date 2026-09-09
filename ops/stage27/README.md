@@ -40,11 +40,19 @@ verification. An initialized but unrecognized disk is never reformatted.
 
 `build-release.sh` clones the public repository as the locked build user, requires the requested
 40-character commit to be reachable from `origin/main`, checks out that exact commit, verifies a
-clean tree, and builds the four locked release binaries with `CARGO_BUILD_JOBS=2`.
+clean tree, and builds the five locked release binaries with `CARGO_BUILD_JOBS=2`. The fifth is the
+one-shot `craxii-stage27-luna-benchmark` operator binary. It validates the active release and live
+runtime, reads the retained device bearer only from a hidden `/dev/tty` prompt, submits the exact
+canonical prompt once, and verifies the resulting Luna/model/tool/host evidence without reading the
+provider credential or retaining raw model content.
 
 `bootstrap-security-boundary.sh` requires an already-built release and verified data layout. It
 installs users, permissions, binaries, the unit, and the non-secret production config, but leaves
 the unit stopped and disabled and does not create a provider credential.
+
+`upgrade-release.sh` is the post-provisioning immutable-release path. It requires an exact clean
+build checkout, installs a new five-binary release without reading or replacing configuration or
+credentials, atomically advances `/opt/craxii/current`, and performs one normal service restart.
 
 `verify-precredential-host.sh` is the real-host precredential check. It verifies Ubuntu/CPU/cgroup,
 UUID/fstab/bind mounts, the controlled toolchain and exact source revision, users/modes/ACLs,

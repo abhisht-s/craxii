@@ -26,7 +26,9 @@ grep -qx 'VERSION_ID="24.04"' /etc/os-release
 for command in groupadd useradd getent install setfacl sha256sum runuser setpriv; do
   command -v "${command}" >/dev/null
 done
-for binary in craxii-server craxii-admin craxii-workstation-launcher craxii-workstation-reader; do
+for binary in \
+  craxii-server craxii-admin craxii-stage27-luna-benchmark \
+  craxii-workstation-launcher craxii-workstation-reader; do
   [[ -f "${source_directory}/${binary}" && -x "${source_directory}/${binary}" ]]
 done
 "${asset_directory}/bootstrap-data-volume.sh" --verify-only
@@ -81,10 +83,13 @@ install -d -o root -g root -m 0755 "${release_directory}"
 # mode prevents model-controlled work from reading or copying its trusted image.
 install -o root -g craxii-server -m 0550 "${source_directory}/craxii-server" "${release_directory}/craxii-server"
 install -o root -g craxii-server -m 0550 "${source_directory}/craxii-admin" "${release_directory}/craxii-admin"
+install -o root -g craxii-server -m 0550 "${source_directory}/craxii-stage27-luna-benchmark" "${release_directory}/craxii-stage27-luna-benchmark"
 install -o root -g root -m 0111 "${source_directory}/craxii-workstation-reader" "${release_directory}/craxii-workstation-reader"
 install -o root -g craxii-server -m 4750 "${source_directory}/craxii-workstation-launcher" "${release_directory}/craxii-workstation-launcher"
 
-for binary in craxii-server craxii-admin craxii-workstation-launcher craxii-workstation-reader; do
+for binary in \
+  craxii-server craxii-admin craxii-stage27-luna-benchmark \
+  craxii-workstation-launcher craxii-workstation-reader; do
   sha256sum "${release_directory}/${binary}"
 done
 temporary_link="/opt/craxii/.current-${release_version}-$$"

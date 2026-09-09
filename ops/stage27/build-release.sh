@@ -59,11 +59,14 @@ runuser -u craxii-build -- /usr/bin/env -i \
   cargo +1.98.0 build --locked --release -p craxii-server \
     --bin craxii-server \
     --bin craxii-admin \
+    --bin craxii-stage27-luna-benchmark \
     --bin craxii-workstation-launcher \
     --bin craxii-workstation-reader \
     --manifest-path "${source_directory}/Cargo.toml"
 
-for binary in craxii-server craxii-admin craxii-workstation-launcher craxii-workstation-reader; do
+for binary in \
+  craxii-server craxii-admin craxii-stage27-luna-benchmark \
+  craxii-workstation-launcher craxii-workstation-reader; do
   [[ -f "${target_directory}/release/${binary}" && -x "${target_directory}/release/${binary}" ]] ||
     fail "release binary is absent: ${binary}"
 done

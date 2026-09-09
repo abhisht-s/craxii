@@ -7,6 +7,7 @@ set -euo pipefail
 cargo build --locked -p craxii-server \
   --bin craxii-server \
   --bin craxii-admin \
+  --bin craxii-stage27-luna-benchmark \
   --bin craxii-workstation-launcher \
   --bin craxii-workstation-reader
 
@@ -19,6 +20,7 @@ useradd --gid craxii --create-home --home-dir /home/craxii --shell /bin/bash cra
 install -d -o root -g root -m 0755 /opt/craxii /opt/craxii/releases /opt/craxii/releases/test
 install -o root -g craxii-server -m 0550 /craxii-target/debug/craxii-server /opt/craxii/releases/test/craxii-server
 install -o root -g craxii-server -m 0550 /craxii-target/debug/craxii-admin /opt/craxii/releases/test/craxii-admin
+install -o root -g craxii-server -m 0550 /craxii-target/debug/craxii-stage27-luna-benchmark /opt/craxii/releases/test/craxii-stage27-luna-benchmark
 install -o root -g root -m 0111 /craxii-target/debug/craxii-workstation-reader /opt/craxii/releases/test/craxii-workstation-reader
 install -o root -g craxii-server -m 4750 /craxii-target/debug/craxii-workstation-launcher /opt/craxii/releases/test/craxii-workstation-launcher
 ln -s releases/test /opt/craxii/current
@@ -37,6 +39,7 @@ launcher=/opt/craxii/current/craxii-workstation-launcher
 reader=/opt/craxii/current/craxii-workstation-reader
 trusted_binary=/opt/craxii/current/craxii-server
 trusted_admin=/opt/craxii/current/craxii-admin
+benchmark_runner=/opt/craxii/current/craxii-stage27-luna-benchmark
 trusted_binary_digest="$(sha256sum "${trusted_binary}")"
 
 printf '%s\n' synthetic-provider-canary >"${credential}"
@@ -56,6 +59,7 @@ chmod 0660 "${workspace}"
 [[ "$(stat -c '%U:%G:%a' "${reader}")" == "root:root:111" ]]
 [[ "$(stat -c '%U:%G:%a' "${trusted_binary}")" == "root:craxii-server:550" ]]
 [[ "$(stat -c '%U:%G:%a' "${trusted_admin}")" == "root:craxii-server:550" ]]
+[[ "$(stat -c '%U:%G:%a' "${benchmark_runner}")" == "root:craxii-server:550" ]]
 [[ "$(id -G craxii | wc -w)" -eq 1 ]]
 if runuser -u craxii -- "${launcher}" shell x y true >/dev/null 2>&1; then
   echo "error: workstation user invoked the privileged launcher" >&2
@@ -87,10 +91,12 @@ runuser -u craxii-server -- /usr/bin/env CRAXII_BACKEND_CANARY=synthetic-environ
    ! cat '${state}' >/dev/null 2>&1; \
    ! cat '${trusted_binary}' >/dev/null 2>&1; \
    ! cat '${trusted_admin}' >/dev/null 2>&1; \
+   ! cat '${benchmark_runner}' >/dev/null 2>&1; \
    ! cat '${reader}' >/dev/null 2>&1; \
    ! cat '${launcher}' >/dev/null 2>&1; \
    ! '${trusted_binary}' --config '${config}' >/dev/null 2>&1; \
    ! '${trusted_admin}' --config '${config}' preflight >/dev/null 2>&1; \
+   ! '${benchmark_runner}' >/dev/null 2>&1; \
    ! '${launcher}' shell x y true >/dev/null 2>&1; \
    printf changed >'${workspace}'; \
    test \"\$(id -u)\" != 0; \
