@@ -122,6 +122,7 @@ def systemd_properties() -> dict[str, str]:
         "WorkingDirectory",
         "FragmentPath",
         "DropInPaths",
+        "NeedDaemonReload",
         "Environment",
         "KillSignal",
         "ExecMainStartTimestampMonotonic",
@@ -591,6 +592,7 @@ def capture(arguments: argparse.Namespace) -> dict[str, Any]:
     require(properties["WorkingDirectory"] == "/var/lib/craxii", "service working directory mismatch")
     require(properties["FragmentPath"] == "/etc/systemd/system/craxii-server.service", "service fragment path mismatch")
     require(properties["DropInPaths"] == "", "unexpected service drop-in configuration")
+    require(properties["NeedDaemonReload"] == "no", "systemd manager state is stale")
     require(properties["Environment"] == "", "unexpected explicit service environment")
     require(properties["KillSignal"] == "15", "service termination signal mismatch")
     main_pid = int(properties["MainPID"])
