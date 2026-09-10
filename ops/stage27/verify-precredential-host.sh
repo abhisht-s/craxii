@@ -220,7 +220,7 @@ grep -Eq '^CapInh:[[:space:]]*0+$' /proc/self/status; \
 grep -Eq '^CapBnd:[[:space:]]*0+$' /proc/self/status; \
 grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status; \
 grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status; \
-test "\$(ulimit -c)" = 0; \
+test \"\$(ulimit -c)\" = 0; \
 test \"\$HOME\" = /home/craxii; test \"\$USER\" = craxii; \
 test \"\$LOGNAME\" = craxii; test \"\$SHELL\" = /bin/bash; \
 test \"\$LANG\" = C.UTF-8; \

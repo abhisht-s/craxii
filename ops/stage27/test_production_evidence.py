@@ -18,6 +18,7 @@ from unittest import mock
 HELPER = pathlib.Path(__file__).with_name("production-evidence.py")
 VERIFIER = pathlib.Path(__file__).with_name("verify-production-host.sh")
 RELEASE_MANIFEST = pathlib.Path(__file__).with_name("verify-release-manifest.sh")
+STAGE27_SHELL_SCRIPTS = tuple(sorted(HELPER.parent.glob("*.sh")))
 SPEC = importlib.util.spec_from_file_location("stage27_production_evidence", HELPER)
 assert SPEC is not None and SPEC.loader is not None
 evidence = importlib.util.module_from_spec(SPEC)
@@ -173,6 +174,18 @@ class EvidenceComparisonTests(unittest.TestCase):
             '"${cargo}" +1.98.0 --manifest-path',
             run_build,
         )
+
+    def test_stage27_shell_scripts_parse_with_bash(self) -> None:
+        for script in STAGE27_SHELL_SCRIPTS:
+            with self.subTest(script=script.name):
+                parsed = subprocess.run(
+                    ["/bin/bash", "-n", str(script)],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(parsed.returncode, 0, parsed.stderr)
 
     def test_create_once_evidence_fsyncs_file_and_parent_directory(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

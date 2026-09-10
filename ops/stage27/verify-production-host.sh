@@ -161,7 +161,7 @@ verify_deployed_assets() {
     fail "deployed config differs from the audited template"
   cmp -s "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service ||
     fail "deployed systemd unit differs from the audited unit"
-  [[ "$(systemctl show "${service}" --property FragmentPath --value)" ==
+  [[ "$(systemctl show "${service}" --property FragmentPath --value)" == \
      /etc/systemd/system/craxii-server.service ]] ||
     fail "systemd loaded the service from an unexpected fragment"
   [[ -z "$(systemctl show "${service}" --property DropInPaths --value)" ]] ||
