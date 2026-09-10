@@ -55,9 +55,11 @@ the unit stopped and disabled and does not create a provider credential.
 `upgrade-release.sh` is the post-provisioning immutable-release path. It requires an exact clean
 build checkout and matching build manifest, installs a new five-binary release plus the audited
 non-secret config/unit (never the credential), stages and validates the mutable assets before
-stopping the healthy service, atomically replaces each installed file, reloads systemd, and proves
-the manager has no pending reload before atomically advancing `/opt/craxii/current`. It performs one
-normal service restart and requires readiness and exact MainPID release identity before success.
+stopping the healthy service, or requires a failed/inactive recovery service to have no live
+MainPID, then atomically replaces each installed file, reloads systemd, and proves the manager has
+no pending reload before atomically advancing `/opt/craxii/current`. It clears any exhausted
+start-rate counter, performs one candidate start, and requires readiness and exact MainPID release
+identity before success.
 Once candidate startup has been attempted, any later deployment failure stops the unverified
 candidate instead of leaving it active or restart-looping.
 Schema V5 is forward-only: once the new binary applies it, the V4 release is not a valid rollback

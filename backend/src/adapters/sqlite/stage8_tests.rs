@@ -3607,6 +3607,95 @@ async fn populated_v2_migrates_through_v5_without_changing_stage7_identity_or_ol
 }
 
 #[tokio::test]
+async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+    use sqlx::{ConnectOptions as _, Connection as _};
+
+    let root = TestRoot::new();
+    let database_directory = root.path().join("db");
+    fs::create_dir(&database_directory).unwrap();
+    fs::set_permissions(&database_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let database = database_directory.join("craxii.sqlite3");
+    let options = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
+        .foreign_keys(true)
+        .disable_statement_logging();
+    let mut connection = options.connect().await.unwrap();
+    let v4_migrator = sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 4)
+            .cloned()
+            .collect(),
+    );
+    v4_migrator.run(&mut connection).await.unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../tests/fixtures/stage27-v4-tool-history.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let journal_before = sqlx::query_as::<_, (i64, String, i64, String, String)>(
+        "SELECT journal_offset, event_type, event_version, payload_json, payload_sha256 \
+         FROM journal_events ORDER BY journal_offset",
+    )
+    .fetch_all(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(journal_before.len(), 17);
+    assert_eq!(
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT timed_out, cancelled FROM tool_executions",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        (None, None)
+    );
+    connection.close().await.unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let migrated = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
+    assert_eq!(
+        migrated.disposition(),
+        super::schema::DatabaseDisposition::Current
+    );
+    let store = SqliteStateStore::new(migrated.runtime().clone());
+    let consistency = store.verify_application_consistency().await.unwrap();
+    assert_eq!(consistency.journal_head.unwrap().get(), 17);
+    let mut connection = migrated.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT timed_out, cancelled FROM tool_executions",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        (Some(0), Some(0))
+    );
+    let journal_after = sqlx::query_as::<_, (i64, String, i64, String, String)>(
+        "SELECT journal_offset, event_type, event_version, payload_json, payload_sha256 \
+         FROM journal_events ORDER BY journal_offset",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(journal_after, journal_before);
+    drop(connection);
+    migrated.shutdown().await;
+}
+
+#[tokio::test]
 async fn natural_stage8_queries_use_the_frozen_named_indexes() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();

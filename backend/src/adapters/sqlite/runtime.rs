@@ -1295,7 +1295,12 @@ pub(super) mod tests {
         sqlx::query(
             "INSERT INTO tool_executions VALUES \
              ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"success\"}', NULL, NULL), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"process_exit\"}', NULL, NULL), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"signal_termination\"}', NULL, NULL), \
              ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"timeout\"}', 1, NULL), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"cancellation\"}', NULL, 1), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"spawn_failure\"}', NULL, NULL), \
+             ('completed', '2026-01-01T00:00:00.000000Z', '{\"result_kind\":\"cleanup_failure\"}', NULL, NULL), \
              ('completed', NULL, '{\"result_kind\":\"validation_rejection\"}', NULL, NULL), \
              ('outcome_unknown', '2026-01-01T00:00:00.000000Z', NULL, NULL, NULL)",
         )
@@ -1320,7 +1325,12 @@ pub(super) mod tests {
             rows,
             vec![
                 (Some(0), Some(0)),
+                (Some(0), Some(0)),
+                (Some(0), Some(0)),
                 (Some(1), Some(0)),
+                (Some(0), Some(1)),
+                (Some(0), Some(0)),
+                (Some(0), Some(0)),
                 (None, None),
                 (None, None),
             ]

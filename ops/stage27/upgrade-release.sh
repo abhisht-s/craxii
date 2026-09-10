@@ -83,7 +83,13 @@ previous_release="$(readlink -f "${current}")"
   fail "requested release is already active"
 [[ ! -e "${release_directory}" && ! -L "${release_directory}" ]] ||
   fail "immutable release path already exists"
-systemctl is-active --quiet "${service}" || fail "service is not active"
+if ! systemctl is-active --quiet "${service}"; then
+  active_state="$(systemctl show "${service}" --property ActiveState --value)"
+  main_pid="$(systemctl show "${service}" --property MainPID --value)"
+  [[ "${active_state}" == inactive || "${active_state}" == failed ]] ||
+    fail "service is neither active nor safely quiescent"
+  [[ "${main_pid}" == 0 ]] || fail "inactive service retains a live MainPID"
+fi
 systemctl is-enabled --quiet "${service}" || fail "service is not enabled"
 
 # Prepare and validate every mutable host asset before stopping the healthy release. The final
@@ -171,6 +177,7 @@ systemctl daemon-reload
 temporary_link="/opt/craxii/.current-${release_version}-$$"
 ln -s "releases/${release_version}" "${temporary_link}"
 mv -Tf "${temporary_link}" "${current}"
+systemctl reset-failed "${service}"
 candidate_start_attempted=1
 systemctl start "${service}"
 systemctl is-active --quiet "${service}" || fail "updated service did not become active"

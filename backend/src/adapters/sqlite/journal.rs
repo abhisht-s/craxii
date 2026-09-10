@@ -18,9 +18,11 @@ use crate::domain::{
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
+use super::schema::MAX_SUPPORTED_SCHEMA_VERSION;
 use super::transaction::WriteTransaction;
 
 const MAX_PAYLOAD_BYTES: usize = 262_144;
+const MIN_RUNTIME_EVENT_SCHEMA_VERSION: i64 = 3;
 
 fn inconsistent() -> SqliteAdapterError {
     SqliteAdapterError::new(SqliteFailureKind::InconsistentSchema)
@@ -953,6 +955,11 @@ pub(super) fn decode_event_payload(
     Ok(payload)
 }
 
+fn runtime_event_schema_is_supported(schema_version: SchemaVersion) -> bool {
+    (MIN_RUNTIME_EVENT_SCHEMA_VERSION..=MAX_SUPPORTED_SCHEMA_VERSION)
+        .contains(&schema_version.get())
+}
+
 fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdapterError> {
     let valid = match payload {
         JournalEventPayload::CraxiiInitialized(value) => {
@@ -1036,13 +1043,14 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         }
         JournalEventPayload::ArtifactRecorded(value) => value.canonical_length <= i64::MAX as u64,
         JournalEventPayload::RuntimeStarted(value) => {
-            value.schema_version.get() == 5
+            runtime_event_schema_is_supported(value.schema_version)
                 && !value.linux_boot_id.as_str().is_empty()
                 && !value.binary_version.as_str().is_empty()
                 && !value.git_revision.as_str().is_empty()
         }
         JournalEventPayload::RuntimeRecoveryPerformed(value) => {
-            value.schema_version.get() == 5 && value.counts_are_persistable()
+            runtime_event_schema_is_supported(value.schema_version)
+                && value.counts_are_persistable()
         }
         JournalEventPayload::RuntimeStopping(value) => {
             value.shutdown_reason == RuntimeShutdownReason::GracefulShutdown
@@ -1052,6 +1060,24 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         }
     };
     if valid { Ok(()) } else { Err(inconsistent()) }
+}
+
+fn validate_current_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdapterError> {
+    validate_payload_kind(payload)?;
+    let current_runtime_schema = match payload {
+        JournalEventPayload::RuntimeStarted(value) => {
+            value.schema_version.get() == MAX_SUPPORTED_SCHEMA_VERSION
+        }
+        JournalEventPayload::RuntimeRecoveryPerformed(value) => {
+            value.schema_version.get() == MAX_SUPPORTED_SCHEMA_VERSION
+        }
+        _ => true,
+    };
+    if current_runtime_schema {
+        Ok(())
+    } else {
+        Err(inconsistent())
+    }
 }
 
 pub(super) struct JournalAppendIntent {
@@ -1079,7 +1105,7 @@ pub(super) fn prepare_event(
     intent: JournalAppendIntent,
 ) -> Result<PreparedJournalEvent, SqliteAdapterError> {
     validate_intent(&intent)?;
-    validate_payload_kind(&intent.payload)?;
+    validate_current_payload_kind(&intent.payload)?;
     let (payload_json, payload_sha256) = encode_event_payload(&intent.payload)?;
     Ok(PreparedJournalEvent {
         intent,
@@ -1337,6 +1363,278 @@ pub(super) async fn load_stream_events(
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
     rows.iter().map(decode_event_row).collect()
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) struct JournalDecodeDiagnostic {
+    pub journal_offset: Option<i64>,
+    pub event_type: String,
+    pub event_version: Option<i64>,
+    pub payload_schema_version: Option<i64>,
+    pub payload_format_version: Option<i64>,
+    pub structural_failure_category: &'static str,
+    pub field_names: &'static str,
+    pub invariant_class: &'static str,
+}
+
+fn safe_event_type(value: String) -> String {
+    let valid = (3..=128).contains(&value.len())
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.')
+        });
+    if valid { value } else { "<invalid>".to_owned() }
+}
+
+fn payload_versions(payload_json: &str) -> (Option<i64>, Option<i64>) {
+    let Ok(serde_json::Value::Object(object)) =
+        serde_json::from_str::<serde_json::Value>(payload_json)
+    else {
+        return (None, None);
+    };
+    let schema = object
+        .get("schema_version")
+        .or_else(|| object.get("schema_revision"))
+        .and_then(serde_json::Value::as_i64);
+    let format = object.get("version").and_then(serde_json::Value::as_i64);
+    (schema, format)
+}
+
+fn payload_field_names(kind: JournalEventKind) -> &'static str {
+    match kind {
+        JournalEventKind::CraxiiInitialized => {
+            "craxii_id,display_name,owner_label,architecture_revision,schema_revision,workstation_id,workstation_generation,workstation_architecture,workstation_os_release,capabilities_sha256,workspace_id,workspace_logical_name,workspace_logical_root,primary_conversation_id,created_at"
+        }
+        JournalEventKind::ConversationCreated => {
+            "conversation_id,craxii_id,kind,lifecycle,next_work_ordinal,state_version,created_at"
+        }
+        JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
+            "message_id,craxii_id,conversation_id,role,content,content_sha256,produced_by_work_id,device_id,client_message_id,committed_at"
+        }
+        JournalEventKind::WorkQueued => {
+            "work_id,craxii_id,conversation_id,conversation_work_ordinal,kind,priority,workspace_id,correlation_id,state_version,created_at,queued_at,trigger"
+        }
+        JournalEventKind::WorkStarted
+        | JournalEventKind::WorkWaitingOnModel
+        | JournalEventKind::WorkWaitingOnTool
+        | JournalEventKind::WorkResumed
+        | JournalEventKind::WorkCancelRequested
+        | JournalEventKind::WorkCancelled
+        | JournalEventKind::WorkCompleted
+        | JournalEventKind::WorkFailed
+        | JournalEventKind::WorkInterrupted => {
+            "work_id,from_state,to_state,expected_state_version,expected_runtime_owner,expected_current_attempt,expected_cancellation_reason,state_version,runtime_owner,current_attempt,cancellation_reason,terminal_reason,transitioned_at"
+        }
+        JournalEventKind::ModelInvocationStarted
+        | JournalEventKind::ModelInvocationStreaming
+        | JournalEventKind::ModelInvocationCompleted
+        | JournalEventKind::ModelInvocationFailed
+        | JournalEventKind::ModelInvocationInterrupted => {
+            "work_id,model_invocation_id,logical_invocation_id,state,observed_at"
+        }
+        JournalEventKind::ToolExecutionRequested
+        | JournalEventKind::ToolExecutionDispatching
+        | JournalEventKind::ToolExecutionCompleted
+        | JournalEventKind::ToolExecutionInterruptedBeforeDispatch
+        | JournalEventKind::ToolExecutionOutcomeUnknown => {
+            "work_id,tool_execution_id,state,outcome_classification,observed_at"
+        }
+        JournalEventKind::ArtifactRecorded => {
+            "work_id,artifact_id,sha256,canonical_length,retention,recorded_at"
+        }
+        JournalEventKind::RuntimeStarted => {
+            "runtime_instance_id,craxii_id,workstation_id,workstation_generation,linux_boot_id,process_id,binary_version,git_revision,schema_version,started_at"
+        }
+        JournalEventKind::RuntimeRecoveryPerformed => {
+            "runtime_instance_id,stale_runtimes_observed,stale_runtimes_closed,retained_queued_work,interrupted_work,model_attempts_provider_outcome_unknown,model_attempts_terminal_preserved,tool_attempts_interrupted_before_dispatch,tool_attempts_outcome_unknown,tool_attempts_terminal_preserved,drafts_abandoned,orphan_artifacts_observed,cleanup_checks_performed,cleanup_unconfirmed,recovery_duration_ms,binary_version,schema_version,recovered_at"
+        }
+        JournalEventKind::RuntimeStopping => {
+            "runtime_instance_id,shutdown_requested_at,shutdown_reason,grace_deadline,active_work_count,active_task_count"
+        }
+    }
+}
+
+fn payload_invariant_class(kind: JournalEventKind) -> &'static str {
+    match kind {
+        JournalEventKind::CraxiiInitialized => "bootstrap_identity_contract",
+        JournalEventKind::ConversationCreated => "primary_conversation_contract",
+        JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
+            "message_role_provenance_and_content_digest"
+        }
+        JournalEventKind::WorkQueued => "work_queue_contract",
+        JournalEventKind::WorkStarted
+        | JournalEventKind::WorkWaitingOnModel
+        | JournalEventKind::WorkWaitingOnTool
+        | JournalEventKind::WorkResumed
+        | JournalEventKind::WorkCancelRequested
+        | JournalEventKind::WorkCancelled
+        | JournalEventKind::WorkCompleted
+        | JournalEventKind::WorkFailed
+        | JournalEventKind::WorkInterrupted => "work_transition_event_type_and_state",
+        JournalEventKind::ModelInvocationStarted
+        | JournalEventKind::ModelInvocationStreaming
+        | JournalEventKind::ModelInvocationCompleted
+        | JournalEventKind::ModelInvocationFailed
+        | JournalEventKind::ModelInvocationInterrupted => "model_invocation_event_type_and_state",
+        JournalEventKind::ToolExecutionRequested
+        | JournalEventKind::ToolExecutionDispatching
+        | JournalEventKind::ToolExecutionCompleted
+        | JournalEventKind::ToolExecutionInterruptedBeforeDispatch
+        | JournalEventKind::ToolExecutionOutcomeUnknown => {
+            "tool_execution_event_type_state_and_outcome_classification"
+        }
+        JournalEventKind::ArtifactRecorded => "artifact_length_range",
+        JournalEventKind::RuntimeStarted => "runtime_metadata_and_supported_schema_version",
+        JournalEventKind::RuntimeRecoveryPerformed => {
+            "runtime_recovery_counters_and_supported_schema_version"
+        }
+        JournalEventKind::RuntimeStopping => "runtime_shutdown_contract",
+    }
+}
+
+fn payload_shape_is_valid(kind: JournalEventKind, payload_json: &str) -> bool {
+    match kind {
+        JournalEventKind::CraxiiInitialized => {
+            serde_json::from_str::<StoredCraxiiInitializedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::ConversationCreated => {
+            serde_json::from_str::<StoredConversationCreatedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
+            serde_json::from_str::<StoredMessageCommittedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::WorkQueued => {
+            serde_json::from_str::<StoredWorkQueuedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::WorkStarted
+        | JournalEventKind::WorkWaitingOnModel
+        | JournalEventKind::WorkWaitingOnTool
+        | JournalEventKind::WorkResumed
+        | JournalEventKind::WorkCancelRequested
+        | JournalEventKind::WorkCancelled
+        | JournalEventKind::WorkCompleted
+        | JournalEventKind::WorkFailed
+        | JournalEventKind::WorkInterrupted => {
+            serde_json::from_str::<StoredWorkTransitionV1>(payload_json).is_ok()
+        }
+        JournalEventKind::ModelInvocationStarted
+        | JournalEventKind::ModelInvocationStreaming
+        | JournalEventKind::ModelInvocationCompleted
+        | JournalEventKind::ModelInvocationFailed
+        | JournalEventKind::ModelInvocationInterrupted => {
+            serde_json::from_str::<StoredModelInvocationEventV1>(payload_json).is_ok()
+        }
+        JournalEventKind::ToolExecutionRequested
+        | JournalEventKind::ToolExecutionDispatching
+        | JournalEventKind::ToolExecutionCompleted
+        | JournalEventKind::ToolExecutionInterruptedBeforeDispatch
+        | JournalEventKind::ToolExecutionOutcomeUnknown => {
+            serde_json::from_str::<StoredToolExecutionEventV1>(payload_json).is_ok()
+        }
+        JournalEventKind::ArtifactRecorded => {
+            serde_json::from_str::<StoredArtifactRecordedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::RuntimeStarted => {
+            serde_json::from_str::<StoredRuntimeStartedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::RuntimeRecoveryPerformed => {
+            serde_json::from_str::<StoredRuntimeRecoveryPerformedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::RuntimeStopping => {
+            serde_json::from_str::<StoredRuntimeStoppingV1>(payload_json).is_ok()
+        }
+    }
+}
+
+pub(super) fn diagnose_event_decode(row: &sqlx::sqlite::SqliteRow) -> JournalDecodeDiagnostic {
+    let journal_offset = row.try_get::<i64, _>("journal_offset").ok();
+    let raw_event_type = row.try_get::<String, _>("event_type").ok();
+    let event_type = raw_event_type
+        .clone()
+        .map_or_else(|| "<unavailable>".to_owned(), safe_event_type);
+    let event_version = row.try_get::<i64, _>("event_version").ok();
+    let payload_json = row.try_get::<String, _>("payload_json").ok();
+    let (payload_schema_version, payload_format_version) = payload_json
+        .as_deref()
+        .map_or((None, None), payload_versions);
+    let mut diagnostic = JournalDecodeDiagnostic {
+        journal_offset,
+        event_type,
+        event_version,
+        payload_schema_version,
+        payload_format_version,
+        structural_failure_category: "row_column_decode",
+        field_names: "journal_offset,event_type,event_version,payload_json,payload_sha256",
+        invariant_class: "required_journal_columns",
+    };
+    let (Some(raw_event_type), Some(event_version), Some(payload_json), Some(payload_sha256)) = (
+        raw_event_type,
+        event_version,
+        payload_json,
+        row.try_get::<String, _>("payload_sha256").ok(),
+    ) else {
+        return diagnostic;
+    };
+    if payload_json.len() > MAX_PAYLOAD_BYTES {
+        diagnostic.structural_failure_category = "payload_size";
+        diagnostic.field_names = "payload_json";
+        diagnostic.invariant_class = "maximum_payload_bytes";
+        return diagnostic;
+    }
+    let Ok(stored_digest) = Sha256Digest::parse_canonical(&payload_sha256) else {
+        diagnostic.structural_failure_category = "payload_digest";
+        diagnostic.field_names = "payload_sha256";
+        diagnostic.invariant_class = "canonical_sha256";
+        return diagnostic;
+    };
+    if Sha256Digest::hash_bytes(payload_json.as_bytes()) != stored_digest {
+        diagnostic.structural_failure_category = "payload_digest";
+        diagnostic.field_names = "payload_json,payload_sha256";
+        diagnostic.invariant_class = "stored_payload_byte_integrity";
+        return diagnostic;
+    }
+    let kind = match resolve_event_version(&raw_event_type, event_version) {
+        crate::domain::JournalVersionResolution::Supported(kind) => kind,
+        crate::domain::JournalVersionResolution::UnsupportedKnown(_) => {
+            diagnostic.structural_failure_category = "event_version_dispatch";
+            diagnostic.field_names = "event_type,event_version";
+            diagnostic.invariant_class = "unsupported_known_event_version";
+            return diagnostic;
+        }
+        crate::domain::JournalVersionResolution::Unknown => {
+            diagnostic.structural_failure_category = "event_version_dispatch";
+            diagnostic.field_names = "event_type,event_version";
+            diagnostic.invariant_class = "unknown_event_type";
+            return diagnostic;
+        }
+    };
+    diagnostic.field_names = payload_field_names(kind);
+    let Ok(serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(&payload_json)
+    else {
+        diagnostic.structural_failure_category = "payload_json_structure";
+        diagnostic.invariant_class = "valid_json_object";
+        return diagnostic;
+    };
+    if !payload_shape_is_valid(kind, &payload_json) {
+        diagnostic.structural_failure_category = "payload_shape";
+        diagnostic.invariant_class = "required_types_and_no_unknown_fields";
+        return diagnostic;
+    }
+    if decode_event_payload(
+        &raw_event_type,
+        event_version,
+        &payload_json,
+        &payload_sha256,
+    )
+    .is_err()
+    {
+        diagnostic.structural_failure_category = "payload_semantic_invariant";
+        diagnostic.invariant_class = payload_invariant_class(kind);
+        return diagnostic;
+    }
+    diagnostic.structural_failure_category = "event_envelope_invariant";
+    diagnostic.field_names = "event_id,craxii_id,stream_id,stream_seq,conversation_id,work_id,causation_event_id,correlation_id,actor_kind,actor_id,runtime_instance_id,recorded_at,occurred_at";
+    diagnostic.invariant_class = "canonical_envelope_and_payload_links";
+    diagnostic
 }
 
 pub(super) fn decode_event_row(
@@ -1828,6 +2126,89 @@ mod tests {
             decode_event_payload("conversation.created", 1, extra, &extra_digest.to_string())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn runtime_v1_decode_accepts_historical_schema_without_permitting_historical_writes() {
+        for kind in [
+            JournalEventKind::RuntimeStarted,
+            JournalEventKind::RuntimeRecoveryPerformed,
+        ] {
+            for schema_version in [3, 4] {
+                let mut payload = sample(kind);
+                match &mut payload {
+                    JournalEventPayload::RuntimeStarted(value) => {
+                        value.schema_version = SchemaVersion::try_new(schema_version).unwrap();
+                    }
+                    JournalEventPayload::RuntimeRecoveryPerformed(value) => {
+                        value.schema_version = SchemaVersion::try_new(schema_version).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let (json, digest) = encode_event_payload(&payload).unwrap();
+                assert_eq!(
+                    decode_event_payload(kind.as_str(), 1, &json, &digest.to_string()).unwrap(),
+                    payload
+                );
+                assert!(validate_current_payload_kind(&payload).is_err());
+            }
+
+            for schema_version in [2, 6] {
+                let mut payload = sample(kind);
+                match &mut payload {
+                    JournalEventPayload::RuntimeStarted(value) => {
+                        value.schema_version = SchemaVersion::try_new(schema_version).unwrap();
+                    }
+                    JournalEventPayload::RuntimeRecoveryPerformed(value) => {
+                        value.schema_version = SchemaVersion::try_new(schema_version).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                let (json, digest) = encode_event_payload(&payload).unwrap();
+                assert!(
+                    decode_event_payload(kind.as_str(), 1, &json, &digest.to_string()).is_err()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn decode_diagnostic_reports_only_safe_runtime_structure() {
+        use sqlx::Connection as _;
+
+        let mut payload = sample(JournalEventKind::RuntimeStarted);
+        let JournalEventPayload::RuntimeStarted(value) = &mut payload else {
+            unreachable!();
+        };
+        value.schema_version = SchemaVersion::try_new(2).unwrap();
+        let (json, digest) = encode_event_payload(&payload).unwrap();
+        let mut connection = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+        let row = sqlx::query(
+            "SELECT 41 AS journal_offset, 'runtime.started' AS event_type, 1 AS event_version, \
+             ? AS payload_json, ? AS payload_sha256",
+        )
+        .bind(json)
+        .bind(digest.to_string())
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        let diagnostic = diagnose_event_decode(&row);
+        assert_eq!(diagnostic.journal_offset, Some(41));
+        assert_eq!(diagnostic.event_type, "runtime.started");
+        assert_eq!(diagnostic.event_version, Some(1));
+        assert_eq!(diagnostic.payload_schema_version, Some(2));
+        assert_eq!(diagnostic.payload_format_version, None);
+        assert_eq!(
+            diagnostic.structural_failure_category,
+            "payload_semantic_invariant"
+        );
+        assert_eq!(
+            diagnostic.invariant_class,
+            "runtime_metadata_and_supported_schema_version"
+        );
+        assert!(diagnostic.field_names.contains("schema_version"));
+        assert!(!diagnostic.field_names.contains("payload_json"));
+        connection.close().await.unwrap();
     }
 
     #[test]

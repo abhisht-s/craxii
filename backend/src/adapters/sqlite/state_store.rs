@@ -23,7 +23,9 @@ use super::codec::{
     decode_work_state, decode_workstation_row, encode_workstation_capabilities,
 };
 use super::error::{SqliteAdapterError, SqliteFailureKind};
-use super::journal::{JournalAppendIntent, append_event, decode_event_row, prepare_event};
+use super::journal::{
+    JournalAppendIntent, append_event, decode_event_row, diagnose_event_decode, prepare_event,
+};
 use super::runtime::SqliteRuntime;
 use super::transaction::WriteTransaction;
 
@@ -170,11 +172,28 @@ impl SqliteStateStore {
             .fetch_all(&mut *transaction)
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
-        let events = event_rows
-            .iter()
-            .map(decode_event_row)
-            .collect::<Result<Vec<_>, _>>();
-        let events = consistency_step!("journal_event_decode", events);
+        let mut events = Vec::with_capacity(event_rows.len());
+        for row in &event_rows {
+            match decode_event_row(row) {
+                Ok(event) => events.push(event),
+                Err(error) => {
+                    let diagnostic = diagnose_event_decode(row);
+                    tracing::error!(
+                        event_name = "application_consistency_check_failed",
+                        validation_stage = "journal_event_decode",
+                        journal_offset = ?diagnostic.journal_offset,
+                        event_type = diagnostic.event_type,
+                        event_version = ?diagnostic.event_version,
+                        payload_schema_version = ?diagnostic.payload_schema_version,
+                        payload_format_version = ?diagnostic.payload_format_version,
+                        structural_failure_category = diagnostic.structural_failure_category,
+                        field_names = diagnostic.field_names,
+                        invariant_class = diagnostic.invariant_class,
+                    );
+                    return Err(error);
+                }
+            }
+        }
         let projected = consistency_step!(
             "journal_projection",
             project(&events).map_err(|_| inconsistent())
