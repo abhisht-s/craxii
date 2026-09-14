@@ -134,8 +134,14 @@ impl LocalWorkstation {
         );
         #[cfg(target_os = "linux")]
         if !credential_free_direct_execution && support.user_switch_launcher.is_none() {
-            return Err(WorkstationError::new(
+            let diagnostic_code = support
+                .user_switch_launcher_failure
+                .map_or("launcher_probe_unknown_failure", |failure| {
+                    failure.diagnostic_code()
+                });
+            return Err(WorkstationError::with_diagnostic_code(
                 WorkstationErrorKind::UnsupportedCapability,
+                diagnostic_code,
             ));
         }
         let capabilities = stage13_capabilities(
@@ -872,6 +878,8 @@ pub(crate) struct LocalExecutionSupport {
     pub(crate) process_group: bool,
     pub(crate) cgroup: bool,
     user_switch_launcher: Option<PathBuf>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    user_switch_launcher_failure: Option<execution::UserSwitchLauncherProbeFailure>,
     cgroup_root: Option<PathBuf>,
 }
 
@@ -901,11 +909,13 @@ pub(crate) fn observe_execution_support(
         });
     let cgroup_root = execution::probe_cgroup_root(delegated_cgroup_root);
     let cgroup = cgroup_root.is_some();
-    let user_switch_launcher = execution::probe_user_switch_launcher(
+    let user_switch_launcher_probe = execution::probe_user_switch_launcher(
         user_switch_launcher,
         user_switch_probe_cwd,
         cgroup_root.as_deref(),
     );
+    let user_switch_launcher_failure = user_switch_launcher_probe.as_ref().err().copied();
+    let user_switch_launcher = user_switch_launcher_probe.ok();
     let foreground = shell_available
         && (cfg!(target_os = "macos")
             || (cgroup && (user_switch_launcher.is_some() || credential_free_direct_execution)));
@@ -919,6 +929,7 @@ pub(crate) fn observe_execution_support(
         process_group: foreground,
         cgroup,
         user_switch_launcher,
+        user_switch_launcher_failure,
         cgroup_root,
     }
 }

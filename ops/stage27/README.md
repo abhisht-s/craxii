@@ -80,8 +80,11 @@ environment variable, refuses overwrite, and installs the systemd credential sou
 `--pre-reboot` mode creates two fixed non-secret persistence sentinels, captures a read-only
 canonical-state snapshot, runs focused recovery/ambiguity checks with a scripted provider, runs a
 real Linux terminal-outcome matrix and cancellation through the installed privilege-drop launcher
-and delegated execution cgroup, and coordinates one normal systemd service restart while both an owned execution and an
-outside control process are alive. It then writes a redacted JSON evidence bundle and restart
+and delegated execution cgroup, and coordinates one normal systemd service restart while both an
+owned execution and an outside control process are alive. Every Rust live-test worker enters the
+delegated execution root before dropping to `craxii-server` and retains only the production
+`CAP_KILL` effective authority and transition bounding set; no cross-delegation `CAP_SYS_ADMIN`
+path is used. It then writes a redacted JSON evidence bundle and restart
 comparison under `/srv/craxii-data/stage27-evidence`. It never reads or hashes the provider
 credential; the credential check is limited to file metadata and a negative model-child access
 probe. Independent read-only and isolated checks accumulate a consolidated result; cgroup residue

@@ -1758,32 +1758,86 @@ pub(super) fn probe_cgroup_root(configured_root: Option<&Path>) -> Option<PathBu
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum UserSwitchLauncherProbeFailure {
+    UnsupportedPlatform,
+    LauncherNotConfigured,
+    ProbeCwdNotConfigured,
+    LauncherPathInvalid,
+    LauncherMetadataUnavailable,
+    ReaderMetadataUnavailable,
+    LauncherMetadataRejected,
+    CgroupUnavailable,
+    ExecutionCgroupCreateFailed,
+    SpawnPermissionDenied,
+    SpawnFailed,
+    ChildRejected,
+    UnexpectedOutput,
+    CleanupUnconfirmed,
+}
+
+impl UserSwitchLauncherProbeFailure {
+    pub(super) const fn diagnostic_code(self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "launcher_probe_unsupported_platform",
+            Self::LauncherNotConfigured => "launcher_probe_not_configured",
+            Self::ProbeCwdNotConfigured => "launcher_probe_cwd_not_configured",
+            Self::LauncherPathInvalid => "launcher_probe_path_invalid",
+            Self::LauncherMetadataUnavailable => "launcher_probe_metadata_unavailable",
+            Self::ReaderMetadataUnavailable => "launcher_probe_reader_metadata_unavailable",
+            Self::LauncherMetadataRejected => "launcher_probe_metadata_rejected",
+            Self::CgroupUnavailable => "launcher_probe_cgroup_unavailable",
+            Self::ExecutionCgroupCreateFailed => "launcher_probe_cgroup_create_failed",
+            Self::SpawnPermissionDenied => "launcher_probe_spawn_permission_denied",
+            Self::SpawnFailed => "launcher_probe_spawn_failed",
+            Self::ChildRejected => "launcher_probe_child_rejected",
+            Self::UnexpectedOutput => "launcher_probe_unexpected_output",
+            Self::CleanupUnconfirmed => "launcher_probe_cleanup_unconfirmed",
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_spawn_error(error: &std::io::Error) -> Self {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            Self::SpawnPermissionDenied
+        } else {
+            Self::SpawnFailed
+        }
+    }
+}
+
 pub(super) fn probe_user_switch_launcher(
     configured: Option<&Path>,
     probe_cwd: Option<&Path>,
     cgroup_root: Option<&Path>,
-) -> Option<PathBuf> {
+) -> Result<PathBuf, UserSwitchLauncherProbeFailure> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (configured, probe_cwd, cgroup_root);
-        None
+        Err(UserSwitchLauncherProbeFailure::UnsupportedPlatform)
     }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
-        let configured = configured?;
-        let probe_cwd = probe_cwd?;
+        let configured = configured.ok_or(UserSwitchLauncherProbeFailure::LauncherNotConfigured)?;
+        let probe_cwd = probe_cwd.ok_or(UserSwitchLauncherProbeFailure::ProbeCwdNotConfigured)?;
         if !configured.is_absolute()
             || configured.file_name().and_then(|value| value.to_str())
                 != Some("craxii-workstation-launcher")
         {
-            return None;
+            return Err(UserSwitchLauncherProbeFailure::LauncherPathInvalid);
         }
-        let canonical = std::fs::canonicalize(configured).ok()?;
-        let metadata = std::fs::metadata(&canonical).ok()?;
-        let reader = canonical.parent()?.join("craxii-workstation-reader");
-        let reader_metadata = std::fs::symlink_metadata(&reader).ok()?;
+        let canonical = std::fs::canonicalize(configured)
+            .map_err(|_| UserSwitchLauncherProbeFailure::LauncherMetadataUnavailable)?;
+        let metadata = std::fs::metadata(&canonical)
+            .map_err(|_| UserSwitchLauncherProbeFailure::LauncherMetadataUnavailable)?;
+        let reader = canonical
+            .parent()
+            .ok_or(UserSwitchLauncherProbeFailure::LauncherPathInvalid)?
+            .join("craxii-workstation-reader");
+        let reader_metadata = std::fs::symlink_metadata(&reader)
+            .map_err(|_| UserSwitchLauncherProbeFailure::ReaderMetadataUnavailable)?;
         let current_gid = unsafe { nix::libc::getegid() };
         if !metadata.is_file()
             || metadata.uid() != 0
@@ -1798,11 +1852,14 @@ pub(super) fn probe_user_switch_launcher(
             || reader_metadata.permissions().mode() & 0o111 == 0
             || !trusted_root_owned_ancestors(&canonical)
         {
-            return None;
+            return Err(UserSwitchLauncherProbeFailure::LauncherMetadataRejected);
         }
 
+        let cgroup_root = cgroup_root.ok_or(UserSwitchLauncherProbeFailure::CgroupUnavailable)?;
         let execution_id = ExecutionId::generate();
-        let cgroup = ExecutionCgroup::create(cgroup_root, execution_id).ok()??;
+        let cgroup = ExecutionCgroup::create(Some(cgroup_root), execution_id)
+            .map_err(|_| UserSwitchLauncherProbeFailure::ExecutionCgroupCreateFailed)?
+            .ok_or(UserSwitchLauncherProbeFailure::ExecutionCgroupCreateFailed)?;
         let procs = cgroup.procs_cstring.clone();
 
         let probe_command = user_switch_launcher_probe_command(execution_id);
@@ -1839,16 +1896,20 @@ pub(super) fn probe_user_switch_launcher(
                 Ok(())
             });
         }
-        let output = command.output().ok();
+        let output = command.output();
         let cleanup = cgroup.cleanup_after_spawn_failure();
-        output
-            .filter(|output| {
-                output.status.success()
-                    && output.stdout == b"ready"
-                    && output.stderr.is_empty()
-                    && cleanup.confirmed()
-            })
-            .map(|_| canonical)
+        if !cleanup.confirmed() {
+            return Err(UserSwitchLauncherProbeFailure::CleanupUnconfirmed);
+        }
+        let output =
+            output.map_err(|error| UserSwitchLauncherProbeFailure::from_spawn_error(&error))?;
+        if !output.status.success() {
+            return Err(UserSwitchLauncherProbeFailure::ChildRejected);
+        }
+        if output.stdout != b"ready" || !output.stderr.is_empty() {
+            return Err(UserSwitchLauncherProbeFailure::UnexpectedOutput);
+        }
+        Ok(canonical)
     }
 }
 
@@ -2011,6 +2072,79 @@ mod tests {
     use crate::ports::workstation_preparation::{
         PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
     };
+
+    #[test]
+    fn launcher_probe_failures_have_specific_safe_diagnostic_codes() {
+        let cases = [
+            (
+                UserSwitchLauncherProbeFailure::UnsupportedPlatform,
+                "launcher_probe_unsupported_platform",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::LauncherNotConfigured,
+                "launcher_probe_not_configured",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::ProbeCwdNotConfigured,
+                "launcher_probe_cwd_not_configured",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::LauncherPathInvalid,
+                "launcher_probe_path_invalid",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::LauncherMetadataUnavailable,
+                "launcher_probe_metadata_unavailable",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::ReaderMetadataUnavailable,
+                "launcher_probe_reader_metadata_unavailable",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::LauncherMetadataRejected,
+                "launcher_probe_metadata_rejected",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::CgroupUnavailable,
+                "launcher_probe_cgroup_unavailable",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::ExecutionCgroupCreateFailed,
+                "launcher_probe_cgroup_create_failed",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::SpawnPermissionDenied,
+                "launcher_probe_spawn_permission_denied",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::SpawnFailed,
+                "launcher_probe_spawn_failed",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::ChildRejected,
+                "launcher_probe_child_rejected",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::UnexpectedOutput,
+                "launcher_probe_unexpected_output",
+            ),
+            (
+                UserSwitchLauncherProbeFailure::CleanupUnconfirmed,
+                "launcher_probe_cleanup_unconfirmed",
+            ),
+        ];
+        let mut observed = std::collections::BTreeSet::new();
+        for (failure, expected) in cases {
+            let code = failure.diagnostic_code();
+            assert_eq!(code, expected);
+            assert!(code.is_ascii());
+            assert!(
+                code.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            );
+            assert!(observed.insert(code));
+        }
+    }
 
     fn request() -> ExecutionRequest {
         let workstation_id = WorkstationId::generate();

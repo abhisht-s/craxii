@@ -672,6 +672,41 @@ fi
         self.assertNotIn("< <(", compile_function)
         self.assertIn('>"${binary_list}"', compile_function)
 
+    def test_live_workers_reuse_the_cap_kill_delegated_runner(self) -> None:
+        source = VERIFIER.read_text(encoding="utf-8")
+        runner = shell_function_source("run_delegated_test")
+        live = shell_function_source("run_live_test")
+        unit = shell_function_source("run_live_unit_test")
+        controller_move = shell_function_source("move_live_test_to_verifier_cgroup")
+
+        self.assertLess(
+            runner.index('printf \'0\\n\' >"${cgroup_root}/cgroup.procs"'),
+            runner.index("--reuid="),
+        )
+        self.assertIn(
+            "--bounding-set=-all,+kill,+setgid,+setuid,+setpcap", runner
+        )
+        self.assertIn("--inh-caps=-all,+kill --ambient-caps=-all,+kill", runner)
+        self.assertNotIn("sys_admin", source.lower())
+        self.assertIn(
+            'run_delegated_test "${installed_test}" yes "${test_name}"', live
+        )
+        self.assertIn(
+            'run_delegated_test "${installed_unit_test}" no "${test_name}"', unit
+        )
+        self.assertIn(
+            'printf \'%s\\n\' "${test_pid}" >"${verifier_cgroup_procs}"',
+            controller_move,
+        )
+        restart_start = source.index(
+            "run_live_test live_systemd_restart_kills_delegated_execution_but_not_verifier"
+        )
+        restart_end = source.index('systemctl restart "${service}"', restart_start)
+        restart_setup = source[restart_start:restart_end]
+        self.assertIn(
+            'move_live_test_to_verifier_cgroup "${live_test_pid}"', restart_setup
+        )
+
     def test_stage27_shell_scripts_parse_with_bash(self) -> None:
         for script in STAGE27_SHELL_SCRIPTS:
             with self.subTest(script=script.name):

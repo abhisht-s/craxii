@@ -369,22 +369,34 @@ run_unit_test() {
     "${test_name}" -- --exact
 }
 
-run_live_test() {
-  local test_name="$1"
-  shift
+run_delegated_test() {
+  (( $# >= 3 )) || fail "delegated test runner requires executable, ignored mode, and test name"
+  local test_executable="$1"
+  local include_ignored="$2"
+  local test_name="$3"
+  shift 3
   local server_uid server_gid
+  local -a ignored_option=()
+  [[ -f "${test_executable}" && -x "${test_executable}" ]] ||
+    fail "delegated test executable is absent"
+  case "${include_ignored}" in
+    yes) ignored_option=(--ignored) ;;
+    no) ;;
+    *) fail "delegated test ignored mode is invalid" ;;
+  esac
   server_uid="$(id -u craxii-server)"
   server_gid="$(id -g craxii-server)"
-  # The verifier must survive the service restart from outside its cgroup. It uses CAP_SYS_ADMIN
-  # for its pre-exec child to cross into the delegated subtree; the fixed launcher clears every
-  # capability before the model-controlled Bash command starts.
   (
     cd /var/lib/craxii
     umask 077
+    # Enter the production delegation before dropping privileges. The non-root worker and every
+    # LocalWorkstation child can then move only within the subtree systemd delegated to Craxii.
+    printf '0\n' >"${cgroup_root}/cgroup.procs"
     exec /usr/bin/prlimit --nofile=65536:65536 --nproc=16384:16384 --core=0:0 \
       /usr/bin/setpriv \
       --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
-      --inh-caps=+kill,+sys_admin --ambient-caps=+kill,+sys_admin \
+      --bounding-set=-all,+kill,+setgid,+setuid,+setpcap \
+      --inh-caps=-all,+kill --ambient-caps=-all,+kill \
       /usr/bin/env -i \
       HOME=/var/lib/craxii \
       USER=craxii-server \
@@ -395,33 +407,42 @@ run_live_test() {
       CRAXII_STAGE27_USER_SWITCH_LAUNCHER="${launcher}" \
       CRAXII_STAGE27_CGROUP_ROOT="${cgroup_root}" \
       "$@" \
-      "${installed_test}" --ignored --exact "${test_name}" --nocapture
+      "${test_executable}" "${ignored_option[@]}" --exact "${test_name}" --nocapture
   )
+}
+
+run_live_test() {
+  local test_name="$1"
+  shift
+  run_delegated_test "${installed_test}" yes "${test_name}" "$@"
 }
 
 run_live_unit_test() {
   local test_name="$1"
-  local server_uid server_gid
-  server_uid="$(id -u craxii-server)"
-  server_gid="$(id -g craxii-server)"
-  (
-    cd /var/lib/craxii
-    umask 077
-    printf '0\n' >"${cgroup_root}/cgroup.procs"
-    exec /usr/bin/prlimit --nofile=65536:65536 --nproc=16384:16384 --core=0:0 \
-      /usr/bin/setpriv \
-      --reuid="${server_uid}" --regid="${server_gid}" --clear-groups \
-      --inh-caps=+kill --ambient-caps=+kill \
-      /usr/bin/env -i \
-      HOME=/var/lib/craxii \
-      USER=craxii-server \
-      LOGNAME=craxii-server \
-      PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-      CRAXII_STAGE27_LIVE_HOST=1 \
-      CRAXII_STAGE27_USER_SWITCH_LAUNCHER="${launcher}" \
-      CRAXII_STAGE27_CGROUP_ROOT="${cgroup_root}" \
-      "${installed_unit_test}" --exact "${test_name}" --nocapture
-  )
+  run_delegated_test "${installed_unit_test}" no "${test_name}"
+}
+
+move_live_test_to_verifier_cgroup() {
+  local test_pid="$1"
+  local verifier_cgroup verifier_cgroup_procs
+  [[ "${test_pid}" =~ ^[1-9][0-9]*$ ]] || fail "live test PID is invalid"
+  verifier_cgroup="$(awk -F: '$1 == "0" { print $3 }' /proc/self/cgroup)"
+  [[ "${verifier_cgroup}" == /* && "${verifier_cgroup}" != *..* ]] ||
+    fail "verifier cgroup path is invalid"
+  [[ "${verifier_cgroup}" != /system.slice/craxii-server.service &&
+     "${verifier_cgroup}" != /system.slice/craxii-server.service/* ]] ||
+    fail "verifier controller unexpectedly entered the service cgroup"
+  if [[ "${verifier_cgroup}" == / ]]; then
+    verifier_cgroup_procs=/sys/fs/cgroup/cgroup.procs
+  else
+    verifier_cgroup_procs="/sys/fs/cgroup${verifier_cgroup}/cgroup.procs"
+  fi
+  [[ -f "${verifier_cgroup_procs}" ]] || fail "verifier cgroup.procs is absent"
+  # Root owns this one controller transition. The worker used production-equivalent authority for
+  # construction and spawn; moving it out now lets it observe systemd killing only the execution.
+  printf '%s\n' "${test_pid}" >"${verifier_cgroup_procs}"
+  grep -Fxq "0::${verifier_cgroup}" "/proc/${test_pid}/cgroup" ||
+    fail "live test worker did not leave the service cgroup"
 }
 
 run_pre_reboot() {
@@ -485,6 +506,7 @@ run_pre_reboot() {
   live_test_pid=$!
   wait_for_path "${restart_ready}"
   kill -0 "${live_test_pid}" 2>/dev/null || fail "service-restart verifier exited before restart"
+  move_live_test_to_verifier_cgroup "${live_test_pid}"
 
   systemctl restart "${service}"
   systemctl is-active --quiet "${service}" || fail "service did not restart"

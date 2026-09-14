@@ -431,21 +431,41 @@ fn require_live_host() {
     assert_eq!(std::env::consts::ARCH, "x86_64");
     assert_ne!(unsafe { nix::libc::geteuid() }, 0);
     let status = fs::read_to_string("/proc/self/status").unwrap();
-    let cap_eff = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:\t"))
-        .and_then(|value| u64::from_str_radix(value, 16).ok())
-        .unwrap();
-    assert_ne!(cap_eff & (1_u64 << 5), 0, "CAP_KILL is required");
-    assert_ne!(
-        cap_eff & (1_u64 << 21),
-        0,
-        "CAP_SYS_ADMIN is required by the credential-free verifier to migrate only its child across the cgroup delegation boundary"
+    let status_hex = |field: &str| {
+        let prefix = format!("{field}:\t");
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(prefix.as_str()))
+            .and_then(|value| u64::from_str_radix(value, 16).ok())
+            .unwrap()
+    };
+    const CAP_KILL: u64 = 1_u64 << 5;
+    const PRODUCTION_BOUNDING_SET: u64 = (1_u64 << 5) | (1_u64 << 6) | (1_u64 << 7) | (1_u64 << 8);
+    for field in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+        assert_eq!(
+            status_hex(field),
+            CAP_KILL,
+            "Stage 27 live worker {field} must contain only CAP_KILL"
+        );
+    }
+    assert_eq!(
+        status_hex("CapBnd"),
+        PRODUCTION_BOUNDING_SET,
+        "Stage 27 live worker bounding set must match production"
     );
+    assert!(
+        status.lines().any(|line| line == "NoNewPrivs:\t0"),
+        "the trusted worker must be able to enter the fixed setuid launcher"
+    );
+    let cgroup_root = required_path(CGROUP_ROOT_ENV);
+    let delegated_relative = cgroup_root
+        .strip_prefix("/sys/fs/cgroup")
+        .expect("Stage 27 cgroup root must be below cgroup v2");
+    let expected_membership = format!("0::/{}", delegated_relative.display());
     let cgroup = fs::read_to_string("/proc/self/cgroup").unwrap();
     assert!(
-        !cgroup.contains("/system.slice/craxii-server.service"),
-        "the verifier must remain outside the service cgroup"
+        cgroup.lines().any(|line| line == expected_membership),
+        "the live test worker must begin inside the delegated execution root"
     );
     for forbidden in [
         "OPENAI_API_KEY",

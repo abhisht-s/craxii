@@ -127,6 +127,7 @@ pub struct WorkstationError {
     byte_length: Option<CanonicalByteCount>,
     sha256: Option<Sha256Digest>,
     certainty: Certainty,
+    diagnostic_code: Option<&'static str>,
 }
 
 impl WorkstationError {
@@ -137,6 +138,7 @@ impl WorkstationError {
             byte_length: None,
             sha256: None,
             certainty: Certainty::Definite,
+            diagnostic_code: None,
         }
     }
 
@@ -151,6 +153,7 @@ impl WorkstationError {
             byte_length: Some(byte_length),
             sha256,
             certainty: Certainty::Definite,
+            diagnostic_code: None,
         }
     }
 
@@ -161,6 +164,22 @@ impl WorkstationError {
             byte_length: None,
             sha256: None,
             certainty: Certainty::OutcomeUnknown,
+            diagnostic_code: None,
+        }
+    }
+
+    /// Adds a static, non-sensitive diagnostic code for operator-visible failures.
+    #[must_use]
+    pub const fn with_diagnostic_code(
+        kind: WorkstationErrorKind,
+        diagnostic_code: &'static str,
+    ) -> Self {
+        Self {
+            kind,
+            byte_length: None,
+            sha256: None,
+            certainty: Certainty::Definite,
+            diagnostic_code: Some(diagnostic_code),
         }
     }
 
@@ -189,6 +208,12 @@ impl WorkstationError {
         self.certainty
     }
 
+    /// Returns a bounded static diagnostic code, when one is available.
+    #[must_use]
+    pub const fn diagnostic_code(&self) -> Option<&'static str> {
+        self.diagnostic_code
+    }
+
     /// Projects to the repository-wide safe normalized envelope.
     #[must_use]
     pub const fn normalized(&self) -> NormalizedError {
@@ -198,7 +223,11 @@ impl WorkstationError {
 
 impl Display for WorkstationError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.kind.code())
+        formatter.write_str(self.kind.code())?;
+        if let Some(diagnostic_code) = self.diagnostic_code {
+            write!(formatter, ":{diagnostic_code}")?;
+        }
+        Ok(())
     }
 }
 
@@ -211,6 +240,7 @@ impl Debug for WorkstationError {
             .field("byte_length", &self.byte_length)
             .field("sha256", &self.sha256)
             .field("certainty", &self.certainty)
+            .field("diagnostic_code", &self.diagnostic_code)
             .finish()
     }
 }
@@ -782,9 +812,28 @@ mod tests {
         for (kind, code, retryability) in cases {
             let error = WorkstationError::new(kind);
             assert_eq!(error.to_string(), code);
+            assert_eq!(error.diagnostic_code(), None);
             assert_eq!(error.retryability(), retryability);
             assert_eq!(error.normalized().retryability(), retryability);
         }
+
+        let diagnostic = WorkstationError::with_diagnostic_code(
+            WorkstationErrorKind::UnsupportedCapability,
+            "launcher_probe_spawn_permission_denied",
+        );
+        assert_eq!(
+            diagnostic.to_string(),
+            "unsupported_capability:launcher_probe_spawn_permission_denied"
+        );
+        assert_eq!(
+            diagnostic.diagnostic_code(),
+            Some("launcher_probe_spawn_permission_denied")
+        );
+        assert_eq!(
+            diagnostic.kind(),
+            WorkstationErrorKind::UnsupportedCapability
+        );
+        assert_eq!(diagnostic.normalized().retryability(), Retryability::Never);
     }
 
     #[test]
