@@ -86,6 +86,16 @@ comparison under `/srv/craxii-data/stage27-evidence`. It never reads or hashes t
 credential; the credential check is limited to file metadata and a negative model-child access
 probe. Independent read-only and isolated checks accumulate a consolidated result; cgroup residue
 and stateful transition failures still stop immediately. It never invokes a real provider.
+Snapshots accept only the exact validation attestations for their named phase, run both SQLite
+quick and full integrity checks, and retain deterministic aggregate fingerprints for every stable
+canonical table (excluding only the workstation observation timestamp refreshed at startup), plus
+a rolling journal-prefix commitment and exact stream-head/sequence consistency result.
+They also revalidate the live persistent-directory ownership, the workspace access/default ACLs,
+the locked and separate backend/workstation identities, and single-link private database/artifact
+metadata so an old bootstrap result cannot substitute for the current security boundary.
+The restart comparator binds the immediate durable runtime predecessor and the effective systemd
+start incarnation; it deliberately does not treat a recyclable diagnostic PID as identity.
+Evidence publication is atomic, create-once, and bounded on read.
 
 The same script's `--post-reboot` mode is intentionally run only after the human reboot boundary.
 It verifies automatic systemd startup, a changed Linux boot/runtime identity, graceful closure of

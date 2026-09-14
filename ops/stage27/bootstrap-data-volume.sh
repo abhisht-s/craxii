@@ -38,16 +38,25 @@ assert_fstab_line() {
   local options="$4"
   awk -v source="${source}" -v target="${target}" -v filesystem="${filesystem}" \
     -v options="${options}" \
-    '$1 == source && $2 == target && $3 == filesystem && $4 == options { found = 1 } \
-     END { exit !found }' /etc/fstab || fail "missing or altered fstab entry for ${target}"
+    '$1 !~ /^#/ && $2 == target { \
+       matches += ($1 == source && $3 == filesystem && $4 == options); entries += 1 \
+     } \
+     END { exit !(entries == 1 && matches == 1) }' /etc/fstab ||
+    fail "missing, duplicated, or altered fstab entry for ${target}"
 }
 
 assert_bind_mount() {
   local target="$1"
   local expected_root="$2"
+  local expected_source="$3"
+  local record source filesystem root options
   mountpoint -q "${target}" || fail "required bind mount is absent: ${target}"
-  [[ "$(findmnt -nro FSROOT --target "${target}")" == "${expected_root}" ]] ||
-    fail "unexpected bind source for ${target}"
+  record="$(findmnt -nro SOURCE,FSTYPE,FSROOT,OPTIONS --target "${target}")"
+  read -r source filesystem root options <<<"${record}"
+  source="${source%%\[*}"
+  [[ "${source}" == "${expected_source}" && "${filesystem}" == ext4 &&
+     "${root}" == "${expected_root}" ]] || fail "unexpected bind source for ${target}"
+  [[ ",${options}," == *,rw,* ]] || fail "persistent bind mount is not writable: ${target}"
 }
 
 verify_layout() {
@@ -55,15 +64,22 @@ verify_layout() {
   [[ "$(findmnt -nro FSTYPE --target "${data_mount}")" == ext4 ]] ||
     fail "${data_mount} is not ext4"
 
-  local source uuid marker
+  local source uuid marker marker_uuid data_root data_options
   source="$(findmnt -nro SOURCE --target "${data_mount}")"
   source="${source%%\[*}"
+  [[ "$(lsblk -bdnro TYPE,SIZE "${source}")" == "disk ${expected_size_bytes}" ]] ||
+    fail "${data_mount} is not backed by the expected whole 80 GiB disk"
+  data_root="$(findmnt -nro FSROOT --target "${data_mount}")"
+  data_options="$(findmnt -nro OPTIONS --target "${data_mount}")"
+  [[ "${data_root}" == / ]] || fail "${data_mount} is not the persistent filesystem root"
+  [[ ",${data_options}," == *,rw,* ]] || fail "${data_mount} is not writable"
   uuid="$(blkid -s UUID -o value "${source}")"
   [[ -n "${uuid}" ]] || fail "data filesystem has no UUID"
   marker="${data_mount}/${marker_name}"
   [[ -f "${marker}" && ! -L "${marker}" ]] || fail "Craxii data-volume marker is absent"
-  [[ "$(<"${marker}")" == "${uuid}" ]] || fail "Craxii data-volume marker UUID mismatch"
-  [[ "$(stat -c '%U:%G:%a' "${marker}")" == root:root:400 ]] ||
+  IFS= read -r marker_uuid <"${marker}" || fail "Craxii data-volume marker is malformed"
+  [[ "${marker_uuid}" == "${uuid}" ]] || fail "Craxii data-volume marker UUID mismatch"
+  [[ "$(stat -c '%U:%G:%a:%h:%s' "${marker}")" == root:root:400:1:37 ]] ||
     fail "Craxii data-volume marker metadata mismatch"
 
   assert_fstab_line "UUID=${uuid}" "${data_mount}" ext4 \
@@ -74,9 +90,9 @@ verify_layout() {
     bind,nofail,x-systemd.requires-mounts-for=/srv/craxii-data
   assert_fstab_line "${data_mount}/home/craxii" "${home_mount}" none \
     bind,nofail,x-systemd.requires-mounts-for=/srv/craxii-data
-  assert_bind_mount "${state_mount}" /state
-  assert_bind_mount "${workspaces_mount}" /workspaces
-  assert_bind_mount "${home_mount}" /home/craxii
+  assert_bind_mount "${state_mount}" /state "${source}"
+  assert_bind_mount "${workspaces_mount}" /workspaces "${source}"
+  assert_bind_mount "${home_mount}" /home/craxii "${source}"
   findmnt --verify --tab-file /etc/fstab >/dev/null
   echo "Stage 27 data volume and persistent bind mounts verified (UUID=${uuid})."
 }

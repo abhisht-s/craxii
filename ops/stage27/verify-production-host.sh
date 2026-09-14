@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+LC_ALL=C
+LANG=C
+export PATH
+export LC_ALL LANG
+readonly PATH LC_ALL LANG
+umask 077
 
 fail() {
   echo "error: $*" >&2
@@ -26,6 +33,7 @@ grep -qx 'VERSION_ID="24.04"' /etc/os-release || fail "expected Ubuntu 24.04"
 asset_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly asset_directory
 readonly evidence_helper="${asset_directory}/production-evidence.py"
+readonly python=/usr/bin/python3
 readonly checkout=/var/lib/craxii-build/source
 readonly cargo=/var/lib/craxii-build/cargo/bin/cargo
 readonly target_directory=/var/lib/craxii-build/target
@@ -44,6 +52,8 @@ readonly runtime_directory
 control_pid=""
 live_test_pid=""
 declare -a check_failures=()
+last_check_name=""
+last_check_status=""
 
 cleanup() {
   if [[ -n "${live_test_pid}" ]]; then
@@ -60,17 +70,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-[[ -x "${evidence_helper}" ]] || fail "Stage 27 evidence helper is absent or not executable"
-[[ -x "${asset_directory}/bootstrap-data-volume.sh" ]] || fail "data-volume verifier is absent"
-if [[ -e "${evidence_directory}" || -L "${evidence_directory}" ]]; then
-  [[ -d "${evidence_directory}" && ! -L "${evidence_directory}" ]] ||
-    fail "persistent evidence directory is unsafe"
-  [[ "$(stat -c '%U:%G:%a' "${evidence_directory}")" == root:root:700 ]] ||
-    fail "persistent evidence directory metadata mismatch"
-else
-  install -d -o root -g root -m 0700 "${evidence_directory}"
-fi
+[[ -f "${evidence_helper}" && ! -L "${evidence_helper}" ]] ||
+  fail "Stage 27 evidence helper is absent or unsafe"
+[[ -x "${python}" ]] || fail "system Python is absent"
+[[ -f "${asset_directory}/bootstrap-data-volume.sh" &&
+   ! -L "${asset_directory}/bootstrap-data-volume.sh" ]] || fail "data-volume verifier is absent or unsafe"
 install -d -o craxii-server -g craxii-server -m 0700 "${runtime_directory}"
+
+prepare_evidence_directory() {
+  if [[ -e "${evidence_directory}" || -L "${evidence_directory}" ]]; then
+    [[ -d "${evidence_directory}" && ! -L "${evidence_directory}" ]] ||
+      fail "persistent evidence directory is unsafe"
+    [[ "$(stat -c '%U:%G:%a' "${evidence_directory}")" == root:root:700 ]] ||
+      fail "persistent evidence directory metadata mismatch"
+  else
+    install -d -o root -g root -m 0700 "${evidence_directory}"
+  fi
+}
 
 build_git() {
   runuser -u craxii-build -- /usr/bin/env -i \
@@ -118,7 +134,7 @@ snapshot() {
   local phase="$1"
   local output="$2"
   shift 2
-  "${evidence_helper}" snapshot \
+  "${python}" "${evidence_helper}" snapshot \
     --phase "${phase}" \
     --deployment-commit "${deployment_commit}" \
     --data-uuid "${data_uuid}" \
@@ -127,9 +143,17 @@ snapshot() {
 }
 
 run_independent_check() {
+  if (( $# < 2 )); then
+    printf 'error: independent check requires a name and command\n' >&2
+    return 2
+  fi
   local name="$1"
   shift
   local status
+  if [[ ! "${name}" =~ ^[a-z0-9][a-z0-9-]*$ ]]; then
+    printf 'error: invalid independent check name: %s\n' "${name:-<empty>}" >&2
+    return 2
+  fi
   printf 'STAGE27_CHECK_START=%s\n' "${name}"
   set +e
   (
@@ -138,12 +162,29 @@ run_independent_check() {
   )
   status=$?
   set -e
+  last_check_name="${name}"
+  last_check_status="${status}"
   if [[ "${status}" -eq 0 ]]; then
     printf 'STAGE27_CHECK=%s:PASS\n' "${name}"
   else
     printf 'STAGE27_CHECK=%s:FAIL:status=%s\n' "${name}" "${status}" >&2
     check_failures+=("${name}:${status}")
   fi
+  return 0
+}
+
+require_last_independent_check_passed() {
+  if (( $# != 1 )); then
+    printf 'error: last-check assertion requires exactly one check name\n' >&2
+    return 2
+  fi
+  local expected_name="$1"
+  if [[ "${last_check_name}" != "${expected_name}" ]]; then
+    printf 'error: last independent check was %s, expected %s\n' \
+      "${last_check_name:-<none>}" "${expected_name}" >&2
+    return 2
+  fi
+  [[ "${last_check_status}" == 0 ]]
 }
 
 require_independent_checks_passed() {
@@ -157,6 +198,15 @@ require_independent_checks_passed() {
 }
 
 verify_deployed_assets() {
+  [[ -f /etc/craxii/config.toml && ! -L /etc/craxii/config.toml ]] ||
+    fail "deployed config path is unsafe"
+  [[ "$(stat -c '%U:%G:%a:%h' /etc/craxii/config.toml)" == root:craxii-server:640:1 ]] ||
+    fail "deployed config metadata mismatch"
+  [[ -f /etc/systemd/system/craxii-server.service &&
+     ! -L /etc/systemd/system/craxii-server.service ]] || fail "deployed systemd unit path is unsafe"
+  [[ "$(stat -c '%U:%G:%a:%h' /etc/systemd/system/craxii-server.service)" == root:root:644:1 ]] ||
+    fail "deployed systemd unit metadata mismatch"
+  [[ -L /opt/craxii/current ]] || fail "active release pointer is not a symbolic link"
   cmp -s "${asset_directory}/config.toml.template" /etc/craxii/config.toml ||
     fail "deployed config differs from the audited template"
   cmp -s "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service ||
@@ -168,7 +218,7 @@ verify_deployed_assets() {
     fail "unexpected systemd drop-in changes production composition"
   [[ "$(systemctl show "${service}" --property NeedDaemonReload --value)" == no ]] ||
     fail "systemd manager state does not match the deployed unit"
-  "${asset_directory}/verify-release-manifest.sh" \
+  /bin/bash "${asset_directory}/verify-release-manifest.sh" \
     "$(readlink -f /opt/craxii/current)" "${deployment_commit}" >/dev/null
   /usr/bin/systemd-analyze verify /etc/systemd/system/craxii-server.service
 }
@@ -192,44 +242,51 @@ import sys
 
 evidence = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 database = evidence["database"]
-print(sys.argv[2])
-print(f"CRAXII_ID={database['craxii_id']}")
-print(f"RUNTIME_INSTANCE_ID={database['current_runtime']['runtime_instance_id']}")
-print(f"LINUX_BOOT_ID={evidence['host']['linux_boot_id']}")
-print(f"RELEASE_PATH={evidence['deployment']['release_path']}")
-print(f"SCHEMA_VERSION={database['applied_schema_version']}")
-print(f"DATA_FILESYSTEM_UUID={evidence['storage']['data_filesystem_uuid']}")
-print(f"WORKSPACE_SENTINEL_SHA256={evidence['workspace_sentinel']['sha256']}")
 artifact = database["artifact_sentinel"]
-print(f"ARTIFACT_SENTINEL_ID={artifact['artifact_id'] if artifact else 'none'}")
-print(f"ARTIFACT_SENTINEL_SHA256={artifact['sha256'] if artifact else 'none'}")
-print(f"ACTIVE_WORK={database['ambiguity']['active_work']}")
-print(f"INTERRUPTED_WORK={database['ambiguity']['interrupted_work']}")
-print(f"MODEL_OUTCOME_UNKNOWN={database['ambiguity']['model_outcome_unknown']}")
-print(f"TOOL_OUTCOME_UNKNOWN={database['ambiguity']['tool_outcome_unknown']}")
-print(f"EVIDENCE_FILE={sys.argv[1]}")
+lines = [
+    f"CRAXII_ID={database['craxii_id']}",
+    f"RUNTIME_INSTANCE_ID={database['current_runtime']['runtime_instance_id']}",
+    f"LINUX_BOOT_ID={evidence['host']['linux_boot_id']}",
+    f"RELEASE_PATH={evidence['deployment']['release_path']}",
+    f"SCHEMA_VERSION={database['applied_schema_version']}",
+    f"DATA_FILESYSTEM_UUID={evidence['storage']['data_filesystem_uuid']}",
+    f"WORKSPACE_SENTINEL_SHA256={evidence['workspace_sentinel']['sha256']}",
+    f"ARTIFACT_SENTINEL_ID={artifact['artifact_id'] if artifact else 'none'}",
+    f"ARTIFACT_SENTINEL_SHA256={artifact['sha256'] if artifact else 'none'}",
+    f"ACTIVE_WORK={database['ambiguity']['active_work']}",
+    f"INTERRUPTED_WORK={database['ambiguity']['interrupted_work']}",
+    f"MODEL_OUTCOME_UNKNOWN={database['ambiguity']['model_outcome_unknown']}",
+    f"TOOL_OUTCOME_UNKNOWN={database['ambiguity']['tool_outcome_unknown']}",
+    f"EVIDENCE_FILE={sys.argv[1]}",
+    sys.argv[2],
+]
+print("\n".join(lines))
 PY
+}
+
+emit_pre_reboot_success() {
+  if (( $# != 1 )); then
+    printf 'error: pre-reboot success emission requires one evidence path\n' >&2
+    return 2
+  fi
+  print_summary "$1" STAGE27_PRE_REBOOT_GATE=PASS
+  printf 'HUMAN_EC2_REBOOT_REQUIRED\n'
 }
 
 prepare_sentinels() {
   if [[ -e "${workspace_sentinel}" || -L "${workspace_sentinel}" ]]; then
     [[ -f "${workspace_sentinel}" && ! -L "${workspace_sentinel}" ]] ||
       fail "workspace sentinel path is unsafe"
-    [[ "$(<"${workspace_sentinel}")" == craxii-stage27-workspace-persistence-sentinel-v1 ]] ||
-      fail "workspace sentinel content mismatch"
   else
     runuser -u craxii -- /usr/bin/env -i PATH=/usr/bin:/bin \
       /bin/bash --noprofile --norc -c \
       'umask 077; printf "%s\n" craxii-stage27-workspace-persistence-sentinel-v1 >"$1"' \
       stage27-sentinel "${workspace_sentinel}"
   fi
-  "${evidence_helper}" validate-workspace-sentinel
 
   if [[ -e "${evidence_sentinel}" || -L "${evidence_sentinel}" ]]; then
     [[ -f "${evidence_sentinel}" && ! -L "${evidence_sentinel}" ]] ||
       fail "evidence sentinel path is unsafe"
-    [[ "$(<"${evidence_sentinel}")" == craxii-stage27-evidence-persistence-sentinel-v1 ]] ||
-      fail "evidence sentinel content mismatch"
   else
     umask 077
     printf '%s\n' craxii-stage27-evidence-persistence-sentinel-v1 >"${evidence_sentinel}"
@@ -238,6 +295,7 @@ prepare_sentinels() {
   fi
   [[ "$(stat -c '%U:%G:%a' "${evidence_sentinel}")" == root:root:400 ]] ||
     fail "evidence sentinel metadata mismatch"
+  "${python}" "${evidence_helper}" validate-sentinels
 }
 
 verify_source_matches_deployment() {
@@ -255,9 +313,10 @@ verify_source_matches_deployment() {
 
 compile_host_tests() {
   local cargo_json="${runtime_directory}/cargo-test-artifacts.jsonl"
+  local binary_list="${runtime_directory}/test-binaries.txt"
   run_build test --locked --features test-failpoints -p craxii-server \
     --lib --test stage27 --no-run --message-format=json >"${cargo_json}"
-  mapfile -t test_binaries < <(/usr/bin/python3 - "${cargo_json}" <<'PY'
+  /usr/bin/python3 - "${cargo_json}" >"${binary_list}" <<'PY'
 import json
 import pathlib
 import sys
@@ -285,7 +344,11 @@ if any(len(paths) != 1 for paths in executables.values()):
 print(executables["live"][0])
 print(executables["unit"][0])
 PY
-)
+  test_binaries=()
+  while IFS= read -r binary; do
+    [[ -n "${binary}" ]] || fail "compiled Stage 27 test executable path is empty"
+    test_binaries+=("${binary}")
+  done <"${binary_list}"
   [[ "${#test_binaries[@]}" -eq 2 ]] || fail "compiled Stage 27 test executables are ambiguous"
   test_binary="${test_binaries[0]}"
   unit_test_binary="${test_binaries[1]}"
@@ -362,11 +425,8 @@ run_live_unit_test() {
 }
 
 run_pre_reboot() {
-  [[ ! -e "${pre_reboot_evidence}" && ! -L "${pre_reboot_evidence}" ]] ||
-    fail "pre-reboot evidence already exists; preserve and review it instead of overwriting"
-  [[ ! -e "${restart_comparison}" && ! -L "${restart_comparison}" ]] ||
-    fail "restart comparison already exists; preserve and review it instead of overwriting"
-  run_independent_check storage-layout "${asset_directory}/bootstrap-data-volume.sh" --verify-only
+  run_independent_check storage-layout /bin/bash \
+    "${asset_directory}/bootstrap-data-volume.sh" --verify-only
   run_independent_check deployed-assets verify_deployed_assets
   run_independent_check service-active systemctl is-active --quiet "${service}"
   run_independent_check service-enabled systemctl is-enabled --quiet "${service}"
@@ -374,6 +434,11 @@ run_pre_reboot() {
   run_independent_check source-parity verify_source_matches_deployment
   require_independent_checks_passed || fail "read-only preflight reported independent failures"
 
+  prepare_evidence_directory
+  [[ ! -e "${pre_reboot_evidence}" && ! -L "${pre_reboot_evidence}" ]] ||
+    fail "pre-reboot evidence already exists; preserve and review it instead of overwriting"
+  [[ ! -e "${restart_comparison}" && ! -L "${restart_comparison}" ]] ||
+    fail "restart comparison already exists; preserve and review it instead of overwriting"
   prepare_sentinels
 
   before_restart="${runtime_directory}/before-restart.json"
@@ -385,30 +450,32 @@ run_pre_reboot() {
   run_independent_check crash-after-spawn run_live_unit_test \
     adapters::sqlite::stage8_tests::crash_after_tool_process_spawn_records_one_side_effect
   run_independent_check post-crash-cgroup-clean require_execution_cgroup_clean
-  [[ "${check_failures[-1]-}" != post-crash-cgroup-clean:* ]] ||
+  require_last_independent_check_passed post-crash-cgroup-clean ||
     fail "unsafe cgroup residue prevents further tests"
   run_independent_check outcome-unknown-no-redispatch run_unit_test \
     application::tool_execution_service::tests::cleanup_ambiguity_and_handler_panic_commit_outcome_unknown_without_redispatch
   run_independent_check linux-terminal-outcome-matrix run_live_test \
     live_linux_terminal_outcome_matrix_is_canonical
   run_independent_check post-outcome-matrix-cgroup-clean require_execution_cgroup_clean
-  [[ "${check_failures[-1]-}" != post-outcome-matrix-cgroup-clean:* ]] ||
+  require_last_independent_check_passed post-outcome-matrix-cgroup-clean ||
     fail "unsafe cgroup residue prevents further tests"
   run_independent_check linux-cancellation run_live_test \
     live_linux_cancellation_cleans_process_tree_and_preserves_follower
   run_independent_check post-cancellation-cgroup-clean require_execution_cgroup_clean
-  [[ "${check_failures[-1]-}" != post-cancellation-cgroup-clean:* ]] ||
+  require_last_independent_check_passed post-cancellation-cgroup-clean ||
     fail "unsafe cgroup residue prevents service restart validation"
   require_independent_checks_passed || fail "isolated checks reported consolidated failures"
 
   control_uid="$(id -u ssm-user)"
   control_gid="$(id -g ssm-user)"
   /usr/bin/setpriv --reuid="${control_uid}" --regid="${control_gid}" --clear-groups \
-    /bin/sleep 120 &
+    /bin/sleep infinity &
   control_pid=$!
   control_start="$(awk '{print $22}' "/proc/${control_pid}/stat")"
-  grep -qv '/system.slice/craxii-server.service' "/proc/${control_pid}/cgroup" ||
+  if grep -Eq '^[^:]*:[^:]*:/system\.slice/craxii-server\.service(/|$)' \
+    "/proc/${control_pid}/cgroup"; then
     fail "non-service control process unexpectedly entered service cgroup"
+  fi
 
   restart_ready="${runtime_directory}/restart-ready"
   restart_done="${runtime_directory}/restart-done"
@@ -443,16 +510,22 @@ run_pre_reboot() {
     --validation G.pre-reboot-evidence \
     --validation H.terminal-outcome-matrix \
     --validation I.production-composition
-  "${evidence_helper}" compare \
+  "${python}" "${evidence_helper}" compare \
     --mode restart \
     --before "${before_restart}" \
     --after "${pre_reboot_evidence}" \
     --output "${restart_comparison}"
-  print_summary "${pre_reboot_evidence}" STAGE27_PRE_REBOOT_GATE=PASS
-  printf 'HUMAN_EC2_REBOOT_REQUIRED\n'
+  emit_pre_reboot_success "${pre_reboot_evidence}"
 }
 
 run_post_reboot() {
+  run_independent_check post-reboot-storage /bin/bash \
+    "${asset_directory}/bootstrap-data-volume.sh" --verify-only
+  run_independent_check post-reboot-assets verify_deployed_assets
+  run_independent_check post-reboot-enabled systemctl is-enabled --quiet "${service}"
+  run_independent_check post-reboot-ready wait_ready
+  require_independent_checks_passed || fail "post-reboot read-only checks reported independent failures"
+  prepare_evidence_directory
   [[ -f "${pre_reboot_evidence}" && ! -L "${pre_reboot_evidence}" ]] ||
     fail "persistent pre-reboot evidence is absent"
   [[ -f "${restart_comparison}" && ! -L "${restart_comparison}" ]] ||
@@ -461,18 +534,13 @@ run_post_reboot() {
     fail "post-reboot evidence already exists; preserve and review it instead of overwriting"
   [[ ! -e "${reboot_comparison}" && ! -L "${reboot_comparison}" ]] ||
     fail "reboot comparison already exists; preserve and review it instead of overwriting"
-  run_independent_check post-reboot-storage "${asset_directory}/bootstrap-data-volume.sh" --verify-only
-  run_independent_check post-reboot-assets verify_deployed_assets
-  run_independent_check post-reboot-enabled systemctl is-enabled --quiet "${service}"
-  run_independent_check post-reboot-ready wait_ready
-  require_independent_checks_passed || fail "post-reboot read-only checks reported independent failures"
   snapshot post-reboot "${post_reboot_evidence}" \
     --validation post-reboot.persistence \
     --validation post-reboot.systemd-auto-start \
     --validation post-reboot.recovery-before-ready \
     --validation post-reboot.credential-boundary \
     --validation post-reboot.loopback-operation
-  "${evidence_helper}" compare \
+  "${python}" "${evidence_helper}" compare \
     --mode reboot \
     --before "${pre_reboot_evidence}" \
     --after "${post_reboot_evidence}" \
