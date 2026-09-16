@@ -23,6 +23,16 @@ pub struct ProjectedMessage {
     pub inbound_delivery_id: Option<InboundDeliveryId>,
 }
 
+/// One journal-derived conversation, including the creation evidence needed to
+/// distinguish independently owned conversation streams during replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectedConversation {
+    pub created: ConversationCreatedV1,
+    pub owner_user_id: Option<UserId>,
+    pub creation_event_id: JournalEventId,
+    pub creation_stream_seq: StreamSeq,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProjectedWork {
     pub created: WorkQueuedV1,
@@ -62,8 +72,7 @@ pub struct ProjectedRuntimeReference {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ProjectedState {
     pub root: Option<CraxiiInitializedV1>,
-    pub primary_conversation: Option<ConversationCreatedV1>,
-    pub primary_conversation_owner_user_id: Option<UserId>,
+    pub conversations: HashMap<ConversationId, ProjectedConversation>,
     pub messages: HashMap<ConversationId, Vec<ProjectedMessage>>,
     pub works: HashMap<WorkId, ProjectedWork>,
     pub models: HashMap<ModelInvocationId, ProjectedModelReference>,
@@ -71,6 +80,15 @@ pub struct ProjectedState {
     pub artifacts: HashSet<ArtifactId>,
     pub runtimes: HashMap<RuntimeInstanceId, ProjectedRuntimeReference>,
     pub evidence_warnings: Vec<JournalEventId>,
+}
+
+impl ProjectedState {
+    /// Resolves the public/native root through the durable principal pointer.
+    #[must_use]
+    pub fn primary_conversation(&self) -> Option<&ProjectedConversation> {
+        let conversation_id = self.root.as_ref()?.primary_conversation_id;
+        self.conversations.get(&conversation_id)
+    }
 }
 
 struct ObservedEvent {
@@ -326,15 +344,25 @@ fn apply_conversation_created(
     let cause = cause.ok_or(JournalContractError::InvalidCausation)?;
     if cause.kind != JournalEventKind::CraxiiInitialized
         || cause.correlation_id != event.correlation_id
-        || payload.conversation_id != root.primary_conversation_id
         || payload.craxii_id != root.craxii_id
         || event.actor != JournalActor::Craxii(root.craxii_id)
-        || state.primary_conversation.is_some()
+        || state.conversations.contains_key(&payload.conversation_id)
     {
         return Err(JournalContractError::InconsistentProjection);
     }
-    state.primary_conversation = Some(payload);
-    state.primary_conversation_owner_user_id = owner_user_id;
+    // V1 predates user ownership and is valid only for the historical root.
+    if owner_user_id.is_none() && payload.conversation_id != root.primary_conversation_id {
+        return Err(JournalContractError::InconsistentProjection);
+    }
+    state.conversations.insert(
+        payload.conversation_id,
+        ProjectedConversation {
+            created: payload,
+            owner_user_id,
+            creation_event_id: event.event_id,
+            creation_stream_seq: event.stream_seq,
+        },
+    );
     Ok(())
 }
 
@@ -350,17 +378,17 @@ fn apply_work_queued(
         root.craxii_id == payload.craxii_id && root.workspace_id == payload.workspace_id
     });
     let conversation = state
-        .primary_conversation
-        .as_mut()
+        .conversations
+        .get_mut(&payload.conversation_id)
         .ok_or(JournalContractError::InconsistentProjection)?;
     if cause.kind != JournalEventKind::MessageAccepted
         || cause.correlation_id != event.correlation_id
         || cause.conversation_id != Some(payload.conversation_id)
         || cause.work_id.is_some()
         || !root_matches
-        || conversation.conversation_id != payload.conversation_id
-        || conversation.craxii_id != payload.craxii_id
-        || conversation.next_work_ordinal != payload.conversation_work_ordinal
+        || conversation.created.conversation_id != payload.conversation_id
+        || conversation.created.craxii_id != payload.craxii_id
+        || conversation.created.next_work_ordinal != payload.conversation_work_ordinal
         || payload.kind != crate::domain::WorkKind::Conversational
         || payload.priority != 0
         || Some(payload.trigger.input_event_id) != event.causation_event_id
@@ -373,11 +401,13 @@ fn apply_work_queued(
     {
         return Err(JournalContractError::InconsistentProjection);
     }
-    conversation.next_work_ordinal = conversation
+    conversation.created.next_work_ordinal = conversation
+        .created
         .next_work_ordinal
         .checked_increment()
         .map_err(|_| JournalContractError::InconsistentProjection)?;
-    conversation.state_version = conversation
+    conversation.created.state_version = conversation
+        .created
         .state_version
         .checked_increment()
         .map_err(|_| JournalContractError::InconsistentProjection)?;
@@ -432,11 +462,11 @@ fn apply_event(
                 || payload.validate_contract().is_err()
                 || event.actor != JournalActor::User(payload.device_id)
                 || state
-                    .primary_conversation
-                    .as_ref()
+                    .conversations
+                    .get(&payload.conversation_id)
                     .is_none_or(|conversation| {
-                        conversation.conversation_id != payload.conversation_id
-                            || conversation.craxii_id != payload.craxii_id
+                        conversation.created.conversation_id != payload.conversation_id
+                            || conversation.created.craxii_id != payload.craxii_id
                     })
                 || state
                     .messages
@@ -463,11 +493,12 @@ fn apply_event(
             if payload.validate_contract().is_err()
                 || event.actor != JournalActor::UserV2(payload.author_user_id)
                 || state
-                    .primary_conversation
-                    .as_ref()
+                    .conversations
+                    .get(&payload.conversation_id)
                     .is_none_or(|conversation| {
-                        conversation.conversation_id != payload.conversation_id
-                            || conversation.craxii_id != payload.craxii_id
+                        conversation.created.conversation_id != payload.conversation_id
+                            || conversation.created.craxii_id != payload.craxii_id
+                            || conversation.owner_user_id != Some(payload.author_user_id)
                     })
                 || state
                     .messages
@@ -494,17 +525,17 @@ fn apply_event(
                 || payload.validate_contract().is_err()
                 || event.actor != JournalActor::Craxii(payload.craxii_id)
                 || state
-                    .primary_conversation
-                    .as_ref()
+                    .conversations
+                    .get(&payload.conversation_id)
                     .is_none_or(|conversation| {
-                        conversation.conversation_id != payload.conversation_id
-                            || conversation.craxii_id != payload.craxii_id
+                        conversation.created.conversation_id != payload.conversation_id
+                            || conversation.created.craxii_id != payload.craxii_id
                     })
                 || payload.produced_by_work_id.is_none_or(|work_id| {
-                    state
-                        .works
-                        .get(&work_id)
-                        .is_none_or(|work| work.created.correlation_id != event.correlation_id)
+                    state.works.get(&work_id).is_none_or(|work| {
+                        work.created.correlation_id != event.correlation_id
+                            || work.created.conversation_id != payload.conversation_id
+                    })
                 })
                 || state
                     .messages
@@ -858,8 +889,9 @@ mod tests {
     use super::*;
     use crate::domain::{
         ClientMessageId, ContentBlock, ConversationLifecycle, ConversationWorkOrdinal, DeviceId,
-        JournalActor, JournalEventPayload, JournalOffset, MessageContent, MessageId, MessageRole,
-        Sha256Digest, UtcTimestamp, WorkInputActor, WorkInputFactV1, WorkInputOrdinal, WorkKind,
+        JournalActor, JournalEventPayload, JournalOffset, MessageAcceptedOriginV2,
+        MessageCommittedV2, MessageContent, MessageId, MessageRole, Sha256Digest, UserId,
+        UtcTimestamp, WorkInputActor, WorkInputFactV1, WorkInputOrdinal, WorkKind,
     };
 
     fn at() -> UtcTimestamp {
@@ -958,6 +990,101 @@ mod tests {
             ),
             committed_at: at(),
         }
+    }
+
+    #[test]
+    fn v2_non_root_conversations_are_independent_and_enforce_their_owner() {
+        let mut events = bootstrap_events();
+        let craxii_id = events[0].craxii_id;
+        let root_event_id = events[0].event_id;
+        let root_correlation = events[0].correlation_id;
+        let conversation_id = ConversationId::generate();
+        let owner_user_id = UserId::generate();
+        let created_event_id = JournalEventId::generate();
+        events.push(JournalEvent {
+            journal_offset: JournalOffset::try_new(5).unwrap(),
+            event_id: created_event_id,
+            craxii_id,
+            stream_id: JournalStreamId::Conversation(conversation_id),
+            stream_seq: StreamSeq::try_new(1).unwrap(),
+            event_version: 2,
+            conversation_id: Some(conversation_id),
+            work_id: None,
+            causation_event_id: Some(root_event_id),
+            correlation_id: root_correlation,
+            actor: JournalActor::Craxii(craxii_id),
+            runtime_instance_id: None,
+            payload: JournalEventPayload::ConversationCreatedV2(ConversationCreatedV2 {
+                conversation_id,
+                craxii_id,
+                owner_user_id,
+                kind: crate::domain::ConversationKind::Primary,
+                lifecycle: ConversationLifecycle::Active,
+                next_work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
+                state_version: ProjectionVersion::try_new(1).unwrap(),
+                created_at: at(),
+            }),
+            payload_sha256: Sha256Digest::hash_bytes(b"conversation-v2"),
+            recorded_at: at(),
+            occurred_at: None,
+        });
+        let projected = project(&events).unwrap();
+        assert_eq!(projected.conversations.len(), 2);
+        assert_eq!(
+            projected
+                .conversations
+                .get(&conversation_id)
+                .unwrap()
+                .owner_user_id,
+            Some(owner_user_id)
+        );
+        assert_eq!(
+            projected
+                .primary_conversation()
+                .unwrap()
+                .created
+                .conversation_id,
+            events[1].conversation_id.unwrap()
+        );
+
+        let content =
+            MessageContent::try_new(vec![ContentBlock::text("owner scoped").unwrap()]).unwrap();
+        let impostor_user_id = UserId::generate();
+        events.push(JournalEvent {
+            journal_offset: JournalOffset::try_new(6).unwrap(),
+            event_id: JournalEventId::generate(),
+            craxii_id,
+            stream_id: JournalStreamId::Conversation(conversation_id),
+            stream_seq: StreamSeq::try_new(2).unwrap(),
+            event_version: 2,
+            conversation_id: Some(conversation_id),
+            work_id: None,
+            causation_event_id: Some(created_event_id),
+            correlation_id: CorrelationId::generate(),
+            actor: JournalActor::UserV2(impostor_user_id),
+            runtime_instance_id: None,
+            payload: JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
+                message_id: MessageId::generate(),
+                craxii_id,
+                conversation_id,
+                role: MessageRole::User,
+                content_sha256: content.content_sha256(),
+                content,
+                author_user_id: impostor_user_id,
+                origin: MessageAcceptedOriginV2::Native {
+                    device_id: DeviceId::generate(),
+                    client_message_id: ClientMessageId::parse_canonical(
+                        "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d",
+                    )
+                    .unwrap(),
+                },
+                committed_at: at(),
+            }),
+            payload_sha256: Sha256Digest::hash_bytes(b"message-v2"),
+            recorded_at: at(),
+            occurred_at: None,
+        });
+        assert_eq!(project(&events), Err(JournalContractError::InvalidEnvelope));
     }
 
     fn append_message_and_work(

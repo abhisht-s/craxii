@@ -15,7 +15,7 @@ use crate::application::authority::{
     AuthorityEvaluator, V0AuthorityConstraints, V0AuthorityEvaluator,
 };
 use crate::application::command_service::{
-    AcceptMessageCommand, CancelWorkCommand, CommandService,
+    AcceptMessageCommand, CancelWorkCommand, CommandService, CommandServiceErrorKind,
 };
 use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
@@ -26,8 +26,8 @@ use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnaps
 use crate::application::runtime::{HeartbeatTask, RuntimeControlError, ShutdownController};
 use crate::application::runtime::{RuntimeBootstrapReceipt, bootstrap_runtime};
 use crate::application::scheduler::{
-    SchedulerReadiness, SchedulerStart, WorkCancellation, WorkRunner, WorkRunnerFuture,
-    WorkRunnerStartError, start_scheduler,
+    SchedulerReadiness, SchedulerStart, WorkCancellation, WorkRunner, WorkRunnerExit,
+    WorkRunnerFuture, WorkRunnerStartError, start_scheduler,
 };
 use crate::application::tool_execution_service::{ToolExecutionService, ToolRuntimeLimits};
 use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
@@ -44,6 +44,7 @@ use crate::ports::state_store::*;
 use crate::ports::workstation::{HARD_FILE_READ_MAX_BYTES, Workstation};
 use crate::ports::workstation_preparation::WorkstationPreparation;
 
+use super::ch3_test_support::{admit_message, create_conversation};
 use super::{SqliteRuntimeGuard, SqliteStateStore};
 
 const T0: &str = "2026-08-28T02:00:00.000000Z";
@@ -235,13 +236,714 @@ async fn claim(
     fixture
         .store
         .claim_next_work(ClaimNextWorkRequest {
-            conversation_id: fixture.identity.conversation_id,
             runtime_id,
             claimed_at,
             event_id: JournalEventId::generate(),
         })
         .await
         .unwrap()
+}
+
+async fn interrupt_claimed(
+    fixture: &Fixture,
+    runtime_id: RuntimeInstanceId,
+    work_id: WorkId,
+    at: UtcTimestamp,
+) {
+    fixture
+        .store
+        .interrupt_abnormal_runner(InterruptOwnedWorkRequest {
+            work_id,
+            runtime_id,
+            interrupted_at: at,
+            event_id: JournalEventId::generate(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn provision_ch3_device(fixture: &Fixture, user_id: UserId) -> DeviceId {
+    DeviceProvisioningService::new(&fixture.store)
+        .provision_fixture_token(
+            user_id,
+            DeviceDisplayName::try_new("CH-3 secondary device".into()).unwrap(),
+            at(T1),
+            BearerToken::parse(
+                "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef".into(),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap()
+        .summary
+        .device_id
+}
+
+#[tokio::test]
+async fn native_root_cancellation_cannot_target_non_root_work() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let work_b = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "non-root cancellation target",
+        at(T1),
+    )
+    .await
+    .unwrap();
+
+    let client_command_id =
+        ClientCommandId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string()).unwrap();
+    let error = CommandService::new(&fixture.store)
+        .cancel_work(
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
+            CancelWorkCommand {
+                idempotency_key: IdempotencyKey::for_cancellation(client_command_id),
+                client_command_id,
+                work_id: work_b,
+                requested_at: at(T2),
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), CommandServiceErrorKind::TargetNotFound);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM work_items WHERE work_id = ?")
+        .bind(work_b.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(state, "queued");
+    let cancellation_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal_events WHERE work_id = ? \
+         AND event_type IN ('work.cancellation_requested','work.cancelled')",
+    )
+    .bind(work_b.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(cancellation_events, 0);
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn global_claim_orders_conversation_heads_by_queued_journal_offset() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let a1 = accept(&fixture, "A1", at(T1)).await;
+    let b1 = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "B1",
+        at(T2),
+    )
+    .await
+    .unwrap();
+    let a2 = accept(&fixture, "A2", at(T3)).await;
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    let first = claim(&fixture, runtime_id, at(T2)).await.unwrap();
+    assert_eq!(first.work.work_id(), a1.work_id);
+    interrupt_claimed(&fixture, runtime_id, a1.work_id, at(T3)).await;
+    let second = claim(&fixture, runtime_id, at(T3)).await.unwrap();
+    assert_eq!(second.work.work_id(), b1);
+    assert_eq!(
+        second.work.conversation_id(),
+        conversation_b.conversation_id
+    );
+    interrupt_claimed(&fixture, runtime_id, b1, at(T4)).await;
+    let third = claim(&fixture, runtime_id, at(T4)).await.unwrap();
+    assert_eq!(third.work.work_id(), a2.work_id);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn every_global_active_state_blocks_other_conversations_until_terminal() {
+    for active_state in [
+        "running",
+        "waiting_on_model",
+        "waiting_on_tool",
+        "cancel_requested",
+    ] {
+        let fixture = fixture().await;
+        let user_b = UserId::generate();
+        let conversation_b = create_conversation(
+            fixture.guard.runtime(),
+            fixture.identity.craxii_id,
+            user_b,
+            true,
+            at(T1),
+        )
+        .await
+        .unwrap();
+        let device_b = provision_ch3_device(&fixture, user_b).await;
+        let a = accept(&fixture, "active A", at(T1)).await;
+        let b = admit_message(
+            fixture.guard.runtime(),
+            conversation_b,
+            device_b,
+            "queued B",
+            at(T2),
+        )
+        .await
+        .unwrap();
+        let runtime_id = RuntimeInstanceId::generate();
+        start_runtime(&fixture, runtime_id, at(T1)).await;
+        assert_eq!(
+            claim(&fixture, runtime_id, at(T2))
+                .await
+                .unwrap()
+                .work
+                .work_id(),
+            a.work_id
+        );
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        match active_state {
+            "running" => {}
+            "waiting_on_model" => {
+                sqlx::query(
+                    "UPDATE work_items SET state = 'waiting_on_model', state_version = 3, \
+                     current_model_invocation_id = ? WHERE work_id = ?",
+                )
+                .bind(ModelInvocationId::generate().to_string())
+                .bind(a.work_id.to_string())
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+            "waiting_on_tool" => {
+                sqlx::query(
+                    "UPDATE work_items SET state = 'waiting_on_tool', state_version = 3, \
+                     current_tool_execution_id = ? WHERE work_id = ?",
+                )
+                .bind(ToolExecutionId::generate().to_string())
+                .bind(a.work_id.to_string())
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+            "cancel_requested" => {
+                sqlx::query(
+                    "UPDATE work_items SET state = 'cancel_requested', state_version = 3, \
+                     cancel_requested_at = ?, cancellation_reason_code = 'user_request' \
+                     WHERE work_id = ?",
+                )
+                .bind(T2)
+                .bind(a.work_id.to_string())
+                .execute(&mut *connection)
+                .await
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        drop(connection);
+        assert!(claim(&fixture, runtime_id, at(T3)).await.is_none());
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        sqlx::query(
+            "UPDATE work_items SET state = 'interrupted', state_version = state_version + 1, \
+             runtime_instance_id = NULL, current_model_invocation_id = NULL, \
+             current_tool_execution_id = NULL, cancel_requested_at = NULL, \
+             cancellation_reason_code = NULL, terminal_at = ?, \
+             terminal_reason_code = 'runtime_ownership_lost' WHERE work_id = ?",
+        )
+        .bind(T3)
+        .bind(a.work_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+        drop(connection);
+        assert_eq!(
+            claim(&fixture, runtime_id, at(T4))
+                .await
+                .unwrap()
+                .work
+                .work_id(),
+            b
+        );
+        fixture.guard.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_global_claims_produce_exactly_one_active_work() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    accept(&fixture, "A", at(T1)).await;
+    admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "B",
+        at(T2),
+    )
+    .await
+    .unwrap();
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(3));
+    let mut joins = Vec::new();
+    for _ in 0..2 {
+        let store = fixture.store.clone();
+        let barrier = Arc::clone(&barrier);
+        joins.push(tokio::spawn(async move {
+            barrier.wait().await;
+            store
+                .claim_next_work(ClaimNextWorkRequest {
+                    runtime_id,
+                    claimed_at: at(T2),
+                    event_id: JournalEventId::generate(),
+                })
+                .await
+                .unwrap()
+        }));
+    }
+    barrier.wait().await;
+    let mut claimed = 0;
+    for join in joins {
+        claimed += usize::from(join.await.unwrap().is_some());
+    }
+    assert_eq!(claimed, 1);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE state IN \
+         ('running','waiting_on_model','waiting_on_tool','cancel_requested')",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(active, 1);
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn corrupt_oldest_conversation_head_queue_evidence_fails_closed() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let a = accept(&fixture, "corrupt A", at(T1)).await;
+    let b = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "intact B",
+        at(T2),
+    )
+    .await
+    .unwrap();
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query("DELETE FROM journal_events WHERE work_id = ? AND event_type = 'work.queued'")
+        .bind(a.work_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    let result = fixture
+        .store
+        .claim_next_work(ClaimNextWorkRequest {
+            runtime_id,
+            claimed_at: at(T2),
+            event_id: JournalEventId::generate(),
+        })
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("corrupt queue evidence must fail closed"),
+    };
+    assert_eq!(error.kind(), StateStoreErrorKind::InternalInvariant);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM work_items WHERE work_id = ?")
+        .bind(b.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(state, "queued");
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn startup_recovery_discovers_non_root_active_work_before_next_global_claim() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let b1 = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "stale B1",
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let old_runtime = RuntimeInstanceId::generate();
+    start_runtime(&fixture, old_runtime, at(T1)).await;
+    assert_eq!(
+        claim(&fixture, old_runtime, at(T2))
+            .await
+            .unwrap()
+            .work
+            .work_id(),
+        b1
+    );
+    let b2 = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "queued B2",
+        at(T2),
+    )
+    .await
+    .unwrap();
+
+    let current_runtime = RuntimeInstanceId::generate();
+    let recovery = start_runtime(&fixture, current_runtime, at(T3)).await;
+    assert_eq!(recovery.recovery.stale_runtimes_observed, 1);
+    assert_eq!(recovery.recovery.stale_runtimes_closed, 1);
+    assert_eq!(recovery.recovery.interrupted_work, 1);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let recovered_state: String =
+        sqlx::query_scalar("SELECT state FROM work_items WHERE work_id = ?")
+            .bind(b1.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(recovered_state, "interrupted");
+    drop(connection);
+    let next = claim(&fixture, current_runtime, at(T4)).await.unwrap();
+    assert_eq!(next.work.work_id(), b2);
+    assert_eq!(next.work.conversation_id(), conversation_b.conversation_id);
+    fixture.guard.shutdown().await;
+}
+
+struct NonRootCancellationRunner {
+    started: Arc<tokio::sync::Notify>,
+    active: Arc<AtomicUsize>,
+    maximum_active: Arc<AtomicUsize>,
+}
+
+impl WorkRunner for NonRootCancellationRunner {
+    fn start(
+        &self,
+        _: ClaimedWork,
+        mut cancellation: WorkCancellation,
+    ) -> Result<WorkRunnerFuture, WorkRunnerStartError> {
+        let started = Arc::clone(&self.started);
+        let active = Arc::clone(&self.active);
+        let maximum_active = Arc::clone(&self.maximum_active);
+        Ok(Box::pin(async move {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum_active.fetch_max(now_active, Ordering::SeqCst);
+            started.notify_one();
+            cancellation.requested().await;
+            active.fetch_sub(1, Ordering::SeqCst);
+            WorkRunnerExit::Abnormal
+        }))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lost_wake_fallback_and_shutdown_join_cover_non_root_work() {
+    let fixture = fixture().await;
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    let store = Arc::new(fixture.store.clone());
+    let health = Health::new();
+    let (fatal, _) = tokio::sync::watch::channel(false);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum_active = Arc::new(AtomicUsize::new(0));
+    let scheduler = start_scheduler(
+        Arc::clone(&store),
+        Arc::new(NonRootCancellationRunner {
+            started: Arc::clone(&started),
+            active: Arc::clone(&active),
+            maximum_active: Arc::clone(&maximum_active),
+        }),
+        Arc::new(TestClock::new(
+            at(T2).to_offset_datetime(),
+            Duration::from_millis(1),
+        )),
+        health.clone(),
+        fatal,
+        SchedulerStart {
+            runtime_instance_id: runtime_id,
+            readiness: SchedulerReadiness::ReadyAfterInitialScan,
+        },
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while health.snapshot().state() != HealthState::Ready {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let b = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "non-root lost wake",
+        at(T2),
+    )
+    .await
+    .unwrap();
+    // No notifier is invoked: the one-second durable fallback must discover B.
+    tokio::time::timeout(Duration::from_secs(3), started.notified())
+        .await
+        .unwrap();
+    assert_eq!(scheduler.registry().snapshot()[0].work_id, b);
+    assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+
+    let root_queued = accept(&fixture, "must remain queued during shutdown", at(T3)).await;
+    scheduler.stop_and_join().await.unwrap();
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let states: (String, String) = sqlx::query_as(
+        "SELECT (SELECT state FROM work_items WHERE work_id = ?), \
+                (SELECT state FROM work_items WHERE work_id = ?)",
+    )
+    .bind(b.to_string())
+    .bind(root_queued.work_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(states.0, "interrupted");
+    assert_eq!(states.1, "queued");
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_conversation_consistency_validates_all_conversations_and_root_pointer() {
+    let valid = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        valid.guard.runtime(),
+        valid.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    valid.store.verify_application_consistency().await.unwrap();
+    let snapshot = valid.store.load_bootstrap_snapshot().await.unwrap();
+    assert_eq!(
+        snapshot.primary_conversation.conversation_id(),
+        valid.identity.conversation_id
+    );
+    assert_ne!(
+        snapshot.primary_conversation.conversation_id(),
+        conversation_b.conversation_id
+    );
+    valid.guard.shutdown().await;
+
+    let missing_evidence = fixture().await;
+    let missing_user = UserId::generate();
+    let missing = create_conversation(
+        missing_evidence.guard.runtime(),
+        missing_evidence.identity.craxii_id,
+        missing_user,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let mut connection = missing_evidence.guard.runtime().acquire().await.unwrap();
+    sqlx::query("DELETE FROM journal_events WHERE event_id = ?")
+        .bind(missing.created_event_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(
+        missing_evidence
+            .store
+            .verify_application_consistency()
+            .await
+            .is_err()
+    );
+    missing_evidence.guard.shutdown().await;
+
+    let owner_mismatch = fixture().await;
+    let original_owner = UserId::generate();
+    let mismatched = create_conversation(
+        owner_mismatch.guard.runtime(),
+        owner_mismatch.identity.craxii_id,
+        original_owner,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let replacement_owner = UserId::generate();
+    let mut connection = owner_mismatch.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
+         VALUES (?, ?, 'active', ?)",
+    )
+    .bind(replacement_owner.to_string())
+    .bind(owner_mismatch.identity.craxii_id.to_string())
+    .bind(T1)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversations SET owner_user_id = ? WHERE conversation_id = ?")
+        .bind(replacement_owner.to_string())
+        .bind(mismatched.conversation_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    drop(connection);
+    assert!(
+        owner_mismatch
+            .store
+            .verify_application_consistency()
+            .await
+            .is_err()
+    );
+    owner_mismatch.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn more_than_one_global_active_work_fails_stage10_consistency() {
+    let fixture = fixture().await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let a = accept(&fixture, "active A", at(T1)).await;
+    let b = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "forced active B",
+        at(T2),
+    )
+    .await
+    .unwrap();
+    let runtime_id = RuntimeInstanceId::generate();
+    start_runtime(&fixture, runtime_id, at(T1)).await;
+    assert_eq!(
+        claim(&fixture, runtime_id, at(T2))
+            .await
+            .unwrap()
+            .work
+            .work_id(),
+        a.work_id
+    );
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE work_items SET state = 'running', state_version = 2, \
+         runtime_instance_id = ?, started_at = ? WHERE work_id = ?",
+    )
+    .bind(runtime_id.to_string())
+    .bind(T2)
+    .bind(b.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    let rows = sqlx::query("SELECT * FROM journal_events ORDER BY journal_offset")
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+    let events = rows
+        .iter()
+        .map(super::journal::decode_event_row)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let projected = crate::application::projector::project(&events).unwrap();
+    assert!(
+        super::stage10::verify_stage10_consistency(&mut connection, &projected, &events)
+            .await
+            .is_err()
+    );
+    drop(connection);
+    fixture.guard.shutdown().await;
 }
 
 #[tokio::test]
@@ -546,13 +1248,25 @@ async fn claim_and_recovery_queries_use_the_frozen_v3_indexes() {
     let fixture = fixture().await;
     let mut connection = fixture.store.runtime.acquire().await.unwrap();
     let claim_plan = sqlx::query(
-        "EXPLAIN QUERY PLAN SELECT * FROM work_items w WHERE w.conversation_id = ? \
-         AND w.state = 'queued' AND NOT EXISTS (SELECT 1 FROM work_items active \
-         WHERE active.conversation_id = w.conversation_id AND active.state IN \
-         ('running','waiting_on_model','waiting_on_tool','cancel_requested')) \
-         ORDER BY w.conversation_work_ordinal ASC, w.work_id ASC LIMIT 1",
+        "EXPLAIN QUERY PLAN WITH conversation_heads AS ( \
+             SELECT conversation_id, MIN(conversation_work_ordinal) AS conversation_work_ordinal \
+             FROM work_items INDEXED BY ix_work_items_queued_fifo \
+             WHERE craxii_id = ? AND state = 'queued' GROUP BY conversation_id \
+         ) \
+         SELECT w.work_id, w.conversation_id, w.conversation_work_ordinal, \
+                COUNT(je.event_id), MIN(je.journal_offset) AS queued_journal_offset \
+         FROM conversation_heads h JOIN work_items w \
+           ON w.conversation_id = h.conversation_id \
+          AND w.conversation_work_ordinal = h.conversation_work_ordinal \
+          AND w.craxii_id = ? AND w.state = 'queued' \
+         LEFT JOIN journal_events AS je INDEXED BY ix_journal_events_work_offset \
+           ON je.work_id = w.work_id AND je.event_type = 'work.queued' \
+         GROUP BY w.work_id, w.conversation_id, w.conversation_work_ordinal \
+         ORDER BY queued_journal_offset, w.conversation_id, \
+                  w.conversation_work_ordinal, w.work_id",
     )
-    .bind(fixture.identity.conversation_id.to_string())
+    .bind(fixture.identity.craxii_id.to_string())
+    .bind(fixture.identity.craxii_id.to_string())
     .fetch_all(&mut *connection)
     .await
     .unwrap();
@@ -564,6 +1278,26 @@ async fn claim_and_recovery_queries_use_the_frozen_v3_indexes() {
     assert!(
         claim_detail.contains("ix_work_items_queued_fifo"),
         "{claim_detail}"
+    );
+    assert!(
+        claim_detail.contains("ix_journal_events_work_offset"),
+        "{claim_detail}"
+    );
+    let active_plan = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT 1 FROM work_items WHERE craxii_id = ? \
+         AND state IN ('running','waiting_on_model','waiting_on_tool','cancel_requested')",
+    )
+    .bind(fixture.identity.craxii_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap()
+    .iter()
+    .map(|row| row.get::<String, _>("detail"))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        active_plan.contains("ux_work_items_one_active_per_conversation"),
+        "{active_plan}"
     );
 
     for (sql, index) in [
@@ -690,12 +1424,10 @@ async fn atomic_claim_and_cancellation_transactions_serialize_under_contention()
     let barrier = Arc::new(tokio::sync::Barrier::new(3));
     let claim_store = Arc::clone(&store);
     let claim_barrier = Arc::clone(&barrier);
-    let conversation_id = fixture.identity.conversation_id;
     let claim_task = tokio::spawn(async move {
         claim_barrier.wait().await;
         claim_store
             .claim_next_work(ClaimNextWorkRequest {
-                conversation_id,
                 runtime_id,
                 claimed_at: at(T2),
                 event_id: JournalEventId::generate(),
@@ -946,7 +1678,6 @@ async fn shutdown_latches_deadline_stops_claims_and_classifies_before_timeout_ab
         fatal,
         SchedulerStart {
             runtime_instance_id: runtime_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
         },
     )
@@ -1076,7 +1807,6 @@ async fn fatal_health_remains_terminal_while_controlled_shutdown_completes() {
         fatal,
         SchedulerStart {
             runtime_instance_id: runtime_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
@@ -1137,7 +1867,6 @@ async fn heartbeat_fatal_error_still_runs_shutdown_and_preserves_original_failur
         fatal.clone(),
         SchedulerStart {
             runtime_instance_id: runtime_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
         },
     )
@@ -1237,7 +1966,6 @@ async fn scheduler_fatal_error_retains_ownership_until_controlled_shutdown() {
         fatal,
         SchedulerStart {
             runtime_instance_id: runtime_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
@@ -1452,7 +2180,6 @@ async fn stage10_failpoint_crash_child() {
                 fatal,
                 SchedulerStart {
                     runtime_instance_id: runtime.runtime_instance_id,
-                    conversation_id: fixture.identity.conversation_id,
                     readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
                 },
             )
@@ -1471,7 +2198,6 @@ async fn stage10_failpoint_crash_child() {
             fixture
                 .store
                 .claim_next_work(ClaimNextWorkRequest {
-                    conversation_id: fixture.identity.conversation_id,
                     runtime_id: runtime.runtime_instance_id,
                     claimed_at: at(T2),
                     event_id: JournalEventId::generate(),
@@ -1498,7 +2224,6 @@ async fn stage10_failpoint_crash_child() {
             fixture
                 .store
                 .claim_next_work(ClaimNextWorkRequest {
-                    conversation_id: fixture.identity.conversation_id,
                     runtime_id: runtime.runtime_instance_id,
                     claimed_at: at(T2),
                     event_id: JournalEventId::generate(),
@@ -1544,7 +2269,6 @@ async fn stage10_failpoint_crash_child() {
             fixture
                 .store
                 .claim_next_work(ClaimNextWorkRequest {
-                    conversation_id: fixture.identity.conversation_id,
                     runtime_id: runtime.runtime_instance_id,
                     claimed_at: at(T2),
                     event_id: JournalEventId::generate(),
@@ -1630,7 +2354,6 @@ async fn after_message_commit_process_loss_replays_once_and_scheduler_scan_claim
         fatal,
         SchedulerStart {
             runtime_instance_id: current.runtime_instance_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: crate::application::scheduler::SchedulerReadiness::RemainLiveUnready,
         },
     )
@@ -2129,7 +2852,7 @@ impl WorkRunner for Stage17ObservedRunner {
 }
 
 #[tokio::test]
-async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic_messages() {
+async fn real_agent_loop_scheduler_preserves_multi_conversation_fifo_tools_and_completions() {
     let fixture = fixture_with_observation(|root| {
         let workspace_root = root.path().join("stage17-workspace");
         let mut value = observation();
@@ -2148,6 +2871,26 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
     let runtime_id = RuntimeInstanceId::generate();
     start_runtime(&fixture, runtime_id, at(T1)).await;
     let first = accept(&fixture, "read the note", at(T1)).await;
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.identity.craxii_id,
+        user_b,
+        true,
+        at(T1),
+    )
+    .await
+    .unwrap();
+    let device_b = provision_ch3_device(&fixture, user_b).await;
+    let non_root = admit_message(
+        fixture.guard.runtime(),
+        conversation_b,
+        device_b,
+        "answer in the secondary conversation",
+        at(T1),
+    )
+    .await
+    .unwrap();
     let second = accept(&fixture, "read both notes in order", at(T1)).await;
     let third = accept(&fixture, "return structured data", at(T1)).await;
     let fourth = accept(&fixture, "decline this one", at(T1)).await;
@@ -2258,6 +3001,7 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
     let provider = Arc::new(Stage17Provider::new(vec![
         Stage17ProviderPlan::ReadFile,
         Stage17ProviderPlan::FinalText("the note was read once"),
+        Stage17ProviderPlan::FinalText("secondary conversation answer"),
         Stage17ProviderPlan::ReadFiles,
         Stage17ProviderPlan::FinalText("both notes were read in order"),
         Stage17ProviderPlan::Structured,
@@ -2318,7 +3062,6 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
         fatal,
         SchedulerStart {
             runtime_instance_id: runtime_id,
-            conversation_id: fixture.identity.conversation_id,
             readiness: SchedulerReadiness::ReadyAfterInitialScan,
         },
     )
@@ -2327,8 +3070,9 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
     provider.first_started.notified().await;
     let mut connection = fixture.store.runtime.acquire().await.unwrap();
     let queued_followers: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?) AND state = 'queued'",
+        "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?, ?) AND state = 'queued'",
     )
+    .bind(non_root.to_string())
     .bind(second.work_id.to_string())
     .bind(third.work_id.to_string())
     .bind(fourth.work_id.to_string())
@@ -2337,8 +3081,11 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
     .unwrap();
     let leaked_sources: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM context_manifest_sources \
-         WHERE source_record_kind = 'message' AND source_record_id IN (?, ?, ?)",
+         WHERE source_record_kind = 'message' AND source_record_id IN \
+         (SELECT message_id FROM messages WHERE conversation_id = ? \
+          OR message_id IN (?, ?, ?))",
     )
+    .bind(conversation_b.conversation_id.to_string())
     .bind(second.message_id.to_string())
     .bind(third.message_id.to_string())
     .bind(fourth.message_id.to_string())
@@ -2346,7 +3093,7 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
     .await
     .unwrap();
     drop(connection);
-    assert_eq!(queued_followers, 3);
+    assert_eq!(queued_followers, 4);
     assert_eq!(leaked_sources, 0);
     provider.release_first.notify_one();
 
@@ -2354,9 +3101,11 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
         loop {
             let mut connection = fixture.store.runtime.acquire().await.unwrap();
             let count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?, ?) AND state = 'completed'",
+                "SELECT COUNT(*) FROM work_items WHERE work_id IN (?, ?, ?, ?, ?) \
+                 AND state = 'completed'",
             )
             .bind(first.work_id.to_string())
+            .bind(non_root.to_string())
             .bind(second.work_id.to_string())
             .bind(third.work_id.to_string())
             .bind(fourth.work_id.to_string())
@@ -2364,7 +3113,7 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
             .await
             .unwrap();
             drop(connection);
-            if count == 4 {
+            if count == 5 {
                 break true;
             }
             tokio::select! {
@@ -2378,9 +3127,10 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
         let mut connection = fixture.store.runtime.acquire().await.unwrap();
         let states: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT work_id, state, COALESCE(terminal_reason_code, '') FROM work_items \
-             WHERE work_id IN (?, ?, ?, ?) ORDER BY conversation_work_ordinal",
+             WHERE work_id IN (?, ?, ?, ?, ?) ORDER BY queued_at, work_id",
         )
         .bind(first.work_id.to_string())
+        .bind(non_root.to_string())
         .bind(second.work_id.to_string())
         .bind(third.work_id.to_string())
         .bind(fourth.work_id.to_string())
@@ -2415,16 +3165,22 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
         );
     }
     assert!(health.snapshot().is_ready());
-    assert_eq!(provider.invocation_count.load(Ordering::SeqCst), 6);
+    assert_eq!(provider.invocation_count.load(Ordering::SeqCst), 7);
     let requests = provider.requests();
-    assert_eq!(requests.len(), 6);
+    assert_eq!(requests.len(), 7);
     assert!(
         requests[1]
             .ordered_input_items()
             .iter()
             .any(|item| matches!(item, ModelInputItem::ToolResult { .. }))
     );
-    let prior_assistant_parts: Vec<&str> = requests[2]
+    assert!(
+        requests[2]
+            .ordered_input_items()
+            .iter()
+            .all(|item| !matches!(item, ModelInputItem::PriorAssistant { .. }))
+    );
+    let prior_assistant_parts: Vec<&str> = requests[3]
         .ordered_input_items()
         .iter()
         .filter_map(|item| match item {
@@ -2436,7 +3192,7 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
         .collect();
     assert_eq!(prior_assistant_parts, ["the note was read once"]);
     assert_eq!(
-        requests[3]
+        requests[4]
             .ordered_input_items()
             .iter()
             .filter(|item| matches!(item, ModelInputItem::ToolResult { .. }))
@@ -2450,25 +3206,47 @@ async fn real_agent_loop_scheduler_preserves_fifo_tools_fresh_context_and_atomic
          (SELECT COUNT(*) FROM tool_executions WHERE work_id = ?), \
          (SELECT COUNT(*) FROM model_invocations WHERE work_id = ?), \
          (SELECT COUNT(*) FROM tool_executions WHERE work_id = ?), \
-         (SELECT COUNT(*) FROM messages WHERE produced_by_work_id IN (?, ?, ?, ?) AND role = 'assistant'), \
-         (SELECT COUNT(*) FROM journal_events WHERE work_id IN (?, ?, ?, ?) AND event_type = 'assistant.message_committed')",
+         (SELECT COUNT(*) FROM messages WHERE produced_by_work_id IN (?, ?, ?, ?, ?) AND role = 'assistant'), \
+         (SELECT COUNT(*) FROM journal_events WHERE work_id IN (?, ?, ?, ?, ?) AND event_type = 'assistant.message_committed')",
     )
     .bind(first.work_id.to_string())
     .bind(first.work_id.to_string())
     .bind(second.work_id.to_string())
     .bind(second.work_id.to_string())
     .bind(first.work_id.to_string())
+    .bind(non_root.to_string())
     .bind(second.work_id.to_string())
     .bind(third.work_id.to_string())
     .bind(fourth.work_id.to_string())
     .bind(first.work_id.to_string())
+    .bind(non_root.to_string())
     .bind(second.work_id.to_string())
     .bind(third.work_id.to_string())
     .bind(fourth.work_id.to_string())
     .fetch_one(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(evidence, (2, 1, 2, 3, 4, 4));
+    assert_eq!(evidence, (2, 1, 2, 3, 5, 5));
+    let non_root_completion: (String, i64, i64) = sqlx::query_as(
+        "SELECT conversation_id, \
+         (SELECT COUNT(*) FROM messages WHERE produced_by_work_id = ? AND role = 'assistant'), \
+         (SELECT COUNT(*) FROM messages WHERE produced_by_work_id = ? \
+          AND conversation_id != ?) \
+         FROM messages WHERE produced_by_work_id = ? AND role = 'assistant'",
+    )
+    .bind(non_root.to_string())
+    .bind(non_root.to_string())
+    .bind(conversation_b.conversation_id.to_string())
+    .bind(non_root.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        non_root_completion.0,
+        conversation_b.conversation_id.to_string()
+    );
+    assert_eq!(non_root_completion.1, 1);
+    assert_eq!(non_root_completion.2, 0);
     let ordered_tool_ordinals: Vec<i64> = sqlx::query_scalar(
         "SELECT tool_ordinal FROM tool_executions WHERE work_id = ? ORDER BY tool_ordinal",
     )

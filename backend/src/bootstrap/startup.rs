@@ -423,7 +423,6 @@ pub async fn run(
             fatal.clone(),
             crate::application::scheduler::SchedulerStart {
                 runtime_instance_id: runtime.runtime_instance_id,
-                conversation_id: snapshot.identity.conversation_id,
                 readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
             },
         )

@@ -241,6 +241,10 @@ impl SqliteStateStore {
             compare_root_projection(&root, &projected, &events)
         );
         consistency_step!(
+            "conversation_projection",
+            compare_conversation_projection(&mut transaction, &projected).await
+        );
+        consistency_step!(
             "message_projection",
             compare_message_projection(&mut transaction, &projected).await
         );
@@ -280,7 +284,7 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 19
+            checked_invariants: 20
                 + stage8_invariants
                 + stage9_invariants
                 + channel_ingress_invariants
@@ -834,10 +838,8 @@ fn compare_root_projection(
         return Err(inconsistent());
     }
     let initialized = projected.root.as_ref().ok_or_else(inconsistent)?;
-    let conversation = projected
-        .primary_conversation
-        .as_ref()
-        .ok_or_else(inconsistent)?;
+    let conversation = projected.primary_conversation().ok_or_else(inconsistent)?;
+    let created = &conversation.created;
     if initialized.craxii_id != root.principal.craxii_id()
         || initialized.display_name != root.principal.display_name()
         || initialized.owner_label != root.principal.owner_label()
@@ -854,18 +856,80 @@ fn compare_root_projection(
         || initialized.created_at != root.principal.created_at()
         || initialized.created_at != root.workstation.created_at()
         || initialized.created_at != root.workspace.created_at()
-        || conversation.conversation_id != root.primary_conversation.conversation_id()
-        || conversation.craxii_id != root.primary_conversation.craxii_id()
-        || conversation.kind != root.primary_conversation.kind()
-        || conversation.lifecycle != root.primary_conversation.lifecycle()
-        || conversation.next_work_ordinal != root.primary_conversation.next_work_ordinal()
-        || conversation.state_version != root.primary_conversation.projection_version()
-        || conversation.created_at != root.primary_conversation.created_at()
-        || projected
-            .primary_conversation_owner_user_id
+        || created.conversation_id != root.primary_conversation.conversation_id()
+        || created.craxii_id != root.primary_conversation.craxii_id()
+        || created.kind != root.primary_conversation.kind()
+        || created.lifecycle != root.primary_conversation.lifecycle()
+        || created.next_work_ordinal != root.primary_conversation.next_work_ordinal()
+        || created.state_version != root.primary_conversation.projection_version()
+        || created.created_at != root.primary_conversation.created_at()
+        || conversation
+            .owner_user_id
             .is_some_and(|owner| owner != root.primary_conversation.owner_user_id())
     {
         return Err(inconsistent());
+    }
+    Ok(())
+}
+
+async fn compare_conversation_projection(
+    connection: &mut sqlx::SqliteConnection,
+    projected: &crate::application::projector::ProjectedState,
+) -> Result<(), SqliteAdapterError> {
+    let rows = sqlx::query(
+        "SELECT c.*, u.craxii_id AS owner_craxii_id, u.lifecycle_state AS owner_lifecycle \
+         FROM conversations c \
+         LEFT JOIN users u ON u.user_id = c.owner_user_id",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if rows.len() != projected.conversations.len() {
+        return Err(inconsistent());
+    }
+    let root_id = projected
+        .root
+        .as_ref()
+        .ok_or_else(inconsistent)?
+        .primary_conversation_id;
+    for row in rows {
+        let conversation_id = crate::domain::ConversationId::parse_canonical(
+            &row.try_get::<String, _>("conversation_id")?,
+        )
+        .map_err(|_| inconsistent())?;
+        let conversation = projected
+            .conversations
+            .get(&conversation_id)
+            .ok_or_else(inconsistent)?;
+        let created = &conversation.created;
+        let owner_user_id = UserId::parse_canonical(&row.try_get::<String, _>("owner_user_id")?)
+            .map_err(|_| inconsistent())?;
+        let owner_matches = conversation.owner_user_id == Some(owner_user_id)
+            || (conversation.owner_user_id.is_none() && conversation_id == root_id);
+        if created.conversation_id != conversation_id
+            || created.craxii_id
+                != CraxiiId::parse_canonical(&row.try_get::<String, _>("craxii_id")?)
+                    .map_err(|_| inconsistent())?
+            || !owner_matches
+            || row.try_get::<String, _>("owner_craxii_id")? != created.craxii_id.to_string()
+            || row.try_get::<String, _>("owner_lifecycle")? != "active"
+            || row.try_get::<String, _>("kind")? != "primary"
+            || created.kind != ConversationKind::Primary
+            || row.try_get::<String, _>("lifecycle_state")? != "active"
+            || created.lifecycle != ConversationLifecycle::Active
+            || ConversationWorkOrdinal::try_new(row.try_get("next_work_ordinal")?)
+                .map_err(|_| inconsistent())?
+                != created.next_work_ordinal
+            || ProjectionVersion::try_new(row.try_get("state_version")?)
+                .map_err(|_| inconsistent())?
+                != created.state_version
+            || UtcTimestamp::parse_canonical(&row.try_get::<String, _>("created_at")?)
+                .map_err(|_| inconsistent())?
+                != created.created_at
+            || conversation.creation_stream_seq.get() != 1
+        {
+            return Err(inconsistent());
+        }
     }
     Ok(())
 }

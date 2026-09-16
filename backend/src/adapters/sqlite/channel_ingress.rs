@@ -244,7 +244,6 @@ async fn duplicate_outcome(
 
 struct AccountTopology {
     craxii_id: CraxiiId,
-    primary_conversation_id: ConversationId,
     workspace_id: WorkspaceId,
     active: bool,
 }
@@ -255,7 +254,7 @@ async fn load_account(
 ) -> Result<AccountTopology, ChannelIngressStoreError> {
     let row = sqlx::query(
         "SELECT a.craxii_id, a.lifecycle_state, p.craxii_id AS principal_craxii_id, \
-                p.primary_conversation_id, p.default_workspace_id \
+                p.default_workspace_id \
          FROM channel_accounts a \
          LEFT JOIN craxii_principals p ON p.craxii_id = a.craxii_id \
          WHERE a.channel_account_id = ?",
@@ -284,10 +283,6 @@ async fn load_account(
     };
     Ok(AccountTopology {
         craxii_id,
-        primary_conversation_id: row
-            .try_get::<String, _>("primary_conversation_id")?
-            .parse()
-            .map_err(|_| inconsistent())?,
         workspace_id: row
             .try_get::<String, _>("default_workspace_id")?
             .parse()
@@ -494,9 +489,6 @@ async fn resolve_authorized_topology(
             != Some(account.craxii_id)
     {
         return Err(inconsistent());
-    }
-    if conversation_id != account.primary_conversation_id {
-        return Ok(None);
     }
     let created = sqlx::query_scalar::<_, String>(
         "SELECT event_id FROM journal_events \

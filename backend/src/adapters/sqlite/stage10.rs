@@ -266,31 +266,93 @@ async fn claim_next(
     request: ClaimNextWorkRequest,
 ) -> Result<Option<ClaimedWork>, SqliteAdapterError> {
     let mut transaction = WriteTransaction::begin(&store.runtime, "claim_next_work").await?;
-    let runtime_state: Option<String> =
-        sqlx::query_scalar("SELECT state FROM runtime_instances WHERE runtime_instance_id = ?")
+    let runtime =
+        sqlx::query("SELECT state, craxii_id FROM runtime_instances WHERE runtime_instance_id = ?")
             .bind(request.runtime_id.to_string())
             .fetch_optional(transaction.connection())
             .await
-            .map_err(SqliteAdapterError::from_sqlx)?;
-    if runtime_state.as_deref() != Some("running") {
+            .map_err(SqliteAdapterError::from_sqlx)?
+            .ok_or_else(conflict)?;
+    if runtime.try_get::<String, _>("state")? != "running" {
         return Err(conflict());
     }
-    let row = sqlx::query(
-        "SELECT * FROM work_items w WHERE w.conversation_id = ? AND w.state = 'queued' \
-         AND NOT EXISTS (SELECT 1 FROM work_items active WHERE active.conversation_id = w.conversation_id \
-         AND active.state IN ('running','waiting_on_model','waiting_on_tool','cancel_requested')) \
-         ORDER BY w.conversation_work_ordinal ASC, w.work_id ASC LIMIT 1",
+    let craxii_id = CraxiiId::parse_canonical(&runtime.try_get::<String, _>("craxii_id")?)
+        .map_err(|_| inconsistent())?;
+
+    // This durable gate is deliberately inside the same IMMEDIATE transaction as selection
+    // and claim. The in-process registry remains a second, independent safety gate.
+    let active_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM work_items \
+         WHERE craxii_id = ? \
+           AND state IN ('running','waiting_on_model','waiting_on_tool','cancel_requested'))",
     )
-    .bind(request.conversation_id.to_string())
-    .fetch_optional(transaction.connection())
+    .bind(craxii_id.to_string())
+    .fetch_one(transaction.connection())
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
-    let Some(row) = row else {
+    if active_exists != 0 {
+        transaction.commit().await?;
+        return Ok(None);
+    }
+
+    // Only the lowest queued ordinal in each conversation may compete. Every head must have
+    // exactly one durable work.queued event; validating the full head set before choosing the
+    // first candidate prevents a corrupt head from being silently skipped.
+    let candidate_rows = sqlx::query(
+        "WITH conversation_heads AS ( \
+             SELECT conversation_id, MIN(conversation_work_ordinal) AS conversation_work_ordinal \
+             FROM work_items INDEXED BY ix_work_items_queued_fifo \
+             WHERE craxii_id = ? AND state = 'queued' \
+             GROUP BY conversation_id \
+         ) \
+         SELECT w.work_id, w.conversation_id, w.conversation_work_ordinal, \
+                COUNT(je.event_id) AS queued_event_count, \
+                MIN(je.journal_offset) AS queued_journal_offset \
+         FROM conversation_heads h \
+         JOIN work_items w \
+           ON w.conversation_id = h.conversation_id \
+          AND w.conversation_work_ordinal = h.conversation_work_ordinal \
+          AND w.craxii_id = ? AND w.state = 'queued' \
+         LEFT JOIN journal_events AS je INDEXED BY ix_journal_events_work_offset \
+           ON je.work_id = w.work_id AND je.event_type = 'work.queued' \
+         GROUP BY w.work_id, w.conversation_id, w.conversation_work_ordinal \
+         ORDER BY queued_journal_offset ASC, w.conversation_id ASC, \
+                  w.conversation_work_ordinal ASC, w.work_id ASC",
+    )
+    .bind(craxii_id.to_string())
+    .bind(craxii_id.to_string())
+    .fetch_all(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    for candidate in &candidate_rows {
+        let event_count: i64 = candidate.try_get("queued_event_count")?;
+        let offset: Option<i64> = candidate.try_get("queued_journal_offset")?;
+        if event_count != 1 || offset.is_none() {
+            return Err(inconsistent());
+        }
+    }
+    let Some(candidate) = candidate_rows.first() else {
         transaction.commit().await?;
         return Ok(None);
     };
+    let candidate_work_id = WorkId::parse_canonical(&candidate.try_get::<String, _>("work_id")?)
+        .map_err(|_| inconsistent())?;
+    let candidate_conversation_id =
+        ConversationId::parse_canonical(&candidate.try_get::<String, _>("conversation_id")?)
+            .map_err(|_| inconsistent())?;
+    let candidate_ordinal =
+        ConversationWorkOrdinal::try_new(candidate.try_get::<i64, _>("conversation_work_ordinal")?)
+            .map_err(|_| inconsistent())?;
+    let row = sqlx::query("SELECT * FROM work_items WHERE work_id = ?")
+        .bind(candidate_work_id.to_string())
+        .fetch_one(transaction.connection())
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?;
     let decoded = decode_active_work_row(&row)?;
     if decoded.lifecycle.state() != WorkState::Queued
+        || decoded.work.craxii_id() != craxii_id
+        || decoded.work.conversation_id() != candidate_conversation_id
+        || decoded.work.conversation_work_ordinal() != candidate_ordinal
         || decoded.lifecycle.runtime_owner().is_some()
         || decoded.lifecycle.current_attempt() != CurrentWorkAttempt::None
         || decoded.started_at.is_some()
@@ -1910,10 +1972,17 @@ pub(super) async fn verify_stage10_consistency(
     .fetch_one(&mut *connection)
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
-    if invalid_ownership != 0 || duplicate_active != 0 {
+    let global_active: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE state IN \
+         ('running','waiting_on_model','waiting_on_tool','cancel_requested')",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if invalid_ownership != 0 || duplicate_active != 0 || global_active > 1 {
         return Err(inconsistent());
     }
-    Ok(8)
+    Ok(9)
 }
 
 impl SchedulerStateStore for SqliteStateStore {

@@ -245,6 +245,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
+    use crate::adapters::sqlite::ch3_test_support::{admit_message, create_conversation};
     use crate::application::command_service::{AcceptMessageCommand, CommandService};
     use crate::application::context_assembler::{
         ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
@@ -254,10 +255,12 @@ mod tests {
     use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
     use crate::domain::{
         AuthenticatedDevice, BearerToken, ClientMessageId, ContentBlock, ConversationId,
-        CorrelationId, CraxiiId, DeviceDisplayName, IdempotencyKey, JournalEventId, MessageContent,
-        ModelCapabilitySnapshot, ModelCapabilitySnapshotInput, ModelConfigReference, ModelTarget,
-        ModelTargetId, ModelTargetInput, ProviderId, ProviderModelId, ProviderModelReference,
-        ProviderNativeOptions, TargetConfigurationVersion, TokenCount, TokenEstimatorIdentity,
+        CorrelationId, CraxiiId, DeviceDisplayName, DiagnosticPid, GitRevision, IdempotencyKey,
+        JournalEventId, LinuxBootId, MessageContent, ModelCapabilitySnapshot,
+        ModelCapabilitySnapshotInput, ModelConfigReference, ModelTarget, ModelTargetId,
+        ModelTargetInput, PackageVersion, ProviderId, ProviderModelId, ProviderModelReference,
+        ProviderNativeOptions, RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput,
+        SchemaVersion, TargetConfigurationVersion, TokenCount, TokenEstimatorIdentity,
         UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
     };
     use crate::ports::clock::TestClock;
@@ -265,8 +268,9 @@ mod tests {
         ConservativeTokenEstimate, ProviderError, TokenEstimateUnit, TokenEstimator,
     };
     use crate::ports::state_store::{
-        BootstrapObservation, BootstrapStateStore, ExecutionCapabilityObservation,
-        LoadOrBootstrapIdentityRequest, V0IdentityReference,
+        BootstrapObservation, BootstrapStateStore, ClaimNextWorkRequest, CreateRuntimeRequest,
+        ExecutionCapabilityObservation, LoadOrBootstrapIdentityRequest, RuntimeStateStore,
+        SchedulerStateStore, V0IdentityReference,
     };
 
     use super::*;
@@ -485,6 +489,113 @@ mod tests {
             .await
             .unwrap()
             .into_receipt()
+    }
+
+    #[tokio::test]
+    async fn rendered_context_is_conversation_user_and_future_message_isolated() {
+        const A_SENTINEL: &str = "CH3_ONLY_CONVERSATION_A";
+        const B_SENTINEL: &str = "CH3_ONLY_CONVERSATION_B";
+        const B_FUTURE_SENTINEL: &str = "CH3_FUTURE_B2_MUST_NOT_LEAK";
+
+        let fixture = fixture().await;
+        let user_b = crate::domain::UserId::generate();
+        let conversation_b = create_conversation(
+            fixture.guard.runtime(),
+            fixture.identity.craxii_id,
+            user_b,
+            true,
+            timestamp(T0),
+        )
+        .await
+        .unwrap();
+        let device_b = DeviceProvisioningService::new(&fixture.store)
+            .provision_fixture_token(
+                user_b,
+                DeviceDisplayName::try_new("CH-3 context device".to_owned()).unwrap(),
+                timestamp(T0),
+                BearerToken::parse(
+                    "abababababababababababababababababababababababababababababababab".to_owned(),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap()
+            .summary
+            .device_id;
+        let b1 = admit_message(
+            fixture.guard.runtime(),
+            conversation_b,
+            device_b,
+            B_SENTINEL,
+            timestamp(T1),
+        )
+        .await
+        .unwrap();
+        let runtime_id = RuntimeInstanceId::generate();
+        fixture
+            .store
+            .create_runtime_and_started_event(CreateRuntimeRequest {
+                evidence: RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+                    runtime_instance_id: runtime_id,
+                    craxii_id: fixture.identity.craxii_id,
+                    workstation_id: fixture.identity.workstation_id,
+                    workstation_generation: WorkstationGeneration::try_new(1).unwrap(),
+                    linux_boot_id: Some(LinuxBootId::try_new("ch3-context-test").unwrap()),
+                    diagnostic_pid: Some(DiagnosticPid::try_new(101).unwrap()),
+                    package_version: PackageVersion::try_new("0.0.1").unwrap(),
+                    git_revision: GitRevision::try_new("ch3-context").unwrap(),
+                    schema_version: SchemaVersion::try_new(6).unwrap(),
+                    started_at: timestamp(T0),
+                }),
+                event_id: JournalEventId::generate(),
+                correlation_id: CorrelationId::generate(),
+            })
+            .await
+            .unwrap();
+        let claimed_b1 = fixture
+            .store
+            .claim_next_work(ClaimNextWorkRequest {
+                runtime_id,
+                claimed_at: timestamp(T1),
+                event_id: JournalEventId::generate(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed_b1.work.work_id(), b1);
+        let a1 = accept(&fixture, A_SENTINEL).await;
+        admit_message(
+            fixture.guard.runtime(),
+            conversation_b,
+            device_b,
+            B_FUTURE_SENTINEL,
+            timestamp(T1),
+        )
+        .await
+        .unwrap();
+
+        let (assembler, selection) = reconstruction_components(Arc::new(fixture.store.clone()));
+        let b_request = assembler
+            .assemble(b1, &selection, &ContextAssemblyVersions::v0())
+            .await
+            .unwrap();
+        let b_bytes = b_request.request().canonical_bytes();
+        let rendered_b = String::from_utf8_lossy(&b_bytes);
+        assert!(rendered_b.contains(B_SENTINEL));
+        assert!(!rendered_b.contains(A_SENTINEL));
+        assert!(!rendered_b.contains(B_FUTURE_SENTINEL));
+
+        let a_request = assembler
+            .assemble(a1.work_id, &selection, &ContextAssemblyVersions::v0())
+            .await
+            .unwrap();
+        let a_bytes = a_request.request().canonical_bytes();
+        let rendered_a = String::from_utf8_lossy(&a_bytes);
+        assert!(rendered_a.contains(A_SENTINEL));
+        assert!(!rendered_a.contains(B_SENTINEL));
+        assert!(!rendered_a.contains(B_FUTURE_SENTINEL));
+        drop(assembler);
+        fixture.guard.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1097,13 +1208,23 @@ async fn load_active_work(
     work_id: WorkId,
 ) -> Result<ContextWorkSource, ContextSourceStoreError> {
     let row = sqlx::query(
-        "SELECT work_id, conversation_id, conversation_work_ordinal, workspace_id, state, \
-                terminal_reason_code, \
+        "SELECT wi.work_id, wi.conversation_id, wi.conversation_work_ordinal, wi.workspace_id, \
+                wi.state, wi.terminal_reason_code, \
                 (SELECT max(je.journal_offset) FROM journal_events je \
-                 WHERE je.work_id = work_items.work_id \
+                 WHERE je.work_id = wi.work_id \
                    AND je.event_type IN ('work.completed', 'work.failed', 'work.cancelled', 'work.interrupted')) \
                  AS terminal_journal_offset \
-         FROM work_items WHERE work_id = ?",
+         FROM work_items wi \
+         JOIN conversations c \
+           ON c.conversation_id = wi.conversation_id AND c.craxii_id = wi.craxii_id \
+         JOIN users u \
+           ON u.user_id = c.owner_user_id AND u.craxii_id = c.craxii_id \
+         JOIN workspaces ws \
+           ON ws.workspace_id = wi.workspace_id AND ws.craxii_id = wi.craxii_id \
+         JOIN craxii_principals p \
+           ON p.craxii_id = wi.craxii_id AND p.default_workspace_id = wi.workspace_id \
+         WHERE wi.work_id = ? AND c.lifecycle_state = 'active' \
+           AND u.lifecycle_state = 'active'",
     )
     .bind(work_id.to_string())
     .fetch_optional(&mut **transaction)

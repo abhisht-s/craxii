@@ -9,8 +9,7 @@ use tracing::Instrument;
 use crate::application::command_service::CommandPostCommit;
 use crate::bootstrap::health::{FatalReasonCode, Health};
 use crate::domain::{
-    ConversationId, CurrentWorkAttempt, JournalEventId, JournalOffset, RuntimeInstanceId,
-    UtcTimestamp, WorkId,
+    CurrentWorkAttempt, JournalEventId, JournalOffset, RuntimeInstanceId, UtcTimestamp, WorkId,
 };
 use crate::ports::clock::Clock;
 use crate::ports::state_store::{
@@ -141,7 +140,6 @@ pub enum SchedulerReadiness {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulerStart {
     pub runtime_instance_id: RuntimeInstanceId,
-    pub conversation_id: ConversationId,
     pub readiness: SchedulerReadiness,
 }
 
@@ -242,7 +240,6 @@ where
     let scheduler_span = tracing::info_span!(
         "scheduler",
         runtime_instance_id = %start.runtime_instance_id,
-        conversation_id = %start.conversation_id,
     );
     let join = tokio::spawn(
         run_scheduler(
@@ -251,7 +248,6 @@ where
             clock,
             health,
             start.runtime_instance_id,
-            start.conversation_id,
             notify,
             commands,
             fatal,
@@ -280,7 +276,6 @@ async fn run_scheduler<S, R, C>(
     clock: Arc<C>,
     health: Health,
     runtime_instance_id: RuntimeInstanceId,
-    conversation_id: ConversationId,
     notify: Arc<tokio::sync::Notify>,
     mut commands: tokio::sync::mpsc::UnboundedReceiver<SchedulerCommand>,
     fatal: tokio::sync::watch::Sender<bool>,
@@ -381,7 +376,6 @@ where
                     runner.as_ref(),
                     clock.as_ref(),
                     runtime_instance_id,
-                    conversation_id,
                     &mut tasks,
                     &mut registry,
                     &mut task_to_work,
@@ -411,7 +405,6 @@ where
                     runner.as_ref(),
                     clock.as_ref(),
                     runtime_instance_id,
-                    conversation_id,
                     &mut tasks,
                     &mut registry,
                     &mut task_to_work,
@@ -446,7 +439,6 @@ async fn scan_once<S, R, C>(
     runner: &R,
     clock: &C,
     runtime_instance_id: RuntimeInstanceId,
-    conversation_id: ConversationId,
     tasks: &mut tokio::task::JoinSet<(WorkId, WorkRunnerExit)>,
     registry: &mut HashMap<WorkId, RegistryEntry>,
     task_to_work: &mut HashMap<tokio::task::Id, WorkId>,
@@ -484,7 +476,6 @@ where
         let queue_span = tracing::info_span!(
             "work_queue_wait",
             runtime_instance_id = %runtime_instance_id,
-            conversation_id = %conversation_id,
             work_id = tracing::field::Empty,
             work_ordinal = tracing::field::Empty,
             queue_duration_ms = tracing::field::Empty,
@@ -494,7 +485,6 @@ where
         if claiming.load(Ordering::Acquire)
             && let Some(claimed) = store
                 .claim_next_work(ClaimNextWorkRequest {
-                    conversation_id,
                     runtime_id: runtime_instance_id,
                     claimed_at,
                     event_id: JournalEventId::generate(),
@@ -747,8 +737,8 @@ mod tests {
     use super::*;
     use crate::bootstrap::health::HealthState;
     use crate::domain::{
-        ConversationWorkOrdinal, CorrelationId, CraxiiId, ProjectionVersion, WorkItem,
-        WorkItemInputData, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState,
+        ConversationId, ConversationWorkOrdinal, CorrelationId, CraxiiId, ProjectionVersion,
+        WorkItem, WorkItemInputData, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState,
         WorkspaceId,
     };
     use crate::ports::clock::TestClock;
@@ -1003,7 +993,6 @@ mod tests {
             &runner,
             test_clock().as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1028,7 +1017,6 @@ mod tests {
             &runner,
             test_clock().as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1073,7 +1061,6 @@ mod tests {
             &StartFailureRunner,
             test_clock().as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1105,7 +1092,6 @@ mod tests {
             &PanicRunner,
             test_clock().as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1151,7 +1137,6 @@ mod tests {
             fatal,
             SchedulerStart {
                 runtime_instance_id: runtime_id,
-                conversation_id: ConversationId::generate(),
                 readiness: SchedulerReadiness::ReadyAfterInitialScan,
             },
         )
@@ -1186,7 +1171,6 @@ mod tests {
             &TerminalRunner,
             clock.as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1216,7 +1200,6 @@ mod tests {
             &TerminalRunner,
             clock.as_ref(),
             runtime_id,
-            ConversationId::generate(),
             &mut tasks,
             &mut registry,
             &mut task_to_work,
@@ -1268,7 +1251,6 @@ mod tests {
             fatal,
             SchedulerStart {
                 runtime_instance_id: runtime_id,
-                conversation_id: ConversationId::generate(),
                 readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )
@@ -1309,7 +1291,6 @@ mod tests {
             fatal,
             SchedulerStart {
                 runtime_instance_id: runtime_id,
-                conversation_id: ConversationId::generate(),
                 readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )
@@ -1343,7 +1324,6 @@ mod tests {
             fatal,
             SchedulerStart {
                 runtime_instance_id: RuntimeInstanceId::generate(),
-                conversation_id: ConversationId::generate(),
                 readiness: SchedulerReadiness::RemainLiveUnready,
             },
         )

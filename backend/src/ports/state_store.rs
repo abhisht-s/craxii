@@ -596,7 +596,6 @@ pub struct AcceptUserMessageRequest {
 /// FIFO claim request; the adapter guards the selected row as queued at its current version.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClaimNextWorkRequest {
-    pub conversation_id: ConversationId,
     pub runtime_id: RuntimeInstanceId,
     pub claimed_at: UtcTimestamp,
     pub event_id: JournalEventId,

@@ -31,6 +31,7 @@ use crate::ports::state_store::{
     SchedulerStateStore, V0IdentityReference,
 };
 
+use super::ch3_test_support::create_conversation;
 use super::journal::load_global_events;
 use super::{SqliteChannelIdentityStore, SqliteRuntimeGuard, SqliteStateStore};
 
@@ -544,7 +545,6 @@ async fn active_control_precedes_queued_and_already_requested_is_eventless() {
     let claimed = fixture
         .store
         .claim_next_work(ClaimNextWorkRequest {
-            conversation_id: fixture.owner.conversation_id,
             runtime_id,
             claimed_at: at(T1),
             event_id: JournalEventId::generate(),
@@ -608,6 +608,152 @@ async fn active_control_precedes_queued_and_already_requested_is_eventless() {
             .unwrap(),
         "queued"
     );
+    drop(connection);
+    fixture
+        .store
+        .verify_application_consistency()
+        .await
+        .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn non_root_active_control_is_conversation_local_and_signals_only_its_work() {
+    let fixture = fixture().await;
+    let identity_store = SqliteChannelIdentityStore::new(fixture.guard.runtime().clone());
+    let user_b = UserId::generate();
+    let conversation_b = create_conversation(
+        fixture.guard.runtime(),
+        fixture.owner.craxii_id,
+        user_b,
+        true,
+        at(T0),
+    )
+    .await
+    .unwrap()
+    .conversation_id;
+    let identity_b = ExternalIdentity {
+        external_identity_id: ExternalIdentityId::generate(),
+        channel_account_id: fixture.account.channel_account_id,
+        craxii_id: fixture.owner.craxii_id,
+        user_id: user_b,
+        external_subject_id: ExternalSubjectId::try_new("secondary-subject").unwrap(),
+        lifecycle: ExternalIdentityLifecycle::Active,
+        created_at: at(T0),
+        revoked_at: None,
+    };
+    identity_store
+        .persist_external_identity(identity_b.clone())
+        .await
+        .unwrap();
+    let binding_b = ConversationBinding {
+        conversation_binding_id: ConversationBindingId::generate(),
+        channel_account_id: fixture.account.channel_account_id,
+        external_identity_id: identity_b.external_identity_id,
+        craxii_id: fixture.owner.craxii_id,
+        user_id: user_b,
+        conversation_id: conversation_b,
+        external_conversation_id: ExternalConversationId::try_new("secondary-destination").unwrap(),
+        external_thread_id: None,
+        lifecycle: ConversationBindingLifecycle::Active,
+        created_at: at(T0),
+        revoked_at: None,
+    };
+    identity_store
+        .persist_conversation_binding(binding_b.clone())
+        .await
+        .unwrap();
+    let service = fixture.service();
+    let event_b = |event_id: &str, message_id: &str, payload: VerifiedInboundPayload| {
+        VerifiedInboundEvent::new(
+            fixture.account.channel_account_id,
+            ExternalEventId::try_new(event_id).unwrap(),
+            Some(ExternalMessageId::try_new(message_id).unwrap()),
+            identity_b.external_subject_id.clone(),
+            binding_b.external_conversation_id.clone(),
+            None,
+            payload,
+            None,
+            at(T1),
+        )
+        .unwrap()
+    };
+    let admitted_b = service
+        .classify(event_b(
+            "secondary-message-event",
+            "secondary-message",
+            VerifiedInboundPayload::Text(text("secondary work")),
+        ))
+        .await
+        .unwrap();
+    let DurableInboundOutcome::MessageAccepted {
+        work_id: work_b, ..
+    } = admitted_b.outcome
+    else {
+        panic!("secondary message outcome expected");
+    };
+    let runtime_id = create_runtime(&fixture).await;
+    let claimed = fixture
+        .store
+        .claim_next_work(ClaimNextWorkRequest {
+            runtime_id,
+            claimed_at: at(T1),
+            event_id: JournalEventId::generate(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.work.work_id(), work_b);
+
+    let admitted_a = service
+        .classify(fixture.event("root-message-event", "root-message", "root work"))
+        .await
+        .unwrap();
+    let DurableInboundOutcome::MessageAccepted {
+        work_id: work_a, ..
+    } = admitted_a.outcome
+    else {
+        panic!("root message outcome expected");
+    };
+    let control = service
+        .classify(event_b(
+            "secondary-control-event",
+            "secondary-control",
+            VerifiedInboundPayload::Text(text("STOP")),
+        ))
+        .await
+        .unwrap();
+    let DurableInboundOutcome::ControlApplied { target_work_id, .. } = control.outcome else {
+        panic!("secondary control outcome expected");
+    };
+    assert_eq!(target_work_id, work_b);
+    assert_eq!(
+        fixture.effects.snapshot().last().unwrap().0,
+        EffectKind::ActiveCancellation
+    );
+    assert_eq!(fixture.effects.snapshot().last().unwrap().1, work_b);
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let states: (String, String) = sqlx::query_as(
+        "SELECT (SELECT state FROM work_items WHERE work_id = ?), \
+                (SELECT state FROM work_items WHERE work_id = ?)",
+    )
+    .bind(work_a.to_string())
+    .bind(work_b.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(states.0, "queued");
+    assert_eq!(states.1, "cancel_requested");
+    let root_cancellation_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM journal_events WHERE work_id = ? \
+         AND event_type IN ('work.cancellation_requested','work.cancelled')",
+    )
+    .bind(work_a.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(root_cancellation_events, 0);
     drop(connection);
     fixture
         .store
@@ -829,32 +975,16 @@ async fn authorization_failures_reject_but_unknown_or_corrupt_topology_fails_clo
     ));
 
     let second_user = UserId::generate();
-    let second_conversation = ConversationId::generate();
-    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
-    sqlx::query(
-        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
-         VALUES (?, ?, 'active', ?)",
+    let second_conversation = create_conversation(
+        fixture.guard.runtime(),
+        fixture.owner.craxii_id,
+        second_user,
+        true,
+        at(T0),
     )
-    .bind(second_user.to_string())
-    .bind(fixture.owner.craxii_id.to_string())
-    .bind(T0)
-    .execute(&mut *connection)
     .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO conversations \
-         (conversation_id, craxii_id, owner_user_id, kind, lifecycle_state, \
-          next_work_ordinal, state_version, created_at) \
-         VALUES (?, ?, ?, 'primary', 'active', 1, 1, ?)",
-    )
-    .bind(second_conversation.to_string())
-    .bind(fixture.owner.craxii_id.to_string())
-    .bind(second_user.to_string())
-    .bind(T0)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    drop(connection);
+    .unwrap()
+    .conversation_id;
     let second_identity = ExternalIdentity {
         external_identity_id: ExternalIdentityId::generate(),
         channel_account_id: fixture.account.channel_account_id,
@@ -898,10 +1028,43 @@ async fn authorization_failures_reject_but_unknown_or_corrupt_topology_fails_clo
         at(T1),
     )
     .unwrap();
-    assert!(matches!(
-        service.classify(non_root).await.unwrap().outcome,
-        DurableInboundOutcome::Rejected { .. }
-    ));
+    let non_root_outcome = service.classify(non_root).await.unwrap().outcome;
+    let (non_root_work_id, non_root_message_id) = match non_root_outcome {
+        DurableInboundOutcome::MessageAccepted {
+            work_id,
+            message_id,
+            ..
+        } => (work_id, message_id),
+        other => panic!("valid non-root admission was not accepted: {other:?}"),
+    };
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let route: (String, String, String) = sqlx::query_as(
+        "SELECT m.conversation_id, w.conversation_id, w.reply_binding_id \
+         FROM messages m JOIN work_items w ON w.work_id = ? \
+         WHERE m.message_id = ?",
+    )
+    .bind(non_root_work_id.to_string())
+    .bind(non_root_message_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(route.0, second_conversation.to_string());
+    assert_eq!(route.1, second_conversation.to_string());
+    assert_eq!(route.2, second_binding.conversation_binding_id.to_string());
+    drop(connection);
+    let runtime_id = create_runtime(&fixture).await;
+    let claimed = fixture
+        .store
+        .claim_next_work(ClaimNextWorkRequest {
+            runtime_id,
+            claimed_at: at(T1),
+            event_id: JournalEventId::generate(),
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(claimed.work.work_id(), non_root_work_id);
+    assert_eq!(claimed.work.conversation_id(), second_conversation);
 
     let unknown_account = VerifiedInboundEvent::new(
         ChannelAccountId::generate(),
@@ -944,8 +1107,8 @@ async fn authorization_failures_reject_but_unknown_or_corrupt_topology_fails_clo
             .kind(),
         ChannelIngressErrorKind::StorageInconsistent
     );
-    assert_eq!(table_count(&fixture, "messages").await, 0);
-    assert_eq!(table_count(&fixture, "work_items").await, 0);
+    assert_eq!(table_count(&fixture, "messages").await, 1);
+    assert_eq!(table_count(&fixture, "work_items").await, 1);
     fixture.guard.shutdown().await;
 }
 

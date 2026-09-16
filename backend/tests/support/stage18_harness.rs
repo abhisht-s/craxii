@@ -1134,7 +1134,6 @@ impl Stage18Harness {
             fatal.clone(),
             SchedulerStart {
                 runtime_instance_id: runtime_id,
-                conversation_id: identity.conversation_id,
                 readiness: SchedulerReadiness::ReadyAfterInitialScan,
             },
         )
