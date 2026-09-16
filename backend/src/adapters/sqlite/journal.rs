@@ -3,18 +3,19 @@ use sqlx::Row;
 
 use crate::domain::{
     ArtifactId, ArtifactRecordedV1, ArtifactRetention, ClientMessageId, ContentBlock,
-    ConversationCreatedV1, ConversationId, ConversationKind, ConversationLifecycle,
-    ConversationWorkOrdinal, CorrelationId, CraxiiId, CraxiiInitializedV1, DeviceId, DiagnosticPid,
-    GitRevision, JournalActor, JournalContractError, JournalCurrentAttempt, JournalEvent,
-    JournalEventId, JournalEventKind, JournalEventPayload, JournalOffset, JournalStreamId,
-    LinuxBootId, LogicalInvocationId, MessageCommittedV1, MessageContent, MessageId, MessageRole,
-    ModelInvocationEventV1, ModelInvocationId, ModelInvocationState, PackageVersion,
+    ConversationBindingId, ConversationCreatedV1, ConversationCreatedV2, ConversationId,
+    ConversationKind, ConversationLifecycle, ConversationWorkOrdinal, CorrelationId, CraxiiId,
+    CraxiiInitializedV1, DeviceId, DiagnosticPid, GitRevision, InboundDeliveryId, JournalActor,
+    JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventKind,
+    JournalEventPayload, JournalOffset, JournalStreamId, LinuxBootId, LogicalInvocationId,
+    MessageAcceptedOriginV2, MessageCommittedV1, MessageCommittedV2, MessageContent, MessageId,
+    MessageRole, ModelInvocationEventV1, ModelInvocationId, ModelInvocationState, PackageVersion,
     ProjectionVersion, RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeShutdownReason,
     RuntimeStartedV1, RuntimeStoppingV1, SchemaVersion, Sha256Digest, StreamSeq,
-    ToolExecutionEventV1, ToolExecutionId, ToolExecutionState, ToolResultClass, UtcTimestamp,
-    WorkCancellationReason, WorkId, WorkInputActor, WorkInputFactV1, WorkInputOrdinal,
-    WorkInputRelationship, WorkKind, WorkQueuedV1, WorkState, WorkTransitionV1, WorkspaceId,
-    WorkstationGeneration, WorkstationId, resolve_event_version,
+    ToolExecutionEventV1, ToolExecutionId, ToolExecutionState, ToolResultClass, UserId,
+    UtcTimestamp, WorkCancellationReason, WorkId, WorkInputActor, WorkInputFactV1,
+    WorkInputOrdinal, WorkInputRelationship, WorkKind, WorkQueuedV1, WorkQueuedV2, WorkState,
+    WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId, resolve_event_version,
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
@@ -123,6 +124,49 @@ impl From<StoredConversationCreatedV1> for ConversationCreatedV1 {
         Self {
             conversation_id: value.conversation_id,
             craxii_id: value.craxii_id,
+            kind: value.kind,
+            lifecycle: value.lifecycle,
+            next_work_ordinal: value.next_work_ordinal,
+            state_version: value.state_version,
+            created_at: value.created_at,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredConversationCreatedV2 {
+    conversation_id: ConversationId,
+    craxii_id: CraxiiId,
+    owner_user_id: UserId,
+    kind: ConversationKind,
+    lifecycle: ConversationLifecycle,
+    next_work_ordinal: ConversationWorkOrdinal,
+    state_version: ProjectionVersion,
+    created_at: UtcTimestamp,
+}
+
+impl From<&ConversationCreatedV2> for StoredConversationCreatedV2 {
+    fn from(value: &ConversationCreatedV2) -> Self {
+        Self {
+            conversation_id: value.conversation_id,
+            craxii_id: value.craxii_id,
+            owner_user_id: value.owner_user_id,
+            kind: value.kind,
+            lifecycle: value.lifecycle,
+            next_work_ordinal: value.next_work_ordinal,
+            state_version: value.state_version,
+            created_at: value.created_at,
+        }
+    }
+}
+
+impl From<StoredConversationCreatedV2> for ConversationCreatedV2 {
+    fn from(value: StoredConversationCreatedV2) -> Self {
+        Self {
+            conversation_id: value.conversation_id,
+            craxii_id: value.craxii_id,
+            owner_user_id: value.owner_user_id,
             kind: value.kind,
             lifecycle: value.lifecycle,
             next_work_ordinal: value.next_work_ordinal,
@@ -253,6 +297,106 @@ impl TryFrom<StoredMessageCommittedV1> for MessageCommittedV1 {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum StoredMessageAcceptedOriginV2 {
+    Native {
+        device_id: DeviceId,
+        client_message_id: ClientMessageId,
+    },
+    InboundDelivery {
+        inbound_delivery_id: InboundDeliveryId,
+    },
+}
+
+impl From<MessageAcceptedOriginV2> for StoredMessageAcceptedOriginV2 {
+    fn from(value: MessageAcceptedOriginV2) -> Self {
+        match value {
+            MessageAcceptedOriginV2::Native {
+                device_id,
+                client_message_id,
+            } => Self::Native {
+                device_id,
+                client_message_id,
+            },
+            MessageAcceptedOriginV2::InboundDelivery {
+                inbound_delivery_id,
+            } => Self::InboundDelivery {
+                inbound_delivery_id,
+            },
+        }
+    }
+}
+
+impl From<StoredMessageAcceptedOriginV2> for MessageAcceptedOriginV2 {
+    fn from(value: StoredMessageAcceptedOriginV2) -> Self {
+        match value {
+            StoredMessageAcceptedOriginV2::Native {
+                device_id,
+                client_message_id,
+            } => Self::Native {
+                device_id,
+                client_message_id,
+            },
+            StoredMessageAcceptedOriginV2::InboundDelivery {
+                inbound_delivery_id,
+            } => Self::InboundDelivery {
+                inbound_delivery_id,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredMessageCommittedV2 {
+    message_id: MessageId,
+    craxii_id: CraxiiId,
+    conversation_id: ConversationId,
+    role: MessageRole,
+    content: StoredMessageContentV1,
+    content_sha256: Sha256Digest,
+    author_user_id: UserId,
+    origin: StoredMessageAcceptedOriginV2,
+    committed_at: UtcTimestamp,
+}
+
+impl From<&MessageCommittedV2> for StoredMessageCommittedV2 {
+    fn from(value: &MessageCommittedV2) -> Self {
+        Self {
+            message_id: value.message_id,
+            craxii_id: value.craxii_id,
+            conversation_id: value.conversation_id,
+            role: value.role,
+            content: StoredMessageContentV1::from_domain(&value.content),
+            content_sha256: value.content_sha256,
+            author_user_id: value.author_user_id,
+            origin: value.origin.into(),
+            committed_at: value.committed_at,
+        }
+    }
+}
+
+impl TryFrom<StoredMessageCommittedV2> for MessageCommittedV2 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredMessageCommittedV2) -> Result<Self, Self::Error> {
+        let result = Self {
+            message_id: value.message_id,
+            craxii_id: value.craxii_id,
+            conversation_id: value.conversation_id,
+            role: value.role,
+            content: value.content.into_domain()?,
+            content_sha256: value.content_sha256,
+            author_user_id: value.author_user_id,
+            origin: value.origin.into(),
+            committed_at: value.committed_at,
+        };
+        result.validate_contract().map_err(|_| inconsistent())?;
+        Ok(result)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredWorkInputFactV1 {
     input_event_id: JournalEventId,
@@ -347,6 +491,84 @@ impl TryFrom<StoredWorkQueuedV1> for WorkQueuedV1 {
             created_at: value.created_at,
             queued_at: value.queued_at,
             trigger: value.trigger.into(),
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredWorkQueuedV2 {
+    work_id: WorkId,
+    craxii_id: CraxiiId,
+    conversation_id: ConversationId,
+    conversation_work_ordinal: ConversationWorkOrdinal,
+    kind: WorkKind,
+    priority: i64,
+    workspace_id: WorkspaceId,
+    correlation_id: CorrelationId,
+    state_version: ProjectionVersion,
+    created_at: UtcTimestamp,
+    queued_at: UtcTimestamp,
+    trigger: StoredWorkInputFactV1,
+    #[serde(deserialize_with = "deserialize_required_reply_binding")]
+    reply_binding_id: Option<ConversationBindingId>,
+}
+
+fn deserialize_required_reply_binding<'de, D>(
+    deserializer: D,
+) -> Result<Option<ConversationBindingId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<ConversationBindingId>::deserialize(deserializer)
+}
+
+impl From<&WorkQueuedV2> for StoredWorkQueuedV2 {
+    fn from(value: &WorkQueuedV2) -> Self {
+        Self {
+            work_id: value.work_id,
+            craxii_id: value.craxii_id,
+            conversation_id: value.conversation_id,
+            conversation_work_ordinal: value.conversation_work_ordinal,
+            kind: value.kind,
+            priority: value.priority,
+            workspace_id: value.workspace_id,
+            correlation_id: value.correlation_id,
+            state_version: value.state_version,
+            created_at: value.created_at,
+            queued_at: value.queued_at,
+            trigger: StoredWorkInputFactV1::from(&value.trigger),
+            reply_binding_id: value.reply_binding_id,
+        }
+    }
+}
+
+impl TryFrom<StoredWorkQueuedV2> for WorkQueuedV2 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredWorkQueuedV2) -> Result<Self, Self::Error> {
+        if value.priority != 0
+            || value.state_version.get() != 1
+            || value.trigger.relationship != WorkInputRelationship::Trigger
+            || value.trigger.ordinal_within_work.get() != 1
+            || value.trigger.actor != WorkInputActor::User
+        {
+            return Err(inconsistent());
+        }
+        Ok(Self {
+            work_id: value.work_id,
+            craxii_id: value.craxii_id,
+            conversation_id: value.conversation_id,
+            conversation_work_ordinal: value.conversation_work_ordinal,
+            kind: value.kind,
+            priority: value.priority,
+            workspace_id: value.workspace_id,
+            correlation_id: value.correlation_id,
+            state_version: value.state_version,
+            created_at: value.created_at,
+            queued_at: value.queued_at,
+            trigger: value.trigger.into(),
+            reply_binding_id: value.reply_binding_id,
         })
     }
 }
@@ -737,8 +959,11 @@ impl TryFrom<StoredRuntimeStoppingV1> for RuntimeStoppingV1 {
 enum StoredEventPayloadV1 {
     CraxiiInitialized(StoredCraxiiInitializedV1),
     ConversationCreated(StoredConversationCreatedV1),
+    ConversationCreatedV2(StoredConversationCreatedV2),
     Message(StoredMessageCommittedV1),
+    MessageV2(StoredMessageCommittedV2),
     WorkQueued(StoredWorkQueuedV1),
+    WorkQueuedV2(StoredWorkQueuedV2),
     WorkTransition(StoredWorkTransitionV1),
     Model(StoredModelInvocationEventV1),
     Tool(StoredToolExecutionEventV1),
@@ -773,11 +998,20 @@ pub(super) fn encode_event_payload(
         JournalEventPayload::ConversationCreated(value) => {
             StoredEventPayloadV1::ConversationCreated(value.into())
         }
+        JournalEventPayload::ConversationCreatedV2(value) => {
+            StoredEventPayloadV1::ConversationCreatedV2(value.into())
+        }
         JournalEventPayload::MessageAccepted(value)
         | JournalEventPayload::AssistantMessageCommitted(value) => {
             StoredEventPayloadV1::Message(value.into())
         }
+        JournalEventPayload::MessageAcceptedV2(value) => {
+            StoredEventPayloadV1::MessageV2(value.into())
+        }
         JournalEventPayload::WorkQueued(value) => StoredEventPayloadV1::WorkQueued(value.into()),
+        JournalEventPayload::WorkQueuedV2(value) => {
+            StoredEventPayloadV1::WorkQueuedV2(value.into())
+        }
         JournalEventPayload::WorkStarted(value)
         | JournalEventPayload::WorkWaitingOnModel(value)
         | JournalEventPayload::WorkWaitingOnTool(value)
@@ -819,8 +1053,11 @@ pub(super) fn encode_event_payload(
     let json = match &stored {
         StoredEventPayloadV1::CraxiiInitialized(value) => to_json(value)?,
         StoredEventPayloadV1::ConversationCreated(value) => to_json(value)?,
+        StoredEventPayloadV1::ConversationCreatedV2(value) => to_json(value)?,
         StoredEventPayloadV1::Message(value) => to_json(value)?,
+        StoredEventPayloadV1::MessageV2(value) => to_json(value)?,
         StoredEventPayloadV1::WorkQueued(value) => to_json(value)?,
+        StoredEventPayloadV1::WorkQueuedV2(value) => to_json(value)?,
         StoredEventPayloadV1::WorkTransition(value) => to_json(value)?,
         StoredEventPayloadV1::Model(value) => to_json(value)?,
         StoredEventPayloadV1::Tool(value) => to_json(value)?,
@@ -853,14 +1090,27 @@ pub(super) fn decode_event_payload(
         JournalEventKind::CraxiiInitialized => JournalEventPayload::CraxiiInitialized(
             from_json::<StoredCraxiiInitializedV1>(payload_json)?.into(),
         ),
-        JournalEventKind::ConversationCreated => JournalEventPayload::ConversationCreated(
-            from_json::<StoredConversationCreatedV1>(payload_json)?.into(),
+        JournalEventKind::ConversationCreated if event_version == 1 => {
+            JournalEventPayload::ConversationCreated(
+                from_json::<StoredConversationCreatedV1>(payload_json)?.into(),
+            )
+        }
+        JournalEventKind::ConversationCreated => JournalEventPayload::ConversationCreatedV2(
+            from_json::<StoredConversationCreatedV2>(payload_json)?.into(),
         ),
-        JournalEventKind::MessageAccepted => JournalEventPayload::MessageAccepted(
-            from_json::<StoredMessageCommittedV1>(payload_json)?.try_into()?,
+        JournalEventKind::MessageAccepted if event_version == 1 => {
+            JournalEventPayload::MessageAccepted(
+                from_json::<StoredMessageCommittedV1>(payload_json)?.try_into()?,
+            )
+        }
+        JournalEventKind::MessageAccepted => JournalEventPayload::MessageAcceptedV2(
+            from_json::<StoredMessageCommittedV2>(payload_json)?.try_into()?,
         ),
-        JournalEventKind::WorkQueued => JournalEventPayload::WorkQueued(
+        JournalEventKind::WorkQueued if event_version == 1 => JournalEventPayload::WorkQueued(
             from_json::<StoredWorkQueuedV1>(payload_json)?.try_into()?,
+        ),
+        JournalEventKind::WorkQueued => JournalEventPayload::WorkQueuedV2(
+            from_json::<StoredWorkQueuedV2>(payload_json)?.try_into()?,
         ),
         JournalEventKind::WorkStarted => JournalEventPayload::WorkStarted(
             from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
@@ -966,7 +1216,7 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
             value.display_name == "Craxii"
                 && value.owner_label == "local-owner"
                 && value.architecture_revision == "V0.0.01"
-                && matches!(value.schema_revision.get(), 2..=4)
+                && matches!(value.schema_revision.get(), 2..=5)
                 && crate::domain::LogicalPathReference::absolute(
                     value.workspace_logical_root.clone(),
                 )
@@ -979,13 +1229,28 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
                 && value.next_work_ordinal.get() == 1
                 && value.state_version.get() == 1
         }
+        JournalEventPayload::ConversationCreatedV2(value) => {
+            value.kind == ConversationKind::Primary
+                && value.lifecycle == ConversationLifecycle::Active
+                && value.next_work_ordinal.get() == 1
+                && value.state_version.get() == 1
+        }
         JournalEventPayload::MessageAccepted(value) => {
             value.role == MessageRole::User && value.validate_contract().is_ok()
         }
+        JournalEventPayload::MessageAcceptedV2(value) => value.validate_contract().is_ok(),
         JournalEventPayload::AssistantMessageCommitted(value) => {
             value.role == MessageRole::Assistant && value.validate_contract().is_ok()
         }
         JournalEventPayload::WorkQueued(value) => {
+            value.kind == WorkKind::Conversational
+                && value.priority == 0
+                && value.state_version.get() == 1
+                && value.trigger.relationship == WorkInputRelationship::Trigger
+                && value.trigger.ordinal_within_work.get() == 1
+                && value.trigger.actor == WorkInputActor::User
+        }
+        JournalEventPayload::WorkQueuedV2(value) => {
             value.kind == WorkKind::Conversational
                 && value.priority == 0
                 && value.state_version.get() == 1
@@ -1137,12 +1402,27 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
                 && intent.causation_event_id.is_some()
                 && intent.actor == JournalActor::Craxii(value.craxii_id)
         }
+        (JournalEventPayload::ConversationCreatedV2(value), JournalStreamId::Conversation(id)) => {
+            id == value.conversation_id
+                && intent.craxii_id == value.craxii_id
+                && intent.conversation_id == Some(value.conversation_id)
+                && intent.work_id.is_none()
+                && intent.causation_event_id.is_some()
+                && intent.actor == JournalActor::Craxii(value.craxii_id)
+        }
         (JournalEventPayload::MessageAccepted(value), JournalStreamId::Conversation(id)) => {
             id == value.conversation_id
                 && intent.craxii_id == value.craxii_id
                 && intent.conversation_id == Some(value.conversation_id)
                 && intent.work_id == value.produced_by_work_id
                 && intent.actor == JournalActor::User(value.device_id)
+        }
+        (JournalEventPayload::MessageAcceptedV2(value), JournalStreamId::Conversation(id)) => {
+            id == value.conversation_id
+                && intent.craxii_id == value.craxii_id
+                && intent.conversation_id == Some(value.conversation_id)
+                && intent.work_id.is_none()
+                && intent.actor == JournalActor::UserV2(value.author_user_id)
         }
         (
             JournalEventPayload::AssistantMessageCommitted(value),
@@ -1155,6 +1435,15 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
                 && intent.actor == JournalActor::Craxii(value.craxii_id)
         }
         (JournalEventPayload::WorkQueued(value), JournalStreamId::Work(id)) => {
+            id == value.work_id
+                && intent.craxii_id == value.craxii_id
+                && intent.conversation_id == Some(value.conversation_id)
+                && intent.work_id == Some(value.work_id)
+                && intent.correlation_id == value.correlation_id
+                && intent.causation_event_id == Some(value.trigger.input_event_id)
+                && intent.actor == JournalActor::Craxii(value.craxii_id)
+        }
+        (JournalEventPayload::WorkQueuedV2(value), JournalStreamId::Work(id)) => {
             id == value.work_id
                 && intent.craxii_id == value.craxii_id
                 && intent.conversation_id == Some(value.conversation_id)
@@ -1253,7 +1542,7 @@ pub(super) async fn append_event(
         "INSERT INTO journal_events (event_id, craxii_id, stream_id, stream_seq, event_type, \
          event_version, conversation_id, work_id, causation_event_id, correlation_id, actor_kind, \
          actor_id, runtime_instance_id, payload_json, payload_sha256, recorded_at, occurred_at) \
-         VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING journal_offset",
     )
     .bind(prepared.intent.event_id.to_string())
@@ -1261,6 +1550,7 @@ pub(super) async fn append_event(
     .bind(prepared.intent.stream_id.to_string())
     .bind(stream_seq.get())
     .bind(prepared.intent.payload.kind().as_str())
+    .bind(prepared.intent.payload.version())
     .bind(prepared.intent.conversation_id.map(|id| id.to_string()))
     .bind(prepared.intent.work_id.map(|id| id.to_string()))
     .bind(prepared.intent.causation_event_id.map(|id| id.to_string()))
@@ -1399,16 +1689,25 @@ fn payload_versions(payload_json: &str) -> (Option<i64>, Option<i64>) {
     (schema, format)
 }
 
-fn payload_field_names(kind: JournalEventKind) -> &'static str {
+fn payload_field_names(kind: JournalEventKind, version: i64) -> &'static str {
     match kind {
         JournalEventKind::CraxiiInitialized => {
             "craxii_id,display_name,owner_label,architecture_revision,schema_revision,workstation_id,workstation_generation,workstation_architecture,workstation_os_release,capabilities_sha256,workspace_id,workspace_logical_name,workspace_logical_root,primary_conversation_id,created_at"
         }
+        JournalEventKind::ConversationCreated if version == 2 => {
+            "conversation_id,craxii_id,owner_user_id,kind,lifecycle,next_work_ordinal,state_version,created_at"
+        }
         JournalEventKind::ConversationCreated => {
             "conversation_id,craxii_id,kind,lifecycle,next_work_ordinal,state_version,created_at"
         }
+        JournalEventKind::MessageAccepted if version == 2 => {
+            "message_id,craxii_id,conversation_id,role,content,content_sha256,author_user_id,origin,committed_at"
+        }
         JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
             "message_id,craxii_id,conversation_id,role,content,content_sha256,produced_by_work_id,device_id,client_message_id,committed_at"
+        }
+        JournalEventKind::WorkQueued if version == 2 => {
+            "work_id,craxii_id,conversation_id,conversation_work_ordinal,kind,priority,workspace_id,correlation_id,state_version,created_at,queued_at,trigger,reply_binding_id"
         }
         JournalEventKind::WorkQueued => {
             "work_id,craxii_id,conversation_id,conversation_work_ordinal,kind,priority,workspace_id,correlation_id,state_version,created_at,queued_at,trigger"
@@ -1491,16 +1790,25 @@ fn payload_invariant_class(kind: JournalEventKind) -> &'static str {
     }
 }
 
-fn payload_shape_is_valid(kind: JournalEventKind, payload_json: &str) -> bool {
+fn payload_shape_is_valid(kind: JournalEventKind, version: i64, payload_json: &str) -> bool {
     match kind {
         JournalEventKind::CraxiiInitialized => {
             serde_json::from_str::<StoredCraxiiInitializedV1>(payload_json).is_ok()
         }
+        JournalEventKind::ConversationCreated if version == 2 => {
+            serde_json::from_str::<StoredConversationCreatedV2>(payload_json).is_ok()
+        }
         JournalEventKind::ConversationCreated => {
             serde_json::from_str::<StoredConversationCreatedV1>(payload_json).is_ok()
         }
+        JournalEventKind::MessageAccepted if version == 2 => {
+            serde_json::from_str::<StoredMessageCommittedV2>(payload_json).is_ok()
+        }
         JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
             serde_json::from_str::<StoredMessageCommittedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::WorkQueued if version == 2 => {
+            serde_json::from_str::<StoredWorkQueuedV2>(payload_json).is_ok()
         }
         JournalEventKind::WorkQueued => {
             serde_json::from_str::<StoredWorkQueuedV1>(payload_json).is_ok()
@@ -1607,14 +1915,14 @@ pub(super) fn diagnose_event_decode(row: &sqlx::sqlite::SqliteRow) -> JournalDec
             return diagnostic;
         }
     };
-    diagnostic.field_names = payload_field_names(kind);
+    diagnostic.field_names = payload_field_names(kind, event_version);
     let Ok(serde_json::Value::Object(_)) = serde_json::from_str::<serde_json::Value>(&payload_json)
     else {
         diagnostic.structural_failure_category = "payload_json_structure";
         diagnostic.invariant_class = "valid_json_object";
         return diagnostic;
     };
-    if !payload_shape_is_valid(kind, &payload_json) {
+    if !payload_shape_is_valid(kind, event_version, &payload_json) {
         diagnostic.structural_failure_category = "payload_shape";
         diagnostic.invariant_class = "required_types_and_no_unknown_fields";
         return diagnostic;
@@ -1675,7 +1983,9 @@ pub(super) fn decode_event_row(
             &row.try_get::<String, _>("correlation_id")?,
         )
         .map_err(|_| inconsistent())?,
-        actor: JournalActor::parse(
+        actor: JournalActor::parse_for_event(
+            payload.kind(),
+            event_version,
             &row.try_get::<String, _>("actor_kind")?,
             actor_id.as_deref(),
         )
@@ -2134,7 +2444,7 @@ mod tests {
             JournalEventKind::RuntimeStarted,
             JournalEventKind::RuntimeRecoveryPerformed,
         ] {
-            for schema_version in [3, 4] {
+            for schema_version in [3, 4, 5] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {
@@ -2153,7 +2463,7 @@ mod tests {
                 assert!(validate_current_payload_kind(&payload).is_err());
             }
 
-            for schema_version in [2, 6] {
+            for schema_version in [2, 7] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {
@@ -2340,6 +2650,87 @@ mod tests {
             );
             assert_eq!(
                 decode_event_payload(kind.as_str(), 1, &json, &digest.to_string()).unwrap(),
+                payload
+            );
+        }
+    }
+
+    #[test]
+    fn ch1_v2_payloads_have_exact_deterministic_bytes_and_roundtrip() {
+        let content = MessageContent::try_new(vec![ContentBlock::text("hello").unwrap()]).unwrap();
+        let payloads = [
+            (
+                JournalEventPayload::ConversationCreatedV2(ConversationCreatedV2 {
+                    conversation_id: id(),
+                    craxii_id: id(),
+                    owner_user_id: id(),
+                    kind: ConversationKind::Primary,
+                    lifecycle: ConversationLifecycle::Active,
+                    next_work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
+                    state_version: ProjectionVersion::try_new(1).unwrap(),
+                    created_at: at(),
+                }),
+                r#"{"conversation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","craxii_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","owner_user_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","kind":"primary","lifecycle":"active","next_work_ordinal":1,"state_version":1,"created_at":"2026-08-28T00:00:00.000001Z"}"#,
+            ),
+            (
+                JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
+                    message_id: id(),
+                    craxii_id: id(),
+                    conversation_id: id(),
+                    role: MessageRole::User,
+                    content: content.clone(),
+                    content_sha256: content.content_sha256(),
+                    author_user_id: id(),
+                    origin: MessageAcceptedOriginV2::Native {
+                        device_id: id(),
+                        client_message_id: id(),
+                    },
+                    committed_at: at(),
+                }),
+                r#"{"message_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","craxii_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","conversation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","role":"user","content":{"version":1,"blocks":[{"type":"text","text":"hello"}]},"content_sha256":"1a21331787ee1777989ae5966488b599347a155d145d953201bda0683bdf40f4","author_user_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","origin":{"type":"native","device_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","client_message_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"},"committed_at":"2026-08-28T00:00:00.000001Z"}"#,
+            ),
+            (
+                JournalEventPayload::WorkQueuedV2(WorkQueuedV2 {
+                    work_id: id(),
+                    craxii_id: id(),
+                    conversation_id: id(),
+                    conversation_work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
+                    kind: WorkKind::Conversational,
+                    priority: 0,
+                    workspace_id: id(),
+                    correlation_id: id(),
+                    state_version: ProjectionVersion::try_new(1).unwrap(),
+                    created_at: at(),
+                    queued_at: at(),
+                    trigger: WorkInputFactV1 {
+                        input_event_id: id(),
+                        relationship: WorkInputRelationship::Trigger,
+                        ordinal_within_work: WorkInputOrdinal::try_new(1).unwrap(),
+                        attached_at: at(),
+                        actor: WorkInputActor::User,
+                    },
+                    reply_binding_id: None,
+                }),
+                r#"{"work_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","craxii_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","conversation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","conversation_work_ordinal":1,"kind":"conversational","priority":0,"workspace_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","correlation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","state_version":1,"created_at":"2026-08-28T00:00:00.000001Z","queued_at":"2026-08-28T00:00:00.000001Z","trigger":{"input_event_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","relationship":"trigger","ordinal_within_work":1,"attached_at":"2026-08-28T00:00:00.000001Z","actor":"user"},"reply_binding_id":null}"#,
+            ),
+        ];
+        for (payload, expected_json) in payloads {
+            assert_eq!(payload.version(), 2);
+            let (json, digest) = encode_event_payload(&payload).unwrap();
+            assert_eq!(json, expected_json);
+            assert_eq!(digest, Sha256Digest::hash_bytes(json.as_bytes()));
+            assert_eq!(
+                encode_event_payload(&payload).unwrap(),
+                (json.clone(), digest)
+            );
+            assert_eq!(
+                decode_event_payload(
+                    payload.kind().as_str(),
+                    payload.version(),
+                    &json,
+                    &digest.to_string(),
+                )
+                .unwrap(),
                 payload
             );
         }

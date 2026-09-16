@@ -119,6 +119,7 @@ async fn fixture_with_observation(
         .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
             proposed: V0IdentityReference {
                 craxii_id: CraxiiId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 conversation_id: ConversationId::generate(),
                 workstation_id: WorkstationId::generate(),
                 workspace_id: WorkspaceId::generate(),
@@ -134,6 +135,7 @@ async fn fixture_with_observation(
         .identity;
     let provisioned = DeviceProvisioningService::new(&store)
         .provision_fixture_token(
+            identity.user_id,
             DeviceDisplayName::try_new("Stage 10 device".into()).unwrap(),
             at(T0),
             BearerToken::parse(TOKEN.to_owned()).unwrap(),
@@ -163,7 +165,7 @@ fn runtime_evidence(
         diagnostic_pid: Some(DiagnosticPid::try_new(101).unwrap()),
         package_version: PackageVersion::try_new("0.0.1").unwrap(),
         git_revision: GitRevision::try_new("stage10-test").unwrap(),
-        schema_version: SchemaVersion::try_new(5).unwrap(),
+        schema_version: SchemaVersion::try_new(6).unwrap(),
         started_at,
     })
 }
@@ -189,7 +191,7 @@ async fn accept(fixture: &Fixture, text: &str, at: UtcTimestamp) -> MessageComma
         ClientMessageId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string()).unwrap();
     CommandService::new(&fixture.store)
         .accept_message(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             AcceptMessageCommand {
                 idempotency_key: IdempotencyKey::for_message(client_message_id),
                 client_message_id,
@@ -212,7 +214,7 @@ async fn cancel(
         ClientCommandId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string()).unwrap();
     CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             CancelWorkCommand {
                 idempotency_key: IdempotencyKey::for_cancellation(client_command_id),
                 client_command_id,
@@ -711,7 +713,7 @@ async fn atomic_claim_and_cancellation_transactions_serialize_under_contention()
         cancel_barrier.wait().await;
         CommandService::new(&*cancel_store)
             .cancel_work(
-                AuthenticatedDevice::new(device_id),
+                AuthenticatedDevice::new(device_id, fixture.identity.user_id),
                 CancelWorkCommand {
                     idempotency_key: IdempotencyKey::for_cancellation(command_id),
                     client_command_id: command_id,
@@ -1302,6 +1304,7 @@ async fn process_fixture(root: &Path) -> ProcessFixture {
         .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
             proposed: V0IdentityReference {
                 craxii_id: CraxiiId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 conversation_id: ConversationId::generate(),
                 workstation_id: WorkstationId::generate(),
                 workspace_id: WorkspaceId::generate(),
@@ -1322,6 +1325,7 @@ async fn process_fixture(root: &Path) -> ProcessFixture {
     } else {
         service
             .provision_fixture_token(
+                identity.user_id,
                 DeviceDisplayName::try_new("Stage 10 crash device".into()).unwrap(),
                 at(T0),
                 BearerToken::parse(TOKEN.to_owned()).unwrap(),
@@ -1425,7 +1429,7 @@ async fn stage10_failpoint_crash_child() {
         "message" => {
             let _ = CommandService::new(&fixture.store)
                 .accept_message(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_message_command(fixture.identity, "message crash"),
                 )
                 .await;
@@ -1433,7 +1437,7 @@ async fn stage10_failpoint_crash_child() {
         "claim" => {
             CommandService::new(&fixture.store)
                 .accept_message(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_message_command(fixture.identity, "claim crash"),
                 )
                 .await
@@ -1458,7 +1462,7 @@ async fn stage10_failpoint_crash_child() {
         "cancel" => {
             let receipt = CommandService::new(&fixture.store)
                 .accept_message(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_message_command(fixture.identity, "cancel crash"),
                 )
                 .await
@@ -1477,7 +1481,7 @@ async fn stage10_failpoint_crash_child() {
                 .unwrap();
             let _ = CommandService::new(&fixture.store)
                 .cancel_work(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_cancel_command(receipt.work_id),
                 )
                 .await;
@@ -1485,7 +1489,7 @@ async fn stage10_failpoint_crash_child() {
         "shutdown" => {
             let receipt = CommandService::new(&fixture.store)
                 .accept_message(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_message_command(fixture.identity, "shutdown crash"),
                 )
                 .await
@@ -1531,7 +1535,7 @@ async fn stage10_failpoint_crash_child() {
         "recovery" => {
             let receipt = CommandService::new(&fixture.store)
                 .accept_message(
-                    AuthenticatedDevice::new(fixture.device_id),
+                    AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                     crash_message_command(fixture.identity, "recovery crash"),
                 )
                 .await
@@ -1606,7 +1610,7 @@ async fn after_message_commit_process_loss_replays_once_and_scheduler_scan_claim
     assert_eq!(current.recovery.retained_queued_work, 1);
     let replay = CommandService::new(&fixture.store)
         .accept_message(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             crash_message_command(fixture.identity, "message crash"),
         )
         .await
@@ -1703,7 +1707,7 @@ async fn after_cancel_requested_process_loss_replays_and_recovery_converges_once
     drop(connection);
     let replay = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             crash_cancel_command(work_id),
         )
         .await

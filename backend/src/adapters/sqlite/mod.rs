@@ -1,5 +1,6 @@
 //! File-backed SQLite lifecycle adapter.
 
+mod channel_identity;
 #[allow(dead_code)] // Stage 6 freezes codecs before Stage 7 composes repository reads/writes.
 mod codec;
 mod context_source_store;
@@ -22,6 +23,8 @@ mod state_store;
 mod transaction;
 
 #[cfg(test)]
+mod ch1_tests;
+#[cfg(test)]
 mod stage10_tests;
 #[cfg(test)]
 mod stage11_tests;
@@ -34,6 +37,7 @@ mod stage8_tests;
 #[cfg(test)]
 mod stage9_tests;
 
+pub use channel_identity::SqliteChannelIdentityStore;
 pub use error::{SqliteAdapterError, SqliteFailureKind};
 pub use evidence_query::SqliteEvidenceQueryStore;
 pub use runtime::{CheckpointReport, SqliteRuntime, SqliteRuntimeGuard};

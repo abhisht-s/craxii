@@ -9,11 +9,11 @@ use tokio::sync::Barrier;
 use crate::domain::{
     ContentBlock, ConversationId, ConversationWorkOrdinal, CraxiiId, CurrentWorkAttempt, DeviceId,
     LogicalPathReference, MessageContent, ModelInvocationId, ProjectionVersion, RuntimeInstanceId,
-    Sha256Digest, ToolExecutionId, UtcTimestamp, WorkCancellationReason, WorkCompletionReason,
-    WorkId, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState, WorkTerminalReason,
-    WorkspaceCapabilityRef, WorkspaceId, WorkstationCapabilities, WorkstationCapabilitiesInput,
-    WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits,
-    WorkstationGeneration, WorkstationId, WorkstationKind,
+    Sha256Digest, ToolExecutionId, UserId, UtcTimestamp, WorkCancellationReason,
+    WorkCompletionReason, WorkId, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkState,
+    WorkTerminalReason, WorkspaceCapabilityRef, WorkspaceId, WorkstationCapabilities,
+    WorkstationCapabilitiesInput, WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput,
+    WorkstationCapabilityLimits, WorkstationGeneration, WorkstationId, WorkstationKind,
 };
 
 use super::codec::{
@@ -66,6 +66,7 @@ async fn database() -> (TestRoot, SqliteRuntimeGuard) {
 #[derive(Clone)]
 struct Fixture {
     craxii_id: String,
+    user_id: String,
     workstation_id: String,
     workspace_id: String,
     conversation_id: String,
@@ -107,6 +108,7 @@ async fn seed_topology(runtime: &SqliteRuntime) -> Fixture {
     let device_id = DeviceId::generate().to_string();
     let fixture = Fixture {
         craxii_id: CraxiiId::generate().to_string(),
+        user_id: UserId::generate().to_string(),
         workstation_id: WorkstationId::generate().to_string(),
         workspace_id: WorkspaceId::generate().to_string(),
         conversation_id: ConversationId::generate().to_string(),
@@ -121,6 +123,16 @@ async fn seed_topology(runtime: &SqliteRuntime) -> Fixture {
           default_workspace_id, created_at, architecture_revision, schema_revision) \
          VALUES (?, 'Craxii', 'owner', 'active', NULL, NULL, ?, 'V0.0.01', 1)",
     )
+    .bind(&fixture.craxii_id)
+    .bind(NOW)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
+         VALUES (?, ?, 'active', ?)",
+    )
+    .bind(&fixture.user_id)
     .bind(&fixture.craxii_id)
     .bind(NOW)
     .execute(&mut *connection)
@@ -159,11 +171,12 @@ async fn seed_topology(runtime: &SqliteRuntime) -> Fixture {
     .unwrap();
     sqlx::query(
         "INSERT INTO conversations \
-         (conversation_id, craxii_id, kind, lifecycle_state, next_work_ordinal, state_version, created_at) \
-         VALUES (?, ?, 'primary', 'active', 1, 1, ?)",
+         (conversation_id, craxii_id, owner_user_id, kind, lifecycle_state, next_work_ordinal, state_version, created_at) \
+         VALUES (?, ?, ?, 'primary', 'active', 1, 1, ?)",
     )
     .bind(&fixture.conversation_id)
     .bind(&fixture.craxii_id)
+    .bind(&fixture.user_id)
     .bind(NOW)
     .execute(&mut *connection)
     .await
@@ -193,10 +206,11 @@ async fn seed_topology(runtime: &SqliteRuntime) -> Fixture {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO client_devices (device_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
-         VALUES (?, 'device', ?, ?, NULL, NULL)",
+        "INSERT INTO client_devices (device_id, user_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
+         VALUES (?, ?, 'device', ?, ?, NULL, NULL)",
     )
     .bind(&fixture.device_id)
+    .bind(&fixture.user_id)
     .bind(&fixture.token_hash)
     .bind(NOW)
     .execute(&mut *connection)
@@ -385,7 +399,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 5);
+    assert_eq!(migrations.len(), 6);
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -465,7 +479,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
 }
 
 #[tokio::test]
-async fn stage5_metadata_only_database_migrates_forward_to_current_version_five() {
+async fn empty_migration_metadata_database_migrates_forward_to_current_version_six() {
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
@@ -477,12 +491,17 @@ async fn stage5_metadata_only_database_migrates_forward_to_current_version_five(
         "work_item_inputs",
         "stream_heads",
         "journal_events",
+        "inbound_deliveries",
         "messages",
         "client_commands",
         "work_items",
+        "conversation_bindings",
+        "external_identities",
+        "channel_accounts",
         "client_devices",
         "runtime_instances",
         "conversations",
+        "users",
         "workspaces",
         "workstations",
         "craxii_principals",
@@ -510,7 +529,7 @@ async fn stage5_metadata_only_database_migrates_forward_to_current_version_five(
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        5
+        6
     );
     drop(connection);
     migrated.shutdown().await;
@@ -664,8 +683,9 @@ async fn scalar_json_literal_foreign_key_and_uniqueness_constraints_fire() {
         format!("-{}", &fixture.device_id[1..]),
     ] {
         assert!(
-            sqlx::query("INSERT INTO client_devices VALUES (?, 'bad', ?, ?, NULL, NULL)")
+            sqlx::query("INSERT INTO client_devices VALUES (?, ?, 'bad', ?, ?, NULL, NULL)")
                 .bind(invalid_id)
+                .bind(&fixture.user_id)
                 .bind("b".repeat(64))
                 .bind(NOW)
                 .execute(&mut *connection)
@@ -674,8 +694,9 @@ async fn scalar_json_literal_foreign_key_and_uniqueness_constraints_fire() {
         );
     }
     assert!(
-        sqlx::query("INSERT INTO client_devices VALUES (?, 'bad', ?, ?, NULL, NULL)")
+        sqlx::query("INSERT INTO client_devices VALUES (?, ?, 'bad', ?, ?, NULL, NULL)")
             .bind(DeviceId::generate().to_string())
+            .bind(&fixture.user_id)
             .bind("A".repeat(64))
             .bind(NOW)
             .execute(&mut *connection)
@@ -683,8 +704,9 @@ async fn scalar_json_literal_foreign_key_and_uniqueness_constraints_fire() {
             .is_err()
     );
     assert!(
-        sqlx::query("INSERT INTO client_devices VALUES (?, 'bad', ?, ?, NULL, NULL)")
+        sqlx::query("INSERT INTO client_devices VALUES (?, ?, 'bad', ?, ?, NULL, NULL)")
             .bind(DeviceId::generate().to_string())
+            .bind(&fixture.user_id)
             .bind("b".repeat(64))
             .bind("2026-02-30T01:02:03Z")
             .execute(&mut *connection)
@@ -726,9 +748,10 @@ async fn scalar_json_literal_foreign_key_and_uniqueness_constraints_fire() {
             .is_err()
     );
     assert!(
-        sqlx::query("INSERT INTO conversations VALUES (?, ?, 'primary', 'active', 1, 1, ?)")
+        sqlx::query("INSERT INTO conversations VALUES (?, ?, ?, 'primary', 'active', 1, 1, ?)")
             .bind(ConversationId::generate().to_string())
             .bind(&fixture.craxii_id)
+            .bind(&fixture.user_id)
             .bind(NOW)
             .execute(&mut *connection)
             .await
@@ -745,13 +768,16 @@ async fn scalar_json_literal_foreign_key_and_uniqueness_constraints_fire() {
             .is_err()
     );
     assert!(
-        sqlx::query("INSERT INTO client_devices VALUES (?, 'duplicate token', ?, ?, NULL, NULL)")
-            .bind(DeviceId::generate().to_string())
-            .bind(&fixture.token_hash)
-            .bind(NOW)
-            .execute(&mut *connection)
-            .await
-            .is_err()
+        sqlx::query(
+            "INSERT INTO client_devices VALUES (?, ?, 'duplicate token', ?, ?, NULL, NULL)"
+        )
+        .bind(DeviceId::generate().to_string())
+        .bind(&fixture.user_id)
+        .bind(&fixture.token_hash)
+        .bind(NOW)
+        .execute(&mut *connection)
+        .await
+        .is_err()
     );
     drop(connection);
     guard.shutdown().await;
@@ -1002,18 +1028,25 @@ async fn messages_enforce_provenance_identity_and_content_hash_codec() {
     let client_message = uuid::Uuid::now_v7().hyphenated().to_string();
     let user_message = uuid::Uuid::now_v7().hyphenated().to_string();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    sqlx::query("INSERT INTO messages VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)")
-        .bind(&user_message)
-        .bind(&fixture.craxii_id)
-        .bind(&fixture.conversation_id)
-        .bind(&content_json)
-        .bind(digest.to_string())
-        .bind(&fixture.device_id)
-        .bind(&client_message)
-        .bind(NOW)
-        .execute(&mut *connection)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO messages \
+         (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+          author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+          inbound_delivery_id, committed_at) \
+         VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
+    )
+    .bind(&user_message)
+    .bind(&fixture.craxii_id)
+    .bind(&fixture.conversation_id)
+    .bind(&content_json)
+    .bind(digest.to_string())
+    .bind(&fixture.user_id)
+    .bind(&fixture.device_id)
+    .bind(&client_message)
+    .bind(NOW)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
     let row = sqlx::query("SELECT * FROM messages WHERE message_id = ?")
         .bind(&user_message)
         .fetch_one(&mut *connection)
@@ -1035,37 +1068,75 @@ async fn messages_enforce_provenance_identity_and_content_hash_codec() {
         ),
     ] {
         assert!(
-            sqlx::query("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                .bind(uuid::Uuid::now_v7().hyphenated().to_string())
-                .bind(&fixture.craxii_id)
-                .bind(&fixture.conversation_id)
-                .bind(role)
-                .bind(&content_json)
-                .bind(digest.to_string())
-                .bind(produced)
-                .bind(device)
-                .bind(client)
-                .bind(NOW)
-                .execute(&mut *connection)
-                .await
-                .is_err()
-        );
-    }
-    assert!(
-        sqlx::query("INSERT INTO messages VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)")
+            sqlx::query(
+                "INSERT INTO messages \
+                 (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+                  author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+                  inbound_delivery_id, committed_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+            )
             .bind(uuid::Uuid::now_v7().hyphenated().to_string())
             .bind(&fixture.craxii_id)
             .bind(&fixture.conversation_id)
+            .bind(role)
             .bind(&content_json)
             .bind(digest.to_string())
-            .bind(&fixture.device_id)
-            .bind(&client_message)
+            .bind((role == "user").then_some(fixture.user_id.as_str()))
+            .bind(produced)
+            .bind(device)
+            .bind(client)
             .bind(NOW)
             .execute(&mut *connection)
             .await
             .is_err()
+        );
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO messages \
+             (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+              author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+              inbound_delivery_id, committed_at) \
+             VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().hyphenated().to_string())
+        .bind(&fixture.craxii_id)
+        .bind(&fixture.conversation_id)
+        .bind(&content_json)
+        .bind(digest.to_string())
+        .bind(&fixture.user_id)
+        .bind(&fixture.device_id)
+        .bind(&client_message)
+        .bind(NOW)
+        .execute(&mut *connection)
+        .await
+        .is_err()
     );
-    sqlx::query("INSERT INTO messages VALUES (?, ?, ?, 'assistant', ?, ?, ?, NULL, NULL, ?)")
+    sqlx::query(
+        "INSERT INTO messages \
+         (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+          author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+          inbound_delivery_id, committed_at) \
+         VALUES (?, ?, ?, 'assistant', ?, ?, NULL, ?, NULL, NULL, NULL, ?)",
+    )
+    .bind(uuid::Uuid::now_v7().hyphenated().to_string())
+    .bind(&fixture.craxii_id)
+    .bind(&fixture.conversation_id)
+    .bind(&content_json)
+    .bind(digest.to_string())
+    .bind(&work.work_id)
+    .bind(NOW)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    assert!(
+        sqlx::query(
+            "INSERT INTO messages \
+             (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+              author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+              inbound_delivery_id, committed_at) \
+             VALUES (?, ?, ?, 'assistant', ?, ?, NULL, ?, NULL, NULL, NULL, ?)",
+        )
         .bind(uuid::Uuid::now_v7().hyphenated().to_string())
         .bind(&fixture.craxii_id)
         .bind(&fixture.conversation_id)
@@ -1075,33 +1146,28 @@ async fn messages_enforce_provenance_identity_and_content_hash_codec() {
         .bind(NOW)
         .execute(&mut *connection)
         .await
-        .unwrap();
-    assert!(
-        sqlx::query("INSERT INTO messages VALUES (?, ?, ?, 'assistant', ?, ?, ?, NULL, NULL, ?)")
-            .bind(uuid::Uuid::now_v7().hyphenated().to_string())
-            .bind(&fixture.craxii_id)
-            .bind(&fixture.conversation_id)
-            .bind(&content_json)
-            .bind(digest.to_string())
-            .bind(&work.work_id)
-            .bind(NOW)
-            .execute(&mut *connection)
-            .await
-            .is_err()
+        .is_err()
     );
     assert!(
-        sqlx::query("INSERT INTO messages VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)")
-            .bind(uuid::Uuid::now_v7().hyphenated().to_string())
-            .bind(&fixture.craxii_id)
-            .bind(&fixture.conversation_id)
-            .bind(&content_json)
-            .bind(digest.to_string())
-            .bind(DeviceId::generate().to_string())
-            .bind(uuid::Uuid::now_v7().hyphenated().to_string())
-            .bind(NOW)
-            .execute(&mut *connection)
-            .await
-            .is_err()
+        sqlx::query(
+            "INSERT INTO messages \
+             (message_id, craxii_id, conversation_id, role, content_json, content_sha256, \
+              author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+              inbound_delivery_id, committed_at) \
+             VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
+        )
+        .bind(uuid::Uuid::now_v7().hyphenated().to_string())
+        .bind(&fixture.craxii_id)
+        .bind(&fixture.conversation_id)
+        .bind(&content_json)
+        .bind(digest.to_string())
+        .bind(&fixture.user_id)
+        .bind(DeviceId::generate().to_string())
+        .bind(uuid::Uuid::now_v7().hyphenated().to_string())
+        .bind(NOW)
+        .execute(&mut *connection)
+        .await
+        .is_err()
     );
     drop(connection);
     guard.shutdown().await;
@@ -1628,8 +1694,8 @@ async fn every_named_performance_index_supports_its_frozen_query_shape() {
 
     let probes = [
         (
-            "ux_conversations_craxii_kind",
-            "SELECT conversation_id FROM conversations INDEXED BY ux_conversations_craxii_kind WHERE craxii_id = ? AND kind = 'primary'",
+            "ux_conversations_craxii_owner_kind",
+            "SELECT conversation_id FROM conversations INDEXED BY ux_conversations_craxii_owner_kind WHERE craxii_id = ? AND owner_user_id = ? AND kind = 'primary'",
         ),
         (
             "ix_workstations_craxii_id",
@@ -1788,7 +1854,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (6, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (7, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

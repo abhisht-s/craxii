@@ -321,6 +321,7 @@ mod tests {
             .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
                 proposed: V0IdentityReference {
                     craxii_id: CraxiiId::generate(),
+                    user_id: crate::domain::UserId::generate(),
                     conversation_id: ConversationId::generate(),
                     workstation_id: WorkstationId::generate(),
                     workspace_id: WorkspaceId::generate(),
@@ -345,6 +346,7 @@ mod tests {
             .identity;
         let device_id = DeviceProvisioningService::new(&store)
             .provision_fixture_token(
+                identity.user_id,
                 DeviceDisplayName::try_new("Stage 16 device".to_owned()).unwrap(),
                 timestamp(T0),
                 BearerToken::parse(TOKEN.to_owned()).unwrap(),
@@ -470,7 +472,7 @@ mod tests {
         let client_message_id = client_message_id();
         CommandService::new(&fixture.store)
             .accept_message(
-                AuthenticatedDevice::new(fixture.device_id),
+                AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                 AcceptMessageCommand {
                     idempotency_key: IdempotencyKey::for_message(client_message_id),
                     client_message_id,
@@ -603,7 +605,7 @@ mod tests {
                     current_model_invocation_id, current_tool_execution_id, correlation_id, \
                     created_at, queued_at, started_at, cancel_requested_at, \
                     cancellation_reason_code, terminal_at, terminal_reason_code, \
-                    terminal_detail_json FROM work_items WHERE work_id = ?",
+                    terminal_detail_json, reply_binding_id FROM work_items WHERE work_id = ?",
         )
         .bind(missing_trigger_work.to_string())
         .bind(active.work_id.to_string())
@@ -1221,20 +1223,98 @@ async fn message_source_from_event(
     event_row: &sqlx::sqlite::SqliteRow,
 ) -> Result<ContextMessageSource, ContextSourceStoreError> {
     let event = decode_event_row(event_row).map_err(|_| corrupt())?;
-    let accepted = match event.payload {
-        JournalEventPayload::MessageAccepted(value) => value,
+    enum AcceptedOrigin {
+        V1 {
+            device_id: crate::domain::DeviceId,
+            client_message_id: crate::domain::ClientMessageId,
+        },
+        NativeV2 {
+            author_user_id: crate::domain::UserId,
+            device_id: crate::domain::DeviceId,
+            client_message_id: crate::domain::ClientMessageId,
+        },
+        ChannelV2 {
+            author_user_id: crate::domain::UserId,
+            inbound_delivery_id: crate::domain::InboundDeliveryId,
+        },
+    }
+    let (message_id, conversation_id, role, content_sha256, origin) = match event.payload {
+        JournalEventPayload::MessageAccepted(value) => (
+            value.message_id,
+            value.conversation_id,
+            value.role,
+            value.content_sha256,
+            AcceptedOrigin::V1 {
+                device_id: value.device_id.ok_or_else(corrupt)?,
+                client_message_id: value.client_message_id.ok_or_else(corrupt)?,
+            },
+        ),
+        JournalEventPayload::MessageAcceptedV2(value) => {
+            let origin = match value.origin {
+                crate::domain::MessageAcceptedOriginV2::Native {
+                    device_id,
+                    client_message_id,
+                } => AcceptedOrigin::NativeV2 {
+                    author_user_id: value.author_user_id,
+                    device_id,
+                    client_message_id,
+                },
+                crate::domain::MessageAcceptedOriginV2::InboundDelivery {
+                    inbound_delivery_id,
+                } => AcceptedOrigin::ChannelV2 {
+                    author_user_id: value.author_user_id,
+                    inbound_delivery_id,
+                },
+            };
+            (
+                value.message_id,
+                value.conversation_id,
+                value.role,
+                value.content_sha256,
+                origin,
+            )
+        }
         _ => return Err(corrupt()),
     };
     let message_row =
         sqlx::query("SELECT * FROM messages WHERE message_id = ? AND conversation_id = ?")
-            .bind(accepted.message_id.to_string())
-            .bind(accepted.conversation_id.to_string())
+            .bind(message_id.to_string())
+            .bind(conversation_id.to_string())
             .fetch_optional(&mut **transaction)
             .await
             .map_err(storage)?
             .ok_or_else(missing)?;
     let message = decode_message_row(&message_row).map_err(|_| corrupt())?;
-    if message.content_sha256() != accepted.content_sha256 || message.role() != accepted.role {
+    let provenance_matches = match origin {
+        AcceptedOrigin::V1 {
+            device_id,
+            client_message_id,
+        } => {
+            message.device_id() == Some(device_id)
+                && message.client_message_id() == Some(client_message_id)
+                && message.inbound_delivery_id().is_none()
+        }
+        AcceptedOrigin::NativeV2 {
+            author_user_id,
+            device_id,
+            client_message_id,
+        } => {
+            message.author_user_id() == Some(author_user_id)
+                && message.device_id() == Some(device_id)
+                && message.client_message_id() == Some(client_message_id)
+                && message.inbound_delivery_id().is_none()
+        }
+        AcceptedOrigin::ChannelV2 {
+            author_user_id,
+            inbound_delivery_id,
+        } => {
+            message.author_user_id() == Some(author_user_id)
+                && message.device_id().is_none()
+                && message.client_message_id().is_none()
+                && message.inbound_delivery_id() == Some(inbound_delivery_id)
+        }
+    };
+    if message.content_sha256() != content_sha256 || message.role() != role || !provenance_matches {
         return Err(corrupt());
     }
     Ok(ContextMessageSource {

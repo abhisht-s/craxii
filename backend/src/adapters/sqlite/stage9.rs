@@ -9,13 +9,14 @@ use crate::domain::{
     CommandKind, CommandOutcome, CommandRequestHash, ConversationId, ConversationWorkOrdinal,
     CorrelationId, CraxiiId, CurrentWorkAttempt, DeviceId, DeviceTokenHash, IdempotencyKey,
     JournalActor, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventPayload,
-    JournalOffset, JournalStreamId, JournalWorkTerminalReason, Message, MessageCommandReceipt,
-    MessageCommittedV1, MessageInput, MessageRole, ModelInvocationId, ProjectionVersion,
-    RuntimeInstanceId, ToolExecutionId, UtcTimestamp, WorkCancellationReason, WorkCompletionReason,
-    WorkFailureReason, WorkId, WorkInputActor, WorkInputFactV1, WorkInputOrdinal,
-    WorkInputRelationship, WorkInterruptionReason, WorkItem, WorkItemInput, WorkItemInputData,
-    WorkKind, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput, WorkQueuedV1, WorkState,
-    WorkTerminalReason, WorkTransitionV1, WorkspaceId, decide_cancellation,
+    JournalOffset, JournalStreamId, JournalWorkTerminalReason, Message, MessageAcceptedOriginV2,
+    MessageCommandReceipt, MessageCommittedV2, MessageInput, MessageRole, ModelInvocationId,
+    ProjectionVersion, RuntimeInstanceId, ToolExecutionId, UserId, UtcTimestamp,
+    WorkCancellationReason, WorkCompletionReason, WorkFailureReason, WorkId, WorkInputActor,
+    WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkInterruptionReason, WorkItem,
+    WorkItemInput, WorkItemInputData, WorkKind, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput,
+    WorkQueuedV2, WorkState, WorkTerminalReason, WorkTransitionV1, WorkspaceId,
+    decide_cancellation,
 };
 use crate::ports::device_credentials::{
     DeviceCredentialFuture, DeviceCredentialMatch, DeviceCredentialStore,
@@ -95,6 +96,8 @@ fn decode_device_summary(
     Ok(DeviceSummary {
         device_id: DeviceId::parse_canonical(&row.try_get::<String, _>("device_id")?)
             .map_err(|_| inconsistent())?,
+        user_id: UserId::parse_canonical(&row.try_get::<String, _>("user_id")?)
+            .map_err(|_| inconsistent())?,
         display_name: crate::domain::DeviceDisplayName::try_new(row.try_get("display_name")?)
             .map_err(|_| inconsistent())?,
         created_at,
@@ -110,10 +113,11 @@ impl SqliteStateStore {
     ) -> Result<DeviceSummary, SqliteAdapterError> {
         let mut transaction = WriteTransaction::begin(&self.runtime, "provision_device").await?;
         let result = sqlx::query(
-            "INSERT INTO client_devices (device_id, display_name, token_hash, created_at, \
-             last_seen_at, revoked_at) VALUES (?, ?, ?, ?, NULL, NULL)",
+            "INSERT INTO client_devices (device_id, user_id, display_name, token_hash, created_at, \
+             last_seen_at, revoked_at) VALUES (?, ?, ?, ?, ?, NULL, NULL)",
         )
         .bind(intent.device_id.to_string())
+        .bind(intent.user_id.to_string())
         .bind(intent.display_name.as_str())
         .bind(intent.token_hash.canonical_text())
         .bind(intent.created_at.to_string())
@@ -135,6 +139,7 @@ impl SqliteStateStore {
         transaction.commit().await?;
         Ok(DeviceSummary {
             device_id: intent.device_id,
+            user_id: intent.user_id,
             display_name: intent.display_name,
             created_at: intent.created_at,
             last_seen_at: None,
@@ -148,7 +153,7 @@ impl SqliteStateStore {
     ) -> Result<Option<DeviceCredentialMatch>, SqliteAdapterError> {
         let mut connection = self.runtime.acquire().await?;
         let row = sqlx::query(
-            "SELECT device_id, token_hash, revoked_at FROM client_devices WHERE token_hash = ?",
+            "SELECT device_id, user_id, token_hash, revoked_at FROM client_devices WHERE token_hash = ?",
         )
         .bind(token_hash.canonical_text())
         .fetch_optional(&mut *connection)
@@ -157,6 +162,8 @@ impl SqliteStateStore {
         row.map(|row| {
             Ok(DeviceCredentialMatch {
                 device_id: DeviceId::parse_canonical(&row.try_get::<String, _>("device_id")?)
+                    .map_err(|_| inconsistent())?,
+                user_id: UserId::parse_canonical(&row.try_get::<String, _>("user_id")?)
                     .map_err(|_| inconsistent())?,
                 matched_hash: DeviceTokenHash::parse_canonical(
                     &row.try_get::<String, _>("token_hash")?,
@@ -173,7 +180,7 @@ impl SqliteStateStore {
     async fn list_devices_inner(&self) -> Result<Vec<DeviceSummary>, SqliteAdapterError> {
         let mut connection = self.runtime.acquire().await?;
         sqlx::query(
-            "SELECT device_id, display_name, created_at, last_seen_at, revoked_at \
+            "SELECT device_id, user_id, display_name, created_at, last_seen_at, revoked_at \
              FROM client_devices ORDER BY created_at ASC, device_id ASC",
         )
         .fetch_all(&mut *connection)
@@ -191,7 +198,7 @@ impl SqliteStateStore {
     ) -> Result<RevokeDeviceOutcome, SqliteAdapterError> {
         let mut transaction = WriteTransaction::begin(&self.runtime, "revoke_device").await?;
         let row = sqlx::query(
-            "SELECT device_id, display_name, created_at, last_seen_at, revoked_at \
+            "SELECT device_id, user_id, display_name, created_at, last_seen_at, revoked_at \
              FROM client_devices WHERE device_id = ?",
         )
         .bind(device_id.to_string())
@@ -309,6 +316,7 @@ impl DeviceCredentialStore for SqliteStateStore {
 
 struct MessageTopology {
     craxii_id: CraxiiId,
+    user_id: UserId,
     conversation_id: ConversationId,
     workspace_id: WorkspaceId,
     next_ordinal: ConversationWorkOrdinal,
@@ -319,15 +327,20 @@ struct MessageTopology {
 async fn load_message_topology(
     transaction: &mut WriteTransaction,
     requested_conversation_id: ConversationId,
+    requested_device_id: DeviceId,
+    requested_user_id: UserId,
 ) -> Result<MessageTopology, SqliteAdapterError> {
     let rows = sqlx::query(
         "SELECT p.craxii_id, p.primary_conversation_id, p.default_workspace_id, \
-                c.craxii_id AS conversation_owner, c.kind, c.lifecycle_state, \
-                c.next_work_ordinal, c.state_version, w.craxii_id AS workspace_owner \
+                c.craxii_id AS conversation_owner, c.owner_user_id, c.kind, c.lifecycle_state, \
+                c.next_work_ordinal, c.state_version, w.craxii_id AS workspace_owner, \
+                d.user_id AS device_user_id \
          FROM craxii_principals p \
          JOIN conversations c ON c.conversation_id = p.primary_conversation_id \
-         JOIN workspaces w ON w.workspace_id = p.default_workspace_id",
+         JOIN workspaces w ON w.workspace_id = p.default_workspace_id \
+         JOIN client_devices d ON d.device_id = ? AND d.revoked_at IS NULL",
     )
+    .bind(requested_device_id.to_string())
     .fetch_all(transaction.connection())
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
@@ -342,7 +355,13 @@ async fn load_message_topology(
     let workspace_id =
         WorkspaceId::parse_canonical(&row.try_get::<String, _>("default_workspace_id")?)
             .map_err(|_| inconsistent())?;
+    let owner_user_id = UserId::parse_canonical(&row.try_get::<String, _>("owner_user_id")?)
+        .map_err(|_| inconsistent())?;
+    let device_user_id = UserId::parse_canonical(&row.try_get::<String, _>("device_user_id")?)
+        .map_err(|_| inconsistent())?;
     if conversation_id != requested_conversation_id
+        || owner_user_id != requested_user_id
+        || device_user_id != requested_user_id
         || CraxiiId::parse_canonical(&row.try_get::<String, _>("conversation_owner")?)
             .map_err(|_| inconsistent())?
             != craxii_id
@@ -368,6 +387,7 @@ async fn load_message_topology(
     };
     Ok(MessageTopology {
         craxii_id,
+        user_id: owner_user_id,
         conversation_id,
         workspace_id,
         next_ordinal: ConversationWorkOrdinal::try_new(row.try_get("next_work_ordinal")?)
@@ -507,7 +527,13 @@ async fn accept_message_inner(
         return Ok(CommandOutcome::Replayed(receipt));
     }
 
-    let topology = load_message_topology(&mut transaction, request.conversation_id).await?;
+    let topology = load_message_topology(
+        &mut transaction,
+        request.conversation_id,
+        request.device_id,
+        request.user_id,
+    )
+    .await?;
     let correlation_id = CorrelationId::for_work(request.candidates.work_id);
     let message = Message::try_new(MessageInput {
         message_id: request.candidates.message_id,
@@ -515,9 +541,11 @@ async fn accept_message_inner(
         conversation_id: topology.conversation_id,
         role: MessageRole::User,
         content: request.content,
+        author_user_id: Some(topology.user_id),
         produced_by_work_id: None,
         device_id: Some(request.device_id),
         client_message_id: Some(request.client_message_id),
+        inbound_delivery_id: None,
         committed_at: request.accepted_at,
     })
     .map_err(|_| invalid())?;
@@ -527,6 +555,7 @@ async fn accept_message_inner(
         conversation_id: topology.conversation_id,
         conversation_work_ordinal: topology.next_ordinal,
         workspace_id: topology.workspace_id,
+        reply_binding_id: None,
         correlation_id,
         created_at: request.accepted_at,
         queued_at: request.accepted_at,
@@ -543,14 +572,15 @@ async fn accept_message_inner(
     let (content_json, content_sha256) = encode_message_content(message.content())?;
     sqlx::query(
         "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
-                content_sha256, produced_by_work_id, client_device_id, client_message_id, \
-                committed_at) VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)",
+                content_sha256, author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+                inbound_delivery_id, committed_at) VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
     )
     .bind(message.message_id().to_string())
     .bind(message.craxii_id().to_string())
     .bind(message.conversation_id().to_string())
     .bind(content_json)
     .bind(content_sha256.to_string())
+    .bind(topology.user_id.to_string())
     .bind(request.device_id.to_string())
     .bind(request.client_message_id.to_string())
     .bind(request.accepted_at.to_string())
@@ -569,18 +599,20 @@ async fn accept_message_inner(
             work_id: None,
             causation_event_id: Some(topology.conversation_created_event_id),
             correlation_id,
-            actor: JournalActor::User(Some(request.device_id)),
+            actor: JournalActor::UserV2(topology.user_id),
             runtime_instance_id: None,
-            payload: JournalEventPayload::MessageAccepted(MessageCommittedV1 {
+            payload: JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
                 message_id: message.message_id(),
                 craxii_id: message.craxii_id(),
                 conversation_id: message.conversation_id(),
                 role: message.role(),
                 content: message.content().clone(),
                 content_sha256: message.content_sha256(),
-                produced_by_work_id: None,
-                device_id: Some(request.device_id),
-                client_message_id: Some(request.client_message_id),
+                author_user_id: topology.user_id,
+                origin: MessageAcceptedOriginV2::Native {
+                    device_id: request.device_id,
+                    client_message_id: request.client_message_id,
+                },
                 committed_at: request.accepted_at,
             }),
             recorded_at: request.accepted_at,
@@ -595,9 +627,10 @@ async fn accept_message_inner(
                 conversation_work_ordinal, kind, state, state_version, priority, workspace_id, \
                 runtime_instance_id, current_model_invocation_id, current_tool_execution_id, \
                 correlation_id, created_at, queued_at, started_at, cancel_requested_at, \
-                cancellation_reason_code, terminal_at, terminal_reason_code, terminal_detail_json) \
+                cancellation_reason_code, terminal_at, terminal_reason_code, terminal_detail_json, \
+                reply_binding_id) \
          VALUES (?, ?, ?, ?, 'conversational', 'queued', 1, 0, ?, NULL, NULL, NULL, ?, ?, ?, \
-                 NULL, NULL, NULL, NULL, NULL, NULL)",
+                 NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
     )
     .bind(work.work_id().to_string())
     .bind(work.craxii_id().to_string())
@@ -637,7 +670,7 @@ async fn accept_message_inner(
             correlation_id,
             actor: JournalActor::Craxii(topology.craxii_id),
             runtime_instance_id: None,
-            payload: JournalEventPayload::WorkQueued(WorkQueuedV1 {
+            payload: JournalEventPayload::WorkQueuedV2(WorkQueuedV2 {
                 work_id: work.work_id(),
                 craxii_id: work.craxii_id(),
                 conversation_id: work.conversation_id(),
@@ -656,6 +689,7 @@ async fn accept_message_inner(
                     attached_at: input.attached_at(),
                     actor: input.actor(),
                 },
+                reply_binding_id: None,
             }),
             recorded_at: request.accepted_at,
             occurred_at: None,
@@ -713,13 +747,19 @@ struct CancellationWork {
 async fn load_cancellation_work(
     transaction: &mut WriteTransaction,
     work_id: WorkId,
+    device_id: DeviceId,
+    user_id: UserId,
 ) -> Result<CancellationWork, SqliteAdapterError> {
     let row = sqlx::query(
-        "SELECT w.*, p.primary_conversation_id, p.default_workspace_id \
+        "SELECT w.*, p.primary_conversation_id, p.default_workspace_id, \
+                c.owner_user_id, d.user_id AS device_user_id \
          FROM work_items w \
          JOIN craxii_principals p ON p.craxii_id = w.craxii_id \
+         JOIN conversations c ON c.conversation_id = w.conversation_id \
+         JOIN client_devices d ON d.device_id = ? AND d.revoked_at IS NULL \
          WHERE w.work_id = ?",
     )
+    .bind(device_id.to_string())
     .bind(work_id.to_string())
     .fetch_optional(transaction.connection())
     .await
@@ -730,12 +770,18 @@ async fn load_cancellation_work(
             .map_err(|_| inconsistent())?;
     let workspace_id = WorkspaceId::parse_canonical(&row.try_get::<String, _>("workspace_id")?)
         .map_err(|_| inconsistent())?;
+    let owner_user_id = UserId::parse_canonical(&row.try_get::<String, _>("owner_user_id")?)
+        .map_err(|_| inconsistent())?;
+    let device_user_id = UserId::parse_canonical(&row.try_get::<String, _>("device_user_id")?)
+        .map_err(|_| inconsistent())?;
     if ConversationId::parse_canonical(&row.try_get::<String, _>("primary_conversation_id")?)
         .map_err(|_| inconsistent())?
         != conversation_id
         || WorkspaceId::parse_canonical(&row.try_get::<String, _>("default_workspace_id")?)
             .map_err(|_| inconsistent())?
             != workspace_id
+        || owner_user_id != user_id
+        || device_user_id != user_id
     {
         return Err(target_not_found());
     }
@@ -943,7 +989,13 @@ async fn cancellation_inner(
         return Ok(CommandOutcome::Replayed(receipt));
     }
 
-    let work = load_cancellation_work(&mut transaction, request.work_id).await?;
+    let work = load_cancellation_work(
+        &mut transaction,
+        request.work_id,
+        request.device_id,
+        request.user_id,
+    )
+    .await?;
     let decision = decide_cancellation(
         &work.snapshot,
         CancellationCheckpoint::BeforeNextIteration,
@@ -1255,8 +1307,26 @@ async fn verify_message_command(
         .get(&accepted_event_id)
         .copied()
         .ok_or_else(inconsistent)?;
-    let JournalEventPayload::MessageAccepted(accepted) = &accepted_event.payload else {
-        return Err(inconsistent());
+    let accepted_matches = match &accepted_event.payload {
+        JournalEventPayload::MessageAccepted(accepted) => {
+            accepted.message_id == message.message_id()
+                && accepted.content == *message.content()
+                && accepted.device_id == Some(command.device_id)
+                && accepted.client_message_id == Some(client_message_id)
+                && accepted_event.actor == JournalActor::User(Some(command.device_id))
+        }
+        JournalEventPayload::MessageAcceptedV2(accepted) => {
+            accepted.message_id == message.message_id()
+                && accepted.content == *message.content()
+                && Some(accepted.author_user_id) == message.author_user_id()
+                && accepted.origin
+                    == crate::domain::MessageAcceptedOriginV2::Native {
+                        device_id: command.device_id,
+                        client_message_id,
+                    }
+                && accepted_event.actor == JournalActor::UserV2(accepted.author_user_id)
+        }
+        _ => false,
     };
     let caused_by = accepted_event
         .causation_event_id
@@ -1266,18 +1336,15 @@ async fn verify_message_command(
         || input.try_get::<i64, _>("ordinal_within_work")? != 1
         || input.try_get::<String, _>("attached_by_actor")? != "user"
         || decode_timestamp(&input.try_get::<String, _>("attached_at")?)? != message.committed_at()
-        || accepted.message_id != message.message_id()
-        || accepted.content != *message.content()
-        || accepted.device_id != Some(command.device_id)
-        || accepted.client_message_id != Some(client_message_id)
+        || !accepted_matches
         || accepted_event.stream_id != JournalStreamId::Conversation(receipt.conversation_id)
         || accepted_event.conversation_id != Some(receipt.conversation_id)
         || accepted_event.work_id.is_some()
         || accepted_event.correlation_id != work_correlation
-        || accepted_event.actor != JournalActor::User(Some(command.device_id))
         || !matches!(
             caused_by.payload,
             JournalEventPayload::ConversationCreated(_)
+                | JournalEventPayload::ConversationCreatedV2(_)
         )
         || caused_by.stream_id != JournalStreamId::Conversation(receipt.conversation_id)
     {
@@ -1292,15 +1359,27 @@ async fn verify_message_command(
                 && event.work_id == Some(receipt.work_id)
         })
         .ok_or_else(inconsistent)?;
-    let JournalEventPayload::WorkQueued(queued) = &queued_event.payload else {
-        return Err(inconsistent());
+    let queued_matches = match &queued_event.payload {
+        JournalEventPayload::WorkQueued(queued) => {
+            queued.work_id == receipt.work_id
+                && queued.craxii_id == work_craxii
+                && queued.conversation_id == receipt.conversation_id
+                && queued.conversation_work_ordinal == receipt.work_ordinal
+                && queued.correlation_id == work_correlation
+                && queued.trigger.input_event_id == accepted_event_id
+        }
+        JournalEventPayload::WorkQueuedV2(queued) => {
+            queued.work_id == receipt.work_id
+                && queued.craxii_id == work_craxii
+                && queued.conversation_id == receipt.conversation_id
+                && queued.conversation_work_ordinal == receipt.work_ordinal
+                && queued.correlation_id == work_correlation
+                && queued.trigger.input_event_id == accepted_event_id
+                && queued.reply_binding_id.is_none()
+        }
+        _ => false,
     };
-    if queued.work_id != receipt.work_id
-        || queued.craxii_id != work_craxii
-        || queued.conversation_id != receipt.conversation_id
-        || queued.conversation_work_ordinal != receipt.work_ordinal
-        || queued.correlation_id != work_correlation
-        || queued.trigger.input_event_id != accepted_event_id
+    if !queued_matches
         || queued_event.stream_id != JournalStreamId::Work(receipt.work_id)
         || queued_event.causation_event_id != Some(accepted_event_id)
         || queued_event.correlation_id != work_correlation
@@ -1457,12 +1536,18 @@ async fn verify_stage9_cancellation_events(
         let JournalActor::User(Some(actor_id)) = event.actor else {
             return Err(inconsistent());
         };
-        let actor_exists: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM client_devices WHERE device_id = ?")
-                .bind(actor_id.to_string())
-                .fetch_one(&mut *connection)
-                .await
-                .map_err(SqliteAdapterError::from_sqlx)?;
+        let actor_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) \
+             FROM client_devices d \
+             JOIN conversations c ON c.owner_user_id = d.user_id \
+             JOIN work_items w ON w.conversation_id = c.conversation_id \
+             WHERE d.device_id = ? AND w.work_id = ?",
+        )
+        .bind(actor_id.to_string())
+        .bind(transition.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?;
         let previous = events
             .iter()
             .find(|candidate| {

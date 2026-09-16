@@ -16,6 +16,8 @@ use sqlx::{ConnectOptions, Connection, SqliteConnection, SqlitePool};
 use tokio::sync::Mutex;
 use tracing::Instrument;
 
+use crate::domain::UserId;
+
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 use super::schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION, MIGRATOR, classify_schema};
 
@@ -381,10 +383,24 @@ impl SqliteRuntimeGuard {
             result_class = tracing::field::Empty,
         );
         let mut migration_observation = SqliteOperationObservation::new(migration_span.clone());
-        MIGRATOR
+        prepare_ch1_owner_seed(&mut bootstrap, existing_migration_count).await?;
+        if existing_migration_count < 6 {
+            sqlx::query("PRAGMA foreign_keys = OFF")
+                .execute(&mut bootstrap)
+                .await
+                .map_err(SqliteAdapterError::schema_query)?;
+        }
+        let migration_result = MIGRATOR
             .run(&mut bootstrap)
             .instrument(migration_span.clone())
-            .await
+            .await;
+        if existing_migration_count < 6 {
+            sqlx::query("PRAGMA foreign_keys = ON")
+                .execute(&mut bootstrap)
+                .await
+                .map_err(SqliteAdapterError::schema_query)?;
+        }
+        migration_result
             .map_err(|_| SqliteAdapterError::new(SqliteFailureKind::InconsistentSchema))?;
         migration_span.record(
             "applied_count",
@@ -454,6 +470,80 @@ impl SqliteRuntimeGuard {
         self.runtime.close().await;
         drop(self.process_lock);
     }
+}
+
+pub(super) async fn prepare_ch1_owner_seed(
+    connection: &mut SqliteConnection,
+    existing_migration_count: i64,
+) -> Result<(), SqliteAdapterError> {
+    if existing_migration_count >= 6 {
+        return Ok(());
+    }
+    sqlx::query(
+        "CREATE TEMP TABLE ch1_owner_seed (user_id TEXT PRIMARY KEY NOT NULL) STRICT, WITHOUT ROWID",
+    )
+    .execute(&mut *connection)
+    .await
+    .map_err(|_| SqliteAdapterError::new(SqliteFailureKind::InconsistentSchema))?;
+
+    if existing_migration_count != 5 {
+        return Ok(());
+    }
+
+    let principal_count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM craxii_principals")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(SqliteAdapterError::schema_query)?;
+    if principal_count == 0 {
+        let root_rows = sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT COUNT(*) FROM conversations) \
+                  + (SELECT COUNT(*) FROM workstations) \
+                  + (SELECT COUNT(*) FROM workspaces) \
+                  + (SELECT COUNT(*) FROM client_devices) \
+                  + (SELECT COUNT(*) FROM messages) \
+                  + (SELECT COUNT(*) FROM work_items) \
+                  + (SELECT COUNT(*) FROM journal_events)",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(SqliteAdapterError::schema_query)?;
+        if root_rows == 0 {
+            return Ok(());
+        }
+        return Err(SqliteAdapterError::new(
+            SqliteFailureKind::InconsistentSchema,
+        ));
+    }
+
+    let valid_topology = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM craxii_principals p \
+         JOIN conversations c ON c.conversation_id = p.primary_conversation_id \
+         JOIN workspaces ws ON ws.workspace_id = p.default_workspace_id \
+         JOIN workstations wst ON wst.workstation_id = ws.workstation_id \
+         WHERE p.lifecycle_state = 'active' \
+           AND c.craxii_id = p.craxii_id AND c.kind = 'primary' AND c.lifecycle_state = 'active' \
+           AND ws.craxii_id = p.craxii_id AND ws.lifecycle_state = 'active' \
+           AND wst.craxii_id = p.craxii_id \
+           AND (SELECT COUNT(*) FROM craxii_principals) = 1 \
+           AND (SELECT COUNT(*) FROM conversations) = 1 \
+           AND (SELECT COUNT(*) FROM workspaces) = 1 \
+           AND (SELECT COUNT(*) FROM workstations) = 1",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(SqliteAdapterError::schema_query)?;
+    if valid_topology != 1 {
+        return Err(SqliteAdapterError::new(
+            SqliteFailureKind::InconsistentSchema,
+        ));
+    }
+
+    sqlx::query("INSERT INTO temp.ch1_owner_seed (user_id) VALUES (?)")
+        .bind(UserId::generate().to_string())
+        .execute(&mut *connection)
+        .await
+        .map_err(|_| SqliteAdapterError::new(SqliteFailureKind::InconsistentSchema))?;
+    Ok(())
 }
 
 fn trace_integrity(phase: &'static str, duration: Duration, disposition: DatabaseDisposition) {
@@ -1241,7 +1331,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_five_inventory_is_exact_and_reopen_is_idempotent() {
+    async fn migration_version_six_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
         assert_eq!(guard.disposition(), DatabaseDisposition::Current);
@@ -1461,7 +1551,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 5);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 6);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1488,7 +1578,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (6, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (7, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

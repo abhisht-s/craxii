@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io::{self, Write};
 
-use crate::domain::{BearerToken, DeviceDisplayName, DeviceId, UtcTimestamp};
+use crate::domain::{BearerToken, DeviceDisplayName, DeviceId, UserId, UtcTimestamp};
 use crate::ports::device_credentials::{
     DeviceCredentialStore, DeviceCredentialStoreErrorKind, DeviceSummary, ProvisionDeviceIntent,
     RevokeDeviceOutcome,
@@ -96,6 +96,7 @@ where
 
     pub async fn provision(
         &self,
+        user_id: UserId,
         display_name: DeviceDisplayName,
         created_at: UtcTimestamp,
     ) -> Result<ProvisionedDevice, DeviceAdministrationError> {
@@ -104,11 +105,13 @@ where
             DeviceAdministrationError::new(DeviceAdministrationErrorKind::EntropyUnavailable)
         })?;
         let bearer = BearerToken::from_random_bytes(random);
-        self.provision_token(display_name, created_at, bearer).await
+        self.provision_token(user_id, display_name, created_at, bearer)
+            .await
     }
 
     async fn provision_token(
         &self,
+        user_id: UserId,
         display_name: DeviceDisplayName,
         created_at: UtcTimestamp,
         bearer: BearerToken,
@@ -117,6 +120,7 @@ where
             .store
             .provision_device(ProvisionDeviceIntent {
                 device_id: DeviceId::generate(),
+                user_id,
                 display_name,
                 token_hash: bearer.token_hash(),
                 created_at,
@@ -144,11 +148,13 @@ where
     #[cfg(test)]
     pub(crate) async fn provision_fixture_token(
         &self,
+        user_id: UserId,
         display_name: DeviceDisplayName,
         created_at: UtcTimestamp,
         bearer: BearerToken,
     ) -> Result<ProvisionedDevice, DeviceAdministrationError> {
-        self.provision_token(display_name, created_at, bearer).await
+        self.provision_token(user_id, display_name, created_at, bearer)
+            .await
     }
 }
 

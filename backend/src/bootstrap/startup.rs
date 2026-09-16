@@ -160,6 +160,7 @@ pub async fn run(
         .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
             proposed: V0IdentityReference {
                 craxii_id: CraxiiId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 conversation_id: ConversationId::generate(),
                 workstation_id: WorkstationId::generate(),
                 workspace_id: WorkspaceId::generate(),
@@ -246,7 +247,7 @@ pub async fn run(
             .map_err(|_| StartupError::BuildMetadata)?,
         git_revision: GitRevision::try_new(process.build().git_revision())
             .map_err(|_| StartupError::BuildMetadata)?,
-        schema_version: SchemaVersion::try_new(5).map_err(|_| StartupError::BuildMetadata)?,
+        schema_version: SchemaVersion::try_new(6).map_err(|_| StartupError::BuildMetadata)?,
         started_at: runtime_started_at,
     });
     let state_store = Arc::new(state_store);

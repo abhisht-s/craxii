@@ -1,6 +1,7 @@
 //! Replacement and test boundaries owned by the application core.
 
 pub mod artifact_store;
+pub mod channel_identity;
 pub mod clock;
 pub mod context_source_store;
 pub mod device_credentials;

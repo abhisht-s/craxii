@@ -13,6 +13,7 @@ use craxii_server::application::device_provisioning::DeviceProvisioningService;
 use craxii_server::bootstrap::health::HealthState;
 use craxii_server::bootstrap::startup;
 use craxii_server::domain::{ClientMessageId, DeviceDisplayName, UtcTimestamp, WorkId};
+use craxii_server::ports::state_store::BootstrapStateStore;
 use serde_json::{Value, json};
 use sqlx::{Connection as _, Row as _};
 
@@ -76,9 +77,16 @@ async fn live_openai_production_path_persists_tool_and_final_completion() {
     );
 
     let store = SqliteStateStore::new(running.sqlite_runtime().runtime().clone());
+    let owner_user_id = store
+        .load_bootstrap_snapshot()
+        .await
+        .expect("load owner identity")
+        .identity
+        .user_id;
     let created_at = UtcTimestamp::from_offset_datetime(time::OffsetDateTime::now_utc()).unwrap();
     let provisioned = DeviceProvisioningService::new(&store)
         .provision(
+            owner_user_id,
             DeviceDisplayName::try_new("Stage 19 live smoke".to_owned()).unwrap(),
             created_at,
         )

@@ -116,6 +116,10 @@ pub(super) fn decode_active_work_row(
         .map_err(|_| inconsistent())?,
         workspace_id: WorkspaceId::parse_canonical(&row.try_get::<String, _>("workspace_id")?)
             .map_err(|_| inconsistent())?,
+        reply_binding_id: decode_optional_id(
+            row.try_get::<Option<String>, _>("reply_binding_id")?
+                .as_deref(),
+        )?,
         correlation_id: CorrelationId::parse_canonical(
             &row.try_get::<String, _>("correlation_id")?,
         )
@@ -542,7 +546,7 @@ async fn create_runtime(
     let evidence = &request.evidence;
     let linux_boot_id = evidence.linux_boot_id().ok_or_else(invariant)?;
     let process_id = evidence.diagnostic_pid().ok_or_else(invariant)?;
-    if evidence.schema_version().get() != 5 {
+    if evidence.schema_version().get() != super::schema::MAX_SUPPORTED_SCHEMA_VERSION {
         return Err(invariant());
     }
     let mut transaction =

@@ -19,8 +19,8 @@ use crate::domain::{
     PrivilegeMode, ProjectionVersion, ProviderModelReference, RuntimeInstanceId,
     RuntimeRecoveryPerformedV1, RuntimeStartEvidence, RuntimeStoppingV1, Sha256Digest,
     ToolExecutionId, ToolExecutionState, ToolLifecycleReference, ToolName, ToolResultClass,
-    ToolVersion, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState, WorkspaceId,
-    WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
+    ToolVersion, UserId, UtcTimestamp, WorkId, WorkItem, WorkLifecycleSnapshot, WorkState,
+    WorkspaceId, WorkspaceIdentity, WorkstationCapabilities, WorkstationGeneration, WorkstationId,
     WorkstationIdentity,
 };
 use crate::ports::artifact_store::FinalizedArtifact;
@@ -516,6 +516,7 @@ pub struct ToolTerminalOutcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct V0IdentityReference {
     pub craxii_id: CraxiiId,
+    pub user_id: UserId,
     pub conversation_id: ConversationId,
     pub workstation_id: WorkstationId,
     pub workspace_id: WorkspaceId,
@@ -582,6 +583,7 @@ pub struct MessageCommandCandidates {
 pub struct AcceptUserMessageRequest {
     pub client_message_id: ClientMessageId,
     pub device_id: DeviceId,
+    pub user_id: UserId,
     pub idempotency_key: IdempotencyKey,
     pub request_hash: CommandRequestHash,
     pub hash_version: CommandHashEncodingVersion,
@@ -609,6 +611,7 @@ pub struct ClaimedWork {
 pub struct RequestCancellationRequest {
     pub client_command_id: ClientCommandId,
     pub device_id: DeviceId,
+    pub user_id: UserId,
     pub idempotency_key: IdempotencyKey,
     pub request_hash: CommandRequestHash,
     pub hash_version: CommandHashEncodingVersion,

@@ -5,9 +5,10 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 
 use super::{
-    ClientMessageId, ConversationId, ConversationWorkOrdinal, CorrelationId, CraxiiId, DeviceId,
-    DomainValidationError, DomainValidationKind, JournalEventId, LogicalPathReference,
-    MessageContent, MessageId, Sha256Digest, UtcTimestamp, WorkId, WorkspaceId, WorkstationId,
+    ClientMessageId, ConversationBindingId, ConversationId, ConversationWorkOrdinal, CorrelationId,
+    CraxiiId, DeviceId, DomainValidationError, DomainValidationKind, InboundDeliveryId,
+    JournalEventId, LogicalPathReference, MessageContent, MessageId, Sha256Digest, UserId,
+    UtcTimestamp, WorkId, WorkspaceId, WorkstationId,
 };
 
 macro_rules! exact_positive_integer {
@@ -383,6 +384,7 @@ impl fmt::Debug for CraxiiPrincipal {
 pub struct Conversation {
     conversation_id: ConversationId,
     craxii_id: CraxiiId,
+    owner_user_id: UserId,
     kind: ConversationKind,
     lifecycle: ConversationLifecycle,
     created_at: UtcTimestamp,
@@ -396,6 +398,7 @@ impl Conversation {
     pub const fn new(
         conversation_id: ConversationId,
         craxii_id: CraxiiId,
+        owner_user_id: UserId,
         created_at: UtcTimestamp,
         next_work_ordinal: ConversationWorkOrdinal,
         projection_version: ProjectionVersion,
@@ -403,6 +406,7 @@ impl Conversation {
         Self {
             conversation_id,
             craxii_id,
+            owner_user_id,
             kind: ConversationKind::Primary,
             lifecycle: ConversationLifecycle::Active,
             created_at,
@@ -416,6 +420,9 @@ impl Conversation {
     }
     pub const fn craxii_id(&self) -> CraxiiId {
         self.craxii_id
+    }
+    pub const fn owner_user_id(&self) -> UserId {
+        self.owner_user_id
     }
     pub const fn kind(&self) -> ConversationKind {
         self.kind
@@ -434,6 +441,24 @@ impl Conversation {
     }
 }
 
+/// Closed immutable provenance for every canonical committed message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageProvenance {
+    NativeUser {
+        author_user_id: UserId,
+        device_id: DeviceId,
+        client_message_id: ClientMessageId,
+    },
+    ChannelUser {
+        author_user_id: UserId,
+        inbound_delivery_id: InboundDeliveryId,
+    },
+    Assistant {
+        produced_by_work_id: WorkId,
+    },
+    System,
+}
+
 /// Construction data for one immutable committed message.
 pub struct MessageInput {
     pub message_id: MessageId,
@@ -441,9 +466,11 @@ pub struct MessageInput {
     pub conversation_id: ConversationId,
     pub role: MessageRole,
     pub content: MessageContent,
+    pub author_user_id: Option<UserId>,
     pub produced_by_work_id: Option<WorkId>,
     pub device_id: Option<DeviceId>,
     pub client_message_id: Option<ClientMessageId>,
+    pub inbound_delivery_id: Option<InboundDeliveryId>,
     pub committed_at: UtcTimestamp,
 }
 
@@ -455,9 +482,12 @@ pub struct Message {
     conversation_id: ConversationId,
     role: MessageRole,
     content: MessageContent,
+    author_user_id: Option<UserId>,
     produced_by_work_id: Option<WorkId>,
     device_id: Option<DeviceId>,
     client_message_id: Option<ClientMessageId>,
+    inbound_delivery_id: Option<InboundDeliveryId>,
+    provenance: MessageProvenance,
     content_sha256: Sha256Digest,
     committed_at: UtcTimestamp,
 }
@@ -465,28 +495,50 @@ pub struct Message {
 impl Message {
     /// Validates the exact role/client/work provenance matrix.
     pub fn try_new(input: MessageInput) -> Result<Self, DomainValidationError> {
-        let valid_provenance = match input.role {
-            MessageRole::User => {
-                input.produced_by_work_id.is_none()
-                    && input.device_id.is_some()
-                    && input.client_message_id.is_some()
+        let provenance = match (
+            input.role,
+            input.author_user_id,
+            input.produced_by_work_id,
+            input.device_id,
+            input.client_message_id,
+            input.inbound_delivery_id,
+        ) {
+            (
+                MessageRole::User,
+                Some(author_user_id),
+                None,
+                Some(device_id),
+                Some(client_message_id),
+                None,
+            ) => Some(MessageProvenance::NativeUser {
+                author_user_id,
+                device_id,
+                client_message_id,
+            }),
+            (
+                MessageRole::User,
+                Some(author_user_id),
+                None,
+                None,
+                None,
+                Some(inbound_delivery_id),
+            ) => Some(MessageProvenance::ChannelUser {
+                author_user_id,
+                inbound_delivery_id,
+            }),
+            (MessageRole::Assistant, None, Some(produced_by_work_id), None, None, None) => {
+                Some(MessageProvenance::Assistant {
+                    produced_by_work_id,
+                })
             }
-            MessageRole::Assistant => {
-                input.produced_by_work_id.is_some()
-                    && input.device_id.is_none()
-                    && input.client_message_id.is_none()
-            }
-            MessageRole::System => {
-                input.produced_by_work_id.is_none()
-                    && input.device_id.is_none()
-                    && input.client_message_id.is_none()
-            }
+            (MessageRole::System, None, None, None, None, None) => Some(MessageProvenance::System),
+            _ => None,
         };
-        if !valid_provenance {
+        let Some(provenance) = provenance else {
             return Err(DomainValidationError::new(
                 DomainValidationKind::InvalidMessageProvenance,
             ));
-        }
+        };
 
         let content_sha256 = input.content.content_sha256();
         Ok(Self {
@@ -495,9 +547,12 @@ impl Message {
             conversation_id: input.conversation_id,
             role: input.role,
             content: input.content,
+            author_user_id: input.author_user_id,
             produced_by_work_id: input.produced_by_work_id,
             device_id: input.device_id,
             client_message_id: input.client_message_id,
+            inbound_delivery_id: input.inbound_delivery_id,
+            provenance,
             content_sha256,
             committed_at: input.committed_at,
         })
@@ -518,6 +573,9 @@ impl Message {
     pub const fn content(&self) -> &MessageContent {
         &self.content
     }
+    pub const fn author_user_id(&self) -> Option<UserId> {
+        self.author_user_id
+    }
     pub const fn produced_by_work_id(&self) -> Option<WorkId> {
         self.produced_by_work_id
     }
@@ -526,6 +584,12 @@ impl Message {
     }
     pub const fn client_message_id(&self) -> Option<ClientMessageId> {
         self.client_message_id
+    }
+    pub const fn inbound_delivery_id(&self) -> Option<InboundDeliveryId> {
+        self.inbound_delivery_id
+    }
+    pub const fn provenance(&self) -> MessageProvenance {
+        self.provenance
     }
     pub const fn content_sha256(&self) -> Sha256Digest {
         self.content_sha256
@@ -556,6 +620,7 @@ pub struct WorkItemInputData {
     pub conversation_id: ConversationId,
     pub conversation_work_ordinal: ConversationWorkOrdinal,
     pub workspace_id: WorkspaceId,
+    pub reply_binding_id: Option<ConversationBindingId>,
     pub correlation_id: CorrelationId,
     pub created_at: UtcTimestamp,
     pub queued_at: UtcTimestamp,
@@ -571,6 +636,7 @@ pub struct WorkItem {
     kind: WorkKind,
     priority: i64,
     workspace_id: WorkspaceId,
+    reply_binding_id: Option<ConversationBindingId>,
     correlation_id: CorrelationId,
     created_at: UtcTimestamp,
     queued_at: UtcTimestamp,
@@ -588,6 +654,7 @@ impl WorkItem {
             kind: WorkKind::Conversational,
             priority: 0,
             workspace_id: input.workspace_id,
+            reply_binding_id: input.reply_binding_id,
             correlation_id: input.correlation_id,
             created_at: input.created_at,
             queued_at: input.queued_at,
@@ -614,6 +681,9 @@ impl WorkItem {
     }
     pub const fn workspace_id(&self) -> WorkspaceId {
         self.workspace_id
+    }
+    pub const fn reply_binding_id(&self) -> Option<ConversationBindingId> {
+        self.reply_binding_id
     }
     pub const fn correlation_id(&self) -> CorrelationId {
         self.correlation_id
@@ -1230,9 +1300,11 @@ mod tests {
             conversation_id: id(V7),
             role: MessageRole::User,
             content: content(),
+            author_user_id: Some(UserId::generate()),
             produced_by_work_id: None,
             device_id: Some(id(V7)),
             client_message_id: Some(id(V7)),
+            inbound_delivery_id: None,
             committed_at: now(),
         })
         .unwrap();
@@ -1242,9 +1314,11 @@ mod tests {
             conversation_id: id(V7),
             role: MessageRole::Assistant,
             content: content(),
+            author_user_id: None,
             produced_by_work_id: Some(id(V7)),
             device_id: None,
             client_message_id: None,
+            inbound_delivery_id: None,
             committed_at: "2027-01-01T00:00:00.000000Z".parse().unwrap(),
         })
         .unwrap();
@@ -1254,9 +1328,11 @@ mod tests {
             conversation_id: ConversationId::generate(),
             role: MessageRole::System,
             content: content(),
+            author_user_id: None,
             produced_by_work_id: None,
             device_id: None,
             client_message_id: None,
+            inbound_delivery_id: None,
             committed_at: now(),
         })
         .unwrap();
@@ -1271,9 +1347,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::User,
                 content: content(),
+                author_user_id: Some(UserId::generate()),
                 produced_by_work_id: None,
                 device_id: Some(id(V7)),
                 client_message_id: None,
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1282,9 +1360,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::User,
                 content: content(),
+                author_user_id: Some(UserId::generate()),
                 produced_by_work_id: None,
                 device_id: None,
                 client_message_id: Some(id(V7)),
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1293,9 +1373,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::User,
                 content: content(),
+                author_user_id: Some(UserId::generate()),
                 produced_by_work_id: Some(id(V7)),
                 device_id: Some(id(V7)),
                 client_message_id: Some(id(V7)),
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1304,9 +1386,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::Assistant,
                 content: content(),
+                author_user_id: None,
                 produced_by_work_id: None,
                 device_id: None,
                 client_message_id: None,
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1315,9 +1399,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::Assistant,
                 content: content(),
+                author_user_id: None,
                 produced_by_work_id: Some(id(V7)),
                 device_id: Some(id(V7)),
                 client_message_id: Some(id(V7)),
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1326,9 +1412,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::System,
                 content: content(),
+                author_user_id: None,
                 produced_by_work_id: Some(id(V7)),
                 device_id: None,
                 client_message_id: None,
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
             MessageInput {
@@ -1337,9 +1425,11 @@ mod tests {
                 conversation_id: id(V7),
                 role: MessageRole::System,
                 content: content(),
+                author_user_id: None,
                 produced_by_work_id: None,
                 device_id: Some(id(V7)),
                 client_message_id: Some(id(V7)),
+                inbound_delivery_id: None,
                 committed_at: now(),
             },
         ];

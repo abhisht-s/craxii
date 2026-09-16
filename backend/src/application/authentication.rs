@@ -109,7 +109,7 @@ where
             return Err(AuthenticationError);
         }
 
-        let authenticated = AuthenticatedDevice::new(matched.device_id);
+        let authenticated = AuthenticatedDevice::new(matched.device_id, matched.user_id);
         let _evidence_only = self
             .store
             .best_effort_touch_last_seen(authenticated.device_id(), observed_at)
@@ -200,6 +200,7 @@ mod tests {
         FakeStore {
             matched: Some(DeviceCredentialMatch {
                 device_id: DeviceId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 matched_hash: token.token_hash(),
                 revoked_at: None,
             }),
@@ -242,6 +243,7 @@ mod tests {
             FakeStore {
                 matched: Some(DeviceCredentialMatch {
                     device_id,
+                    user_id: crate::domain::UserId::generate(),
                     matched_hash: matching_hash,
                     revoked_at: Some(now()),
                 }),
@@ -253,6 +255,7 @@ mod tests {
             FakeStore {
                 matched: Some(DeviceCredentialMatch {
                     device_id,
+                    user_id: crate::domain::UserId::generate(),
                     matched_hash: other_hash,
                     revoked_at: None,
                 }),
@@ -300,6 +303,7 @@ mod tests {
             let store = FakeStore {
                 matched: Some(DeviceCredentialMatch {
                     device_id: DeviceId::generate(),
+                    user_id: crate::domain::UserId::generate(),
                     matched_hash,
                     revoked_at: Some(now()),
                 }),

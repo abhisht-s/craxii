@@ -113,6 +113,7 @@ fn bootstrap_request() -> LoadOrBootstrapIdentityRequest {
     LoadOrBootstrapIdentityRequest {
         proposed: V0IdentityReference {
             craxii_id: CraxiiId::generate(),
+            user_id: crate::domain::UserId::generate(),
             conversation_id: ConversationId::generate(),
             workstation_id: WorkstationId::generate(),
             workspace_id: WorkspaceId::generate(),
@@ -136,6 +137,7 @@ async fn fixture() -> Fixture {
         .identity;
     let provisioned = DeviceProvisioningService::new(&store)
         .provision_fixture_token(
+            identity.user_id,
             DeviceDisplayName::try_new("Stage 9 device".into()).unwrap(),
             timestamp(T0),
             BearerToken::parse(SENTINEL.to_owned()).unwrap(),
@@ -220,7 +222,7 @@ async fn accept(
 ) -> crate::domain::CommandOutcome<crate::domain::MessageCommandReceipt> {
     CommandService::new(store)
         .accept_message(
-            AuthenticatedDevice::new(device_id),
+            AuthenticatedDevice::new(device_id, identity.user_id),
             message_command(identity, client_message_id, text, timestamp(T1)),
         )
         .await
@@ -266,6 +268,7 @@ async fn provision_auth_touch_revoke_and_secret_storage_contract_is_exact() {
 
     let duplicate = DeviceProvisioningService::new(&fixture.store)
         .provision_fixture_token(
+            fixture.identity.user_id,
             DeviceDisplayName::try_new("Duplicate".into()).unwrap(),
             timestamp(T1),
             BearerToken::parse(fixture.token_text.clone()).unwrap(),
@@ -362,7 +365,7 @@ async fn message_commit_replay_conflict_event_order_and_future_isolation_are_ato
 
     let conflict = CommandService::new(&fixture.store)
         .accept_message(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             message_command(fixture.identity, first_id, "changed", timestamp(T1)),
         )
         .await
@@ -374,7 +377,7 @@ async fn message_commit_replay_conflict_event_order_and_future_isolation_are_ato
     let cross_kind_id = ClientCommandId::parse_canonical(&first_id.to_string()).unwrap();
     let cross_kind = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(cross_kind_id, first_receipt.work_id, timestamp(T2)),
         )
         .await
@@ -439,7 +442,7 @@ async fn every_message_precommit_failure_boundary_rolls_back_all_durable_truth()
         fixture.store.set_stage9_test_hook(Some(hook));
         let error = CommandService::new(&fixture.store)
             .accept_message(
-                AuthenticatedDevice::new(fixture.device_id),
+                AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
                 message_command(
                     fixture.identity,
                     ClientMessageId::generate(),
@@ -535,7 +538,7 @@ async fn concurrent_identical_message_key_has_one_winner_and_exact_replay() {
             barrier.wait().await;
             CommandService::new(&*store)
                 .accept_message(
-                    AuthenticatedDevice::new(device),
+                    AuthenticatedDevice::new(device, identity.user_id),
                     message_command(identity, client_message_id, "same", timestamp(T1)),
                 )
                 .await
@@ -557,7 +560,7 @@ async fn message_key_body_mismatch_and_duplicate_identity_bypass_persist_nothing
     let client_message_id = ClientMessageId::generate();
     let mismatched = CommandService::new(&fixture.store)
         .accept_message(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             AcceptMessageCommand {
                 idempotency_key: IdempotencyKey::for_message(ClientMessageId::generate()),
                 client_message_id,
@@ -592,7 +595,7 @@ async fn message_key_body_mismatch_and_duplicate_identity_bypass_persist_nothing
     drop(connection);
     let bypass = CommandService::new(&fixture.store)
         .accept_message(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             message_command(fixture.identity, client_message_id, "winner", timestamp(T1)),
         )
         .await
@@ -621,7 +624,7 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
     let command_id = ClientCommandId::generate();
     let cancelled = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(command_id, work, timestamp(T2)),
         )
         .await
@@ -637,7 +640,7 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
 
     let replay = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(command_id, work, timestamp(T2)),
         )
         .await
@@ -647,7 +650,7 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
 
     let no_op = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(ClientCommandId::generate(), work, timestamp(T2)),
         )
         .await
@@ -680,7 +683,7 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
     .work_id;
     let conflict = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(command_id, other_work, timestamp(T2)),
         )
         .await
@@ -691,7 +694,7 @@ async fn queued_cancellation_replay_terminal_noop_conflict_and_not_found_are_dur
     );
     let missing = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(
                 ClientCommandId::generate(),
                 WorkId::generate(),
@@ -723,7 +726,7 @@ async fn transition_to_running(fixture: &Fixture, work_id: WorkId) -> RuntimeIns
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage9-test").unwrap(),
-                schema_version: SchemaVersion::try_new(5).unwrap(),
+                schema_version: SchemaVersion::try_new(6).unwrap(),
                 started_at: timestamp(T1),
             }),
             event_id: JournalEventId::generate(),
@@ -835,7 +838,7 @@ async fn persisted_cancellation(kind: CancellationTransitionKind) -> PersistedCa
     let command_id = ClientCommandId::generate();
     let receipt = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(command_id, work_id, timestamp(T2)),
         )
         .await
@@ -984,6 +987,7 @@ async fn queued_cancellation_rejects_nonexistent_and_wrong_existing_device_actor
         let actor_id = if wrong_existing {
             DeviceProvisioningService::new(&persisted.fixture.store)
                 .provision_fixture_token(
+                    persisted.fixture.identity.user_id,
                     DeviceDisplayName::try_new("Unrelated device".into()).unwrap(),
                     timestamp(T0),
                     BearerToken::parse("cd".repeat(32)).unwrap(),
@@ -1051,7 +1055,10 @@ async fn cancellation_noop_receipts_keep_the_v3_high_water_compatibility_path() 
         .await;
         let no_op = CommandService::new(&persisted.fixture.store)
             .cancel_work(
-                AuthenticatedDevice::new(persisted.fixture.device_id),
+                AuthenticatedDevice::new(
+                    persisted.fixture.device_id,
+                    persisted.fixture.identity.user_id,
+                ),
                 cancel_command(
                     ClientCommandId::generate(),
                     persisted.work_id,
@@ -1093,7 +1100,7 @@ async fn active_cancellation_requests_cleanup_once_and_preserves_runtime_ownersh
     let first_id = ClientCommandId::generate();
     let first = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(first_id, work, timestamp(T2)),
         )
         .await
@@ -1104,7 +1111,7 @@ async fn active_cancellation_requests_cleanup_once_and_preserves_runtime_ownersh
     assert!(first.cleanup.is_pending());
     let replay = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(first_id, work, timestamp(T2)),
         )
         .await
@@ -1113,7 +1120,7 @@ async fn active_cancellation_requests_cleanup_once_and_preserves_runtime_ownersh
     assert_eq!(replay.into_receipt(), first);
     let second = CommandService::new(&fixture.store)
         .cancel_work(
-            AuthenticatedDevice::new(fixture.device_id),
+            AuthenticatedDevice::new(fixture.device_id, fixture.identity.user_id),
             cancel_command(ClientCommandId::generate(), work, timestamp(T2)),
         )
         .await
@@ -1161,11 +1168,12 @@ async fn concurrent_cancellations_have_one_transition_and_stable_noop_receipts()
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         let device = fixture.device_id;
+        let user = fixture.identity.user_id;
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             CommandService::new(&*store)
                 .cancel_work(
-                    AuthenticatedDevice::new(device),
+                    AuthenticatedDevice::new(device, user),
                     cancel_command(ClientCommandId::generate(), work, timestamp(T2)),
                 )
                 .await
@@ -1212,11 +1220,12 @@ async fn concurrent_same_cancellation_key_replays_and_changed_target_conflicts()
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         let device = fixture.device_id;
+        let user = fixture.identity.user_id;
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             CommandService::new(&*store)
                 .cancel_work(
-                    AuthenticatedDevice::new(device),
+                    AuthenticatedDevice::new(device, user),
                     cancel_command(command_id, first_work, timestamp(T2)),
                 )
                 .await
@@ -1256,11 +1265,12 @@ async fn concurrent_same_cancellation_key_replays_and_changed_target_conflicts()
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         let device = fixture.device_id;
+        let user = fixture.identity.user_id;
         changed_tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             CommandService::new(&*store)
                 .cancel_work(
-                    AuthenticatedDevice::new(device),
+                    AuthenticatedDevice::new(device, user),
                     cancel_command(changed_key, work, timestamp(T2)),
                 )
                 .await
@@ -1307,11 +1317,12 @@ async fn concurrent_active_cancellation_keys_emit_one_request_event() {
         let store = Arc::clone(&store);
         let barrier = Arc::clone(&barrier);
         let device = fixture.device_id;
+        let user = fixture.identity.user_id;
         tasks.push(tokio::spawn(async move {
             barrier.wait().await;
             CommandService::new(&*store)
                 .cancel_work(
-                    AuthenticatedDevice::new(device),
+                    AuthenticatedDevice::new(device, user),
                     cancel_command(ClientCommandId::generate(), work, timestamp(T2)),
                 )
                 .await
@@ -1391,7 +1402,7 @@ async fn postcommit_message_and_cancellation_responses_replay_after_reopen() {
     let store = SqliteStateStore::new(guard.runtime().clone());
     let cancellation_replay = CommandService::new(&store)
         .cancel_work(
-            AuthenticatedDevice::new(device_id),
+            AuthenticatedDevice::new(device_id, identity.user_id),
             cancel_command(cancellation_id, message_receipt.work_id, timestamp(T2)),
         )
         .await

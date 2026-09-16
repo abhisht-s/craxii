@@ -170,6 +170,7 @@
 //! ```
 
 mod authentication;
+mod channel;
 mod command;
 mod content;
 mod digest;
@@ -189,6 +190,13 @@ pub use authentication::{
     AuthenticatedDevice, BearerToken, CredentialValidationError, CredentialValidationKind,
     DeviceDisplayName, DeviceTokenHash, MAX_DEVICE_DISPLAY_NAME_BYTES, device_token_hashes_equal,
 };
+pub use channel::{
+    ChannelAccount, ChannelAccountLifecycle, ChannelProviderId, ConversationBinding,
+    ConversationBindingLifecycle, ExternalAccountId, ExternalConversationId, ExternalEventId,
+    ExternalIdentity, ExternalIdentityLifecycle, ExternalMessageId, ExternalSubjectId,
+    ExternalThreadId, InboundClassification, InboundDelivery, InboundReceiptState,
+    MAX_CHANNEL_PROVIDER_ID_BYTES, MAX_EXTERNAL_ID_BYTES, User, UserLifecycle,
+};
 pub use command::{
     CancellationCleanupDisposition, CancellationCommandReceipt, CommandHashEncodingVersion,
     CommandKind, CommandOutcome, CommandRequestHash, CommandValidationError, CommandValidationKind,
@@ -198,10 +206,10 @@ pub use content::{ContentBlock, ContentVersion, MAX_CONTENT_TEXT_BYTES, MessageC
 pub use digest::{CanonicalByteCount, Sha256Digest};
 pub use entities::{
     Conversation, ConversationKind, ConversationLifecycle, CraxiiLifecycle, CraxiiPrincipal,
-    CraxiiPrincipalInput, HostingProvider, Message, MessageInput, MessageRole, ProjectionVersion,
-    SchemaVersion, WorkInputActor, WorkInputOrdinal, WorkInputRelationship, WorkItem,
-    WorkItemInput, WorkItemInputData, WorkKind, WorkspaceCapabilityRef, WorkspaceIdentity,
-    WorkspaceIdentityInput, WorkspaceLifecycle, WorkstationCapabilities,
+    CraxiiPrincipalInput, HostingProvider, Message, MessageInput, MessageProvenance, MessageRole,
+    ProjectionVersion, SchemaVersion, WorkInputActor, WorkInputOrdinal, WorkInputRelationship,
+    WorkItem, WorkItemInput, WorkItemInputData, WorkKind, WorkspaceCapabilityRef,
+    WorkspaceIdentity, WorkspaceIdentityInput, WorkspaceLifecycle, WorkstationCapabilities,
     WorkstationCapabilitiesInput, WorkstationCapabilitiesVersion, WorkstationCapabilityFlags,
     WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits, WorkstationGeneration,
     WorkstationIdentity, WorkstationIdentityInput, WorkstationKind,
@@ -222,18 +230,20 @@ pub use evidence::{
     ToolName, ToolVersion,
 };
 pub use ids::{
-    ArtifactId, ClientCommandId, ClientMessageId, ContextManifestId, ConversationId, CorrelationId,
-    CraxiiId, DeviceId, DraftId, ExecutionId, JournalEventId, LogicalInvocationId, MessageId,
-    ModelInvocationId, OperationId, RuntimeInstanceId, ToolExecutionId, WorkId, WorkspaceId,
-    WorkstationId,
+    ArtifactId, ChannelAccountId, ClientCommandId, ClientMessageId, ContextManifestId,
+    ConversationBindingId, ConversationId, CorrelationId, CraxiiId, DeviceId, DraftId, ExecutionId,
+    ExternalIdentityId, InboundDeliveryId, JournalEventId, LogicalInvocationId, MessageId,
+    ModelInvocationId, OperationId, RuntimeInstanceId, ToolExecutionId, UserId, WorkId,
+    WorkspaceId, WorkstationId,
 };
 pub use journal::{
-    ArtifactRecordedV1, ConversationCreatedV1, CraxiiInitializedV1, JournalActor,
-    JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventKind,
+    ArtifactRecordedV1, ConversationCreatedV1, ConversationCreatedV2, CraxiiInitializedV1,
+    JournalActor, JournalContractError, JournalCurrentAttempt, JournalEvent, JournalEventKind,
     JournalEventPayload, JournalStageOwner, JournalStreamFamily, JournalStreamId,
-    JournalVersionResolution, JournalWorkTerminalReason, MessageCommittedV1,
-    ModelInvocationEventV1, RuntimeRecoveryPerformedV1, RuntimeStartedV1, RuntimeStoppingV1,
-    ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1, WorkTransitionV1, resolve_event_version,
+    JournalVersionResolution, JournalWorkTerminalReason, MessageAcceptedOriginV2,
+    MessageCommittedV1, MessageCommittedV2, ModelInvocationEventV1, RuntimeRecoveryPerformedV1,
+    RuntimeStartedV1, RuntimeStoppingV1, ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1,
+    WorkQueuedV2, WorkTransitionV1, resolve_event_version,
 };
 pub use lifecycle::{
     CancellationCheckpoint, CancellationChildOutcome, CancellationDecision, CleanupStatus,

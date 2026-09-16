@@ -555,9 +555,11 @@ impl AgentLoop {
             conversation_id: work_item.conversation_id(),
             role: MessageRole::Assistant,
             content,
+            author_user_id: None,
             produced_by_work_id: Some(work_item.work_id()),
             device_id: None,
             client_message_id: None,
+            inbound_delivery_id: None,
             committed_at,
         }) {
             Ok(value) => value,

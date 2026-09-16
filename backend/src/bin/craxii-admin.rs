@@ -14,7 +14,9 @@ use craxii_server::application::evidence_inspection::{
     EvidenceInspectionService, EvidenceOutputFormat,
 };
 use craxii_server::bootstrap::config;
-use craxii_server::domain::{DeviceDisplayName, DeviceId, RuntimeInstanceId, UtcTimestamp, WorkId};
+use craxii_server::domain::{
+    DeviceDisplayName, DeviceId, RuntimeInstanceId, UserId, UtcTimestamp, WorkId,
+};
 use craxii_server::ports::clock::Clock;
 use craxii_server::ports::device_credentials::RevokeDeviceOutcome;
 use craxii_server::ports::state_store::BootstrapStateStore;
@@ -59,11 +61,11 @@ async fn run(
     let mut verification_failed = false;
     match cli.action {
         Action::Provision(display_name) => {
-            load_snapshot(&store).await?;
+            let user_id = load_owner_user_id(&store).await?;
             let observed_at = observed_at()?;
             let service = DeviceProvisioningService::new(&store);
             let provisioned = service
-                .provision(display_name, observed_at)
+                .provision(user_id, display_name, observed_at)
                 .await
                 .map_err(|_| AdminError::DeviceAdministration)?;
             writeln!(
@@ -78,7 +80,7 @@ async fn run(
                 .map_err(|_| AdminError::Output)?;
         }
         Action::List => {
-            load_snapshot(&store).await?;
+            load_owner_user_id(&store).await?;
             let service = DeviceProvisioningService::new(&store);
             writeln!(
                 stdout,
@@ -109,7 +111,7 @@ async fn run(
             stdout.flush().map_err(|_| AdminError::Output)?;
         }
         Action::Revoke(device_id) => {
-            load_snapshot(&store).await?;
+            load_owner_user_id(&store).await?;
             let observed_at = observed_at()?;
             let service = DeviceProvisioningService::new(&store);
             let outcome = service
@@ -220,11 +222,11 @@ async fn run(
     }
 }
 
-async fn load_snapshot(store: &SqliteStateStore) -> Result<(), AdminError> {
+async fn load_owner_user_id(store: &SqliteStateStore) -> Result<UserId, AdminError> {
     store
         .load_bootstrap_snapshot()
         .await
-        .map(|_| ())
+        .map(|snapshot| snapshot.identity.user_id)
         .map_err(|_| AdminError::DatabaseIntegrity)
 }
 

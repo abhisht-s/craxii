@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use super::{DeviceId, Sha256Digest};
+use super::{DeviceId, Sha256Digest, UserId};
 
 const BEARER_TOKEN_BYTES: usize = 32;
 const BEARER_TOKEN_TEXT_BYTES: usize = BEARER_TOKEN_BYTES * 2;
@@ -166,17 +166,23 @@ impl fmt::Debug for DeviceDisplayName {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AuthenticatedDevice {
     device_id: DeviceId,
+    user_id: UserId,
 }
 
 impl AuthenticatedDevice {
     #[must_use]
-    pub(crate) const fn new(device_id: DeviceId) -> Self {
-        Self { device_id }
+    pub(crate) const fn new(device_id: DeviceId, user_id: UserId) -> Self {
+        Self { device_id, user_id }
     }
 
     #[must_use]
     pub const fn device_id(self) -> DeviceId {
         self.device_id
+    }
+
+    #[must_use]
+    pub const fn user_id(self) -> UserId {
+        self.user_id
     }
 }
 

@@ -74,6 +74,7 @@ fn request() -> LoadOrBootstrapIdentityRequest {
     LoadOrBootstrapIdentityRequest {
         proposed: V0IdentityReference {
             craxii_id: CraxiiId::generate(),
+            user_id: crate::domain::UserId::generate(),
             conversation_id: ConversationId::generate(),
             workstation_id: WorkstationId::generate(),
             workspace_id: WorkspaceId::generate(),
@@ -202,12 +203,12 @@ fn conversation_event_intent(
 }
 
 #[tokio::test]
-async fn migration_three_manifest_schema_and_zero_product_rows_are_exact() {
+async fn current_manifest_schema_and_zero_product_rows_are_exact() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    assert_eq!(PRODUCT_TABLES.len(), 17);
-    assert_eq!(PRODUCT_INDEXES.len(), 40);
+    assert_eq!(PRODUCT_TABLES.len(), 22);
+    assert_eq!(PRODUCT_INDEXES.len(), 48);
     for table in PRODUCT_TABLES {
         assert_eq!(count(guard.runtime(), table).await, 0, "{table}");
     }
@@ -258,7 +259,7 @@ async fn migration_three_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e"
+        "b24c145128287dc40a5a59adb7f8c6c1a75367fe8d563c295f2509ec505b2706"
     );
     assert_eq!(
         v1_schema_fingerprint(),
@@ -591,7 +592,7 @@ async fn work_input_constraints_and_private_causal_validation_fail_closed() {
 }
 
 #[tokio::test]
-async fn valid_version_one_database_migrates_to_version_five_and_reopens() {
+async fn valid_version_one_database_migrates_to_version_six_and_reopens() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -628,7 +629,7 @@ async fn valid_version_one_database_migrates_to_version_five_and_reopens() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        5
+        6
     );
     drop(connection);
     guard.shutdown().await;
@@ -1168,10 +1169,11 @@ async fn persisted_message_work_and_input_projection_comparison_is_exact() {
     .unwrap();
     sqlx::query(
         "INSERT INTO client_devices \
-         (device_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
-         VALUES (?, 'fixture', ?, ?, NULL, NULL)",
+         (device_id, user_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
+         VALUES (?, ?, 'fixture', ?, ?, NULL, NULL)",
     )
     .bind(device_id.to_string())
+    .bind(snapshot.identity.user_id.to_string())
     .bind(Sha256Digest::hash_bytes(b"fixture-token").to_string())
     .bind(AT)
     .execute(&mut *connection)
@@ -1208,14 +1210,16 @@ async fn persisted_message_work_and_input_projection_comparison_is_exact() {
     .unwrap();
     sqlx::query(
         "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
-         content_sha256, produced_by_work_id, client_device_id, client_message_id, committed_at) \
-         VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)",
+         content_sha256, author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+         inbound_delivery_id, committed_at) \
+         VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
     )
     .bind(message_id.to_string())
     .bind(snapshot.identity.craxii_id.to_string())
     .bind(snapshot.identity.conversation_id.to_string())
     .bind(content_json)
     .bind(content_sha256.to_string())
+    .bind(snapshot.identity.user_id.to_string())
     .bind(device_id.to_string())
     .bind(client_message_id.to_string())
     .bind(AT)
@@ -1605,6 +1609,7 @@ async fn partial_bootstrap_matrix_fails_closed_and_never_repairs() {
             }
             BootstrapCorruption::ExtraPrimaryConversation => {
                 let extra_craxii = CraxiiId::generate();
+                let extra_user = crate::domain::UserId::generate();
                 sqlx::query(
                     "INSERT INTO craxii_principals \
                      (craxii_id, display_name, owner_label, lifecycle_state, \
@@ -1617,11 +1622,19 @@ async fn partial_bootstrap_matrix_fails_closed_and_never_repairs() {
                 .execute(&mut *connection)
                 .await
                 .unwrap();
+                sqlx::query("INSERT INTO users VALUES (?, ?, 'active', ?)")
+                    .bind(extra_user.to_string())
+                    .bind(extra_craxii.to_string())
+                    .bind(AT)
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
                 sqlx::query(
-                    "INSERT INTO conversations VALUES (?, ?, 'primary', 'active', 1, 1, ?)",
+                    "INSERT INTO conversations VALUES (?, ?, ?, 'primary', 'active', 1, 1, ?)",
                 )
                 .bind(ConversationId::generate().to_string())
                 .bind(extra_craxii.to_string())
+                .bind(extra_user.to_string())
                 .bind(AT)
                 .execute(&mut *connection)
                 .await

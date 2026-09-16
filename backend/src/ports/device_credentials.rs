@@ -4,7 +4,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::domain::{DeviceDisplayName, DeviceId, DeviceTokenHash, UtcTimestamp};
+use crate::domain::{DeviceDisplayName, DeviceId, DeviceTokenHash, UserId, UtcTimestamp};
 
 pub type DeviceCredentialFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, DeviceCredentialStoreError>> + Send + 'a>>;
@@ -53,6 +53,7 @@ impl std::error::Error for DeviceCredentialStoreError {}
 
 pub struct ProvisionDeviceIntent {
     pub device_id: DeviceId,
+    pub user_id: UserId,
     pub display_name: DeviceDisplayName,
     pub token_hash: DeviceTokenHash,
     pub created_at: UtcTimestamp,
@@ -61,6 +62,7 @@ pub struct ProvisionDeviceIntent {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSummary {
     pub device_id: DeviceId,
+    pub user_id: UserId,
     pub display_name: DeviceDisplayName,
     pub created_at: UtcTimestamp,
     pub last_seen_at: Option<UtcTimestamp>,
@@ -77,6 +79,7 @@ impl DeviceSummary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeviceCredentialMatch {
     pub device_id: DeviceId,
+    pub user_id: UserId,
     pub matched_hash: DeviceTokenHash,
     pub revoked_at: Option<UtcTimestamp>,
 }

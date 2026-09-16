@@ -3040,12 +3040,14 @@ mod tests {
             conversation_id,
             role,
             content: MessageContent::try_new(vec![ContentBlock::text(text).unwrap()]).unwrap(),
+            author_user_id: (role == MessageRole::User).then(crate::domain::UserId::generate),
             produced_by_work_id: work_id,
             device_id: (role == MessageRole::User).then(DeviceId::generate),
             client_message_id: (role == MessageRole::User).then(|| {
                 ClientMessageId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string())
                     .unwrap()
             }),
+            inbound_delivery_id: None,
             committed_at: now(),
         })
         .unwrap()

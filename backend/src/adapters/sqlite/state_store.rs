@@ -2,14 +2,14 @@ use sqlx::Row;
 
 use crate::application::projector::project;
 use crate::domain::{
-    Conversation, ConversationKind, ConversationLifecycle, ConversationWorkOrdinal, CraxiiId,
-    CraxiiInitializedV1, CraxiiPrincipal, CraxiiPrincipalInput, JournalActor,
-    JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventPayload, JournalStreamId,
-    LogicalPathReference, ModelInvocationId, ProjectionVersion, RuntimeInstanceId, SchemaVersion,
-    Sha256Digest, ToolExecutionId, UtcTimestamp, WorkId, WorkspaceCapabilityRef, WorkspaceIdentity,
-    WorkspaceIdentityInput, WorkstationCapabilities, WorkstationCapabilitiesInput,
-    WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits,
-    WorkstationIdentity,
+    Conversation, ConversationCreatedV2, ConversationKind, ConversationLifecycle,
+    ConversationWorkOrdinal, CraxiiId, CraxiiInitializedV1, CraxiiPrincipal, CraxiiPrincipalInput,
+    JournalActor, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventPayload,
+    JournalStreamId, LogicalPathReference, ModelInvocationId, ProjectionVersion, RuntimeInstanceId,
+    SchemaVersion, Sha256Digest, ToolExecutionId, UserId, UtcTimestamp, WorkId,
+    WorkspaceCapabilityRef, WorkspaceIdentity, WorkspaceIdentityInput, WorkstationCapabilities,
+    WorkstationCapabilitiesInput, WorkstationCapabilityFlags, WorkstationCapabilityFlagsInput,
+    WorkstationCapabilityLimits, WorkstationIdentity,
 };
 use crate::ports::state_store::{
     ApplicationConsistencyReceipt, BootstrapObservation, BootstrapSnapshot, BootstrapStateStore,
@@ -32,7 +32,7 @@ use super::transaction::WriteTransaction;
 const DISPLAY_NAME: &str = "Craxii";
 const OWNER_LABEL: &str = "local-owner";
 const ARCHITECTURE_REVISION: &str = "V0.0.01";
-const SCHEMA_REVISION: i64 = 4;
+const SCHEMA_REVISION: i64 = 5;
 
 #[derive(Clone, Debug)]
 pub struct SqliteStateStore {
@@ -110,7 +110,7 @@ impl SqliteStateStore {
                     correlation_id: request.correlation_id,
                     actor: JournalActor::Craxii(request.proposed.craxii_id),
                     runtime_instance_id: None,
-                    payload: JournalEventPayload::ConversationCreated(prepared.conversation),
+                    payload: JournalEventPayload::ConversationCreatedV2(prepared.conversation),
                     recorded_at: request.created_at,
                     occurred_at: None,
                 })?,
@@ -249,6 +249,10 @@ impl SqliteStateStore {
             compare_work_projection(&mut transaction, &projected).await
         );
         consistency_step!(
+            "inbound_delivery_routes",
+            verify_inbound_delivery_routes(&mut transaction).await
+        );
+        consistency_step!(
             "work_inputs",
             compare_work_inputs(&mut transaction, &projected).await
         );
@@ -271,7 +275,7 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 18 + stage8_invariants + stage9_invariants + stage10_invariants,
+            checked_invariants: 19 + stage8_invariants + stage9_invariants + stage10_invariants,
             journal_head,
         })
     }
@@ -294,6 +298,7 @@ impl SqliteStateStore {
         Ok(BootstrapSnapshot {
             identity: V0IdentityReference {
                 craxii_id: root.principal.craxii_id(),
+                user_id: root.primary_conversation.owner_user_id(),
                 conversation_id: root.primary_conversation.conversation_id(),
                 workstation_id: root.workstation.workstation_id(),
                 workspace_id: root.workspace.workspace_id(),
@@ -381,7 +386,7 @@ fn inconsistent() -> SqliteAdapterError {
 struct PreparedBootstrap {
     capabilities_json: String,
     initialized: CraxiiInitializedV1,
-    conversation: crate::domain::ConversationCreatedV1,
+    conversation: ConversationCreatedV2,
 }
 
 impl PreparedBootstrap {
@@ -455,9 +460,10 @@ impl PreparedBootstrap {
                 primary_conversation_id: request.proposed.conversation_id,
                 created_at: request.created_at,
             },
-            conversation: crate::domain::ConversationCreatedV1 {
+            conversation: ConversationCreatedV2 {
                 conversation_id: request.proposed.conversation_id,
                 craxii_id: request.proposed.craxii_id,
+                owner_user_id: request.proposed.user_id,
                 kind: ConversationKind::Primary,
                 lifecycle: ConversationLifecycle::Active,
                 next_work_ordinal: ConversationWorkOrdinal::try_new(1)
@@ -507,6 +513,16 @@ async fn insert_root_rows(
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
     sqlx::query(
+        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
+         VALUES (?, ?, 'active', ?)",
+    )
+    .bind(request.proposed.user_id.to_string())
+    .bind(request.proposed.craxii_id.to_string())
+    .bind(request.created_at.to_string())
+    .execute(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    sqlx::query(
         "INSERT INTO workspaces (workspace_id, craxii_id, workstation_id, logical_name, \
          logical_root, local_resolved_root, lifecycle_state, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, 'active', ?)",
@@ -522,11 +538,12 @@ async fn insert_root_rows(
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
     sqlx::query(
-        "INSERT INTO conversations (conversation_id, craxii_id, kind, lifecycle_state, created_at, \
-         next_work_ordinal, state_version) VALUES (?, ?, 'primary', 'active', ?, 1, 1)",
+        "INSERT INTO conversations (conversation_id, craxii_id, owner_user_id, kind, lifecycle_state, created_at, \
+         next_work_ordinal, state_version) VALUES (?, ?, ?, 'primary', 'active', ?, 1, 1)",
     )
     .bind(request.proposed.conversation_id.to_string())
     .bind(request.proposed.craxii_id.to_string())
+    .bind(request.proposed.user_id.to_string())
     .bind(request.created_at.to_string())
     .execute(transaction.connection())
     .await
@@ -559,6 +576,7 @@ async fn product_row_count(
          (SELECT COUNT(*) FROM workstations) + \
          (SELECT COUNT(*) FROM workspaces) + \
          (SELECT COUNT(*) FROM conversations) + \
+         (SELECT COUNT(*) FROM users) + \
          (SELECT COUNT(*) FROM runtime_instances) + \
          (SELECT COUNT(*) FROM client_devices) + \
          (SELECT COUNT(*) FROM work_items) + \
@@ -582,6 +600,7 @@ async fn validate_existing_bootstrap_in_write(
     let expected = PreparedBootstrap::new(&LoadOrBootstrapIdentityRequest {
         proposed: V0IdentityReference {
             craxii_id: root.principal.craxii_id(),
+            user_id: root.primary_conversation.owner_user_id(),
             conversation_id: root.primary_conversation.conversation_id(),
             workstation_id: root.workstation.workstation_id(),
             workspace_id: root.workspace.workspace_id(),
@@ -633,6 +652,7 @@ async fn validate_existing_bootstrap_in_write(
     }
     Ok(V0IdentityReference {
         craxii_id: root.principal.craxii_id(),
+        user_id: root.primary_conversation.owner_user_id(),
         conversation_id: root.primary_conversation.conversation_id(),
         workstation_id: root.workstation.workstation_id(),
         workspace_id: root.workspace.workspace_id(),
@@ -650,7 +670,6 @@ async fn validate_exact_root_counts(
         ("craxii_principals", 1_i64),
         ("workstations", 1),
         ("workspaces", 1),
-        ("conversations", 1),
     ] {
         let statement = format!("SELECT COUNT(*) FROM {table}");
         let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(statement))
@@ -746,10 +765,15 @@ async fn load_root_snapshot(
     })
     .map_err(|_| inconsistent())?;
 
-    let conversation_row = sqlx::query("SELECT * FROM conversations")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(SqliteAdapterError::from_sqlx)?;
+    let conversation_row = sqlx::query(
+        "SELECT c.* FROM conversations c \
+         JOIN users u ON u.user_id = c.owner_user_id AND u.craxii_id = c.craxii_id \
+         WHERE c.conversation_id = ? AND u.lifecycle_state = 'active'",
+    )
+    .bind(conversation_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
     if conversation_row.try_get::<String, _>("kind")? != "primary"
         || conversation_row.try_get::<String, _>("lifecycle_state")? != "active"
     {
@@ -761,6 +785,8 @@ async fn load_root_snapshot(
         )
         .map_err(|_| inconsistent())?,
         CraxiiId::parse_canonical(&conversation_row.try_get::<String, _>("craxii_id")?)
+            .map_err(|_| inconsistent())?,
+        UserId::parse_canonical(&conversation_row.try_get::<String, _>("owner_user_id")?)
             .map_err(|_| inconsistent())?,
         UtcTimestamp::parse_canonical(&conversation_row.try_get::<String, _>("created_at")?)
             .map_err(|_| inconsistent())?,
@@ -776,7 +802,7 @@ async fn load_root_snapshot(
         || principal.primary_conversation_id() != primary_conversation.conversation_id()
         || principal.default_workspace_id() != workspace.workspace_id()
         || workstation.workstation_id() != workspace.workstation_id()
-        || !matches!(principal.schema_revision().get(), 2 | 3 | SCHEMA_REVISION)
+        || !matches!(principal.schema_revision().get(), 2..=SCHEMA_REVISION)
     {
         return Err(inconsistent());
     }
@@ -826,6 +852,9 @@ fn compare_root_projection(
         || conversation.next_work_ordinal != root.primary_conversation.next_work_ordinal()
         || conversation.state_version != root.primary_conversation.projection_version()
         || conversation.created_at != root.primary_conversation.created_at()
+        || projected
+            .primary_conversation_owner_user_id
+            .is_some_and(|owner| owner != root.primary_conversation.owner_user_id())
     {
         return Err(inconsistent());
     }
@@ -859,6 +888,10 @@ async fn compare_message_projection(
             || payload.produced_by_work_id != stored.produced_by_work_id()
             || payload.device_id != stored.device_id()
             || payload.client_message_id != stored.client_message_id()
+            || event
+                .author_user_id
+                .is_some_and(|author| stored.author_user_id() != Some(author))
+            || event.inbound_delivery_id != stored.inbound_delivery_id()
             || payload.committed_at != stored.committed_at()
         {
             return Err(inconsistent());
@@ -908,6 +941,10 @@ async fn compare_work_projection(
             .try_get::<Option<String>, _>("terminal_reason_code")?
             .map(|value| decode_journal_terminal_reason(&value))
             .transpose()?;
+        let reply_binding_id: Option<crate::domain::ConversationBindingId> = decode_optional_id(
+            row.try_get::<Option<String>, _>("reply_binding_id")?
+                .as_deref(),
+        )?;
         let created = &work.created;
         if CraxiiId::parse_canonical(&row.try_get::<String, _>("craxii_id")?)
             .map_err(|_| inconsistent())?
@@ -942,6 +979,7 @@ async fn compare_work_projection(
             || current_attempt != work.current_attempt
             || cancellation_reason != work.cancellation_reason
             || terminal_reason != work.terminal_reason
+            || reply_binding_id != work.reply_binding_id
             || decode_optional_timestamp(
                 row.try_get::<Option<String>, _>("started_at")?.as_deref(),
             )? != work.started_at
@@ -955,8 +993,73 @@ async fn compare_work_projection(
         {
             return Err(inconsistent());
         }
+        if let Some(binding_id) = reply_binding_id {
+            verify_reply_binding_route(connection, binding_id, created.conversation_id).await?;
+        }
     }
     Ok(())
+}
+
+pub(super) async fn verify_reply_binding_route(
+    connection: &mut sqlx::SqliteConnection,
+    binding_id: crate::domain::ConversationBindingId,
+    work_conversation_id: crate::domain::ConversationId,
+) -> Result<(), SqliteAdapterError> {
+    let binding = sqlx::query(
+        "SELECT b.conversation_id, b.user_id, c.owner_user_id \
+         FROM conversation_bindings b \
+         JOIN conversations c ON c.conversation_id = b.conversation_id \
+         WHERE b.conversation_binding_id = ?",
+    )
+    .bind(binding_id.to_string())
+    .fetch_optional(connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?
+    .ok_or_else(inconsistent)?;
+    if binding.try_get::<String, _>("conversation_id")? == work_conversation_id.to_string()
+        && binding.try_get::<String, _>("user_id")?
+            == binding.try_get::<String, _>("owner_user_id")?
+    {
+        Ok(())
+    } else {
+        Err(inconsistent())
+    }
+}
+
+async fn verify_inbound_delivery_routes(
+    connection: &mut sqlx::SqliteConnection,
+) -> Result<(), SqliteAdapterError> {
+    let mismatches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) \
+         FROM inbound_deliveries d \
+         LEFT JOIN external_identities i \
+           ON i.external_identity_id = d.external_identity_id \
+          AND i.channel_account_id = d.channel_account_id \
+          AND i.craxii_id = d.craxii_id \
+          AND i.user_id = d.user_id \
+         LEFT JOIN conversation_bindings b \
+           ON b.conversation_binding_id = d.conversation_binding_id \
+          AND b.channel_account_id = d.channel_account_id \
+          AND b.external_identity_id = d.external_identity_id \
+          AND b.craxii_id = d.craxii_id \
+          AND b.user_id = d.user_id \
+          AND b.conversation_id = d.conversation_id \
+         WHERE (d.external_identity_id IS NOT NULL AND ( \
+                    i.external_identity_id IS NULL \
+                 OR i.external_subject_id <> d.external_subject_id)) \
+            OR (d.conversation_binding_id IS NOT NULL AND ( \
+                    b.conversation_binding_id IS NULL \
+                 OR b.external_conversation_id <> d.external_conversation_id \
+                 OR b.external_thread_id IS NOT d.external_thread_id))",
+    )
+    .fetch_one(connection)
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if mismatches == 0 {
+        Ok(())
+    } else {
+        Err(inconsistent())
+    }
 }
 
 fn decode_journal_terminal_reason(

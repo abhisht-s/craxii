@@ -106,6 +106,7 @@ async fn fixture_at(root: TestRoot) -> Fixture {
         .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
             proposed: V0IdentityReference {
                 craxii_id: CraxiiId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 conversation_id: ConversationId::generate(),
                 workstation_id: WorkstationId::generate(),
                 workspace_id: WorkspaceId::generate(),
@@ -142,7 +143,7 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(5).unwrap(),
+                schema_version: SchemaVersion::try_new(6).unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -206,10 +207,11 @@ async fn make_fixture_journal_consistent(fixture: &Fixture) {
         .unwrap();
         sqlx::query(
             "INSERT INTO client_devices \
-             (device_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
-             VALUES (?, 'stage8-fixture', ?, ?, NULL, NULL)",
+             (device_id, user_id, display_name, token_hash, created_at, last_seen_at, revoked_at) \
+             VALUES (?, ?, 'stage8-fixture', ?, ?, NULL, NULL)",
         )
         .bind(device_id.to_string())
+        .bind(fixture.identity.user_id.to_string())
         .bind(Sha256Digest::hash_bytes(b"stage8-fixture-token").to_string())
         .bind(T0)
         .execute(&mut *connection)
@@ -261,14 +263,16 @@ async fn make_fixture_journal_consistent(fixture: &Fixture) {
     .unwrap();
     sqlx::query(
         "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
-         content_sha256, produced_by_work_id, client_device_id, client_message_id, committed_at) \
-         VALUES (?, ?, ?, 'user', ?, ?, NULL, ?, ?, ?)",
+         content_sha256, author_user_id, produced_by_work_id, client_device_id, client_message_id, \
+         inbound_delivery_id, committed_at) \
+         VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
     )
     .bind(message_id.to_string())
     .bind(fixture.identity.craxii_id.to_string())
     .bind(fixture.identity.conversation_id.to_string())
     .bind(content_json)
     .bind(content_sha256.to_string())
+    .bind(fixture.identity.user_id.to_string())
     .bind(device_id.to_string())
     .bind(client_message_id.to_string())
     .bind(T0)
@@ -2686,9 +2690,11 @@ async fn assistant_completion_is_one_atomic_authoritative_message_and_work_commi
         conversation_id: fixture.identity.conversation_id,
         role: MessageRole::Assistant,
         content: MessageContent::try_new(vec![ContentBlock::text("done").unwrap()]).unwrap(),
+        author_user_id: None,
         produced_by_work_id: Some(fixture.work_id),
         device_id: None,
         client_message_id: None,
+        inbound_delivery_id: None,
         committed_at: T4.parse().unwrap(),
     })
     .unwrap();
@@ -3443,6 +3449,7 @@ async fn artifact_publish_crash_child() {
         .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
             proposed: V0IdentityReference {
                 craxii_id: CraxiiId::generate(),
+                user_id: crate::domain::UserId::generate(),
                 conversation_id: ConversationId::generate(),
                 workstation_id: WorkstationId::generate(),
                 workspace_id: WorkspaceId::generate(),
@@ -3519,70 +3526,38 @@ async fn durable_publish_before_database_commit_reopens_as_nonfatal_orphan_witho
 }
 
 #[tokio::test]
-async fn populated_v2_migrates_through_v5_without_changing_stage7_identity_or_old_fingerprints() {
+async fn genuine_empty_v2_migrates_to_v6_without_changing_old_fingerprints() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+    use sqlx::{ConnectOptions as _, Connection as _};
+
     let root = TestRoot::new();
-    let guard = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
-    let state_store = SqliteStateStore::new(guard.runtime().clone());
-    let identity = state_store
-        .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
-            proposed: V0IdentityReference {
-                craxii_id: CraxiiId::generate(),
-                conversation_id: ConversationId::generate(),
-                workstation_id: WorkstationId::generate(),
-                workspace_id: WorkspaceId::generate(),
-            },
-            initialized_event_id: JournalEventId::generate(),
-            conversation_created_event_id: JournalEventId::generate(),
-            correlation_id: CorrelationId::generate(),
-            created_at: T0.parse().unwrap(),
-            observation: BootstrapObservation {
-                initial_generation: WorkstationGeneration::try_new(1).unwrap(),
-                architecture: "aarch64".to_owned(),
-                os_release: "macos".to_owned(),
-                default_shell: "/bin/zsh".to_owned(),
-                workspace_logical_name: "primary".to_owned(),
-                workspace_logical_root: "/workspace".to_owned(),
-                workspace_resolved_root: "/workspace".to_owned(),
-                execution_capabilities:
-                    crate::ports::state_store::ExecutionCapabilityObservation::unavailable(),
-            },
-        })
-        .await
-        .unwrap()
-        .identity;
-    let mut connection = guard.runtime().acquire().await.unwrap();
-    for table in [
-        "context_manifest_sources",
-        "tool_executions",
-        "model_invocations",
-        "context_manifests",
-        "artifacts",
-    ] {
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-    }
-    sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 3")
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-    drop(connection);
-    guard.shutdown().await;
+    let database_directory = root.path().join("db");
+    fs::create_dir(&database_directory).unwrap();
+    fs::set_permissions(&database_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let database = database_directory.join("craxii.sqlite3");
+    let options = SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Full)
+        .foreign_keys(true)
+        .disable_statement_logging();
+    let mut connection = options.connect().await.unwrap();
+    let v2_migrator = sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 2)
+            .cloned()
+            .collect(),
+    );
+    v2_migrator.run(&mut connection).await.unwrap();
+    connection.close().await.unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
 
     let migrated = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
     assert_eq!(
         migrated.disposition(),
         super::schema::DatabaseDisposition::Current
-    );
-    let migrated_store = SqliteStateStore::new(migrated.runtime().clone());
-    assert_eq!(
-        migrated_store
-            .load_bootstrap_snapshot()
-            .await
-            .unwrap()
-            .identity,
-        identity
     );
     assert_eq!(
         super::schema::v1_schema_fingerprint(),
@@ -3594,7 +3569,7 @@ async fn populated_v2_migrates_through_v5_without_changing_stage7_identity_or_ol
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e"
+        "b24c145128287dc40a5a59adb7f8c6c1a75367fe8d563c295f2509ec505b2706"
     );
     migrated.shutdown().await;
 
@@ -3607,7 +3582,7 @@ async fn populated_v2_migrates_through_v5_without_changing_stage7_identity_or_ol
 }
 
 #[tokio::test]
-async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
+async fn genuine_v5_writer_history_migrates_to_v6_without_journal_mutation() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
     use sqlx::{ConnectOptions as _, Connection as _};
 
@@ -3638,6 +3613,14 @@ async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
     .execute(&mut connection)
     .await
     .unwrap();
+    let v5_migrator = sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR
+            .iter()
+            .filter(|migration| migration.version <= 5)
+            .cloned()
+            .collect(),
+    );
+    v5_migrator.run(&mut connection).await.unwrap();
     let journal_before = sqlx::query_as::<_, (i64, String, i64, String, String)>(
         "SELECT journal_offset, event_type, event_version, payload_json, payload_sha256 \
          FROM journal_events ORDER BY journal_offset",
@@ -3645,6 +3628,32 @@ async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
     .fetch_all(&mut connection)
     .await
     .unwrap();
+    assert_eq!(
+        super::schema::classify_schema(&mut connection)
+            .await
+            .unwrap(),
+        super::schema::DatabaseDisposition::MigratedUninitialized
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM craxii_principals p \
+             JOIN conversations c ON c.conversation_id = p.primary_conversation_id \
+             JOIN workspaces ws ON ws.workspace_id = p.default_workspace_id \
+             JOIN workstations wst ON wst.workstation_id = ws.workstation_id \
+             WHERE p.lifecycle_state = 'active' \
+               AND c.craxii_id = p.craxii_id AND c.kind = 'primary' AND c.lifecycle_state = 'active' \
+               AND ws.craxii_id = p.craxii_id AND ws.lifecycle_state = 'active' \
+               AND wst.craxii_id = p.craxii_id \
+               AND (SELECT COUNT(*) FROM craxii_principals) = 1 \
+               AND (SELECT COUNT(*) FROM conversations) = 1 \
+               AND (SELECT COUNT(*) FROM workspaces) = 1 \
+               AND (SELECT COUNT(*) FROM workstations) = 1"
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap(),
+        1
+    );
     assert_eq!(journal_before.len(), 17);
     assert_eq!(
         sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
@@ -3653,7 +3662,7 @@ async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
         .fetch_one(&mut connection)
         .await
         .unwrap(),
-        (None, None)
+        (Some(0), Some(0))
     );
     connection.close().await.unwrap();
     fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
@@ -3672,7 +3681,7 @@ async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        5
+        6
     );
     assert_eq!(
         sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
@@ -3691,6 +3700,29 @@ async fn genuine_v4_writer_history_migrates_to_v5_without_journal_mutation() {
     .await
     .unwrap();
     assert_eq!(journal_after, journal_before);
+    let owner = sqlx::query_as::<_, (String, String)>(
+        "SELECT user_id, craxii_id FROM users WHERE lifecycle_state = 'active'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT owner_user_id FROM conversations WHERE conversation_id = \
+             (SELECT primary_conversation_id FROM craxii_principals)"
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        owner.0
+    );
     drop(connection);
     migrated.shutdown().await;
 }
@@ -3822,7 +3854,7 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(5).unwrap(),
+                schema_version: SchemaVersion::try_new(6).unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -3862,7 +3894,7 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(5).unwrap(),
+                schema_version: SchemaVersion::try_new(6).unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),
@@ -4503,8 +4535,9 @@ async fn verify_stage14_crash_window(hook: &str) {
     let row = sqlx::query(
         "SELECT t.tool_execution_id, t.execution_id, t.runtime_instance_id, t.work_id, t.state, \
          w.craxii_id, w.conversation_id, w.workspace_id, w.correlation_id, \
-         r.workstation_id FROM tool_executions t \
+         c.owner_user_id, r.workstation_id FROM tool_executions t \
          JOIN work_items w ON w.work_id = t.work_id \
+         JOIN conversations c ON c.conversation_id = w.conversation_id \
          JOIN runtime_instances r ON r.runtime_instance_id = t.runtime_instance_id",
     )
     .fetch_one(&mut *connection)
@@ -4519,6 +4552,8 @@ async fn verify_stage14_crash_window(hook: &str) {
     let work_id = WorkId::parse_canonical(&row.get::<String, _>("work_id")).unwrap();
     let identity = V0IdentityReference {
         craxii_id: CraxiiId::parse_canonical(&row.get::<String, _>("craxii_id")).unwrap(),
+        user_id: crate::domain::UserId::parse_canonical(&row.get::<String, _>("owner_user_id"))
+            .unwrap(),
         conversation_id: ConversationId::parse_canonical(&row.get::<String, _>("conversation_id"))
             .unwrap(),
         workstation_id: WorkstationId::parse_canonical(&row.get::<String, _>("workstation_id"))

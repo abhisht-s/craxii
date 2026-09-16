@@ -130,8 +130,8 @@ mod tests {
     use super::*;
     use crate::domain::{
         ConversationId, ConversationWorkOrdinal, CorrelationId, CraxiiId, CraxiiPrincipalInput,
-        JournalEventId, LogicalPathReference, ProjectionVersion, SchemaVersion, UtcTimestamp,
-        WorkId, WorkInputActor, WorkInputOrdinal, WorkItemInputData, WorkspaceId,
+        JournalEventId, LogicalPathReference, ProjectionVersion, SchemaVersion, UserId,
+        UtcTimestamp, WorkId, WorkInputActor, WorkInputOrdinal, WorkItemInputData, WorkspaceId,
         WorkspaceIdentityInput, WorkstationId,
     };
 
@@ -151,6 +151,7 @@ mod tests {
     fn topology() -> (CraxiiPrincipal, Conversation, WorkspaceIdentity) {
         let craxii_id = id(V7);
         let conversation_id = ConversationId::generate();
+        let user_id = UserId::generate();
         let workspace_id = WorkspaceId::generate();
         let principal = CraxiiPrincipal::try_new(CraxiiPrincipalInput {
             craxii_id,
@@ -166,6 +167,7 @@ mod tests {
         let conversation = Conversation::new(
             conversation_id,
             craxii_id,
+            user_id,
             now(),
             ConversationWorkOrdinal::try_new(1).unwrap(),
             ProjectionVersion::try_new(1).unwrap(),
@@ -189,6 +191,7 @@ mod tests {
             conversation_id: id(V7),
             conversation_work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
             workspace_id: id(V7),
+            reply_binding_id: None,
             correlation_id: id::<CorrelationId>(V7),
             created_at: now(),
             queued_at: now(),
@@ -243,6 +246,7 @@ mod tests {
         let replacement = Conversation::new(
             ConversationId::generate(),
             principal.craxii_id(),
+            conversation.owner_user_id(),
             now(),
             ConversationWorkOrdinal::try_new(1).unwrap(),
             ProjectionVersion::try_new(1).unwrap(),
@@ -255,6 +259,7 @@ mod tests {
         let wrong_owner_conversation = Conversation::new(
             principal.primary_conversation_id(),
             CraxiiId::generate(),
+            conversation.owner_user_id(),
             now(),
             ConversationWorkOrdinal::try_new(1).unwrap(),
             ProjectionVersion::try_new(1).unwrap(),

@@ -125,11 +125,13 @@ impl SqliteStateStore {
             "SELECT p.craxii_id, p.display_name, p.owner_label, p.primary_conversation_id, \
                     p.default_workspace_id, p.created_at AS principal_created_at, \
                     p.architecture_revision, p.schema_revision, p.lifecycle_state AS principal_lifecycle, \
-                    c.craxii_id AS conversation_owner, c.kind AS conversation_kind, \
+                    c.craxii_id AS conversation_owner, c.owner_user_id, c.kind AS conversation_kind, \
                     c.lifecycle_state AS conversation_lifecycle, c.created_at AS conversation_created_at, \
                     c.next_work_ordinal, c.state_version \
              FROM craxii_principals p \
-             JOIN conversations c ON c.conversation_id = p.primary_conversation_id",
+             JOIN conversations c ON c.conversation_id = p.primary_conversation_id \
+             JOIN users u ON u.user_id = c.owner_user_id AND u.craxii_id = c.craxii_id \
+             WHERE u.lifecycle_state = 'active'",
         )
         .fetch_all(&mut *transaction)
         .await
@@ -169,6 +171,8 @@ impl SqliteStateStore {
         let primary_conversation = Conversation::new(
             conversation_id,
             craxii_id,
+            crate::domain::UserId::parse_canonical(&root.try_get::<String, _>("owner_user_id")?)
+                .map_err(|_| inconsistent())?,
             decode_timestamp(&root.try_get::<String, _>("conversation_created_at")?)?,
             ConversationWorkOrdinal::try_new(root.try_get("next_work_ordinal")?)
                 .map_err(|_| inconsistent())?,

@@ -150,6 +150,7 @@ impl Harness {
             .identity;
         let provisioned = DeviceProvisioningService::new(store.as_ref())
             .provision_fixture_token(
+                identity.user_id,
                 DeviceDisplayName::try_new("Stage 11 device".into()).unwrap(),
                 at(T0),
                 BearerToken::parse(TOKEN.to_owned()).unwrap(),
@@ -370,6 +371,7 @@ fn bootstrap_request() -> LoadOrBootstrapIdentityRequest {
     LoadOrBootstrapIdentityRequest {
         proposed: V0IdentityReference {
             craxii_id: CraxiiId::generate(),
+            user_id: crate::domain::UserId::generate(),
             conversation_id: ConversationId::generate(),
             workstation_id: WorkstationId::generate(),
             workspace_id: WorkspaceId::generate(),
@@ -405,7 +407,7 @@ fn runtime_evidence(
         diagnostic_pid: Some(DiagnosticPid::try_new(111).unwrap()),
         package_version: PackageVersion::try_new("0.0.1").unwrap(),
         git_revision: GitRevision::try_new("stage11-test").unwrap(),
-        schema_version: SchemaVersion::try_new(5).unwrap(),
+        schema_version: SchemaVersion::try_new(6).unwrap(),
         started_at: at(T0),
     })
 }
@@ -438,7 +440,7 @@ async fn journal_count(store: &SqliteStateStore) -> i64 {
 async fn accept_without_hint(harness: &Harness, id: ClientMessageId, text: &str) -> WorkId {
     CommandService::new(harness.store.as_ref())
         .accept_message(
-            AuthenticatedDevice::new(harness.device_id),
+            AuthenticatedDevice::new(harness.device_id, harness.identity.user_id),
             AcceptMessageCommand {
                 idempotency_key: IdempotencyKey::for_message(id),
                 client_message_id: id,
@@ -1820,7 +1822,7 @@ async fn atomic_bootstrap_releases_read_transaction_and_replay_pages_cross_filte
         let id = client_id();
         CommandService::new(harness.store.as_ref())
             .accept_message(
-                AuthenticatedDevice::new(harness.device_id),
+                AuthenticatedDevice::new(harness.device_id, harness.identity.user_id),
                 AcceptMessageCommand {
                     idempotency_key: IdempotencyKey::for_message(id),
                     client_message_id: id,

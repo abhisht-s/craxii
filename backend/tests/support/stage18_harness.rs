@@ -63,7 +63,7 @@ const PROVIDER_ID: &str = "stage18-scripted";
 const TARGET_ID: &str = "stage18-primary";
 const ESTIMATOR_ID: &str = "stage18_fixed";
 const SHELL: &str = "/bin/bash";
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const T0: &str = "2026-09-01T00:00:00.000000Z";
 const REQUESTED_OUTPUT_TOKENS: i64 = 512;
 
@@ -890,6 +890,7 @@ impl Stage18Harness {
             .load_or_bootstrap_v0_identity(LoadOrBootstrapIdentityRequest {
                 proposed: V0IdentityReference {
                     craxii_id: CraxiiId::generate(),
+                    user_id: craxii_server::domain::UserId::generate(),
                     conversation_id: ConversationId::generate(),
                     workstation_id: WorkstationId::generate(),
                     workspace_id: WorkspaceId::generate(),
@@ -944,6 +945,7 @@ impl Stage18Harness {
         .map_err(|error| error.to_string())?;
         let provisioned = DeviceProvisioningService::new(store.as_ref())
             .provision(
+                identity.user_id,
                 DeviceDisplayName::try_new("Stage 18 harness".to_owned()).unwrap(),
                 now(clock.as_ref())?,
             )

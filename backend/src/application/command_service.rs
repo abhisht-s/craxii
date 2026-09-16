@@ -144,6 +144,7 @@ where
             .accept_user_message_and_create_work(AcceptUserMessageRequest {
                 client_message_id: command.client_message_id,
                 device_id: authenticated.device_id(),
+                user_id: authenticated.user_id(),
                 idempotency_key: command.idempotency_key,
                 request_hash,
                 hash_version: CommandHashEncodingVersion::V1,
@@ -191,6 +192,7 @@ where
             .request_cancellation(RequestCancellationRequest {
                 client_command_id: command.client_command_id,
                 device_id: authenticated.device_id(),
+                user_id: authenticated.user_id(),
                 idempotency_key: command.idempotency_key,
                 request_hash,
                 hash_version: CommandHashEncodingVersion::V1,

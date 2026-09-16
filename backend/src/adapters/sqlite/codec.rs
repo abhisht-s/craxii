@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, sqlite::SqliteRow};
 
 use crate::domain::{
-    ClientCommandId, ClientMessageId, ContentBlock, ConversationId, CorrelationId, CraxiiId,
-    DeviceId, HostingProvider, LogicalPathKind, LogicalPathReference, Message, MessageContent,
-    MessageId, MessageInput, MessageRole, ModelInvocationId, NormalizedError, RuntimeInstanceId,
-    Sha256Digest, ToolExecutionId, UtcTimestamp, WorkCancellationReason, WorkCompletionReason,
-    WorkId, WorkInterruptionReason, WorkState, WorkspaceCapabilityRef, WorkspaceId,
+    ChannelAccountId, ClientCommandId, ClientMessageId, ContentBlock, ConversationBindingId,
+    ConversationId, CorrelationId, CraxiiId, DeviceId, ExternalIdentityId, HostingProvider,
+    InboundDeliveryId, LogicalPathKind, LogicalPathReference, Message, MessageContent, MessageId,
+    MessageInput, MessageRole, ModelInvocationId, NormalizedError, RuntimeInstanceId, Sha256Digest,
+    ToolExecutionId, UserId, UtcTimestamp, WorkCancellationReason, WorkCompletionReason, WorkId,
+    WorkInterruptionReason, WorkState, WorkspaceCapabilityRef, WorkspaceId,
     WorkstationCapabilities, WorkstationCapabilitiesInput, WorkstationCapabilityFlags,
     WorkstationCapabilityFlagsInput, WorkstationCapabilityLimits, WorkstationGeneration,
     WorkstationId, WorkstationIdentity, WorkstationIdentityInput, WorkstationKind,
@@ -46,6 +47,11 @@ sql_id_codec!(
     ModelInvocationId,
     ToolExecutionId,
     CorrelationId,
+    UserId,
+    ChannelAccountId,
+    ExternalIdentityId,
+    ConversationBindingId,
+    InboundDeliveryId,
 );
 
 pub(super) fn encode_id(value: impl CanonicalSqlId) -> String {
@@ -612,6 +618,14 @@ pub(super) fn decode_message_row(row: &SqliteRow) -> Result<Message, SqliteAdapt
         row.try_get::<Option<String>, _>("client_message_id")?
             .as_deref(),
     )?;
+    let author_user_id = decode_optional_id(
+        row.try_get::<Option<String>, _>("author_user_id")?
+            .as_deref(),
+    )?;
+    let inbound_delivery_id = decode_optional_id(
+        row.try_get::<Option<String>, _>("inbound_delivery_id")?
+            .as_deref(),
+    )?;
     let committed_at = decode_timestamp(&row.try_get::<String, _>("committed_at")?)?;
 
     Message::try_new(MessageInput {
@@ -620,9 +634,11 @@ pub(super) fn decode_message_row(row: &SqliteRow) -> Result<Message, SqliteAdapt
         conversation_id,
         role,
         content,
+        author_user_id,
         produced_by_work_id,
         device_id,
         client_message_id,
+        inbound_delivery_id,
         committed_at,
     })
     .map_err(|_| corrupt_row())

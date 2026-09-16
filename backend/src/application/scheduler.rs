@@ -778,6 +778,7 @@ mod tests {
                 conversation_id: ConversationId::generate(),
                 conversation_work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
                 workspace_id: WorkspaceId::generate(),
+                reply_binding_id: None,
                 correlation_id: CorrelationId::generate(),
                 created_at: "2026-08-28T03:00:00.000000Z".parse().unwrap(),
                 queued_at: "2026-08-28T03:00:00.000000Z".parse().unwrap(),

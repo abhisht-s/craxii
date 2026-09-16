@@ -6,14 +6,15 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    ArtifactId, ArtifactRetention, ClientMessageId, ConversationId, ConversationKind,
-    ConversationLifecycle, ConversationWorkOrdinal, CorrelationId, CraxiiId, DeviceId,
-    DiagnosticPid, GitRevision, JournalEventId, JournalOffset, LinuxBootId, LogicalInvocationId,
-    Message, MessageContent, MessageId, MessageInput, MessageRole, ModelInvocationId,
+    ArtifactId, ArtifactRetention, ClientMessageId, ConversationBindingId, ConversationId,
+    ConversationKind, ConversationLifecycle, ConversationWorkOrdinal, CorrelationId, CraxiiId,
+    DeviceId, DiagnosticPid, GitRevision, InboundDeliveryId, JournalEventId, JournalOffset,
+    LinuxBootId, LogicalInvocationId, MessageContent, MessageId, MessageRole, ModelInvocationId,
     ModelInvocationState, PackageVersion, ProjectionVersion, RuntimeInstanceId,
     RuntimeShutdownReason, SchemaVersion, Sha256Digest, StreamSeq, ToolExecutionId,
-    ToolExecutionState, ToolResultClass, UtcTimestamp, WorkId, WorkInputActor, WorkInputOrdinal,
-    WorkInputRelationship, WorkKind, WorkspaceId, WorkstationGeneration, WorkstationId,
+    ToolExecutionState, ToolResultClass, UserId, UtcTimestamp, WorkId, WorkInputActor,
+    WorkInputOrdinal, WorkInputRelationship, WorkKind, WorkspaceId, WorkstationGeneration,
+    WorkstationId,
 };
 
 /// The four aggregate families with durable journal streams in V0.
@@ -88,7 +89,10 @@ impl FromStr for JournalStreamId {
 /// The exact typed actor identity stored in the event envelope.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JournalActor {
+    /// Historical V1 user actors are native device identities.
     User(Option<DeviceId>),
+    /// V2 accepted-message user actors are human/account identities.
+    UserV2(UserId),
     Craxii(CraxiiId),
     Model(ModelInvocationId),
     Tool(ToolExecutionId),
@@ -100,7 +104,7 @@ impl JournalActor {
     #[must_use]
     pub const fn kind(self) -> &'static str {
         match self {
-            Self::User(_) => "user",
+            Self::User(_) | Self::UserV2(_) => "user",
             Self::Craxii(_) => "craxii",
             Self::Model(_) => "model",
             Self::Tool(_) => "tool",
@@ -113,6 +117,7 @@ impl JournalActor {
     pub fn id(self) -> Option<String> {
         match self {
             Self::User(id) => id.map(|value| value.to_string()),
+            Self::UserV2(id) => Some(id.to_string()),
             Self::Craxii(id) => Some(id.to_string()),
             Self::Model(id) => Some(id.to_string()),
             Self::Tool(id) => Some(id.to_string()),
@@ -145,6 +150,23 @@ impl JournalActor {
             _ => Err(JournalContractError::InvalidActor),
         }
     }
+
+    pub fn parse_for_event(
+        event_kind: JournalEventKind,
+        event_version: i64,
+        kind: &str,
+        id: Option<&str>,
+    ) -> Result<Self, JournalContractError> {
+        if event_kind == JournalEventKind::MessageAccepted && event_version == 2 {
+            return match (kind, id) {
+                ("user", Some(id)) => UserId::parse_canonical(id)
+                    .map(Self::UserV2)
+                    .map_err(|_| JournalContractError::InvalidActor),
+                _ => Err(JournalContractError::InvalidActor),
+            };
+        }
+        Self::parse(kind, id)
+    }
 }
 
 /// The implementation stage responsible for first emitting a registered event.
@@ -175,7 +197,12 @@ macro_rules! event_kinds {
             #[must_use]
             pub const fn public_candidate(self) -> bool { match self { $(Self::$variant => $public),+ } }
             #[must_use]
-            pub const fn current_version(self) -> i64 { 1 }
+            pub const fn current_version(self) -> i64 {
+                match self {
+                    Self::ConversationCreated | Self::MessageAccepted | Self::WorkQueued => 2,
+                    _ => 1,
+                }
+            }
             pub fn parse(value: &str) -> Result<Self, JournalContractError> {
                 match value { $($literal => Ok(Self::$variant),)+ _ => Err(JournalContractError::UnknownEventType) }
             }
@@ -231,7 +258,18 @@ pub enum JournalVersionResolution {
 #[must_use]
 pub fn resolve_event_version(event_type: &str, version: i64) -> JournalVersionResolution {
     match JournalEventKind::parse(event_type) {
-        Ok(kind) if version == kind.current_version() => JournalVersionResolution::Supported(kind),
+        Ok(kind)
+            if version == kind.current_version()
+                || (version == 1
+                    && matches!(
+                        kind,
+                        JournalEventKind::ConversationCreated
+                            | JournalEventKind::MessageAccepted
+                            | JournalEventKind::WorkQueued
+                    )) =>
+        {
+            JournalVersionResolution::Supported(kind)
+        }
         Ok(kind) => JournalVersionResolution::UnsupportedKnown(kind),
         Err(_) => JournalVersionResolution::Unknown,
     }
@@ -268,6 +306,18 @@ pub struct ConversationCreatedV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationCreatedV2 {
+    pub conversation_id: ConversationId,
+    pub craxii_id: CraxiiId,
+    pub owner_user_id: UserId,
+    pub kind: ConversationKind,
+    pub lifecycle: ConversationLifecycle,
+    pub next_work_ordinal: ConversationWorkOrdinal,
+    pub state_version: ProjectionVersion,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageCommittedV1 {
     pub message_id: MessageId,
     pub craxii_id: CraxiiId,
@@ -282,21 +332,60 @@ pub struct MessageCommittedV1 {
 }
 
 impl MessageCommittedV1 {
-    /// Reuses the canonical message constructor to validate provenance and content identity.
+    /// Validates the immutable historical V1 provenance and content identity.
     pub fn validate_contract(&self) -> Result<(), JournalContractError> {
-        let message = Message::try_new(MessageInput {
-            message_id: self.message_id,
-            craxii_id: self.craxii_id,
-            conversation_id: self.conversation_id,
-            role: self.role,
-            content: self.content.clone(),
-            produced_by_work_id: self.produced_by_work_id,
-            device_id: self.device_id,
-            client_message_id: self.client_message_id,
-            committed_at: self.committed_at,
-        })
-        .map_err(|_| JournalContractError::InvalidPayload)?;
-        if message.content_sha256() == self.content_sha256 {
+        let valid_provenance = match self.role {
+            MessageRole::User => {
+                self.produced_by_work_id.is_none()
+                    && self.device_id.is_some()
+                    && self.client_message_id.is_some()
+            }
+            MessageRole::Assistant => {
+                self.produced_by_work_id.is_some()
+                    && self.device_id.is_none()
+                    && self.client_message_id.is_none()
+            }
+            MessageRole::System => {
+                self.produced_by_work_id.is_none()
+                    && self.device_id.is_none()
+                    && self.client_message_id.is_none()
+            }
+        };
+        if valid_provenance && self.content.content_sha256() == self.content_sha256 {
+            Ok(())
+        } else {
+            Err(JournalContractError::InvalidPayload)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MessageAcceptedOriginV2 {
+    Native {
+        device_id: DeviceId,
+        client_message_id: ClientMessageId,
+    },
+    InboundDelivery {
+        inbound_delivery_id: InboundDeliveryId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageCommittedV2 {
+    pub message_id: MessageId,
+    pub craxii_id: CraxiiId,
+    pub conversation_id: ConversationId,
+    pub role: MessageRole,
+    pub content: MessageContent,
+    pub content_sha256: Sha256Digest,
+    pub author_user_id: UserId,
+    pub origin: MessageAcceptedOriginV2,
+    pub committed_at: UtcTimestamp,
+}
+
+impl MessageCommittedV2 {
+    pub fn validate_contract(&self) -> Result<(), JournalContractError> {
+        if self.role == MessageRole::User && self.content.content_sha256() == self.content_sha256 {
             Ok(())
         } else {
             Err(JournalContractError::InvalidPayload)
@@ -345,6 +434,23 @@ pub struct WorkQueuedV1 {
     pub created_at: UtcTimestamp,
     pub queued_at: UtcTimestamp,
     pub trigger: WorkInputFactV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkQueuedV2 {
+    pub work_id: WorkId,
+    pub craxii_id: CraxiiId,
+    pub conversation_id: ConversationId,
+    pub conversation_work_ordinal: ConversationWorkOrdinal,
+    pub kind: WorkKind,
+    pub priority: i64,
+    pub workspace_id: WorkspaceId,
+    pub correlation_id: CorrelationId,
+    pub state_version: ProjectionVersion,
+    pub created_at: UtcTimestamp,
+    pub queued_at: UtcTimestamp,
+    pub trigger: WorkInputFactV1,
+    pub reply_binding_id: Option<ConversationBindingId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -470,8 +576,11 @@ pub struct RuntimeStoppingV1 {
 pub enum JournalEventPayload {
     CraxiiInitialized(CraxiiInitializedV1),
     ConversationCreated(ConversationCreatedV1),
+    ConversationCreatedV2(ConversationCreatedV2),
     MessageAccepted(MessageCommittedV1),
+    MessageAcceptedV2(MessageCommittedV2),
     WorkQueued(WorkQueuedV1),
+    WorkQueuedV2(WorkQueuedV2),
     WorkStarted(WorkTransitionV1),
     WorkWaitingOnModel(WorkTransitionV1),
     WorkWaitingOnTool(WorkTransitionV1),
@@ -504,8 +613,11 @@ impl JournalEventPayload {
         match self {
             Self::CraxiiInitialized(_) => JournalEventKind::CraxiiInitialized,
             Self::ConversationCreated(_) => JournalEventKind::ConversationCreated,
+            Self::ConversationCreatedV2(_) => JournalEventKind::ConversationCreated,
             Self::MessageAccepted(_) => JournalEventKind::MessageAccepted,
+            Self::MessageAcceptedV2(_) => JournalEventKind::MessageAccepted,
             Self::WorkQueued(_) => JournalEventKind::WorkQueued,
+            Self::WorkQueuedV2(_) => JournalEventKind::WorkQueued,
             Self::WorkStarted(_) => JournalEventKind::WorkStarted,
             Self::WorkWaitingOnModel(_) => JournalEventKind::WorkWaitingOnModel,
             Self::WorkWaitingOnTool(_) => JournalEventKind::WorkWaitingOnTool,
@@ -532,6 +644,16 @@ impl JournalEventPayload {
             Self::RuntimeStarted(_) => JournalEventKind::RuntimeStarted,
             Self::RuntimeRecoveryPerformed(_) => JournalEventKind::RuntimeRecoveryPerformed,
             Self::RuntimeStopping(_) => JournalEventKind::RuntimeStopping,
+        }
+    }
+
+    #[must_use]
+    pub const fn version(&self) -> i64 {
+        match self {
+            Self::ConversationCreatedV2(_) | Self::MessageAcceptedV2(_) | Self::WorkQueuedV2(_) => {
+                2
+            }
+            _ => 1,
         }
     }
 }
@@ -632,10 +754,13 @@ mod tests {
             .map(|kind| kind.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), 28);
-        assert!(
-            JournalEventKind::ALL
-                .iter()
-                .all(|kind| kind.current_version() == 1)
+        assert_eq!(JournalEventKind::ConversationCreated.current_version(), 2);
+        assert_eq!(JournalEventKind::MessageAccepted.current_version(), 2);
+        assert_eq!(JournalEventKind::WorkQueued.current_version(), 2);
+        assert_eq!(JournalEventKind::WorkStarted.current_version(), 1);
+        assert_eq!(
+            resolve_event_version("message.accepted", 1),
+            JournalVersionResolution::Supported(JournalEventKind::MessageAccepted)
         );
         assert_eq!(
             JournalEventKind::ALL

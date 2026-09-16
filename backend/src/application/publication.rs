@@ -266,7 +266,7 @@ fn project_replay_page(
 }
 
 fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>, PublicationError> {
-    if event.event_version != 1 {
+    if event.event_version != event.payload.version() {
         return Err(PublicationError::invariant());
     }
     let (event_type, payload) = match &event.payload {
@@ -280,7 +280,34 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
                 "committed_at": message.committed_at,
             }),
         ),
+        JournalEventPayload::MessageAcceptedV2(message) => {
+            let client_message_id = match message.origin {
+                crate::domain::MessageAcceptedOriginV2::Native {
+                    client_message_id, ..
+                } => Some(client_message_id),
+                crate::domain::MessageAcceptedOriginV2::InboundDelivery { .. } => None,
+            };
+            (
+                "message.accepted",
+                json!({
+                    "message_id": message.message_id,
+                    "role": message.role,
+                    "content": message.content.blocks().iter().map(PublicContentBlock::from_domain).collect::<Vec<_>>(),
+                    "client_message_id": client_message_id,
+                    "committed_at": message.committed_at,
+                }),
+            )
+        }
         JournalEventPayload::WorkQueued(work) => (
+            "work.queued",
+            json!({
+                "work_id": work.work_id,
+                "conversation_work_ordinal": work.conversation_work_ordinal,
+                "state": "queued",
+                "queued_at": work.queued_at,
+            }),
+        ),
+        JournalEventPayload::WorkQueuedV2(work) => (
             "work.queued",
             json!({
                 "work_id": work.work_id,
@@ -414,6 +441,7 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
         }
         JournalEventPayload::CraxiiInitialized(_)
         | JournalEventPayload::ConversationCreated(_)
+        | JournalEventPayload::ConversationCreatedV2(_)
         | JournalEventPayload::ModelInvocationStarted(_)
         | JournalEventPayload::ModelInvocationStreaming(_)
         | JournalEventPayload::ModelInvocationCompleted(_)
@@ -518,8 +546,13 @@ impl std::error::Error for PublicationError {}
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{PublicationErrorKind, encode_public_event_frame};
-    use crate::domain::{JournalEventId, JournalOffset, UtcTimestamp};
+    use super::{PublicationErrorKind, encode_public_event_frame, map_public_event};
+    use crate::domain::{
+        ClientMessageId, ContentBlock, ConversationId, CraxiiId, DeviceId, JournalActor,
+        JournalEvent, JournalEventId, JournalEventPayload, JournalOffset, JournalStreamId,
+        MessageAcceptedOriginV2, MessageCommittedV1, MessageCommittedV2, MessageContent, MessageId,
+        MessageRole, Sha256Digest, StreamSeq, UserId, UtcTimestamp,
+    };
     use crate::protocol::{
         DeliveryKind, DurableEventEnvelope, MAX_DURABLE_PAYLOAD_BYTES, MAX_WEBSOCKET_FRAME_BYTES,
         ProtocolVersion,
@@ -559,5 +592,71 @@ mod tests {
         let oversized = event("x".repeat(legal_body_bytes + 1));
         let error = encode_public_event_frame(&oversized).unwrap_err();
         assert_eq!(error.kind(), PublicationErrorKind::Invariant);
+    }
+
+    #[test]
+    fn historical_v1_and_native_v2_message_events_have_identical_public_projection() {
+        let at = UtcTimestamp::parse_canonical("2026-08-28T00:00:00.000000Z").unwrap();
+        let craxii_id = CraxiiId::generate();
+        let conversation_id = ConversationId::generate();
+        let message_id = MessageId::generate();
+        let device_id = DeviceId::generate();
+        let client_message_id =
+            ClientMessageId::parse_canonical(&uuid::Uuid::now_v7().hyphenated().to_string())
+                .unwrap();
+        let content =
+            MessageContent::try_new(vec![ContentBlock::text("compatible").unwrap()]).unwrap();
+        let content_sha256 = content.content_sha256();
+        let v1_payload = MessageCommittedV1 {
+            message_id,
+            craxii_id,
+            conversation_id,
+            role: MessageRole::User,
+            content: content.clone(),
+            content_sha256,
+            produced_by_work_id: None,
+            device_id: Some(device_id),
+            client_message_id: Some(client_message_id),
+            committed_at: at,
+        };
+        let v1 = JournalEvent {
+            journal_offset: JournalOffset::try_new(1).unwrap(),
+            event_id: JournalEventId::generate(),
+            craxii_id,
+            stream_id: JournalStreamId::Conversation(conversation_id),
+            stream_seq: StreamSeq::try_new(1).unwrap(),
+            event_version: 1,
+            conversation_id: Some(conversation_id),
+            work_id: None,
+            causation_event_id: None,
+            correlation_id: crate::domain::CorrelationId::generate(),
+            actor: JournalActor::User(Some(device_id)),
+            runtime_instance_id: None,
+            payload: JournalEventPayload::MessageAccepted(v1_payload),
+            payload_sha256: Sha256Digest::hash_bytes(b"v1 fixture payload"),
+            recorded_at: at,
+            occurred_at: None,
+        };
+        let author_user_id = UserId::generate();
+        let mut v2 = v1.clone();
+        v2.event_version = 2;
+        v2.actor = JournalActor::UserV2(author_user_id);
+        v2.payload = JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
+            message_id,
+            craxii_id,
+            conversation_id,
+            role: MessageRole::User,
+            content,
+            content_sha256,
+            author_user_id,
+            origin: MessageAcceptedOriginV2::Native {
+                device_id,
+                client_message_id,
+            },
+            committed_at: at,
+        });
+        v2.payload_sha256 = Sha256Digest::hash_bytes(b"v2 fixture payload");
+
+        assert_eq!(map_public_event(v1).unwrap(), map_public_event(v2).unwrap());
     }
 }

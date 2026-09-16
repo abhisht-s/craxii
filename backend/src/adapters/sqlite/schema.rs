@@ -3,7 +3,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 5;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 6;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
 pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
@@ -16,6 +16,9 @@ pub(super) const MODEL_ATTEMPT_EVIDENCE_MIGRATION_DESCRIPTION: &str =
 pub(super) const TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION: i64 = 5;
 pub(super) const TOOL_TERMINAL_EVIDENCE_MIGRATION_DESCRIPTION: &str =
     "tool terminal outcome evidence";
+pub(super) const CHAT_CHANNEL_IDENTITY_MIGRATION_VERSION: i64 = 6;
+pub(super) const CHAT_CHANNEL_IDENTITY_MIGRATION_DESCRIPTION: &str =
+    "chat channel identity and ingress";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -88,7 +91,7 @@ pub(super) const V2_PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
-pub(super) const PRODUCT_TABLES: &[&str] = &[
+pub(super) const V5_PRODUCT_TABLES: &[&str] = &[
     "artifacts",
     "client_commands",
     "client_devices",
@@ -108,7 +111,7 @@ pub(super) const PRODUCT_TABLES: &[&str] = &[
     "workstations",
 ];
 
-pub(super) const PRODUCT_INDEXES: &[&str] = &[
+pub(super) const V5_PRODUCT_INDEXES: &[&str] = &[
     "ix_artifacts_content",
     "ix_artifacts_producer_kind_id",
     "ix_artifacts_producing_work",
@@ -151,6 +154,82 @@ pub(super) const PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
+pub(super) const PRODUCT_TABLES: &[&str] = &[
+    "artifacts",
+    "channel_accounts",
+    "client_commands",
+    "client_devices",
+    "context_manifest_sources",
+    "context_manifests",
+    "conversation_bindings",
+    "conversations",
+    "craxii_principals",
+    "external_identities",
+    "inbound_deliveries",
+    "journal_events",
+    "messages",
+    "model_invocations",
+    "runtime_instances",
+    "stream_heads",
+    "tool_executions",
+    "users",
+    "work_item_inputs",
+    "work_items",
+    "workspaces",
+    "workstations",
+];
+
+pub(super) const PRODUCT_INDEXES: &[&str] = &[
+    "ix_artifacts_content",
+    "ix_artifacts_producer_kind_id",
+    "ix_artifacts_producing_work",
+    "ix_artifacts_storage_key",
+    "ix_client_devices_user_id",
+    "ix_context_manifest_sources_artifact",
+    "ix_context_manifest_sources_event",
+    "ix_context_manifests_work_created",
+    "ix_journal_events_conversation_offset",
+    "ix_journal_events_work_offset",
+    "ix_messages_author_user_id",
+    "ix_messages_conversation",
+    "ix_model_invocations_context_attempt",
+    "ix_model_invocations_runtime_nonterminal",
+    "ix_runtime_instances_craxii_state",
+    "ix_tool_executions_runtime_nonterminal",
+    "ix_users_craxii_id",
+    "ix_work_items_nonterminal_by_runtime",
+    "ix_work_items_queued_fifo",
+    "ix_workspaces_craxii_id",
+    "ix_workstations_craxii_id",
+    "ux_client_devices_token_hash",
+    "ux_context_manifests_logical_invocation",
+    "ux_conversation_bindings_active_destination",
+    "ux_conversations_craxii_owner_kind",
+    "ux_external_identities_active_subject",
+    "ux_inbound_deliveries_account_event",
+    "ux_inbound_deliveries_account_message",
+    "ux_journal_events_event_id",
+    "ux_journal_events_stream_sequence",
+    "ux_messages_client_identity",
+    "ux_messages_inbound_delivery",
+    "ux_messages_produced_by_work",
+    "ux_model_invocations_logical_attempt",
+    "ux_model_invocations_one_nonterminal_per_work",
+    "ux_model_invocations_retry_of",
+    "ux_model_invocations_work_step_attempt",
+    "ux_tool_executions_execution_id",
+    "ux_tool_executions_one_nonterminal_per_work",
+    "ux_tool_executions_source_ordinal",
+    "ux_tool_executions_source_provider_call",
+    "ux_tool_executions_work_step_ordinal",
+    "ux_work_item_inputs_work_ordinal",
+    "ux_work_items_conversation_ordinal",
+    "ux_work_items_current_model_invocation",
+    "ux_work_items_current_tool_execution",
+    "ux_work_items_one_active_per_conversation",
+    "ux_workspaces_workstation_logical_name",
+];
+
 // Filled from deterministic structural manifests produced by the bundled SQLite engine. The
 // generation test fails closed if either frozen value ever becomes stale.
 const V1_SCHEMA_FINGERPRINT: &str =
@@ -161,8 +240,10 @@ const V3_SCHEMA_FINGERPRINT: &str =
     "73ab94c2ec36ef1b09addc475aa6bcf806336612f58fd551fd4648c5a124f5a3";
 const V4_SCHEMA_FINGERPRINT: &str =
     "78eed488a202c15dac3215ea96ca860907d472c393639bdc94f90301007e4fb2";
-const CURRENT_SCHEMA_FINGERPRINT: &str =
+const V5_SCHEMA_FINGERPRINT: &str =
     "fbc43b70e5455f4a20ee9378dab335f9849419ef262da47f031986737084f89e";
+const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "b24c145128287dc40a5a59adb7f8c6c1a75367fe8d563c295f2509ec505b2706";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DatabaseDisposition {
@@ -260,8 +341,8 @@ pub(super) async fn classify_schema(
         }
         Some(EVIDENCE_MIGRATION_VERSION) => {
             if migrations.len() != 3
-                || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
-                || !schema_matches(connection, PRODUCT_TABLES, V3_SCHEMA_FINGERPRINT).await?
+                || !has_exact_objects(&objects, V5_PRODUCT_TABLES, V5_PRODUCT_INDEXES)
+                || !schema_matches(connection, V5_PRODUCT_TABLES, V3_SCHEMA_FINGERPRINT).await?
             {
                 Ok(DatabaseDisposition::Inconsistent)
             } else {
@@ -270,8 +351,8 @@ pub(super) async fn classify_schema(
         }
         Some(MODEL_ATTEMPT_EVIDENCE_MIGRATION_VERSION) => {
             if migrations.len() != 4
-                || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
-                || !schema_matches(connection, PRODUCT_TABLES, V4_SCHEMA_FINGERPRINT).await?
+                || !has_exact_objects(&objects, V5_PRODUCT_TABLES, V5_PRODUCT_INDEXES)
+                || !schema_matches(connection, V5_PRODUCT_TABLES, V4_SCHEMA_FINGERPRINT).await?
             {
                 Ok(DatabaseDisposition::Inconsistent)
             } else {
@@ -280,6 +361,16 @@ pub(super) async fn classify_schema(
         }
         Some(TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION) => {
             if migrations.len() != 5
+                || !has_exact_objects(&objects, V5_PRODUCT_TABLES, V5_PRODUCT_INDEXES)
+                || !schema_matches(connection, V5_PRODUCT_TABLES, V5_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::MigratedUninitialized)
+            }
+        }
+        Some(CHAT_CHANNEL_IDENTITY_MIGRATION_VERSION) => {
+            if migrations.len() != 6
                 || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
                 || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
             {
@@ -348,6 +439,10 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
         (
             TOOL_TERMINAL_EVIDENCE_MIGRATION_VERSION,
             TOOL_TERMINAL_EVIDENCE_MIGRATION_DESCRIPTION,
+        ),
+        (
+            CHAT_CHANNEL_IDENTITY_MIGRATION_VERSION,
+            CHAT_CHANNEL_IDENTITY_MIGRATION_DESCRIPTION,
         ),
     ];
     if embedded_contracts.iter().any(|(version, description)| {
@@ -682,6 +777,10 @@ mod tests {
             .create_if_missing(true)
             .foreign_keys(true);
         let mut connection = options.connect().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE ch1_owner_seed (user_id TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
         MIGRATOR.run(&mut connection).await.unwrap();
         let manifest = structural_manifest(&mut connection).await.unwrap();
         let actual = sha256_hex(manifest.as_bytes());

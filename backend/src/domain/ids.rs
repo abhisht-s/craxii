@@ -123,6 +123,23 @@ macro_rules! server_generated_id {
 }
 
 canonical_id!(CraxiiId, "The durable identity of one Craxii.");
+canonical_id!(UserId, "The durable identity of one human account.");
+canonical_id!(
+    ChannelAccountId,
+    "The durable identity of one configured channel account."
+);
+canonical_id!(
+    ExternalIdentityId,
+    "The durable identity of one channel-scoped external identity mapping."
+);
+canonical_id!(
+    ConversationBindingId,
+    "The durable identity of one external conversation binding."
+);
+canonical_id!(
+    InboundDeliveryId,
+    "The durable identity of one normalized inbound delivery."
+);
 canonical_id!(ConversationId, "The durable identity of a conversation.");
 canonical_id!(MessageId, "The durable identity of a committed message.");
 canonical_id!(WorkId, "The durable identity of a work item.");
@@ -171,6 +188,11 @@ canonical_id!(
 );
 
 server_generated_id!(CraxiiId);
+server_generated_id!(UserId);
+server_generated_id!(ChannelAccountId);
+server_generated_id!(ExternalIdentityId);
+server_generated_id!(ConversationBindingId);
+server_generated_id!(InboundDeliveryId);
 server_generated_id!(ConversationId);
 server_generated_id!(MessageId);
 server_generated_id!(WorkId);
@@ -235,6 +257,11 @@ mod tests {
     #[test]
     fn every_frozen_id_has_the_same_strict_roundtrip_contract() {
         assert_id_contract!(CraxiiId);
+        assert_id_contract!(UserId);
+        assert_id_contract!(ChannelAccountId);
+        assert_id_contract!(ExternalIdentityId);
+        assert_id_contract!(ConversationBindingId);
+        assert_id_contract!(InboundDeliveryId);
         assert_id_contract!(ConversationId);
         assert_id_contract!(MessageId);
         assert_id_contract!(WorkId);
