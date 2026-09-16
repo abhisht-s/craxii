@@ -2,6 +2,7 @@
 
 pub mod artifact_store;
 pub mod channel_identity;
+pub mod channel_ingress;
 pub mod clock;
 pub mod context_source_store;
 pub mod device_credentials;

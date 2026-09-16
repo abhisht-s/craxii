@@ -13,9 +13,10 @@ use crate::domain::{
     ProjectionVersion, RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeShutdownReason,
     RuntimeStartedV1, RuntimeStoppingV1, SchemaVersion, Sha256Digest, StreamSeq,
     ToolExecutionEventV1, ToolExecutionId, ToolExecutionState, ToolResultClass, UserId,
-    UtcTimestamp, WorkCancellationReason, WorkId, WorkInputActor, WorkInputFactV1,
-    WorkInputOrdinal, WorkInputRelationship, WorkKind, WorkQueuedV1, WorkQueuedV2, WorkState,
-    WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId, resolve_event_version,
+    UtcTimestamp, WorkCancellationReason, WorkCancellationV2, WorkId, WorkInputActor,
+    WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkKind, WorkQueuedV1, WorkQueuedV2,
+    WorkState, WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId,
+    resolve_event_version,
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
@@ -673,6 +674,33 @@ impl TryFrom<StoredWorkTransitionV1> for WorkTransitionV1 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredWorkCancellationV2 {
+    transition: StoredWorkTransitionV1,
+    inbound_delivery_id: InboundDeliveryId,
+}
+
+impl From<&WorkCancellationV2> for StoredWorkCancellationV2 {
+    fn from(value: &WorkCancellationV2) -> Self {
+        Self {
+            transition: StoredWorkTransitionV1::from(&value.transition),
+            inbound_delivery_id: value.inbound_delivery_id,
+        }
+    }
+}
+
+impl TryFrom<StoredWorkCancellationV2> for WorkCancellationV2 {
+    type Error = SqliteAdapterError;
+
+    fn try_from(value: StoredWorkCancellationV2) -> Result<Self, Self::Error> {
+        Ok(Self {
+            transition: value.transition.try_into()?,
+            inbound_delivery_id: value.inbound_delivery_id,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredModelInvocationEventV1 {
     work_id: WorkId,
     model_invocation_id: ModelInvocationId,
@@ -965,6 +993,7 @@ enum StoredEventPayloadV1 {
     WorkQueued(StoredWorkQueuedV1),
     WorkQueuedV2(StoredWorkQueuedV2),
     WorkTransition(StoredWorkTransitionV1),
+    WorkCancellationV2(StoredWorkCancellationV2),
     Model(StoredModelInvocationEventV1),
     Tool(StoredToolExecutionEventV1),
     Artifact(StoredArtifactRecordedV1),
@@ -1011,6 +1040,10 @@ pub(super) fn encode_event_payload(
         JournalEventPayload::WorkQueued(value) => StoredEventPayloadV1::WorkQueued(value.into()),
         JournalEventPayload::WorkQueuedV2(value) => {
             StoredEventPayloadV1::WorkQueuedV2(value.into())
+        }
+        JournalEventPayload::WorkCancelRequestedV2(value)
+        | JournalEventPayload::WorkCancelledV2(value) => {
+            StoredEventPayloadV1::WorkCancellationV2(value.into())
         }
         JournalEventPayload::WorkStarted(value)
         | JournalEventPayload::WorkWaitingOnModel(value)
@@ -1059,6 +1092,7 @@ pub(super) fn encode_event_payload(
         StoredEventPayloadV1::WorkQueued(value) => to_json(value)?,
         StoredEventPayloadV1::WorkQueuedV2(value) => to_json(value)?,
         StoredEventPayloadV1::WorkTransition(value) => to_json(value)?,
+        StoredEventPayloadV1::WorkCancellationV2(value) => to_json(value)?,
         StoredEventPayloadV1::Model(value) => to_json(value)?,
         StoredEventPayloadV1::Tool(value) => to_json(value)?,
         StoredEventPayloadV1::Artifact(value) => to_json(value)?,
@@ -1124,11 +1158,21 @@ pub(super) fn decode_event_payload(
         JournalEventKind::WorkResumed => JournalEventPayload::WorkResumed(
             from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
         ),
-        JournalEventKind::WorkCancelRequested => JournalEventPayload::WorkCancelRequested(
-            from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
+        JournalEventKind::WorkCancelRequested if event_version == 1 => {
+            JournalEventPayload::WorkCancelRequested(
+                from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
+            )
+        }
+        JournalEventKind::WorkCancelRequested => JournalEventPayload::WorkCancelRequestedV2(
+            from_json::<StoredWorkCancellationV2>(payload_json)?.try_into()?,
         ),
-        JournalEventKind::WorkCancelled => JournalEventPayload::WorkCancelled(
-            from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
+        JournalEventKind::WorkCancelled if event_version == 1 => {
+            JournalEventPayload::WorkCancelled(
+                from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
+            )
+        }
+        JournalEventKind::WorkCancelled => JournalEventPayload::WorkCancelledV2(
+            from_json::<StoredWorkCancellationV2>(payload_json)?.try_into()?,
         ),
         JournalEventKind::WorkCompleted => JournalEventPayload::WorkCompleted(
             from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
@@ -1267,7 +1311,13 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         JournalEventPayload::WorkCancelRequested(value) => {
             value.to_state == WorkState::CancelRequested
         }
+        JournalEventPayload::WorkCancelRequestedV2(value) => {
+            value.transition.to_state == WorkState::CancelRequested
+        }
         JournalEventPayload::WorkCancelled(value) => value.to_state == WorkState::Cancelled,
+        JournalEventPayload::WorkCancelledV2(value) => {
+            value.transition.to_state == WorkState::Cancelled
+        }
         JournalEventPayload::WorkCompleted(value) => value.to_state == WorkState::Completed,
         JournalEventPayload::WorkFailed(value) => value.to_state == WorkState::Failed,
         JournalEventPayload::WorkInterrupted(value) => value.to_state == WorkState::Interrupted,
@@ -1451,6 +1501,15 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
                 && intent.correlation_id == value.correlation_id
                 && intent.causation_event_id == Some(value.trigger.input_event_id)
                 && intent.actor == JournalActor::Craxii(value.craxii_id)
+        }
+        (
+            JournalEventPayload::WorkCancelRequestedV2(value)
+            | JournalEventPayload::WorkCancelledV2(value),
+            JournalStreamId::Work(id),
+        ) => {
+            id == value.transition.work_id
+                && intent.work_id == Some(value.transition.work_id)
+                && matches!(intent.actor, JournalActor::UserV2(_))
         }
         (
             JournalEventPayload::WorkStarted(value)
@@ -1712,6 +1771,9 @@ fn payload_field_names(kind: JournalEventKind, version: i64) -> &'static str {
         JournalEventKind::WorkQueued => {
             "work_id,craxii_id,conversation_id,conversation_work_ordinal,kind,priority,workspace_id,correlation_id,state_version,created_at,queued_at,trigger"
         }
+        JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 2 => {
+            "transition,inbound_delivery_id"
+        }
         JournalEventKind::WorkStarted
         | JournalEventKind::WorkWaitingOnModel
         | JournalEventKind::WorkWaitingOnTool
@@ -1812,6 +1874,9 @@ fn payload_shape_is_valid(kind: JournalEventKind, version: i64, payload_json: &s
         }
         JournalEventKind::WorkQueued => {
             serde_json::from_str::<StoredWorkQueuedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 2 => {
+            serde_json::from_str::<StoredWorkCancellationV2>(payload_json).is_ok()
         }
         JournalEventKind::WorkStarted
         | JournalEventKind::WorkWaitingOnModel
@@ -2656,7 +2721,7 @@ mod tests {
     }
 
     #[test]
-    fn ch1_v2_payloads_have_exact_deterministic_bytes_and_roundtrip() {
+    fn ch1_and_ch2_v2_payloads_have_exact_deterministic_bytes_and_roundtrip() {
         let content = MessageContent::try_new(vec![ContentBlock::text("hello").unwrap()]).unwrap();
         let payloads = [
             (
@@ -2712,6 +2777,20 @@ mod tests {
                     reply_binding_id: None,
                 }),
                 r#"{"work_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","craxii_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","conversation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","conversation_work_ordinal":1,"kind":"conversational","priority":0,"workspace_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","correlation_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","state_version":1,"created_at":"2026-08-28T00:00:00.000001Z","queued_at":"2026-08-28T00:00:00.000001Z","trigger":{"input_event_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","relationship":"trigger","ordinal_within_work":1,"attached_at":"2026-08-28T00:00:00.000001Z","actor":"user"},"reply_binding_id":null}"#,
+            ),
+            (
+                JournalEventPayload::WorkCancelRequestedV2(WorkCancellationV2 {
+                    transition: transition(JournalEventKind::WorkCancelRequested),
+                    inbound_delivery_id: id(),
+                }),
+                r#"{"transition":{"work_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","from_state":"running","to_state":"cancel_requested","expected_state_version":1,"expected_runtime_owner":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","expected_current_attempt":{"kind":"none"},"expected_cancellation_reason":null,"state_version":2,"runtime_owner":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","current_attempt":{"kind":"none"},"cancellation_reason":"user_request","terminal_reason":null,"transitioned_at":"2026-08-28T00:00:00.000001Z"},"inbound_delivery_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"}"#,
+            ),
+            (
+                JournalEventPayload::WorkCancelledV2(WorkCancellationV2 {
+                    transition: transition(JournalEventKind::WorkCancelled),
+                    inbound_delivery_id: id(),
+                }),
+                r#"{"transition":{"work_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d","from_state":"queued","to_state":"cancelled","expected_state_version":1,"expected_runtime_owner":null,"expected_current_attempt":{"kind":"none"},"expected_cancellation_reason":null,"state_version":2,"runtime_owner":null,"current_attempt":{"kind":"none"},"cancellation_reason":null,"terminal_reason":"user_request","transitioned_at":"2026-08-28T00:00:00.000001Z"},"inbound_delivery_id":"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"}"#,
             ),
         ];
         for (payload, expected_json) in payloads {

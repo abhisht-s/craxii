@@ -242,8 +242,8 @@ pub use journal::{
     JournalEventPayload, JournalStageOwner, JournalStreamFamily, JournalStreamId,
     JournalVersionResolution, JournalWorkTerminalReason, MessageAcceptedOriginV2,
     MessageCommittedV1, MessageCommittedV2, ModelInvocationEventV1, RuntimeRecoveryPerformedV1,
-    RuntimeStartedV1, RuntimeStoppingV1, ToolExecutionEventV1, WorkInputFactV1, WorkQueuedV1,
-    WorkQueuedV2, WorkTransitionV1, resolve_event_version,
+    RuntimeStartedV1, RuntimeStoppingV1, ToolExecutionEventV1, WorkCancellationV2, WorkInputFactV1,
+    WorkQueuedV1, WorkQueuedV2, WorkTransitionV1, resolve_event_version,
 };
 pub use lifecycle::{
     CancellationCheckpoint, CancellationChildOutcome, CancellationDecision, CleanupStatus,

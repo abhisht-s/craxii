@@ -264,6 +264,11 @@ impl SqliteStateStore {
             "stage9",
             super::stage9::verify_stage9_consistency(&mut transaction, &events).await
         );
+        let channel_ingress_invariants = consistency_step!(
+            "channel_ingress",
+            super::channel_ingress::verify_channel_ingress_consistency(&mut transaction, &events,)
+                .await
+        );
         let stage10_invariants = consistency_step!(
             "stage10",
             super::stage10::verify_stage10_consistency(&mut transaction, &projected, &events).await
@@ -275,7 +280,11 @@ impl SqliteStateStore {
             .await
             .map_err(SqliteAdapterError::from_sqlx)?;
         Ok(ApplicationConsistencyReceipt {
-            checked_invariants: 19 + stage8_invariants + stage9_invariants + stage10_invariants,
+            checked_invariants: 19
+                + stage8_invariants
+                + stage9_invariants
+                + channel_ingress_invariants
+                + stage10_invariants,
             journal_head,
         })
     }

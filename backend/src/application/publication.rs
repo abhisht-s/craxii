@@ -340,12 +340,24 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
             "work.cancel_requested",
             json!({"state": transition.to_state, "transitioned_at": transition.transitioned_at}),
         ),
+        JournalEventPayload::WorkCancelRequestedV2(cancellation) => (
+            "work.cancel_requested",
+            json!({"state": cancellation.transition.to_state, "transitioned_at": cancellation.transition.transitioned_at}),
+        ),
         JournalEventPayload::WorkCancelled(transition) => (
             "work.cancelled",
             json!({
                 "state": transition.to_state,
                 "terminal_reason": transition.terminal_reason,
                 "transitioned_at": transition.transitioned_at,
+            }),
+        ),
+        JournalEventPayload::WorkCancelledV2(cancellation) => (
+            "work.cancelled",
+            json!({
+                "state": cancellation.transition.to_state,
+                "terminal_reason": cancellation.transition.terminal_reason,
+                "transitioned_at": cancellation.transition.transitioned_at,
             }),
         ),
         JournalEventPayload::WorkCompleted(transition) => (
@@ -548,10 +560,12 @@ mod tests {
 
     use super::{PublicationErrorKind, encode_public_event_frame, map_public_event};
     use crate::domain::{
-        ClientMessageId, ContentBlock, ConversationId, CraxiiId, DeviceId, JournalActor,
-        JournalEvent, JournalEventId, JournalEventPayload, JournalOffset, JournalStreamId,
-        MessageAcceptedOriginV2, MessageCommittedV1, MessageCommittedV2, MessageContent, MessageId,
-        MessageRole, Sha256Digest, StreamSeq, UserId, UtcTimestamp,
+        ClientMessageId, ContentBlock, ConversationId, CraxiiId, DeviceId, InboundDeliveryId,
+        JournalActor, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventPayload,
+        JournalOffset, JournalStreamId, JournalWorkTerminalReason, MessageAcceptedOriginV2,
+        MessageCommittedV1, MessageCommittedV2, MessageContent, MessageId, MessageRole,
+        ProjectionVersion, RuntimeInstanceId, Sha256Digest, StreamSeq, UserId, UtcTimestamp,
+        WorkCancellationReason, WorkCancellationV2, WorkId, WorkState, WorkTransitionV1,
     };
     use crate::protocol::{
         DeliveryKind, DurableEventEnvelope, MAX_DURABLE_PAYLOAD_BYTES, MAX_WEBSOCKET_FRAME_BYTES,
@@ -658,5 +672,89 @@ mod tests {
         v2.payload_sha256 = Sha256Digest::hash_bytes(b"v2 fixture payload");
 
         assert_eq!(map_public_event(v1).unwrap(), map_public_event(v2).unwrap());
+    }
+
+    #[test]
+    fn native_v1_and_channel_v2_cancellations_have_identical_public_projection() {
+        let at = UtcTimestamp::parse_canonical("2026-08-28T00:00:00.000000Z").unwrap();
+        let craxii_id = CraxiiId::generate();
+        let conversation_id = ConversationId::generate();
+        let work_id = WorkId::generate();
+        let device_id = DeviceId::generate();
+        let user_id = UserId::generate();
+        let runtime_id = RuntimeInstanceId::generate();
+        let transitions = [
+            WorkTransitionV1 {
+                work_id,
+                from_state: WorkState::Running,
+                to_state: WorkState::CancelRequested,
+                expected_state_version: ProjectionVersion::try_new(2).unwrap(),
+                expected_runtime_owner: Some(runtime_id),
+                expected_current_attempt: JournalCurrentAttempt::None,
+                expected_cancellation_reason: None,
+                state_version: ProjectionVersion::try_new(3).unwrap(),
+                runtime_owner: Some(runtime_id),
+                current_attempt: JournalCurrentAttempt::None,
+                cancellation_reason: Some(WorkCancellationReason::UserRequest),
+                terminal_reason: None,
+                transitioned_at: at,
+            },
+            WorkTransitionV1 {
+                work_id,
+                from_state: WorkState::Queued,
+                to_state: WorkState::Cancelled,
+                expected_state_version: ProjectionVersion::try_new(1).unwrap(),
+                expected_runtime_owner: None,
+                expected_current_attempt: JournalCurrentAttempt::None,
+                expected_cancellation_reason: None,
+                state_version: ProjectionVersion::try_new(2).unwrap(),
+                runtime_owner: None,
+                current_attempt: JournalCurrentAttempt::None,
+                cancellation_reason: None,
+                terminal_reason: Some(JournalWorkTerminalReason::UserRequest),
+                transitioned_at: at,
+            },
+        ];
+        for transition in transitions {
+            let requested = transition.to_state == WorkState::CancelRequested;
+            let mut v1 = JournalEvent {
+                journal_offset: JournalOffset::try_new(1).unwrap(),
+                event_id: JournalEventId::generate(),
+                craxii_id,
+                stream_id: JournalStreamId::Work(work_id),
+                stream_seq: StreamSeq::try_new(2).unwrap(),
+                event_version: 1,
+                conversation_id: Some(conversation_id),
+                work_id: Some(work_id),
+                causation_event_id: Some(JournalEventId::generate()),
+                correlation_id: crate::domain::CorrelationId::for_work(work_id),
+                actor: JournalActor::User(Some(device_id)),
+                runtime_instance_id: transition.runtime_owner,
+                payload: if requested {
+                    JournalEventPayload::WorkCancelRequested(transition.clone())
+                } else {
+                    JournalEventPayload::WorkCancelled(transition.clone())
+                },
+                payload_sha256: Sha256Digest::hash_bytes(b"v1 fixture payload"),
+                recorded_at: at,
+                occurred_at: None,
+            };
+            let expected = map_public_event(v1.clone()).unwrap();
+            v1.event_version = 2;
+            v1.actor = JournalActor::UserV2(user_id);
+            v1.payload = if requested {
+                JournalEventPayload::WorkCancelRequestedV2(WorkCancellationV2 {
+                    transition,
+                    inbound_delivery_id: InboundDeliveryId::generate(),
+                })
+            } else {
+                JournalEventPayload::WorkCancelledV2(WorkCancellationV2 {
+                    transition,
+                    inbound_delivery_id: InboundDeliveryId::generate(),
+                })
+            };
+            v1.payload_sha256 = Sha256Digest::hash_bytes(b"v2 fixture payload");
+            assert_eq!(expected, map_public_event(v1).unwrap());
+        }
     }
 }

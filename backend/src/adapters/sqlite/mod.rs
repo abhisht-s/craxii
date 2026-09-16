@@ -1,6 +1,8 @@
 //! File-backed SQLite lifecycle adapter.
 
+mod cancellation;
 mod channel_identity;
+mod channel_ingress;
 #[allow(dead_code)] // Stage 6 freezes codecs before Stage 7 composes repository reads/writes.
 mod codec;
 mod context_source_store;
@@ -8,6 +10,7 @@ mod error;
 mod evidence_query;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.
 mod journal;
+mod message_admission;
 #[allow(dead_code)] // Stage 6 freezes guarded primitives before Stage 7 journal composition.
 mod projection;
 mod runtime;
@@ -24,6 +27,8 @@ mod transaction;
 
 #[cfg(test)]
 mod ch1_tests;
+#[cfg(test)]
+mod channel_ingress_tests;
 #[cfg(test)]
 mod stage10_tests;
 #[cfg(test)]

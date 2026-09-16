@@ -194,6 +194,15 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
                 && event.correlation_id == payload.correlation_id
         }
         (
+            JournalEventPayload::WorkCancelRequestedV2(payload)
+            | JournalEventPayload::WorkCancelledV2(payload),
+            JournalStreamId::Work(id),
+        ) => {
+            id == payload.transition.work_id
+                && event.work_id == Some(payload.transition.work_id)
+                && matches!(event.actor, JournalActor::UserV2(_))
+        }
+        (
             JournalEventPayload::WorkStarted(payload)
             | JournalEventPayload::WorkWaitingOnModel(payload)
             | JournalEventPayload::WorkWaitingOnTool(payload)
@@ -528,6 +537,16 @@ fn apply_event(
                 work_v1_from_v2(payload),
                 payload.reply_binding_id,
             )?;
+        }
+        JournalEventPayload::WorkCancelRequestedV2(payload)
+        | JournalEventPayload::WorkCancelledV2(payload) => {
+            require_work_context(state, event, payload.transition.work_id)?;
+            if !matches!(event.actor, JournalActor::UserV2(_))
+                || event.runtime_instance_id != payload.transition.runtime_owner
+            {
+                return Err(JournalContractError::InvalidEnvelope);
+            }
+            apply_work_transition(state, event.correlation_id, &payload.transition)?;
         }
         JournalEventPayload::WorkStarted(payload)
         | JournalEventPayload::WorkWaitingOnModel(payload)

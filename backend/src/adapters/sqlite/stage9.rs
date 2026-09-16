@@ -4,19 +4,13 @@ use sqlx::Row;
 
 use crate::bootstrap::compatibility::PROTOCOL_VERSION;
 use crate::domain::{
-    CancellationCheckpoint, CancellationCleanupDisposition, CancellationCommandReceipt,
-    CancellationDecision, ClientCommandId, ClientMessageId, CommandHashEncodingVersion,
-    CommandKind, CommandOutcome, CommandRequestHash, ConversationId, ConversationWorkOrdinal,
-    CorrelationId, CraxiiId, CurrentWorkAttempt, DeviceId, DeviceTokenHash, IdempotencyKey,
+    CancellationCleanupDisposition, CancellationCommandReceipt, ClientCommandId, ClientMessageId,
+    CommandHashEncodingVersion, CommandKind, CommandOutcome, CommandRequestHash, ConversationId,
+    ConversationWorkOrdinal, CorrelationId, CraxiiId, DeviceId, DeviceTokenHash, IdempotencyKey,
     JournalActor, JournalCurrentAttempt, JournalEvent, JournalEventId, JournalEventPayload,
-    JournalOffset, JournalStreamId, JournalWorkTerminalReason, Message, MessageAcceptedOriginV2,
-    MessageCommandReceipt, MessageCommittedV2, MessageInput, MessageRole, ModelInvocationId,
-    ProjectionVersion, RuntimeInstanceId, ToolExecutionId, UserId, UtcTimestamp,
-    WorkCancellationReason, WorkCompletionReason, WorkFailureReason, WorkId, WorkInputActor,
-    WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkInterruptionReason, WorkItem,
-    WorkItemInput, WorkItemInputData, WorkKind, WorkLifecycleSnapshot, WorkLifecycleSnapshotInput,
-    WorkQueuedV2, WorkState, WorkTerminalReason, WorkTransitionV1, WorkspaceId,
-    decide_cancellation,
+    JournalOffset, JournalStreamId, JournalWorkTerminalReason, MessageCommandReceipt, MessageRole,
+    ProjectionVersion, UserId, UtcTimestamp, WorkCancellationReason, WorkId, WorkState,
+    WorkTransitionV1, WorkspaceId,
 };
 use crate::ports::device_credentials::{
     DeviceCredentialFuture, DeviceCredentialMatch, DeviceCredentialStore,
@@ -28,14 +22,9 @@ use crate::ports::state_store::{
 };
 
 use super::codec::{
-    decode_cancellation_reason, decode_message_row, decode_optional_id, decode_optional_timestamp,
-    decode_timestamp, decode_work_state, encode_message_content,
+    decode_message_row, decode_optional_timestamp, decode_timestamp, decode_work_state,
 };
 use super::error::{SqliteAdapterError, SqliteFailureKind};
-use super::journal::{JournalAppendIntent, append_event, prepare_event};
-use super::projection::{
-    ProjectionMutationError, WorkProjectionTimes, advance_conversation_ordinal, guarded_work_update,
-};
 use super::stage9_codec::{
     decode_cancellation_receipt, decode_client_command_row, decode_message_receipt,
     encode_cancellation_receipt, encode_message_receipt,
@@ -57,14 +46,6 @@ fn idempotency_conflict() -> SqliteAdapterError {
 
 fn target_not_found() -> SqliteAdapterError {
     SqliteAdapterError::new(SqliteFailureKind::TargetNotFound)
-}
-
-fn map_projection_error<C>(error: ProjectionMutationError<C>) -> SqliteAdapterError {
-    match error {
-        ProjectionMutationError::Conflict(_) => inconsistent(),
-        ProjectionMutationError::Storage(error) => error,
-        ProjectionMutationError::Invariant => invalid(),
-    }
 }
 
 fn map_device_store_error(error: SqliteAdapterError) -> DeviceCredentialStoreError {
@@ -314,22 +295,12 @@ impl DeviceCredentialStore for SqliteStateStore {
     }
 }
 
-struct MessageTopology {
-    craxii_id: CraxiiId,
-    user_id: UserId,
-    conversation_id: ConversationId,
-    workspace_id: WorkspaceId,
-    next_ordinal: ConversationWorkOrdinal,
-    conversation_version: ProjectionVersion,
-    conversation_created_event_id: JournalEventId,
-}
-
 async fn load_message_topology(
     transaction: &mut WriteTransaction,
     requested_conversation_id: ConversationId,
     requested_device_id: DeviceId,
     requested_user_id: UserId,
-) -> Result<MessageTopology, SqliteAdapterError> {
+) -> Result<super::message_admission::CanonicalMessageTopology, SqliteAdapterError> {
     let rows = sqlx::query(
         "SELECT p.craxii_id, p.primary_conversation_id, p.default_workspace_id, \
                 c.craxii_id AS conversation_owner, c.owner_user_id, c.kind, c.lifecycle_state, \
@@ -385,7 +356,7 @@ async fn load_message_topology(
     let [created] = created_rows.as_slice() else {
         return Err(inconsistent());
     };
-    Ok(MessageTopology {
+    Ok(super::message_admission::CanonicalMessageTopology {
         craxii_id,
         user_id: owner_user_id,
         conversation_id,
@@ -534,186 +505,56 @@ async fn accept_message_inner(
         request.user_id,
     )
     .await?;
-    let correlation_id = CorrelationId::for_work(request.candidates.work_id);
-    let message = Message::try_new(MessageInput {
-        message_id: request.candidates.message_id,
-        craxii_id: topology.craxii_id,
-        conversation_id: topology.conversation_id,
-        role: MessageRole::User,
-        content: request.content,
-        author_user_id: Some(topology.user_id),
-        produced_by_work_id: None,
-        device_id: Some(request.device_id),
-        client_message_id: Some(request.client_message_id),
-        inbound_delivery_id: None,
-        committed_at: request.accepted_at,
-    })
-    .map_err(|_| invalid())?;
-    let work = WorkItem::new(WorkItemInputData {
-        work_id: request.candidates.work_id,
-        craxii_id: topology.craxii_id,
-        conversation_id: topology.conversation_id,
-        conversation_work_ordinal: topology.next_ordinal,
-        workspace_id: topology.workspace_id,
-        reply_binding_id: None,
-        correlation_id,
-        created_at: request.accepted_at,
-        queued_at: request.accepted_at,
-    });
-    let input = WorkItemInput::new(
-        work.work_id(),
-        request.candidates.acceptance_event_id,
-        WorkInputRelationship::Trigger,
-        WorkInputOrdinal::try_new(1).map_err(|_| invalid())?,
-        request.accepted_at,
-        WorkInputActor::User,
-    );
-
-    let (content_json, content_sha256) = encode_message_content(message.content())?;
-    sqlx::query(
-        "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
-                content_sha256, author_user_id, produced_by_work_id, client_device_id, client_message_id, \
-                inbound_delivery_id, committed_at) VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, NULL, ?)",
-    )
-    .bind(message.message_id().to_string())
-    .bind(message.craxii_id().to_string())
-    .bind(message.conversation_id().to_string())
-    .bind(content_json)
-    .bind(content_sha256.to_string())
-    .bind(topology.user_id.to_string())
-    .bind(request.device_id.to_string())
-    .bind(request.client_message_id.to_string())
-    .bind(request.accepted_at.to_string())
-    .execute(transaction.connection())
-    .await
-    .map_err(SqliteAdapterError::from_sqlx)?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterMessageInsert)?;
-
-    append_event(
+    let conversation_id = topology.conversation_id;
+    let admission = super::message_admission::admit_canonical_message(
         &mut transaction,
-        prepare_event(JournalAppendIntent {
-            event_id: request.candidates.acceptance_event_id,
-            craxii_id: topology.craxii_id,
-            stream_id: JournalStreamId::Conversation(topology.conversation_id),
-            conversation_id: Some(topology.conversation_id),
-            work_id: None,
-            causation_event_id: Some(topology.conversation_created_event_id),
-            correlation_id,
-            actor: JournalActor::UserV2(topology.user_id),
-            runtime_instance_id: None,
-            payload: JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
-                message_id: message.message_id(),
-                craxii_id: message.craxii_id(),
-                conversation_id: message.conversation_id(),
-                role: message.role(),
-                content: message.content().clone(),
-                content_sha256: message.content_sha256(),
-                author_user_id: topology.user_id,
-                origin: MessageAcceptedOriginV2::Native {
-                    device_id: request.device_id,
-                    client_message_id: request.client_message_id,
-                },
-                committed_at: request.accepted_at,
-            }),
-            recorded_at: request.accepted_at,
-            occurred_at: None,
-        })?,
+        super::message_admission::CanonicalMessageAdmission {
+            topology,
+            origin: super::message_admission::CanonicalMessageOrigin::Native {
+                device_id: request.device_id,
+                client_message_id: request.client_message_id,
+            },
+            content: request.content,
+            reply_binding_id: None,
+            admitted_at: request.accepted_at,
+            candidates: super::message_admission::CanonicalMessageCandidates {
+                message_id: request.candidates.message_id,
+                work_id: request.candidates.work_id,
+                acceptance_event_id: request.candidates.acceptance_event_id,
+                queued_event_id: request.candidates.queued_event_id,
+            },
+        },
+        |step| {
+            let hook = match step {
+                super::message_admission::CanonicalMessageAdmissionStep::MessageInserted => {
+                    Stage9TestHook::AfterMessageInsert
+                }
+                super::message_admission::CanonicalMessageAdmissionStep::MessageAccepted => {
+                    Stage9TestHook::AfterMessageAccepted
+                }
+                super::message_admission::CanonicalMessageAdmissionStep::WorkInserted => {
+                    Stage9TestHook::AfterWorkInsert
+                }
+                super::message_admission::CanonicalMessageAdmissionStep::WorkInputInserted => {
+                    Stage9TestHook::AfterWorkInput
+                }
+                super::message_admission::CanonicalMessageAdmissionStep::WorkQueued => {
+                    Stage9TestHook::AfterWorkQueued
+                }
+                super::message_admission::CanonicalMessageAdmissionStep::ConversationAdvanced => {
+                    Stage9TestHook::AfterConversationAdvance
+                }
+            };
+            store.fire_stage9_test_hook(hook)
+        },
     )
     .await?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterMessageAccepted)?;
-
-    sqlx::query(
-        "INSERT INTO work_items (work_id, craxii_id, conversation_id, \
-                conversation_work_ordinal, kind, state, state_version, priority, workspace_id, \
-                runtime_instance_id, current_model_invocation_id, current_tool_execution_id, \
-                correlation_id, created_at, queued_at, started_at, cancel_requested_at, \
-                cancellation_reason_code, terminal_at, terminal_reason_code, terminal_detail_json, \
-                reply_binding_id) \
-         VALUES (?, ?, ?, ?, 'conversational', 'queued', 1, 0, ?, NULL, NULL, NULL, ?, ?, ?, \
-                 NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-    )
-    .bind(work.work_id().to_string())
-    .bind(work.craxii_id().to_string())
-    .bind(work.conversation_id().to_string())
-    .bind(work.conversation_work_ordinal().get())
-    .bind(work.workspace_id().to_string())
-    .bind(correlation_id.to_string())
-    .bind(request.accepted_at.to_string())
-    .bind(request.accepted_at.to_string())
-    .execute(transaction.connection())
-    .await
-    .map_err(SqliteAdapterError::from_sqlx)?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterWorkInsert)?;
-
-    sqlx::query(
-        "INSERT INTO work_item_inputs (work_id, input_event_id, relationship, \
-                ordinal_within_work, attached_at, attached_by_actor) \
-         VALUES (?, ?, 'trigger', 1, ?, 'user')",
-    )
-    .bind(input.work_id().to_string())
-    .bind(input.input_event_id().to_string())
-    .bind(input.attached_at().to_string())
-    .execute(transaction.connection())
-    .await
-    .map_err(SqliteAdapterError::from_sqlx)?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterWorkInput)?;
-
-    let queued_position = append_event(
-        &mut transaction,
-        prepare_event(JournalAppendIntent {
-            event_id: request.candidates.queued_event_id,
-            craxii_id: topology.craxii_id,
-            stream_id: JournalStreamId::Work(work.work_id()),
-            conversation_id: Some(topology.conversation_id),
-            work_id: Some(work.work_id()),
-            causation_event_id: Some(request.candidates.acceptance_event_id),
-            correlation_id,
-            actor: JournalActor::Craxii(topology.craxii_id),
-            runtime_instance_id: None,
-            payload: JournalEventPayload::WorkQueuedV2(WorkQueuedV2 {
-                work_id: work.work_id(),
-                craxii_id: work.craxii_id(),
-                conversation_id: work.conversation_id(),
-                conversation_work_ordinal: work.conversation_work_ordinal(),
-                kind: WorkKind::Conversational,
-                priority: 0,
-                workspace_id: work.workspace_id(),
-                correlation_id,
-                state_version: ProjectionVersion::try_new(1).map_err(|_| invalid())?,
-                created_at: work.created_at(),
-                queued_at: work.queued_at(),
-                trigger: WorkInputFactV1 {
-                    input_event_id: input.input_event_id(),
-                    relationship: input.relationship(),
-                    ordinal_within_work: input.ordinal_within_work(),
-                    attached_at: input.attached_at(),
-                    actor: input.actor(),
-                },
-                reply_binding_id: None,
-            }),
-            recorded_at: request.accepted_at,
-            occurred_at: None,
-        })?,
-    )
-    .await?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterWorkQueued)?;
-
-    advance_conversation_ordinal(
-        &mut transaction,
-        topology.conversation_id,
-        topology.conversation_version,
-        topology.next_ordinal,
-    )
-    .await
-    .map_err(map_projection_error)?;
-    store.fire_stage9_test_hook(Stage9TestHook::AfterConversationAdvance)?;
-
     let receipt = MessageCommandReceipt {
-        conversation_id: topology.conversation_id,
-        message_id: message.message_id(),
-        work_id: work.work_id(),
-        work_ordinal: work.conversation_work_ordinal(),
-        committed_cursor: queued_position.offset,
+        conversation_id,
+        message_id: admission.message_id,
+        work_id: admission.work_id,
+        work_ordinal: admission.work_ordinal,
+        committed_cursor: admission.committed_cursor,
     };
     let response_json = encode_message_receipt(&receipt)?;
     store.fire_stage9_test_hook(Stage9TestHook::BeforeClientCommandInsert)?;
@@ -736,20 +577,12 @@ async fn accept_message_inner(
     Ok(CommandOutcome::Committed(receipt))
 }
 
-struct CancellationWork {
-    craxii_id: CraxiiId,
-    conversation_id: ConversationId,
-    correlation_id: CorrelationId,
-    snapshot: WorkLifecycleSnapshot,
-    started_at: Option<UtcTimestamp>,
-}
-
 async fn load_cancellation_work(
     transaction: &mut WriteTransaction,
     work_id: WorkId,
     device_id: DeviceId,
     user_id: UserId,
-) -> Result<CancellationWork, SqliteAdapterError> {
+) -> Result<super::cancellation::LoadedCancellationWork, SqliteAdapterError> {
     let row = sqlx::query(
         "SELECT w.*, p.primary_conversation_id, p.default_workspace_id, \
                 c.owner_user_id, d.user_id AS device_user_id \
@@ -785,109 +618,7 @@ async fn load_cancellation_work(
     {
         return Err(target_not_found());
     }
-    let state = decode_work_state(&row.try_get::<String, _>("state")?)?;
-    let owner: Option<RuntimeInstanceId> = decode_optional_id(
-        row.try_get::<Option<String>, _>("runtime_instance_id")?
-            .as_deref(),
-    )?;
-    let model: Option<ModelInvocationId> = decode_optional_id(
-        row.try_get::<Option<String>, _>("current_model_invocation_id")?
-            .as_deref(),
-    )?;
-    let tool: Option<ToolExecutionId> = decode_optional_id(
-        row.try_get::<Option<String>, _>("current_tool_execution_id")?
-            .as_deref(),
-    )?;
-    let current_attempt = match (model, tool) {
-        (None, None) => CurrentWorkAttempt::None,
-        (Some(value), None) => CurrentWorkAttempt::Model(value),
-        (None, Some(value)) => CurrentWorkAttempt::Tool(value),
-        (Some(_), Some(_)) => return Err(inconsistent()),
-    };
-    let cancellation_reason = row
-        .try_get::<Option<String>, _>("cancellation_reason_code")?
-        .map(|value| decode_cancellation_reason(&value))
-        .transpose()?;
-    let terminal_reason = representative_terminal_reason(
-        state,
-        row.try_get::<Option<String>, _>("terminal_reason_code")?
-            .as_deref(),
-    )?;
-    let snapshot = WorkLifecycleSnapshot::try_new(WorkLifecycleSnapshotInput {
-        work_id,
-        state,
-        projection_version: ProjectionVersion::try_new(row.try_get("state_version")?)
-            .map_err(|_| inconsistent())?,
-        runtime_owner: owner,
-        current_attempt,
-        cancellation_reason,
-        terminal_reason,
-    })
-    .map_err(|_| inconsistent())?;
-    Ok(CancellationWork {
-        craxii_id: CraxiiId::parse_canonical(&row.try_get::<String, _>("craxii_id")?)
-            .map_err(|_| inconsistent())?,
-        conversation_id,
-        correlation_id: CorrelationId::parse_canonical(
-            &row.try_get::<String, _>("correlation_id")?,
-        )
-        .map_err(|_| inconsistent())?,
-        snapshot,
-        started_at: decode_optional_timestamp(
-            row.try_get::<Option<String>, _>("started_at")?.as_deref(),
-        )?,
-    })
-}
-
-fn representative_terminal_reason(
-    state: WorkState,
-    code: Option<&str>,
-) -> Result<Option<WorkTerminalReason>, SqliteAdapterError> {
-    match state {
-        WorkState::Completed => match code {
-            Some("answered") => Ok(Some(WorkTerminalReason::Completion(
-                WorkCompletionReason::Answered,
-            ))),
-            Some("refused") => Ok(Some(WorkTerminalReason::Completion(
-                WorkCompletionReason::Refused,
-            ))),
-            _ => Err(inconsistent()),
-        },
-        WorkState::Failed => Ok(Some(WorkTerminalReason::Failure(
-            WorkFailureReason::ProviderExhausted,
-        ))),
-        WorkState::Cancelled => match code {
-            Some("user_request") => Ok(Some(WorkTerminalReason::Cancellation(
-                WorkCancellationReason::UserRequest,
-            ))),
-            Some("graceful_shutdown") => Ok(Some(WorkTerminalReason::Cancellation(
-                WorkCancellationReason::GracefulShutdown,
-            ))),
-            _ => Err(inconsistent()),
-        },
-        WorkState::Interrupted => Ok(Some(WorkTerminalReason::Interruption(
-            WorkInterruptionReason::RuntimeOwnershipLost,
-        ))),
-        _ if code.is_none() => Ok(None),
-        _ => Err(inconsistent()),
-    }
-}
-
-async fn latest_work_event(
-    transaction: &mut WriteTransaction,
-    work_id: WorkId,
-) -> Result<JournalEventId, SqliteAdapterError> {
-    let row = sqlx::query(
-        "SELECT event_id FROM journal_events WHERE stream_id = ? \
-         ORDER BY stream_seq DESC LIMIT 1",
-    )
-    .bind(JournalStreamId::Work(work_id).to_string())
-    .fetch_optional(transaction.connection())
-    .await
-    .map_err(SqliteAdapterError::from_sqlx)?
-    .ok_or_else(inconsistent)?;
-    JournalEventId::parse_canonical(&row.try_get::<String, _>("event_id")?)
-        .map_err(|_| inconsistent())
+    super::cancellation::decode_loaded_cancellation_work(&row, work_id)
 }
 
 async fn journal_head_in_write(
@@ -900,51 +631,6 @@ async fn journal_head_in_write(
             .map_err(SqliteAdapterError::from_sqlx)?
             .ok_or_else(inconsistent)?;
     JournalOffset::try_new(value).map_err(|_| inconsistent())
-}
-
-fn journal_attempt(value: CurrentWorkAttempt) -> JournalCurrentAttempt {
-    match value {
-        CurrentWorkAttempt::None => JournalCurrentAttempt::None,
-        CurrentWorkAttempt::Model(id) => JournalCurrentAttempt::Model(id),
-        CurrentWorkAttempt::Tool(id) => JournalCurrentAttempt::Tool(id),
-    }
-}
-
-fn cancellation_payload(
-    current: &WorkLifecycleSnapshot,
-    next: &WorkLifecycleSnapshot,
-    requested_at: UtcTimestamp,
-) -> Result<JournalEventPayload, SqliteAdapterError> {
-    let terminal_reason = match next.terminal_reason() {
-        Some(WorkTerminalReason::Cancellation(WorkCancellationReason::UserRequest)) => {
-            Some(JournalWorkTerminalReason::UserRequest)
-        }
-        Some(WorkTerminalReason::Cancellation(WorkCancellationReason::GracefulShutdown)) => {
-            Some(JournalWorkTerminalReason::GracefulShutdown)
-        }
-        None => None,
-        _ => return Err(invalid()),
-    };
-    let transition = WorkTransitionV1 {
-        work_id: current.work_id(),
-        from_state: current.state(),
-        to_state: next.state(),
-        expected_state_version: current.projection_version(),
-        expected_runtime_owner: current.runtime_owner(),
-        expected_current_attempt: journal_attempt(current.current_attempt()),
-        expected_cancellation_reason: current.cancellation_reason(),
-        state_version: next.projection_version(),
-        runtime_owner: next.runtime_owner(),
-        current_attempt: journal_attempt(next.current_attempt()),
-        cancellation_reason: next.cancellation_reason(),
-        terminal_reason,
-        transitioned_at: requested_at,
-    };
-    match next.state() {
-        WorkState::CancelRequested => Ok(JournalEventPayload::WorkCancelRequested(transition)),
-        WorkState::Cancelled => Ok(JournalEventPayload::WorkCancelled(transition)),
-        _ => Err(invalid()),
-    }
 }
 
 async fn cancellation_inner(
@@ -996,75 +682,25 @@ async fn cancellation_inner(
         request.user_id,
     )
     .await?;
-    let decision = decide_cancellation(
-        &work.snapshot,
-        CancellationCheckpoint::BeforeNextIteration,
-        WorkCancellationReason::UserRequest,
+    let mutation = super::cancellation::apply_cancellation_decision(
+        &mut transaction,
+        &work,
+        request.requested_at,
+        request.event_id,
+        super::cancellation::CancellationJournalOrigin::Native {
+            device_id: request.device_id,
+        },
     )
-    .map_err(|_| inconsistent())?;
-    let (resulting_state, cleanup, cursor) = match &decision {
-        CancellationDecision::DirectCancelled { transition, .. }
-        | CancellationDecision::CancellationRequested { transition, .. } => {
-            let next = transition.next();
-            guarded_work_update(
-                &mut transaction,
-                &work.snapshot,
-                next,
-                WorkProjectionTimes {
-                    started_at: work.started_at,
-                    cancel_requested_at: if next.state() == WorkState::CancelRequested {
-                        Some(request.requested_at)
-                    } else {
-                        None
-                    },
-                    terminal_at: if next.state() == WorkState::Cancelled {
-                        Some(request.requested_at)
-                    } else {
-                        None
-                    },
-                },
-            )
-            .await
-            .map_err(map_projection_error)?;
-            let causation = latest_work_event(&mut transaction, request.work_id).await?;
-            let position = append_event(
-                &mut transaction,
-                prepare_event(JournalAppendIntent {
-                    event_id: request.event_id,
-                    craxii_id: work.craxii_id,
-                    stream_id: JournalStreamId::Work(request.work_id),
-                    conversation_id: Some(work.conversation_id),
-                    work_id: Some(request.work_id),
-                    causation_event_id: Some(causation),
-                    correlation_id: work.correlation_id,
-                    actor: JournalActor::User(Some(request.device_id)),
-                    runtime_instance_id: next.runtime_owner(),
-                    payload: cancellation_payload(&work.snapshot, next, request.requested_at)?,
-                    recorded_at: request.requested_at,
-                    occurred_at: None,
-                })?,
-            )
-            .await?;
-            (
-                next.state(),
-                if next.state() == WorkState::CancelRequested {
-                    CancellationCleanupDisposition::Pending
-                } else {
-                    CancellationCleanupDisposition::NotPending
-                },
-                position.offset,
-            )
-        }
-        CancellationDecision::AlreadyRequestedNoOp { .. } => (
-            WorkState::CancelRequested,
-            CancellationCleanupDisposition::Pending,
-            journal_head_in_write(&mut transaction).await?,
-        ),
-        CancellationDecision::AlreadyTerminalNoOp { state, .. } => (
-            *state,
-            CancellationCleanupDisposition::NotPending,
-            journal_head_in_write(&mut transaction).await?,
-        ),
+    .await?;
+    let resulting_state = mutation.resulting_state;
+    let cleanup = if resulting_state == WorkState::CancelRequested {
+        CancellationCleanupDisposition::Pending
+    } else {
+        CancellationCleanupDisposition::NotPending
+    };
+    let cursor = match mutation.committed_cursor {
+        Some(cursor) => cursor,
+        None => journal_head_in_write(&mut transaction).await?,
     };
     let receipt =
         CancellationCommandReceipt::try_new(request.work_id, resulting_state, cleanup, cursor)
@@ -1442,12 +1078,18 @@ async fn verify_cancellation_command(
                 && events.iter().any(|event| {
                     event.journal_offset <= receipt.committed_cursor
                         && event.work_id == Some(receipt.work_id)
-                        && matches!(
+                        && (matches!(
                             &event.payload,
                             JournalEventPayload::WorkCancelRequested(transition)
                                 if transition.work_id == receipt.work_id
                                     && transition.to_state == WorkState::CancelRequested
-                        )
+                        ) || matches!(
+                            &event.payload,
+                            JournalEventPayload::WorkCancelRequestedV2(cancellation)
+                                if cancellation.transition.work_id == receipt.work_id
+                                    && cancellation.transition.to_state
+                                        == WorkState::CancelRequested
+                        ))
                 })
         }
         state if state.is_terminal() => {
@@ -1463,6 +1105,9 @@ async fn verify_cancellation_command(
                         | JournalEventPayload::WorkFailed(value)
                         | JournalEventPayload::WorkCancelled(value)
                         | JournalEventPayload::WorkInterrupted(value) => value.to_state == state,
+                        JournalEventPayload::WorkCancelledV2(value) => {
+                            value.transition.to_state == state
+                        }
                         _ => false,
                     }
                 })
@@ -1600,7 +1245,7 @@ async fn verify_stage9_cancellation_events(
     Ok(())
 }
 
-fn exact_stage9_cancellation_shape(transition: &WorkTransitionV1) -> bool {
+pub(super) fn exact_stage9_cancellation_shape(transition: &WorkTransitionV1) -> bool {
     let common = transition.expected_cancellation_reason.is_none()
         && transition.runtime_owner == transition.expected_runtime_owner
         && transition.current_attempt == transition.expected_current_attempt;
