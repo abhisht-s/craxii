@@ -573,6 +573,13 @@ pub async fn run(
             .install_scheduler(scheduler)
             .await
             .map_err(|_| StartupError::RuntimeLifecycle)?;
+        // At this point recovery and consistency checks, delivery initialization, provider
+        // topology, and the scheduler's initial scan are complete. Channel work is internally
+        // safe to admit even when a retained provider startup batch still keeps public readiness
+        // false.
+        health
+            .mark_ingress_admission_ready()
+            .map_err(|_| StartupError::RuntimeLifecycle)?;
         Some(notifier)
     } else {
         None
@@ -1245,6 +1252,12 @@ mod tests {
         let scheduler_scan = startup
             .find("scheduler\n            .wait_initial_scan()")
             .expect("scheduler initial scan is awaited");
+        let scheduler_install = startup
+            .find(".install_scheduler(scheduler)")
+            .expect("scheduler ownership is installed before ingress admission");
+        let ingress_admission = startup
+            .find(".mark_ingress_admission_ready()")
+            .expect("internal ingress admission has an explicit safe point");
         let probe = startup
             .find("let initial_batch = startup_probe(")
             .expect("Telegram startup probe has an explicit retained batch");
@@ -1260,7 +1273,9 @@ mod tests {
                 && adapters < worker
                 && worker < delivery_scan
                 && delivery_scan < scheduler_scan
-                && scheduler_scan < probe
+                && scheduler_scan < scheduler_install
+                && scheduler_install < ingress_admission
+                && ingress_admission < probe
                 && probe < poller
                 && poller < handshake
         );

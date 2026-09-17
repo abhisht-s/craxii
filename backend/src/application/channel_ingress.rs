@@ -389,7 +389,7 @@ where
                 HealthState::LiveUnready | HealthState::Ready
             )
         } else {
-            self.health.snapshot().state() == HealthState::Ready
+            self.health.snapshot().is_ingress_admission_ready()
         };
         if !health_allowed {
             return Err(ChannelIngressError::new(
@@ -626,5 +626,33 @@ mod tests {
         assert!(!error.acknowledgement_safe());
         assert_eq!(format!("{error}"), "channel ingress storage failure");
         assert_eq!(format!("{error:?}"), "channel ingress storage failure");
+    }
+
+    #[tokio::test]
+    async fn ordinary_ingress_requires_internal_admission_not_public_readiness() {
+        let health = Health::new();
+        let service = ChannelIngressService::new(
+            Arc::new(FailingStore),
+            health.clone(),
+            MutationAdmission::new(),
+            NoopCommandPostCommit,
+        );
+
+        let unavailable = service
+            .classify(event("before", "hello"))
+            .await
+            .unwrap_err();
+        assert_eq!(unavailable.kind(), ChannelIngressErrorKind::Unavailable);
+
+        health.mark_ingress_admission_ready().unwrap();
+        assert!(!health.snapshot().is_ready());
+        let admitted = service.classify(event("after", "hello")).await.unwrap_err();
+        assert_eq!(admitted.kind(), ChannelIngressErrorKind::StorageFailure);
+
+        let control = service
+            .classify(event("control", "/cancel"))
+            .await
+            .unwrap_err();
+        assert_eq!(control.kind(), ChannelIngressErrorKind::StorageFailure);
     }
 }

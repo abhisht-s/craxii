@@ -4,6 +4,7 @@ use std::future::Future;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +31,10 @@ use crate::domain::{
     WorkstationId,
 };
 use crate::ports::channel_delivery::ChannelDeliveryAdapter;
+use crate::ports::channel_ingress::{
+    ChannelIngressFuture, ChannelIngressStore, ChannelIngressStoreError,
+    ChannelIngressStoreErrorKind, ChannelProviderFuture, ClassifyInboundRequest,
+};
 use crate::ports::clock::TestClock;
 use crate::ports::state_store::{
     BootstrapObservation, BootstrapStateStore, ExecutionCapabilityObservation,
@@ -42,7 +47,7 @@ use super::wire::RawUpdate;
 use super::{
     TELEGRAM_PROVIDER_KEY, TelegramDeliveryAdapter, TelegramInboundProcessor, TelegramJitterSource,
     TelegramPollBatch, TelegramPollerError, TelegramPollerErrorKind, TelegramStartupFailureBudget,
-    start_long_polling, telegram_delivery_profile, verify_startup_identity,
+    start_long_polling, startup_probe, telegram_delivery_profile, verify_startup_identity,
 };
 
 const TOKEN: &str = "123456:abcdefghijklmnopqrstuvwxyzABCDEFGH";
@@ -607,7 +612,10 @@ impl TelegramJitterSource for FixedJitter {
 }
 
 #[derive(Clone)]
-struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+struct TraceCapture {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
 
 impl<'writer> MakeWriter<'writer> for TraceCapture {
     type Writer = Self;
@@ -619,7 +627,8 @@ impl<'writer> MakeWriter<'writer> for TraceCapture {
 
 impl std::io::Write for TraceCapture {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
+        self.changed.notify_one();
         Ok(bytes.len())
     }
 
@@ -628,21 +637,39 @@ impl std::io::Write for TraceCapture {
     }
 }
 
-fn trace_dispatch() -> (tracing::Dispatch, Arc<Mutex<Vec<u8>>>) {
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let capture = TraceCapture(Arc::clone(&bytes));
+fn trace_dispatch() -> (tracing::Dispatch, TraceCapture) {
+    let capture = TraceCapture {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+        changed: Arc::new(tokio::sync::Notify::new()),
+    };
     let dispatch = tracing::Dispatch::new(
         tracing_subscriber::fmt()
             .json()
             .with_ansi(false)
-            .with_writer(capture)
+            .with_writer(capture.clone())
             .finish(),
     );
-    (dispatch, bytes)
+    (dispatch, capture)
 }
 
-fn trace_output(bytes: &Mutex<Vec<u8>>) -> String {
-    String::from_utf8(bytes.lock().unwrap().clone()).unwrap()
+fn trace_output(capture: &TraceCapture) -> String {
+    String::from_utf8(capture.bytes.lock().unwrap().clone()).unwrap()
+}
+
+async fn wait_for_trace(
+    capture: &TraceCapture,
+    expected: &str,
+) -> Result<(), tokio::time::error::Elapsed> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let changed = capture.changed.notified();
+            if trace_output(capture).contains(expected) {
+                return;
+            }
+            changed.await;
+        }
+    })
+    .await
 }
 
 fn event_count(output: &str, event_name: &str) -> usize {
@@ -718,10 +745,20 @@ async fn retryable_polling_degradation_is_safe_bounded_and_recovers_once() {
             FixedJitter,
         );
         handle.wait_started().await.unwrap();
-        wait_until(|| recorded.lock().unwrap().len() >= 2).await;
+        wait_for_trace(&traces, r#""consecutive_retry_count":2"#)
+            .await
+            .unwrap();
         assert_eq!(health.snapshot().state(), HealthState::Ready);
         assert!(!*fatal_receiver.borrow());
-        wait_until(|| trace_output(traces.as_ref()).contains("telegram_polling_recovered")).await;
+        let recovery_observed =
+            wait_for_trace(&traces, r#""event_name":"telegram_polling_recovered""#).await;
+        assert!(
+            recovery_observed.is_ok(),
+            "recovery timed out after {} requests with health {:?} and traces: {}",
+            recorded.lock().unwrap().len(),
+            health.snapshot().state(),
+            trace_output(&traces)
+        );
         assert_eq!(health.snapshot().state(), HealthState::Ready);
         assert!(!*fatal_receiver.borrow());
         handle
@@ -732,7 +769,7 @@ async fn retryable_polling_degradation_is_safe_bounded_and_recovers_once() {
     exercise.with_subscriber(dispatch).await;
     server.await.unwrap();
 
-    let output = trace_output(traces.as_ref());
+    let output = trace_output(&traces);
     let server_rejections: Vec<_> = output
         .lines()
         .filter(|line| line.contains(r#""failure_class":"server_rejected""#))
@@ -789,8 +826,9 @@ async fn healthy_polling_without_prior_degradation_emits_no_recovery() {
             FixedJitter,
         );
         handle.wait_started().await.unwrap();
-        wait_until(|| recorded.lock().unwrap().len() == 2).await;
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_for_trace(&traces, r#""failure_class":"transport_unavailable""#)
+            .await
+            .unwrap();
         assert_eq!(health.snapshot().state(), HealthState::Ready);
         assert!(!*fatal_receiver.borrow());
         handle
@@ -801,7 +839,8 @@ async fn healthy_polling_without_prior_degradation_emits_no_recovery() {
     exercise.with_subscriber(dispatch).await;
     server.await.unwrap();
 
-    let output = trace_output(traces.as_ref());
+    assert_eq!(recorded.lock().unwrap().len(), 2);
+    let output = trace_output(&traces);
     assert_eq!(event_count(&output, "telegram_polling_recovered"), 0);
 }
 
@@ -860,16 +899,24 @@ async fn three_consecutive_malformed_polls_are_fatal_but_a_valid_poll_resets_the
     let sink = Arc::new(PollingSink::default());
     let health = Health::new();
     let (fatal, mut fatal_receiver) = tokio::sync::watch::channel(false);
-    let mut handle = start_long_polling(
-        client,
-        TelegramPollBatch {
-            updates: Vec::new(),
-        },
-        sink,
-        health.clone(),
-        fatal,
-        FixedJitter,
-    );
+    // This poller emits a recovery event after the valid second response. Keep that task under a
+    // scoped dispatcher so concurrent observability tests never register the shared callsite
+    // against a no-subscriber dispatcher.
+    let (dispatch, _traces) = trace_dispatch();
+    let mut handle = async {
+        start_long_polling(
+            client,
+            TelegramPollBatch {
+                updates: Vec::new(),
+            },
+            sink,
+            health.clone(),
+            fatal,
+            FixedJitter,
+        )
+    }
+    .with_subscriber(dispatch)
+    .await;
     handle.wait_started().await.unwrap();
     wait_until(|| recorded.lock().unwrap().len() >= 4).await;
     assert!(!*fatal_receiver.borrow());
@@ -1061,10 +1108,12 @@ type Processor =
 struct InboundFixture {
     _root: TestRoot,
     guard: SqliteRuntimeGuard,
+    store: Arc<SqliteStateStore>,
     topology: TelegramOwnerTopology,
     topology_service: Arc<ChannelTopologyService<SqliteChannelIdentityStore>>,
     ingress: Arc<ChannelIngressService<SqliteStateStore, Effects>>,
     clock: Arc<TestClock>,
+    health: Health,
 }
 
 impl InboundFixture {
@@ -1087,6 +1136,12 @@ impl InboundFixture {
 }
 
 async fn inbound_fixture() -> InboundFixture {
+    let health = Health::new();
+    health.mark_ready().unwrap();
+    inbound_fixture_with_health(health).await
+}
+
+async fn inbound_fixture_with_health(health: Health) -> InboundFixture {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 4).await.unwrap();
     let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
@@ -1134,14 +1189,12 @@ async fn inbound_fixture() -> InboundFixture {
         )
         .await
         .unwrap();
-    let health = Health::new();
-    health.mark_ready().unwrap();
     let profiles =
         Arc::new(ChannelDeliveryProfileRegistry::try_new([telegram_delivery_profile()]).unwrap());
     let ingress = Arc::new(
         ChannelIngressService::new(
             Arc::clone(&store),
-            health,
+            health.clone(),
             MutationAdmission::new(),
             Effects,
         )
@@ -1150,6 +1203,7 @@ async fn inbound_fixture() -> InboundFixture {
     InboundFixture {
         _root: root,
         guard,
+        store,
         topology: TelegramOwnerTopology {
             channel_account_id: account_id,
             external_identity_id: ensured.external_identity_id,
@@ -1165,7 +1219,104 @@ async fn inbound_fixture() -> InboundFixture {
                 .unwrap(),
             Duration::ZERO,
         )),
+        health,
     }
+}
+
+struct FirstClassificationGate {
+    inner: Arc<SqliteStateStore>,
+    first: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl FirstClassificationGate {
+    fn new(inner: Arc<SqliteStateStore>) -> Self {
+        Self {
+            inner,
+            first: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl ChannelIngressStore for FirstClassificationGate {
+    fn load_channel_provider_id(
+        &self,
+        channel_account_id: ChannelAccountId,
+    ) -> ChannelProviderFuture<'_> {
+        self.inner.load_channel_provider_id(channel_account_id)
+    }
+
+    fn classify_inbound(&self, request: ClassifyInboundRequest) -> ChannelIngressFuture<'_> {
+        Box::pin(async move {
+            if self.first.swap(false, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.classify_inbound(request).await
+        })
+    }
+}
+
+struct FailFirstClassification {
+    inner: Arc<SqliteStateStore>,
+    calls: AtomicUsize,
+}
+
+impl ChannelIngressStore for FailFirstClassification {
+    fn load_channel_provider_id(
+        &self,
+        channel_account_id: ChannelAccountId,
+    ) -> ChannelProviderFuture<'_> {
+        self.inner.load_channel_provider_id(channel_account_id)
+    }
+
+    fn classify_inbound(&self, request: ClassifyInboundRequest) -> ChannelIngressFuture<'_> {
+        Box::pin(async move {
+            if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                Err(ChannelIngressStoreError::new(
+                    ChannelIngressStoreErrorKind::Storage,
+                ))
+            } else {
+                self.inner.classify_inbound(request).await
+            }
+        })
+    }
+}
+
+async fn run_retained_update(fixture: &InboundFixture, retained: Value) {
+    assert_eq!(fixture.health.snapshot().state(), HealthState::LiveUnready);
+    assert!(fixture.health.snapshot().is_ingress_admission_ready());
+    let (client, recorded, server) = client_with(vec![
+        ResponseSpec::json(200, json!({"ok":true,"result":[retained]})),
+        ResponseSpec::json(200, json!({"ok":true,"result":[]})),
+    ])
+    .await;
+    let mut budget = TelegramStartupFailureBudget::default();
+    let initial_batch = startup_probe(client.as_ref(), &mut FixedJitter, &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(fixture.health.snapshot().state(), HealthState::LiveUnready);
+    let (fatal, fatal_receiver) = tokio::sync::watch::channel(false);
+    let mut handle = start_long_polling(
+        client,
+        initial_batch,
+        fixture.processor(),
+        fixture.health.clone(),
+        fatal,
+        FixedJitter,
+    );
+    handle.wait_started().await.unwrap();
+    assert_eq!(fixture.health.snapshot().state(), HealthState::Ready);
+    assert!(!*fatal_receiver.borrow());
+    wait_until(|| recorded.lock().unwrap().len() == 2).await;
+    handle
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
 }
 
 fn update(value: Value) -> RawUpdate {
@@ -1173,7 +1324,11 @@ fn update(value: Value) -> RawUpdate {
 }
 
 fn text_update(update_id: i64, text: &str) -> RawUpdate {
-    update(json!({
+    update(text_update_value(update_id, text))
+}
+
+fn text_update_value(update_id: i64, text: &str) -> Value {
+    json!({
         "update_id": update_id,
         "message": {
             "message_id": update_id + 100,
@@ -1182,7 +1337,305 @@ fn text_update(update_id: i64, text: &str) -> RawUpdate {
             "date": 1789516923,
             "text": text
         }
-    }))
+    })
+}
+
+#[tokio::test]
+async fn retained_startup_text_uses_internal_admission_before_public_readiness() {
+    let health = Health::new();
+    let fixture = inbound_fixture_with_health(health.clone()).await;
+    assert!(!health.snapshot().is_ingress_admission_ready());
+    health.mark_ingress_admission_ready().unwrap();
+
+    let gate = Arc::new(FirstClassificationGate::new(Arc::clone(&fixture.store)));
+    let ingress = Arc::new(
+        ChannelIngressService::new(
+            Arc::clone(&gate),
+            health.clone(),
+            MutationAdmission::new(),
+            Effects,
+        )
+        .with_delivery(
+            Arc::new(
+                ChannelDeliveryProfileRegistry::try_new([telegram_delivery_profile()]).unwrap(),
+            ),
+            DeliveryNotifier::new(),
+        ),
+    );
+    let processor = Arc::new(TelegramInboundProcessor::new(
+        fixture.topology,
+        Arc::clone(&fixture.topology_service),
+        ingress,
+        Arc::clone(&fixture.clock),
+    ));
+    let (client, recorded, server) = client_with(vec![
+        ResponseSpec::json(
+            200,
+            json!({"ok":true,"result":[text_update_value(10, "retained startup work")]}),
+        ),
+        ResponseSpec::json(200, json!({"ok":true,"result":[]})),
+    ])
+    .await;
+    let mut budget = TelegramStartupFailureBudget::default();
+    let initial_batch = startup_probe(client.as_ref(), &mut FixedJitter, &mut budget)
+        .await
+        .unwrap();
+    assert_eq!(health.snapshot().state(), HealthState::LiveUnready);
+    let (fatal, fatal_receiver) = tokio::sync::watch::channel(false);
+    let mut handle = start_long_polling(
+        client,
+        initial_batch,
+        Arc::clone(&processor),
+        health.clone(),
+        fatal,
+        FixedJitter,
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(health.snapshot().state(), HealthState::LiveUnready);
+    assert!(health.snapshot().is_ingress_admission_ready());
+    assert!(!health.snapshot().is_ready());
+    assert_eq!(fixture.count("inbound_deliveries").await, 0);
+    assert_eq!(fixture.count("messages").await, 0);
+    assert_eq!(fixture.count("work_items").await, 0);
+
+    gate.release.notify_one();
+    handle.wait_started().await.unwrap();
+    assert_eq!(health.snapshot().state(), HealthState::Ready);
+    assert!(!*fatal_receiver.borrow());
+    assert_eq!(fixture.count("inbound_deliveries").await, 1);
+    assert_eq!(fixture.count("messages").await, 1);
+    assert_eq!(fixture.count("work_items").await, 1);
+    assert_eq!(fixture.count("conversation_bindings").await, 1);
+    let mut connection = fixture.guard.runtime().acquire_for_test().await.unwrap();
+    let row = sqlx::query(
+        "SELECT d.receipt_state, d.classification, w.reply_binding_id, \
+                b.conversation_binding_id \
+         FROM inbound_deliveries d \
+         JOIN work_items w ON w.work_id = d.work_id \
+         JOIN conversation_bindings b ON b.conversation_binding_id = w.reply_binding_id \
+         WHERE d.external_event_id = '10'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("receipt_state").unwrap(),
+        "classified"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("classification").unwrap(),
+        "message"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("reply_binding_id").unwrap(),
+        row.try_get::<String, _>("conversation_binding_id").unwrap()
+    );
+    drop(connection);
+
+    processor
+        .process_update(text_update(11, "normal post-startup work"))
+        .await
+        .unwrap();
+    assert_eq!(fixture.count("messages").await, 2);
+    assert_eq!(fixture.count("work_items").await, 2);
+
+    wait_until(|| recorded.lock().unwrap().len() == 2).await;
+    let request = serde_json::from_slice::<Value>(&recorded.lock().unwrap()[1].body).unwrap();
+    assert_eq!(request["offset"], 11);
+    handle
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_startup_unsupported_is_durable_before_public_readiness() {
+    let health = Health::new();
+    let fixture = inbound_fixture_with_health(health.clone()).await;
+    health.mark_ingress_admission_ready().unwrap();
+    run_retained_update(
+        &fixture,
+        json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 120,
+                "from": {"id": 20002, "is_bot": false},
+                "chat": {"id": 20002, "type": "private"},
+                "date": 1789516923,
+                "photo": [{"file_id": "never-fetched"}]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(fixture.count("inbound_deliveries").await, 1);
+    assert_eq!(fixture.count("work_items").await, 0);
+    let mut connection = fixture.guard.runtime().acquire_for_test().await.unwrap();
+    let row = sqlx::query(
+        "SELECT receipt_state, classification FROM inbound_deliveries \
+         WHERE external_event_id = '20' ",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("receipt_state").unwrap(),
+        "classified"
+    );
+    assert!(matches!(
+        row.try_get::<String, _>("classification").unwrap().as_str(),
+        "unsupported" | "rejected"
+    ));
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_startup_unauthorized_is_rejected_before_public_readiness() {
+    let health = Health::new();
+    let fixture = inbound_fixture_with_health(health.clone()).await;
+    health.mark_ingress_admission_ready().unwrap();
+    run_retained_update(
+        &fixture,
+        json!({
+            "update_id": 30,
+            "message": {
+                "message_id": 130,
+                "from": {"id": 99999, "is_bot": false},
+                "chat": {"id": 99999, "type": "private"},
+                "date": 1789516923,
+                "text": "unauthorized"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(fixture.count("inbound_deliveries").await, 1);
+    assert_eq!(fixture.count("conversation_bindings").await, 0);
+    assert_eq!(fixture.count("work_items").await, 0);
+    let mut connection = fixture.guard.runtime().acquire_for_test().await.unwrap();
+    let classification = sqlx::query_scalar::<_, String>(
+        "SELECT classification FROM inbound_deliveries WHERE external_event_id = '30'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(classification, "rejected");
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_startup_control_uses_existing_generic_control_semantics() {
+    let health = Health::new();
+    let fixture = inbound_fixture_with_health(health.clone()).await;
+    health.mark_ingress_admission_ready().unwrap();
+    run_retained_update(&fixture, text_update_value(40, "/cancel")).await;
+    assert_eq!(fixture.count("inbound_deliveries").await, 1);
+    assert_eq!(fixture.count("messages").await, 0);
+    assert_eq!(fixture.count("work_items").await, 0);
+    assert_eq!(fixture.count("outbound_deliveries").await, 1);
+    let mut connection = fixture.guard.runtime().acquire_for_test().await.unwrap();
+    let row = sqlx::query(
+        "SELECT i.classification, o.control_outcome \
+         FROM inbound_deliveries i \
+         JOIN outbound_deliveries o ON o.source_inbound_delivery_id = i.inbound_delivery_id \
+         WHERE i.external_event_id = '40'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.try_get::<String, _>("classification").unwrap(),
+        "control"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("control_outcome").unwrap(),
+        "no_op"
+    );
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn retained_startup_storage_failure_blocks_readiness_and_later_updates() {
+    let health = Health::new();
+    let fixture = inbound_fixture_with_health(health.clone()).await;
+    health.mark_ingress_admission_ready().unwrap();
+    let failing = Arc::new(FailFirstClassification {
+        inner: Arc::clone(&fixture.store),
+        calls: AtomicUsize::new(0),
+    });
+    let ingress = Arc::new(ChannelIngressService::new(
+        Arc::clone(&failing),
+        health.clone(),
+        MutationAdmission::new(),
+        Effects,
+    ));
+    let processor = Arc::new(TelegramInboundProcessor::new(
+        fixture.topology,
+        Arc::clone(&fixture.topology_service),
+        ingress,
+        Arc::clone(&fixture.clock),
+    ));
+    let (client, recorded, server) = client_with(vec![ResponseSpec::json(
+        200,
+        json!({
+            "ok":true,
+            "result":[
+                text_update_value(50, "must fail"),
+                text_update_value(51, "must not skip")
+            ]
+        }),
+    )])
+    .await;
+    let mut budget = TelegramStartupFailureBudget::default();
+    let initial_batch = startup_probe(client.as_ref(), &mut FixedJitter, &mut budget)
+        .await
+        .unwrap();
+    let (fatal, mut fatal_receiver) = tokio::sync::watch::channel(false);
+    let mut handle = start_long_polling(
+        client,
+        initial_batch,
+        processor,
+        health.clone(),
+        fatal,
+        FixedJitter,
+    );
+    assert_eq!(
+        handle.wait_started().await.unwrap_err().kind(),
+        TelegramPollerErrorKind::RetryableState
+    );
+    tokio::time::timeout(Duration::from_secs(2), fatal_receiver.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(*fatal_receiver.borrow());
+    assert_eq!(health.snapshot().state(), HealthState::Fatal);
+    assert!(!health.snapshot().is_ready());
+    assert_eq!(failing.calls.load(Ordering::Acquire), 1);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    assert!(
+        serde_json::from_slice::<Value>(&recorded.lock().unwrap()[0].body)
+            .unwrap()
+            .get("offset")
+            .is_none()
+    );
+    assert_eq!(fixture.count("inbound_deliveries").await, 0);
+    assert_eq!(fixture.count("work_items").await, 0);
+    assert_eq!(
+        handle
+            .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap_err()
+            .kind(),
+        TelegramPollerErrorKind::RetryableState
+    );
+    server.await.unwrap();
+    fixture.guard.shutdown().await;
 }
 
 #[tokio::test]

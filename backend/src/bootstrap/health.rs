@@ -47,6 +47,7 @@ impl HealthReasonCode {
 pub struct HealthSnapshot {
     state: HealthState,
     reason: HealthReasonCode,
+    ingress_admission_ready: bool,
 }
 
 impl HealthSnapshot {
@@ -65,6 +66,15 @@ impl HealthSnapshot {
     pub const fn is_ready(self) -> bool {
         matches!(self.state, HealthState::Ready)
     }
+
+    /// Whether provider-neutral channel ingress may safely create canonical work.
+    ///
+    /// This is deliberately narrower than public runtime readiness: startup providers may need
+    /// to durably classify retained input before the runtime can advertise itself as ready.
+    pub const fn is_ingress_admission_ready(self) -> bool {
+        self.ingress_admission_ready
+            && matches!(self.state, HealthState::LiveUnready | HealthState::Ready)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +88,7 @@ impl Health {
             state: Arc::new(RwLock::new(HealthSnapshot {
                 state: HealthState::LiveUnready,
                 reason: HealthReasonCode::Starting,
+                ingress_admission_ready: false,
             })),
         }
     }
@@ -88,7 +99,24 @@ impl Health {
             Err(_) => HealthSnapshot {
                 state: HealthState::Fatal,
                 reason: HealthReasonCode::SynchronizationFailure,
+                ingress_admission_ready: false,
             },
+        }
+    }
+
+    /// Opens internal channel ingress admission without changing externally visible readiness.
+    pub fn mark_ingress_admission_ready(&self) -> Result<(), HealthTransitionError> {
+        let mut current = self
+            .state
+            .write()
+            .map_err(|_| HealthTransitionError::SynchronizationFailure)?;
+        match current.state {
+            HealthState::LiveUnready | HealthState::Ready => {
+                current.ingress_admission_ready = true;
+                Ok(())
+            }
+            HealthState::Fatal => Err(HealthTransitionError::FatalIsTerminal),
+            HealthState::Draining => Err(HealthTransitionError::InvalidIngressAdmissionTransition),
         }
     }
 
@@ -136,7 +164,13 @@ impl Health {
                 to: state,
             });
         }
-        *current = HealthSnapshot { state, reason };
+        let ingress_admission_ready =
+            current.ingress_admission_ready || state == HealthState::Ready;
+        *current = HealthSnapshot {
+            state,
+            reason,
+            ingress_admission_ready,
+        };
         Ok(())
     }
 }
@@ -157,6 +191,7 @@ pub enum FatalReasonCode {
 pub enum HealthTransitionError {
     FatalIsTerminal,
     InvalidTransition { from: HealthState, to: HealthState },
+    InvalidIngressAdmissionTransition,
     SynchronizationFailure,
 }
 
@@ -165,6 +200,9 @@ impl Display for HealthTransitionError {
         formatter.write_str(match self {
             Self::FatalIsTerminal => "fatal health state is terminal",
             Self::InvalidTransition { .. } => "invalid health state transition",
+            Self::InvalidIngressAdmissionTransition => {
+                "invalid ingress admission readiness transition"
+            }
             Self::SynchronizationFailure => "health state synchronization failed",
         })
     }
@@ -185,6 +223,24 @@ mod tests {
         assert_eq!(snapshot.reason(), HealthReasonCode::Starting);
         assert!(snapshot.is_live());
         assert!(!snapshot.is_ready());
+        assert!(!snapshot.is_ingress_admission_ready());
+    }
+
+    #[test]
+    fn ingress_admission_can_open_without_public_readiness_and_closes_on_shutdown() {
+        let health = Health::new();
+        health.mark_ingress_admission_ready().unwrap();
+        let snapshot = health.snapshot();
+        assert_eq!(snapshot.state(), HealthState::LiveUnready);
+        assert!(snapshot.is_ingress_admission_ready());
+        assert!(!snapshot.is_ready());
+
+        health.mark_draining().unwrap();
+        assert!(!health.snapshot().is_ingress_admission_ready());
+        assert_eq!(
+            health.mark_ingress_admission_ready(),
+            Err(HealthTransitionError::InvalidIngressAdmissionTransition)
+        );
     }
 
     #[test]
@@ -193,6 +249,7 @@ mod tests {
         health.mark_ready().unwrap();
         assert!(health.snapshot().is_live());
         assert!(health.snapshot().is_ready());
+        assert!(health.snapshot().is_ingress_admission_ready());
 
         health.mark_draining().unwrap();
         let snapshot = health.snapshot();
