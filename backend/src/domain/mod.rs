@@ -173,6 +173,7 @@ mod authentication;
 mod channel;
 mod command;
 mod content;
+mod delivery;
 mod digest;
 mod entities;
 mod error;
@@ -203,6 +204,11 @@ pub use command::{
     IdempotencyKey, MessageCommandReceipt,
 };
 pub use content::{ContentBlock, ContentVersion, MAX_CONTENT_TEXT_BYTES, MessageContent};
+pub use delivery::{
+    ChannelDeliveryProfile, ChannelDispatchResult, ControlAcknowledgementOutcome, DeliveryFailure,
+    DeliveryFailureClass, DeliveryFailureCode, DeliverySource, OutboundDelivery,
+    OutboundDeliveryAttempt, OutboundDeliveryState, PreparedChannelDispatch,
+};
 pub use digest::{CanonicalByteCount, Sha256Digest};
 pub use entities::{
     Conversation, ConversationKind, ConversationLifecycle, CraxiiLifecycle, CraxiiPrincipal,
@@ -233,8 +239,8 @@ pub use ids::{
     ArtifactId, ChannelAccountId, ClientCommandId, ClientMessageId, ContextManifestId,
     ConversationBindingId, ConversationId, CorrelationId, CraxiiId, DeviceId, DraftId, ExecutionId,
     ExternalIdentityId, InboundDeliveryId, JournalEventId, LogicalInvocationId, MessageId,
-    ModelInvocationId, OperationId, RuntimeInstanceId, ToolExecutionId, UserId, WorkId,
-    WorkspaceId, WorkstationId,
+    ModelInvocationId, OperationId, OutboundDeliveryAttemptId, OutboundDeliveryId,
+    RuntimeInstanceId, ToolExecutionId, UserId, WorkId, WorkspaceId, WorkstationId,
 };
 pub use journal::{
     ArtifactRecordedV1, ConversationCreatedV1, ConversationCreatedV2, CraxiiInitializedV1,

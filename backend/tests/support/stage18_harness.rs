@@ -63,7 +63,7 @@ const PROVIDER_ID: &str = "stage18-scripted";
 const TARGET_ID: &str = "stage18-primary";
 const ESTIMATOR_ID: &str = "stage18_fixed";
 const SHELL: &str = "/bin/bash";
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const T0: &str = "2026-09-01T00:00:00.000000Z";
 const REQUESTED_OUTPUT_TOKENS: i64 = 512;
 

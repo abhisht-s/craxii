@@ -9,13 +9,15 @@ use crate::application::channel_ingress::{
     VerifiedInboundPayload,
 };
 use crate::domain::{
-    ChannelAccountId, ExternalConversationId, ExternalEventId, ExternalMessageId,
-    ExternalSubjectId, ExternalThreadId, InboundDeliveryId, JournalEventId, MessageId,
-    Sha256Digest, UtcTimestamp, WorkId,
+    ChannelAccountId, ChannelDeliveryProfile, ChannelProviderId, ExternalConversationId,
+    ExternalEventId, ExternalMessageId, ExternalSubjectId, ExternalThreadId, InboundDeliveryId,
+    JournalEventId, MessageId, OutboundDeliveryId, Sha256Digest, UtcTimestamp, WorkId,
 };
 
 pub type ChannelIngressFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ClassifiedInbound, ChannelIngressStoreError>> + Send + 'a>>;
+pub type ChannelProviderFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ChannelProviderId, ChannelIngressStoreError>> + Send + 'a>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ChannelIngressStoreErrorKind {
@@ -71,6 +73,7 @@ pub struct InboundCandidates {
     pub acceptance_event_id: JournalEventId,
     pub queued_event_id: JournalEventId,
     pub cancellation_event_id: JournalEventId,
+    pub outbound_delivery_id: OutboundDeliveryId,
 }
 
 /// Complete normalized intent for one atomic durable classification.
@@ -86,6 +89,7 @@ pub struct ClassifyInboundRequest {
     pub observed_at: UtcTimestamp,
     pub material_digest: Sha256Digest,
     pub is_control: bool,
+    pub delivery_profile: Option<ChannelDeliveryProfile>,
     pub candidates: InboundCandidates,
 }
 
@@ -99,11 +103,14 @@ pub(crate) enum InboundPostCommitEffect {
     ActiveCancellationCommitted {
         work_id: WorkId,
         cursor: crate::domain::JournalOffset,
+        delivery_created: bool,
     },
     DirectCancellationCommitted {
         work_id: WorkId,
         cursor: crate::domain::JournalOffset,
+        delivery_created: bool,
     },
+    ControlAcknowledgementCommitted,
 }
 
 pub struct ClassifiedInbound {
@@ -138,5 +145,10 @@ impl ClassifiedInbound {
 
 /// The store owns dedupe, topology resolution, and exactly one atomic classification transaction.
 pub trait ChannelIngressStore: Send + Sync {
+    fn load_channel_provider_id(
+        &self,
+        channel_account_id: ChannelAccountId,
+    ) -> ChannelProviderFuture<'_>;
+
     fn classify_inbound(&self, request: ClassifyInboundRequest) -> ChannelIngressFuture<'_>;
 }

@@ -2802,7 +2802,7 @@ async fn assert_persistence_contract(
 ) -> PersistedSummary {
     let data = &export["data"];
     let preflight = &data["preflight"];
-    assert_eq!(preflight["schema_version"], 6);
+    assert_eq!(preflight["schema_version"], 7);
     assert_eq!(preflight["database_disposition"], "current");
     assert_eq!(preflight["work_count"], 2);
     assert_eq!(preflight["runtime_count"], 2);
@@ -3175,6 +3175,7 @@ async fn assert_sqlite_contract(database: &Path) {
             (4, true),
             (5, true),
             (6, true),
+            (7, true),
         ]
     );
     let mut migration_files: Vec<String> =
@@ -3192,6 +3193,7 @@ async fn assert_sqlite_contract(database: &Path) {
             "0004_model_attempt_outcome_evidence.sql",
             "0005_tool_terminal_outcome_evidence.sql",
             "0006_chat_channel_identity_and_ingress.sql",
+            "0007_durable_channel_delivery.sql",
         ]
     );
 }

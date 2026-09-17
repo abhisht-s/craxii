@@ -140,6 +140,14 @@ canonical_id!(
     InboundDeliveryId,
     "The durable identity of one normalized inbound delivery."
 );
+canonical_id!(
+    OutboundDeliveryId,
+    "The durable identity of one persisted outbound payload part."
+);
+canonical_id!(
+    OutboundDeliveryAttemptId,
+    "The durable identity of one outbound dispatch attempt."
+);
 canonical_id!(ConversationId, "The durable identity of a conversation.");
 canonical_id!(MessageId, "The durable identity of a committed message.");
 canonical_id!(WorkId, "The durable identity of a work item.");
@@ -193,6 +201,8 @@ server_generated_id!(ChannelAccountId);
 server_generated_id!(ExternalIdentityId);
 server_generated_id!(ConversationBindingId);
 server_generated_id!(InboundDeliveryId);
+server_generated_id!(OutboundDeliveryId);
+server_generated_id!(OutboundDeliveryAttemptId);
 server_generated_id!(ConversationId);
 server_generated_id!(MessageId);
 server_generated_id!(WorkId);
@@ -262,6 +272,8 @@ mod tests {
         assert_id_contract!(ExternalIdentityId);
         assert_id_contract!(ConversationBindingId);
         assert_id_contract!(InboundDeliveryId);
+        assert_id_contract!(OutboundDeliveryId);
+        assert_id_contract!(OutboundDeliveryAttemptId);
         assert_id_contract!(ConversationId);
         assert_id_contract!(MessageId);
         assert_id_contract!(WorkId);

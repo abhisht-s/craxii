@@ -5,12 +5,14 @@ use std::sync::Arc;
 
 use crate::application::command_service::CommandPostCommit;
 use crate::application::control_message_policy::ControlMessagePolicy;
+use crate::application::delivery_planner::ChannelDeliveryProfileRegistry;
+use crate::application::delivery_worker::DeliveryNotifier;
 use crate::application::transport::MutationAdmission;
 use crate::bootstrap::health::{Health, HealthState};
 use crate::domain::{
     ChannelAccountId, ExternalConversationId, ExternalEventId, ExternalMessageId,
     ExternalSubjectId, ExternalThreadId, InboundDeliveryId, JournalEventId, JournalOffset,
-    MessageContent, MessageId, Sha256Digest, UtcTimestamp, WorkId,
+    MessageContent, MessageId, OutboundDeliveryId, Sha256Digest, UtcTimestamp, WorkId,
 };
 use crate::ports::channel_ingress::{
     ChannelIngressStore, ChannelIngressStoreError, ChannelIngressStoreErrorKind,
@@ -333,6 +335,8 @@ pub struct ChannelIngressService<S, H> {
     health: Health,
     admission: MutationAdmission,
     post_commit: H,
+    delivery_profiles: Arc<ChannelDeliveryProfileRegistry>,
+    delivery_notifier: DeliveryNotifier,
 }
 
 impl<S, H> ChannelIngressService<S, H>
@@ -341,7 +345,7 @@ where
     H: CommandPostCommit,
 {
     #[must_use]
-    pub const fn new(
+    pub fn new(
         store: Arc<S>,
         health: Health,
         admission: MutationAdmission,
@@ -352,7 +356,20 @@ where
             health,
             admission,
             post_commit,
+            delivery_profiles: Arc::new(ChannelDeliveryProfileRegistry::default()),
+            delivery_notifier: DeliveryNotifier::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_delivery(
+        mut self,
+        profiles: Arc<ChannelDeliveryProfileRegistry>,
+        notifier: DeliveryNotifier,
+    ) -> Self {
+        self.delivery_profiles = profiles;
+        self.delivery_notifier = notifier;
+        self
     }
 
     pub async fn classify(
@@ -385,6 +402,16 @@ where
             .await
             .map_err(|_| ChannelIngressError::new(ChannelIngressErrorKind::Unavailable))?;
         let material_digest = event.material_digest();
+        let delivery_profile = if is_control {
+            let provider_id = self
+                .store
+                .load_channel_provider_id(event.channel_account_id)
+                .await
+                .map_err(map_store_error)?;
+            self.delivery_profiles.profile(&provider_id).cloned()
+        } else {
+            None
+        };
         let classified = self
             .store
             .classify_inbound(ClassifyInboundRequest {
@@ -399,6 +426,7 @@ where
                 observed_at: event.observed_at,
                 material_digest,
                 is_control,
+                delivery_profile,
                 candidates: InboundCandidates {
                     inbound_delivery_id: InboundDeliveryId::generate(),
                     message_id: MessageId::generate(),
@@ -406,6 +434,7 @@ where
                     acceptance_event_id: JournalEventId::generate(),
                     queued_event_id: JournalEventId::generate(),
                     cancellation_event_id: JournalEventId::generate(),
+                    outbound_delivery_id: OutboundDeliveryId::generate(),
                 },
             })
             .await
@@ -415,13 +444,30 @@ where
             InboundPostCommitEffect::MessageCommitted { work_id, cursor } => {
                 self.post_commit.message_committed(work_id, cursor);
             }
-            InboundPostCommitEffect::ActiveCancellationCommitted { work_id, cursor } => {
+            InboundPostCommitEffect::ActiveCancellationCommitted {
+                work_id,
+                cursor,
+                delivery_created,
+            } => {
                 self.post_commit
                     .active_cancellation_committed(work_id, cursor);
+                if delivery_created {
+                    self.delivery_notifier.wake();
+                }
             }
-            InboundPostCommitEffect::DirectCancellationCommitted { work_id, cursor } => {
+            InboundPostCommitEffect::DirectCancellationCommitted {
+                work_id,
+                cursor,
+                delivery_created,
+            } => {
                 self.post_commit
                     .direct_cancellation_committed(work_id, cursor);
+                if delivery_created {
+                    self.delivery_notifier.wake();
+                }
+            }
+            InboundPostCommitEffect::ControlAcknowledgementCommitted => {
+                self.delivery_notifier.wake()
             }
         }
         Ok(classified.result)
@@ -451,6 +497,17 @@ mod tests {
     struct FailingStore;
 
     impl ChannelIngressStore for FailingStore {
+        fn load_channel_provider_id(
+            &self,
+            _: ChannelAccountId,
+        ) -> crate::ports::channel_ingress::ChannelProviderFuture<'_> {
+            Box::pin(async {
+                Err(ChannelIngressStoreError::new(
+                    ChannelIngressStoreErrorKind::Storage,
+                ))
+            })
+        }
+
         fn classify_inbound(&self, _request: ClassifyInboundRequest) -> ChannelIngressFuture<'_> {
             Box::pin(async {
                 Err(ChannelIngressStoreError::new(

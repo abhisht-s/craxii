@@ -273,6 +273,10 @@ impl SqliteStateStore {
             super::channel_ingress::verify_channel_ingress_consistency(&mut transaction, &events,)
                 .await
         );
+        let delivery_invariants = consistency_step!(
+            "outbound_delivery",
+            super::delivery::verify_delivery_consistency_inner(&mut transaction).await
+        );
         let stage10_invariants = consistency_step!(
             "stage10",
             super::stage10::verify_stage10_consistency(&mut transaction, &projected, &events).await
@@ -288,6 +292,7 @@ impl SqliteStateStore {
                 + stage8_invariants
                 + stage9_invariants
                 + channel_ingress_invariants
+                + delivery_invariants
                 + stage10_invariants,
             journal_head,
         })

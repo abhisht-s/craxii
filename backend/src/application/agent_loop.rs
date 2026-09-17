@@ -8,6 +8,10 @@ use crate::application::authority::V0AuthorityConstraints;
 use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyErrorKind, ContextAssemblyVersions,
 };
+use crate::application::delivery_planner::{
+    ChannelDeliveryProfileRegistry, plan_assistant_delivery,
+};
+use crate::application::delivery_worker::DeliveryNotifier;
 use crate::application::model_gateway::{
     DraftAbandonCause, DurableModelAttempt, DurableModelOutcome, GatewayInvocation, ModelGateway,
 };
@@ -28,6 +32,7 @@ use crate::domain::{
     decide_work_transition,
 };
 use crate::ports::clock::{Clock, MonotonicInstant};
+use crate::ports::delivery_store::{DeliveryStore, LoadDeliveryRouteRequest};
 use crate::ports::model_provider::ProviderErrorKind;
 use crate::ports::state_store::{
     CommitAssistantCompletionRequest, CompletionStateStore, EventIntent, LoadOwnedWorkRequest,
@@ -41,9 +46,9 @@ pub const MAX_TOOL_CALLS_PER_WORK: u32 = 32;
 pub const MAX_WORK_DURATION: Duration = Duration::from_secs(30 * 60);
 
 /// Exact state-store capabilities the loop needs; SQL and adapter types remain behind the port.
-pub trait AgentLoopStateStore: ModelStateStore + CompletionStateStore {}
+pub trait AgentLoopStateStore: ModelStateStore + CompletionStateStore + DeliveryStore {}
 
-impl<T> AgentLoopStateStore for T where T: ModelStateStore + CompletionStateStore {}
+impl<T> AgentLoopStateStore for T where T: ModelStateStore + CompletionStateStore + DeliveryStore {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentLoopLimits {
@@ -125,6 +130,8 @@ pub struct AgentLoop {
     required_capabilities: RequiredModelCapabilities,
     runtime_context: AgentLoopRuntimeContext,
     limits: AgentLoopLimits,
+    delivery_profiles: Arc<ChannelDeliveryProfileRegistry>,
+    delivery_notifier: DeliveryNotifier,
 }
 
 impl fmt::Debug for AgentLoop {
@@ -175,7 +182,21 @@ impl AgentLoop {
             required_capabilities,
             runtime_context,
             limits: limits.validate()?,
+            delivery_profiles: Arc::new(ChannelDeliveryProfileRegistry::default()),
+            delivery_notifier: DeliveryNotifier::new(),
         })
+    }
+
+    /// Installs the immutable delivery-planning catalog and shared lossy wake hint.
+    #[must_use]
+    pub fn with_delivery(
+        mut self,
+        profiles: Arc<ChannelDeliveryProfileRegistry>,
+        notifier: DeliveryNotifier,
+    ) -> Self {
+        self.delivery_profiles = profiles;
+        self.delivery_notifier = notifier;
+        self
     }
 
     async fn run(
@@ -565,6 +586,26 @@ impl AgentLoop {
             Ok(value) => value,
             Err(_) => return WorkRunnerExit::Abnormal,
         };
+        let deliveries = if let Some(binding_id) = work_item.reply_binding_id() {
+            let route = match self
+                .state_store
+                .load_delivery_route(LoadDeliveryRouteRequest {
+                    work_id: work_item.work_id(),
+                    conversation_binding_id: binding_id,
+                })
+                .await
+            {
+                Ok(route) => route,
+                Err(_) => return WorkRunnerExit::Abnormal,
+            };
+            match plan_assistant_delivery(&message, &route, self.delivery_profiles.as_ref()) {
+                Ok(deliveries) if !deliveries.is_empty() => deliveries,
+                _ => return WorkRunnerExit::Abnormal,
+            }
+        } else {
+            Vec::new()
+        };
+        let has_deliveries = !deliveries.is_empty();
         let assistant_event = JournalEventId::generate();
         match self
             .state_store
@@ -586,6 +627,7 @@ impl AgentLoop {
                     causation_event_id: Some(assistant_event),
                 },
                 work_next: completed,
+                deliveries,
             })
             .await
         {
@@ -596,6 +638,9 @@ impl AgentLoop {
                 );
                 self.model_gateway
                     .finalize_drafts_for_work(work_item.work_id());
+                if has_deliveries {
+                    self.delivery_notifier.wake();
+                }
                 WorkRunnerExit::TerminalCommitted
             }
             Err(_) => {

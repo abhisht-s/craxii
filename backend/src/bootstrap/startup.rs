@@ -23,6 +23,10 @@ use crate::application::authority::{
 use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
 };
+use crate::application::delivery_planner::ChannelDeliveryProfileRegistry;
+use crate::application::delivery_worker::{
+    DeliveryJitterSource, DeliveryNotifier, DeliveryWorkerHandle, start_delivery_worker,
+};
 use crate::application::event_delivery::LiveEventBroker;
 use crate::application::model_gateway::{DraftSink, ModelGateway, ModelGatewayLimits};
 use crate::application::model_selection::{ModelSelectionPolicy, ModelTargetSnapshot};
@@ -43,8 +47,10 @@ use crate::domain::{
     UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
 };
 use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
+use crate::ports::channel_delivery::ChannelDeliveryAdapterRegistry;
 use crate::ports::clock::Clock;
 use crate::ports::context_source_store::ContextSourceStore;
+use crate::ports::delivery_store::{DeliveryStore, RecoverDeliveriesRequest};
 use crate::ports::model_provider::{FullJitterSource, ModelProvider, TokenEstimator};
 use crate::ports::runtime_observation::RuntimeProcessObserver;
 use crate::ports::state_store::{
@@ -247,7 +253,7 @@ pub async fn run(
             .map_err(|_| StartupError::BuildMetadata)?,
         git_revision: GitRevision::try_new(process.build().git_revision())
             .map_err(|_| StartupError::BuildMetadata)?,
-        schema_version: SchemaVersion::try_new(6).map_err(|_| StartupError::BuildMetadata)?,
+        schema_version: SchemaVersion::try_new(7).map_err(|_| StartupError::BuildMetadata)?,
         started_at: runtime_started_at,
     });
     let state_store = Arc::new(state_store);
@@ -259,6 +265,16 @@ pub async fn run(
     )
     .await
     .map_err(StartupError::from_runtime)?;
+    let delivery_store: Arc<dyn DeliveryStore> = state_store.clone();
+    delivery_store
+        .recover_stale_deliveries(RecoverDeliveriesRequest {
+            recovered_at: UtcTimestamp::from_offset_datetime(
+                clock.utc_now().map_err(|_| StartupError::Clock)?,
+            )
+            .map_err(|_| StartupError::Clock)?,
+        })
+        .await
+        .map_err(|_| StartupError::DatabaseIntegrity)?;
     if let Err(error) = state_store.verify_application_consistency().await {
         if let Ok(wall_time) = clock.utc_now()
             && let Ok(stopped_at) = UtcTimestamp::from_offset_datetime(wall_time)
@@ -286,6 +302,29 @@ pub async fn run(
         return Err(StartupError::Telemetry(error));
     }
     let (fatal, fatal_receiver) = tokio::sync::watch::channel(false);
+    let delivery_profiles = Arc::new(
+        ChannelDeliveryProfileRegistry::try_new(std::iter::empty())
+            .map_err(|_| StartupError::ProviderComposition)?,
+    );
+    let delivery_adapters = Arc::new(
+        ChannelDeliveryAdapterRegistry::try_new(delivery_profiles.as_ref(), std::iter::empty())
+            .map_err(|_| StartupError::ProviderComposition)?,
+    );
+    let delivery_notifier = DeliveryNotifier::new();
+    let delivery_clock: Arc<dyn Clock> = clock.clone();
+    let mut delivery_worker = start_delivery_worker(
+        delivery_store,
+        delivery_adapters,
+        delivery_clock,
+        runtime.runtime_instance_id,
+        delivery_notifier.clone(),
+        SystemJitter,
+        fatal.clone(),
+    );
+    delivery_worker
+        .wait_initial_scan()
+        .await
+        .map_err(|_| StartupError::DatabaseIntegrity)?;
     let heartbeat = HeartbeatTask::start(
         Arc::clone(&state_store),
         Arc::clone(&clock),
@@ -413,7 +452,8 @@ pub async fn run(
                 },
                 configured_agent_loop_limits(&config)?,
             )
-            .map_err(|_| StartupError::ProviderComposition)?,
+            .map_err(|_| StartupError::ProviderComposition)?
+            .with_delivery(Arc::clone(&delivery_profiles), delivery_notifier.clone()),
         );
         let scheduler = crate::application::scheduler::start_scheduler(
             Arc::clone(&state_store),
@@ -466,6 +506,7 @@ pub async fn run(
         live_events,
         server,
         fatal_receiver,
+        delivery_worker,
     })
 }
 
@@ -592,6 +633,12 @@ impl FullJitterSource for SystemJitter {
     }
 }
 
+impl DeliveryJitterSource for SystemJitter {
+    fn sample_inclusive(&mut self, upper_bound_millis: u64) -> u64 {
+        FullJitterSource::sample_inclusive(self, upper_bound_millis)
+    }
+}
+
 /// Successful Stage 7 bootstrap ownership.
 ///
 /// This guard keeps the database pool and process lock alive without making the application layer
@@ -611,6 +658,7 @@ pub struct RunningBootstrap {
     live_events: Arc<LiveEventBroker>,
     server: ServerHandle,
     fatal_receiver: tokio::sync::watch::Receiver<bool>,
+    delivery_worker: DeliveryWorkerHandle,
 }
 
 impl RunningBootstrap {
@@ -687,6 +735,7 @@ impl RunningBootstrap {
     pub async fn shutdown(self) -> Result<(), StartupError> {
         let mut runtime_cleanup_failed = false;
         let deadline = self.shutdown.latch_shutdown_request();
+        self.delivery_worker.stop_claiming_and_wait().await;
         match self.application.health().snapshot().state() {
             crate::bootstrap::health::HealthState::LiveUnready
             | crate::bootstrap::health::HealthState::Ready => self
@@ -713,6 +762,14 @@ impl RunningBootstrap {
         }
         self.live_events.close_admission();
         self.server.close_websockets();
+        if self
+            .delivery_worker
+            .shutdown_before(deadline)
+            .await
+            .is_err()
+        {
+            runtime_cleanup_failed = true;
+        }
         if self.shutdown.finish().await.is_err() {
             runtime_cleanup_failed = true;
         }

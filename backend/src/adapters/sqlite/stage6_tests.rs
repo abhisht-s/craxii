@@ -399,7 +399,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 6);
+    assert_eq!(migrations.len(), 7);
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -479,10 +479,12 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
 }
 
 #[tokio::test]
-async fn empty_migration_metadata_database_migrates_forward_to_current_version_six() {
+async fn empty_migration_metadata_database_migrates_forward_to_current_version_seven() {
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
+        "outbound_delivery_attempts",
+        "outbound_deliveries",
         "context_manifest_sources",
         "context_manifests",
         "tool_executions",
@@ -529,7 +531,114 @@ async fn empty_migration_metadata_database_migrates_forward_to_current_version_s
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
+        7
+    );
+    drop(connection);
+    migrated.shutdown().await;
+}
+
+#[tokio::test]
+async fn genuine_v6_database_migrates_to_v7_without_backfill_or_data_loss() {
+    let root = TestRoot::new();
+    let database_directory = root.path().join("db");
+    fs::create_dir(&database_directory).unwrap();
+    fs::set_permissions(&database_directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let database_path = database_directory.join("craxii.sqlite3");
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&database_path)
+        .create_if_missing(true)
+        .foreign_keys(false);
+    let mut connection = options.connect().await.unwrap();
+    sqlx::query("CREATE TEMP TABLE ch1_owner_seed (user_id TEXT NOT NULL)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    let v6 = sqlx::migrate::Migrator::with_migrations(MIGRATOR.iter().take(6).cloned().collect());
+    v6.run(&mut connection).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap(),
         6
+    );
+    let craxii_id = CraxiiId::generate();
+    let user_id = UserId::generate();
+    sqlx::query(
+        "INSERT INTO craxii_principals \
+         (craxii_id, display_name, owner_label, lifecycle_state, primary_conversation_id, \
+          default_workspace_id, created_at, architecture_revision, schema_revision) \
+         VALUES (?, 'preserved', 'owner', 'active', NULL, NULL, ?, 'V0.0.01', 1)",
+    )
+    .bind(craxii_id.to_string())
+    .bind(NOW)
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
+         VALUES (?, ?, 'active', ?)",
+    )
+    .bind(user_id.to_string())
+    .bind(craxii_id.to_string())
+    .bind(NOW)
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let migrated = SqliteRuntimeGuard::start(root.path(), 1).await.unwrap();
+    assert_eq!(
+        migrated.disposition(),
+        super::schema::DatabaseDisposition::Current
+    );
+    let mut connection = migrated.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM craxii_principals WHERE craxii_id = ?",
+        )
+        .bind(craxii_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        "preserved"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE user_id = ?")
+            .bind(user_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_delivery_attempts")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap()
+            .is_empty()
     );
     drop(connection);
     migrated.shutdown().await;
@@ -1854,7 +1963,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (7, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (8, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

@@ -2509,7 +2509,7 @@ mod tests {
             JournalEventKind::RuntimeStarted,
             JournalEventKind::RuntimeRecoveryPerformed,
         ] {
-            for schema_version in [3, 4, 5] {
+            for schema_version in [3, 4, 5, 6] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {
@@ -2528,7 +2528,7 @@ mod tests {
                 assert!(validate_current_payload_kind(&payload).is_err());
             }
 
-            for schema_version in [2, 7] {
+            for schema_version in [2, 8] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {

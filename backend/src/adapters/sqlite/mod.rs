@@ -6,6 +6,7 @@ mod channel_ingress;
 #[allow(dead_code)] // Stage 6 freezes codecs before Stage 7 composes repository reads/writes.
 mod codec;
 mod context_source_store;
+mod delivery;
 mod error;
 mod evidence_query;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.
@@ -45,6 +46,7 @@ mod stage8_tests;
 mod stage9_tests;
 
 pub use channel_identity::SqliteChannelIdentityStore;
+pub use delivery::dispatch_material_sha256_v1;
 pub use error::{SqliteAdapterError, SqliteFailureKind};
 pub use evidence_query::SqliteEvidenceQueryStore;
 pub use runtime::{CheckpointReport, SqliteRuntime, SqliteRuntimeGuard};

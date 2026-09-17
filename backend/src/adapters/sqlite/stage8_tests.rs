@@ -5,9 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(feature = "test-failpoints")]
 use std::sync::Arc;
-#[cfg(feature = "test-failpoints")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use sqlx::Row;
@@ -19,6 +18,12 @@ use crate::adapters::sqlite::SqliteEvidenceQueryStore;
 #[cfg(feature = "test-failpoints")]
 #[cfg(feature = "test-failpoints")]
 use crate::application::authority::{AuthorityEvaluator, V0AuthorityEvaluator};
+use crate::application::delivery_planner::{
+    ChannelDeliveryProfileRegistry, plan_assistant_delivery,
+};
+use crate::application::delivery_worker::{
+    DeliveryJitterSource, DeliveryNotifier, start_delivery_worker,
+};
 use crate::application::evidence_inspection::{EvidenceInspectionService, EvidenceOutputFormat};
 #[cfg(feature = "test-failpoints")]
 use crate::application::tool_execution_service::{
@@ -28,8 +33,16 @@ use crate::application::tool_execution_service::{
 use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
 use crate::domain::*;
 use crate::ports::artifact_store::{ArtifactStore, BeginArtifactCapture};
+use crate::ports::channel_delivery::{
+    ChannelDeliveryAdapter, ChannelDeliveryAdapterRegistry, ChannelDeliveryFuture,
+};
+use crate::ports::channel_identity::ChannelIdentityStore;
 #[cfg(feature = "test-failpoints")]
-use crate::ports::clock::{Clock, MonotonicInstant, TestClock};
+use crate::ports::clock::MonotonicInstant;
+use crate::ports::clock::{Clock, TestClock};
+use crate::ports::delivery_store::{
+    ClaimDeliveryRequest, DeliveryClaim, DeliveryRoute, DeliveryStore, PersistDispatchResultRequest,
+};
 use crate::ports::evidence_query::{EvidenceQueryStore, VerificationIssue};
 use crate::ports::state_store::*;
 #[cfg(feature = "test-failpoints")]
@@ -40,9 +53,10 @@ use crate::ports::workstation_preparation::{
     PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
 };
 
+use super::channel_ingress_tests::BlockingDeliveryStore;
 use super::journal::{JournalAppendIntent, append_event, prepare_event};
 use super::transaction::WriteTransaction;
-use super::{SqliteRuntimeGuard, SqliteStateStore};
+use super::{SqliteChannelIdentityStore, SqliteRuntimeGuard, SqliteStateStore};
 
 const T0: &str = "2026-08-28T01:02:03.000000Z";
 const T1: &str = "2026-08-28T01:02:04.000000Z";
@@ -94,6 +108,34 @@ struct Fixture {
     correlation_id: CorrelationId,
 }
 
+struct NeverInvokedDeliveryAdapter {
+    provider_id: ChannelProviderId,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ChannelDeliveryAdapter for NeverInvokedDeliveryAdapter {
+    fn provider_id(&self) -> &ChannelProviderId {
+        &self.provider_id
+    }
+
+    fn dispatch(&self, _dispatch: PreparedChannelDispatch) -> ChannelDeliveryFuture<'_> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        Box::pin(async {
+            ChannelDispatchResult::Accepted {
+                external_message_id: None,
+            }
+        })
+    }
+}
+
+struct ZeroDeliveryJitter;
+
+impl DeliveryJitterSource for ZeroDeliveryJitter {
+    fn sample_inclusive(&mut self, _upper_bound_millis: u64) -> u64 {
+        0
+    }
+}
+
 async fn fixture() -> Fixture {
     fixture_at(TestRoot::new()).await
 }
@@ -143,7 +185,7 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(6).unwrap(),
+                schema_version: SchemaVersion::try_new(7).unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -183,6 +225,71 @@ async fn fixture_at(root: TestRoot) -> Fixture {
         runtime_id,
         work_id,
         correlation_id,
+    }
+}
+
+async fn attach_channel_reply(fixture: &Fixture) -> DeliveryRoute {
+    let identity_store = SqliteChannelIdentityStore::new(fixture.guard.runtime().clone());
+    let account = ChannelAccount {
+        channel_account_id: ChannelAccountId::generate(),
+        craxii_id: fixture.identity.craxii_id,
+        provider_id: ChannelProviderId::try_new("test.adapter").unwrap(),
+        external_account_id: ExternalAccountId::try_new("stage8-account").unwrap(),
+        lifecycle: ChannelAccountLifecycle::Active,
+        created_at: T0.parse().unwrap(),
+        disabled_at: None,
+    };
+    identity_store
+        .persist_channel_account(account.clone())
+        .await
+        .unwrap();
+    let identity = ExternalIdentity {
+        external_identity_id: ExternalIdentityId::generate(),
+        channel_account_id: account.channel_account_id,
+        craxii_id: fixture.identity.craxii_id,
+        user_id: fixture.identity.user_id,
+        external_subject_id: ExternalSubjectId::try_new("stage8-subject").unwrap(),
+        lifecycle: ExternalIdentityLifecycle::Active,
+        created_at: T0.parse().unwrap(),
+        revoked_at: None,
+    };
+    identity_store
+        .persist_external_identity(identity.clone())
+        .await
+        .unwrap();
+    let binding = ConversationBinding {
+        conversation_binding_id: ConversationBindingId::generate(),
+        channel_account_id: account.channel_account_id,
+        external_identity_id: identity.external_identity_id,
+        craxii_id: fixture.identity.craxii_id,
+        user_id: fixture.identity.user_id,
+        conversation_id: fixture.identity.conversation_id,
+        external_conversation_id: ExternalConversationId::try_new("stage8-conversation").unwrap(),
+        external_thread_id: Some(ExternalThreadId::try_new("stage8-thread").unwrap()),
+        lifecycle: ConversationBindingLifecycle::Active,
+        created_at: T0.parse().unwrap(),
+        revoked_at: None,
+    };
+    identity_store
+        .persist_conversation_binding(binding.clone())
+        .await
+        .unwrap();
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query("UPDATE work_items SET reply_binding_id = ? WHERE work_id = ?")
+        .bind(binding.conversation_binding_id.to_string())
+        .bind(fixture.work_id.to_string())
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    DeliveryRoute {
+        craxii_id: fixture.identity.craxii_id,
+        conversation_binding_id: binding.conversation_binding_id,
+        channel_account_id: account.channel_account_id,
+        provider_id: account.provider_id,
+        external_conversation_id: binding.external_conversation_id,
+        external_thread_id: binding.external_thread_id,
+        binding_active: true,
+        account_active: true,
     }
 }
 
@@ -1277,6 +1384,230 @@ async fn complete_model(fixture: &Fixture, model: &BegunModel) {
         .finish_model_invocation(model_completion_request(fixture, model, Vec::new(), None))
         .await
         .unwrap();
+}
+
+async fn assistant_completion_request(
+    fixture: &Fixture,
+    model: &BegunModel,
+    message: Message,
+    deliveries: Vec<OutboundDelivery>,
+) -> CommitAssistantCompletionRequest {
+    let terminal_model_event: JournalEventId = {
+        let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+        sqlx::query_scalar::<_, String>(
+            "SELECT event_id FROM journal_events WHERE work_id = ? \
+             AND event_type = 'model.invocation_completed'",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap()
+        .parse()
+        .unwrap()
+    };
+    let running = resumed(fixture, 4);
+    let completed = decide_work_transition(
+        &running,
+        WorkTransitionGuard::for_snapshot(&running),
+        WorkTransitionRequest::Complete {
+            reason: WorkCompletionReason::Answered,
+            evidence: WorkCompletionEvidence::SATISFIED,
+        },
+    )
+    .unwrap()
+    .into_next();
+    let assistant_event = JournalEventId::generate();
+    CommitAssistantCompletionRequest {
+        expected_work: WorkExpectation::for_snapshot(&running),
+        expected_model: ModelExpectation {
+            model_invocation_id: model.invocation_id,
+            state: ModelInvocationState::Completed,
+        },
+        assistant_message: message,
+        assistant_event: EventIntent {
+            event_id: assistant_event,
+            correlation_id: fixture.correlation_id,
+            causation_event_id: Some(terminal_model_event),
+        },
+        completion_event: EventIntent {
+            event_id: JournalEventId::generate(),
+            correlation_id: fixture.correlation_id,
+            causation_event_id: Some(assistant_event),
+        },
+        work_next: completed,
+        deliveries,
+    }
+}
+
+async fn completed_channel_fixture() -> (Fixture, BegunModel, DeliveryRoute) {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let route = attach_channel_reply(&fixture).await;
+    (fixture, model, route)
+}
+
+fn assistant_message(fixture: &Fixture, value: impl Into<String>) -> Message {
+    Message::try_new(MessageInput {
+        message_id: MessageId::generate(),
+        craxii_id: fixture.identity.craxii_id,
+        conversation_id: fixture.identity.conversation_id,
+        role: MessageRole::Assistant,
+        content: MessageContent::try_new(vec![ContentBlock::text(value.into()).unwrap()]).unwrap(),
+        author_user_id: None,
+        produced_by_work_id: Some(fixture.work_id),
+        device_id: None,
+        client_message_id: None,
+        inbound_delivery_id: None,
+        committed_at: T4.parse().unwrap(),
+    })
+    .unwrap()
+}
+
+async fn assert_completion_route_failure_cascade(
+    fixture: &Fixture,
+    route: &DeliveryRoute,
+    message_id: MessageId,
+    content: &str,
+    root_failure: &str,
+) {
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let rows = sqlx::query(
+        "SELECT conversation_binding_id, channel_account_id, provider_key, \
+                external_conversation_id, external_thread_id, source_kind, source_message_id, \
+                source_work_id, payload_text, payload_sha256, part_ordinal, part_count, state, \
+                attempt_count, dispatch_runtime_instance_id, next_attempt_at, \
+                delivery_deadline_at, accepted_external_message_id, failure_class, failure_code, \
+                created_at, updated_at, accepted_at, terminal_at \
+         FROM outbound_deliveries WHERE source_message_id = ? ORDER BY part_ordinal",
+    )
+    .bind(message_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 3);
+    let shared_deadline = rows[0].get::<String, _>("delivery_deadline_at");
+    let expected_thread = route
+        .external_thread_id
+        .as_ref()
+        .map(|value| value.as_str().to_owned());
+    let mut persisted_content = String::new();
+    for (index, row) in rows.iter().enumerate() {
+        let payload = row.get::<String, _>("payload_text");
+        assert_eq!(
+            Sha256Digest::parse_canonical(&row.get::<String, _>("payload_sha256")).unwrap(),
+            Sha256Digest::hash_bytes(payload.as_bytes())
+        );
+        persisted_content.push_str(&payload);
+        assert_eq!(
+            row.get::<String, _>("conversation_binding_id"),
+            route.conversation_binding_id.to_string()
+        );
+        assert_eq!(
+            row.get::<String, _>("channel_account_id"),
+            route.channel_account_id.to_string()
+        );
+        assert_eq!(
+            row.get::<String, _>("provider_key"),
+            route.provider_id.as_str()
+        );
+        assert_eq!(
+            row.get::<String, _>("external_conversation_id"),
+            route.external_conversation_id.as_str()
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("external_thread_id"),
+            expected_thread
+        );
+        assert_eq!(row.get::<String, _>("source_kind"), "assistant");
+        assert_eq!(
+            row.get::<String, _>("source_message_id"),
+            message_id.to_string()
+        );
+        assert_eq!(
+            row.get::<String, _>("source_work_id"),
+            fixture.work_id.to_string()
+        );
+        assert_eq!(
+            row.get::<i64, _>("part_ordinal"),
+            i64::try_from(index + 1).unwrap()
+        );
+        assert_eq!(row.get::<i64, _>("part_count"), 3);
+        assert_eq!(row.get::<String, _>("state"), "permanent_failure");
+        assert_eq!(
+            row.get::<String, _>("failure_class"),
+            if index == 0 {
+                root_failure
+            } else {
+                "prior_part_permanent_failure"
+            }
+        );
+        assert_eq!(row.get::<Option<String>, _>("failure_code"), None);
+        assert_eq!(row.get::<i64, _>("attempt_count"), 0);
+        assert_eq!(
+            row.get::<Option<String>, _>("dispatch_runtime_instance_id"),
+            None
+        );
+        assert_eq!(row.get::<Option<String>, _>("next_attempt_at"), None);
+        assert_eq!(
+            row.get::<String, _>("delivery_deadline_at"),
+            shared_deadline
+        );
+        assert_eq!(
+            row.get::<Option<String>, _>("accepted_external_message_id"),
+            None
+        );
+        assert_eq!(row.get::<String, _>("created_at"), T4);
+        assert_eq!(row.get::<String, _>("updated_at"), T4);
+        assert_eq!(row.get::<Option<String>, _>("accepted_at"), None);
+        assert_eq!(row.get::<String, _>("terminal_at"), T4);
+    }
+    assert_eq!(persisted_content, content);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ? AND role = 'assistant' \
+             AND produced_by_work_id = ?",
+        )
+        .bind(message_id.to_string())
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM work_items WHERE work_id = ?")
+            .bind(fixture.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        "completed"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_delivery_attempts")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    assert!(matches!(
+        fixture
+            .store
+            .claim_next_delivery(ClaimDeliveryRequest {
+                runtime_instance_id: fixture.runtime_id,
+                outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+                now: T4.parse().unwrap(),
+            })
+            .await
+            .unwrap(),
+        DeliveryClaim::NoneDue
+    ));
+    assert_eq!(
+        fixture.store.verify_delivery_consistency().await.unwrap(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -2720,6 +3051,7 @@ async fn assistant_completion_is_one_atomic_authoritative_message_and_work_commi
                 causation_event_id: Some(assistant_event),
             },
             work_next: completed,
+            deliveries: Vec::new(),
         })
         .await
         .unwrap();
@@ -2748,6 +3080,13 @@ async fn assistant_completion_is_one_atomic_authoritative_message_and_work_commi
     .await
     .unwrap();
     assert_eq!(message_count, 1);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(work_state, "completed");
     assert_eq!(
         terminal_events,
@@ -2759,6 +3098,639 @@ async fn assistant_completion_is_one_atomic_authoritative_message_and_work_commi
         .verify_application_consistency()
         .await
         .unwrap();
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn channel_completion_atomically_commits_one_message_and_exact_multipart_intent() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let route = attach_channel_reply(&fixture).await;
+    let content = "é".repeat(70);
+    let message = Message::try_new(MessageInput {
+        message_id: MessageId::generate(),
+        craxii_id: fixture.identity.craxii_id,
+        conversation_id: fixture.identity.conversation_id,
+        role: MessageRole::Assistant,
+        content: MessageContent::try_new(vec![ContentBlock::text(content.clone()).unwrap()])
+            .unwrap(),
+        author_user_id: None,
+        produced_by_work_id: Some(fixture.work_id),
+        device_id: None,
+        client_message_id: None,
+        inbound_delivery_id: None,
+        committed_at: T4.parse().unwrap(),
+    })
+    .unwrap();
+    let message_id = message.message_id();
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        4,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    assert_eq!(deliveries.len(), 3);
+    fixture
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&fixture, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM messages WHERE message_id = ? AND role = 'assistant'",
+        )
+        .bind(message_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    let parts: Vec<String> = sqlx::query_scalar(
+        "SELECT payload_text FROM outbound_deliveries WHERE source_message_id = ? \
+         ORDER BY part_ordinal",
+    )
+    .bind(message_id.to_string())
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(parts.len(), 3);
+    assert_eq!(parts.concat().as_bytes(), content.as_bytes());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM work_items WHERE work_id = ?")
+            .bind(fixture.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        "completed"
+    );
+    drop(connection);
+    assert_eq!(
+        fixture.store.verify_delivery_consistency().await.unwrap(),
+        3
+    );
+
+    let DeliveryClaim::Dispatch(first) = fixture
+        .store
+        .claim_next_delivery(ClaimDeliveryRequest {
+            runtime_instance_id: fixture.runtime_id,
+            outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+            now: T4.parse().unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("first multipart delivery was not claimable");
+    };
+    assert_eq!(first.part_ordinal, 1);
+    assert!(matches!(
+        fixture
+            .store
+            .claim_next_delivery(ClaimDeliveryRequest {
+                runtime_instance_id: fixture.runtime_id,
+                outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+                now: T4.parse().unwrap(),
+            })
+            .await
+            .unwrap(),
+        DeliveryClaim::NoneDue
+    ));
+    fixture
+        .store
+        .persist_dispatch_result(PersistDispatchResultRequest {
+            dispatch: first,
+            runtime_instance_id: fixture.runtime_id,
+            result: ChannelDispatchResult::Accepted {
+                external_message_id: None,
+            },
+            local_retry_delay: None,
+            completed_at: T5.parse().unwrap(),
+        })
+        .await
+        .unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapter: Arc<dyn ChannelDeliveryAdapter> = Arc::new(NeverInvokedDeliveryAdapter {
+        provider_id: route.provider_id.clone(),
+        calls: Arc::clone(&calls),
+    });
+    let adapters = Arc::new(
+        ChannelDeliveryAdapterRegistry::try_new(&profiles, [(route.provider_id.clone(), adapter)])
+            .unwrap(),
+    );
+    let inner: Arc<dyn DeliveryStore> = Arc::new(fixture.store.clone());
+    let (blocking, mut claim_entered) = BlockingDeliveryStore::new(inner, true, false, false);
+    let worker_store: Arc<dyn DeliveryStore> = blocking.clone();
+    let clock: Arc<dyn Clock> = Arc::new(TestClock::new(
+        T5.parse::<UtcTimestamp>().unwrap().to_offset_datetime(),
+        Duration::ZERO,
+    ));
+    let (fatal, fatal_rx) = tokio::sync::watch::channel(false);
+    let worker = start_delivery_worker(
+        worker_store,
+        adapters,
+        clock,
+        fixture.runtime_id,
+        DeliveryNotifier::new(),
+        ZeroDeliveryJitter,
+        fatal,
+    );
+    claim_entered
+        .recv()
+        .await
+        .expect("worker did not enter multipart claim");
+    let quiesced = worker.stop_claiming_and_wait();
+    blocking.release_claim();
+    quiesced.await;
+    worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert!(!*fatal_rx.borrow());
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let states: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, failure_class FROM outbound_deliveries ORDER BY part_ordinal",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        states,
+        vec![
+            ("accepted".into(), None),
+            (
+                "outcome_unknown".into(),
+                Some("shutdown_interrupted".into())
+            ),
+            (
+                "permanent_failure".into(),
+                Some("prior_part_outcome_unknown".into()),
+            ),
+        ]
+    );
+    drop(connection);
+    assert_eq!(
+        fixture.store.verify_delivery_consistency().await.unwrap(),
+        3
+    );
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn invalid_delivery_insert_rolls_back_assistant_message_events_and_work_completion() {
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let model = begin_and_stream_model(&fixture).await;
+    complete_model(&fixture, &model).await;
+    let route = attach_channel_reply(&fixture).await;
+    let message = Message::try_new(MessageInput {
+        message_id: MessageId::generate(),
+        craxii_id: fixture.identity.craxii_id,
+        conversation_id: fixture.identity.conversation_id,
+        role: MessageRole::Assistant,
+        content: MessageContent::try_new(vec![ContentBlock::text("never committed").unwrap()])
+            .unwrap(),
+        author_user_id: None,
+        produced_by_work_id: Some(fixture.work_id),
+        device_id: None,
+        client_message_id: None,
+        inbound_delivery_id: None,
+        committed_at: T4.parse().unwrap(),
+    })
+    .unwrap();
+    let message_id = message.message_id();
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        1,
+    )
+    .unwrap()])
+    .unwrap();
+    let mut deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    deliveries[0].payload_sha256 = Sha256Digest::hash_bytes(b"wrong");
+    assert!(
+        fixture
+            .store
+            .commit_assistant_completion(
+                assistant_completion_request(&fixture, &model, message, deliveries).await,
+            )
+            .await
+            .is_err()
+    );
+
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM messages WHERE message_id = ?")
+            .bind(message_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE work_id = ? \
+             AND event_type IN ('assistant.message_committed','work.completed')",
+        )
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM work_items WHERE work_id = ?")
+            .bind(fixture.work_id.to_string())
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        "running"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        0
+    );
+    drop(connection);
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn missing_profile_and_unpackageable_output_commit_terminal_delivery_evidence() {
+    let (missing, model, route) = completed_channel_fixture().await;
+    let message = assistant_message(&missing, "profile-less response");
+    let message_id = message.message_id();
+    let deliveries =
+        plan_assistant_delivery(&message, &route, &ChannelDeliveryProfileRegistry::default())
+            .unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0].failure.as_ref().unwrap().class(),
+        DeliveryFailureClass::ProfileUnavailable
+    );
+    missing
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&missing, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+    let mut connection = missing.guard.runtime().acquire().await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, failure_class, payload_text FROM outbound_deliveries \
+         WHERE source_message_id = ?",
+    )
+    .bind(message_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "permanent_failure");
+    assert_eq!(row.get::<String, _>("failure_class"), "profile_unavailable");
+    assert_eq!(
+        row.get::<String, _>("payload_text"),
+        "profile-less response"
+    );
+    drop(connection);
+    missing.store.verify_delivery_consistency().await.unwrap();
+    missing.guard.shutdown().await;
+
+    let (oversized, model, route) = completed_channel_fixture().await;
+    let content = "x".repeat(65);
+    let message = assistant_message(&oversized, content.clone());
+    let message_id = message.message_id();
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        1,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].payload_text, content);
+    assert_eq!(
+        deliveries[0].failure.as_ref().unwrap().class(),
+        DeliveryFailureClass::PayloadTooLarge
+    );
+    oversized
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&oversized, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+    let mut connection = oversized.guard.runtime().acquire().await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, failure_class, part_ordinal, part_count FROM outbound_deliveries \
+         WHERE source_message_id = ?",
+    )
+    .bind(message_id.to_string())
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "permanent_failure");
+    assert_eq!(row.get::<String, _>("failure_class"), "payload_too_large");
+    assert_eq!(row.get::<i64, _>("part_ordinal"), 1);
+    assert_eq!(row.get::<i64, _>("part_count"), 1);
+    drop(connection);
+    oversized.store.verify_delivery_consistency().await.unwrap();
+    oversized.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_time_multipart_binding_revocation_cascades_after_root_failure() {
+    let (fixture, model, route) = completed_channel_fixture().await;
+    let content = "r".repeat(130);
+    let message = assistant_message(&fixture, content.clone());
+    let message_id = message.message_id();
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        4,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    assert_eq!(deliveries.len(), 3);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE conversation_bindings SET lifecycle_state = 'revoked', revoked_at = ? \
+         WHERE conversation_binding_id = ?",
+    )
+    .bind(T4)
+    .bind(route.conversation_binding_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+
+    fixture
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&fixture, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+
+    assert_completion_route_failure_cascade(
+        &fixture,
+        &route,
+        message_id,
+        &content,
+        "binding_revoked",
+    )
+    .await;
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_time_multipart_account_disablement_cascades_after_root_failure() {
+    let (fixture, model, route) = completed_channel_fixture().await;
+    let content = "d".repeat(130);
+    let message = assistant_message(&fixture, content.clone());
+    let message_id = message.message_id();
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        4,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    assert_eq!(deliveries.len(), 3);
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE channel_accounts SET lifecycle_state = 'disabled', disabled_at = ? \
+         WHERE channel_account_id = ?",
+    )
+    .bind(T4)
+    .bind(route.channel_account_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+
+    fixture
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&fixture, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+
+    assert_completion_route_failure_cascade(
+        &fixture,
+        &route,
+        message_id,
+        &content,
+        "channel_account_disabled",
+    )
+    .await;
+    fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn completion_revalidates_historical_binding_and_account_without_rerouting() {
+    let (revoked, model, route) = completed_channel_fixture().await;
+    let message = assistant_message(&revoked, "original route");
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        1,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    let mut connection = revoked.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE conversation_bindings SET lifecycle_state = 'revoked', revoked_at = ? \
+         WHERE conversation_binding_id = ?",
+    )
+    .bind(T4)
+    .bind(route.conversation_binding_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    revoked
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&revoked, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+    let mut connection = revoked.guard.runtime().acquire().await.unwrap();
+    let row = sqlx::query(
+        "SELECT state, failure_class, conversation_binding_id FROM outbound_deliveries",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "permanent_failure");
+    assert_eq!(row.get::<String, _>("failure_class"), "binding_revoked");
+    assert_eq!(
+        row.get::<String, _>("conversation_binding_id"),
+        route.conversation_binding_id.to_string()
+    );
+    drop(connection);
+    revoked.store.verify_delivery_consistency().await.unwrap();
+    revoked.guard.shutdown().await;
+
+    let (disabled, model, route) = completed_channel_fixture().await;
+    let message = assistant_message(&disabled, "original account");
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        1,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    let mut connection = disabled.guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE channel_accounts SET lifecycle_state = 'disabled', disabled_at = ? \
+         WHERE channel_account_id = ?",
+    )
+    .bind(T4)
+    .bind(route.channel_account_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    disabled
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&disabled, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+    let mut connection = disabled.guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT failure_class FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        "channel_account_disabled"
+    );
+    drop(connection);
+    disabled.store.verify_delivery_consistency().await.unwrap();
+    disabled.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn multipart_permanent_failure_blocks_every_later_part() {
+    let (fixture, model, route) = completed_channel_fixture().await;
+    let message = assistant_message(&fixture, "z".repeat(130));
+    let profiles = ChannelDeliveryProfileRegistry::try_new([ChannelDeliveryProfile::try_new(
+        route.provider_id.clone(),
+        64,
+        4,
+    )
+    .unwrap()])
+    .unwrap();
+    let deliveries = plan_assistant_delivery(&message, &route, &profiles).unwrap();
+    fixture
+        .store
+        .commit_assistant_completion(
+            assistant_completion_request(&fixture, &model, message, deliveries).await,
+        )
+        .await
+        .unwrap();
+    let DeliveryClaim::Dispatch(first) = fixture
+        .store
+        .claim_next_delivery(ClaimDeliveryRequest {
+            runtime_instance_id: fixture.runtime_id,
+            outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+            now: T4.parse().unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("first part expected");
+    };
+    fixture
+        .store
+        .persist_dispatch_result(PersistDispatchResultRequest {
+            dispatch: first,
+            runtime_instance_id: fixture.runtime_id,
+            result: ChannelDispatchResult::Accepted {
+                external_message_id: None,
+            },
+            local_retry_delay: None,
+            completed_at: T5.parse().unwrap(),
+        })
+        .await
+        .unwrap();
+    let DeliveryClaim::Dispatch(second) = fixture
+        .store
+        .claim_next_delivery(ClaimDeliveryRequest {
+            runtime_instance_id: fixture.runtime_id,
+            outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+            now: T5.parse().unwrap(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("second part expected");
+    };
+    fixture
+        .store
+        .persist_dispatch_result(PersistDispatchResultRequest {
+            dispatch: second,
+            runtime_instance_id: fixture.runtime_id,
+            result: ChannelDispatchResult::PermanentFailure {
+                failure: DeliveryFailure::provider(DeliveryFailureClass::ProviderPermanent, None)
+                    .unwrap(),
+            },
+            local_retry_delay: None,
+            completed_at: T5.parse().unwrap(),
+        })
+        .await
+        .unwrap();
+    let mut connection = fixture.guard.runtime().acquire().await.unwrap();
+    let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT state, failure_class FROM outbound_deliveries ORDER BY part_ordinal",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("accepted".into(), None),
+            (
+                "permanent_failure".into(),
+                Some("provider_permanent".into())
+            ),
+            (
+                "permanent_failure".into(),
+                Some("prior_part_permanent_failure".into()),
+            ),
+        ]
+    );
+    drop(connection);
+    assert!(matches!(
+        fixture
+            .store
+            .claim_next_delivery(ClaimDeliveryRequest {
+                runtime_instance_id: fixture.runtime_id,
+                outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+                now: T5.parse().unwrap(),
+            })
+            .await
+            .unwrap(),
+        DeliveryClaim::NoneDue
+    ));
+    fixture.store.verify_delivery_consistency().await.unwrap();
     fixture.guard.shutdown().await;
 }
 
@@ -3526,7 +4498,7 @@ async fn durable_publish_before_database_commit_reopens_as_nonfatal_orphan_witho
 }
 
 #[tokio::test]
-async fn genuine_empty_v2_migrates_to_v6_without_changing_old_fingerprints() {
+async fn genuine_empty_v2_migrates_to_v7_without_changing_old_fingerprints() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
     use sqlx::{ConnectOptions as _, Connection as _};
 
@@ -3569,7 +4541,7 @@ async fn genuine_empty_v2_migrates_to_v6_without_changing_old_fingerprints() {
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "b24c145128287dc40a5a59adb7f8c6c1a75367fe8d563c295f2509ec505b2706"
+        "8ed74572f4b786d60291ef64a8ef3b982fce7a3bf7df70e5b65efd9d7b2bf1c2"
     );
     migrated.shutdown().await;
 
@@ -3582,7 +4554,7 @@ async fn genuine_empty_v2_migrates_to_v6_without_changing_old_fingerprints() {
 }
 
 #[tokio::test]
-async fn genuine_v5_writer_history_migrates_to_v6_without_journal_mutation() {
+async fn genuine_v5_writer_history_migrates_to_v7_without_journal_mutation() {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
     use sqlx::{ConnectOptions as _, Connection as _};
 
@@ -3681,7 +4653,7 @@ async fn genuine_v5_writer_history_migrates_to_v6_without_journal_mutation() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        6
+        7
     );
     assert_eq!(
         sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
@@ -3854,7 +4826,7 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(6).unwrap(),
+                schema_version: SchemaVersion::try_new(7).unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -3894,7 +4866,7 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(6).unwrap(),
+                schema_version: SchemaVersion::try_new(7).unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),

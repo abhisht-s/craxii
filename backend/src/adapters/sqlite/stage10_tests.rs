@@ -166,7 +166,7 @@ fn runtime_evidence(
         diagnostic_pid: Some(DiagnosticPid::try_new(101).unwrap()),
         package_version: PackageVersion::try_new("0.0.1").unwrap(),
         git_revision: GitRevision::try_new("stage10-test").unwrap(),
-        schema_version: SchemaVersion::try_new(6).unwrap(),
+        schema_version: SchemaVersion::try_new(7).unwrap(),
         started_at,
     })
 }

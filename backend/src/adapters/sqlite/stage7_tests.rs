@@ -207,8 +207,8 @@ async fn current_manifest_schema_and_zero_product_rows_are_exact() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    assert_eq!(PRODUCT_TABLES.len(), 22);
-    assert_eq!(PRODUCT_INDEXES.len(), 48);
+    assert_eq!(PRODUCT_TABLES.len(), 24);
+    assert_eq!(PRODUCT_INDEXES.len(), 56);
     for table in PRODUCT_TABLES {
         assert_eq!(count(guard.runtime(), table).await, 0, "{table}");
     }
@@ -259,7 +259,7 @@ async fn current_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "b24c145128287dc40a5a59adb7f8c6c1a75367fe8d563c295f2509ec505b2706"
+        "8ed74572f4b786d60291ef64a8ef3b982fce7a3bf7df70e5b65efd9d7b2bf1c2"
     );
     assert_eq!(
         v1_schema_fingerprint(),
@@ -592,7 +592,7 @@ async fn work_input_constraints_and_private_causal_validation_fail_closed() {
 }
 
 #[tokio::test]
-async fn valid_version_one_database_migrates_to_version_six_and_reopens() {
+async fn valid_version_one_database_migrates_to_version_seven_and_reopens() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -629,7 +629,7 @@ async fn valid_version_one_database_migrates_to_version_six_and_reopens() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        6
+        7
     );
     drop(connection);
     guard.shutdown().await;

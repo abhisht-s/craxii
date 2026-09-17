@@ -1331,7 +1331,7 @@ pub(super) mod tests {
     }
 
     #[tokio::test]
-    async fn migration_version_six_inventory_is_exact_and_reopen_is_idempotent() {
+    async fn migration_version_seven_inventory_is_exact_and_reopen_is_idempotent() {
         let root = TestRoot::new();
         let guard = runtime(&root, 1).await;
         assert_eq!(guard.disposition(), DatabaseDisposition::Current);
@@ -1551,7 +1551,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 6);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 7);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1578,7 +1578,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (7, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (8, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

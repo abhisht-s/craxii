@@ -729,6 +729,8 @@ pub struct CommitAssistantCompletionRequest {
     pub assistant_event: EventIntent,
     pub completion_event: EventIntent,
     pub work_next: WorkLifecycleSnapshot,
+    /// Precomputed provider-neutral outbound parts. Native work supplies an empty vector.
+    pub deliveries: Vec<crate::domain::OutboundDelivery>,
 }
 
 /// Stable verified V0 bootstrap state available to the application shell.

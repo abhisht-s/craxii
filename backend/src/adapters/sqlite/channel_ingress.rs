@@ -3,15 +3,19 @@
 use sqlx::Row;
 
 use crate::application::channel_ingress::{DurableInboundOutcome, VerifiedInboundPayload};
+use crate::application::delivery_planner::{
+    ChannelDeliveryProfileRegistry, plan_control_acknowledgement,
+};
 use crate::domain::{
-    ConversationBindingId, ConversationId, ConversationWorkOrdinal, CraxiiId, ExternalIdentityId,
-    InboundDeliveryId, JournalActor, JournalEvent, JournalEventId, JournalEventPayload,
-    JournalOffset, JournalStreamId, MessageAcceptedOriginV2, MessageId, MessageRole,
-    ProjectionVersion, Sha256Digest, UserId, WorkCancellationV2, WorkId, WorkState, WorkspaceId,
+    ChannelProviderId, ControlAcknowledgementOutcome, ConversationBindingId, ConversationId,
+    ConversationWorkOrdinal, CraxiiId, ExternalIdentityId, InboundDeliveryId, JournalActor,
+    JournalEvent, JournalEventId, JournalEventPayload, JournalOffset, JournalStreamId,
+    MessageAcceptedOriginV2, MessageId, MessageRole, ProjectionVersion, Sha256Digest, UserId,
+    WorkCancellationV2, WorkId, WorkState, WorkspaceId,
 };
 use crate::ports::channel_ingress::{
     ChannelIngressFuture, ChannelIngressStore, ChannelIngressStoreError,
-    ChannelIngressStoreErrorKind, ClassifiedInbound, ClassifyInboundRequest,
+    ChannelIngressStoreErrorKind, ChannelProviderFuture, ClassifiedInbound, ClassifyInboundRequest,
     InboundPostCommitEffect,
 };
 
@@ -246,6 +250,7 @@ struct AccountTopology {
     craxii_id: CraxiiId,
     workspace_id: WorkspaceId,
     active: bool,
+    provider_id: ChannelProviderId,
 }
 
 async fn load_account(
@@ -253,7 +258,7 @@ async fn load_account(
     request: &ClassifyInboundRequest,
 ) -> Result<AccountTopology, ChannelIngressStoreError> {
     let row = sqlx::query(
-        "SELECT a.craxii_id, a.lifecycle_state, p.craxii_id AS principal_craxii_id, \
+        "SELECT a.craxii_id, a.provider_key, a.lifecycle_state, p.craxii_id AS principal_craxii_id, \
                 p.default_workspace_id \
          FROM channel_accounts a \
          LEFT JOIN craxii_principals p ON p.craxii_id = a.craxii_id \
@@ -288,6 +293,8 @@ async fn load_account(
             .parse()
             .map_err(|_| inconsistent())?,
         active,
+        provider_id: ChannelProviderId::try_new(row.try_get::<String, _>("provider_key")?)
+            .map_err(|_| inconsistent())?,
     })
 }
 
@@ -618,6 +625,7 @@ async fn classify_control(
     transaction: &mut WriteTransaction,
     request: &ClassifyInboundRequest,
     authorized: &AuthorizedTopology,
+    account: &AccountTopology,
 ) -> Result<ClassifiedInbound, ChannelIngressStoreError> {
     let target = select_control_target(transaction, authorized.conversation_id).await?;
     let target_work_id = target
@@ -648,12 +656,52 @@ async fn classify_control(
     if affected != 1 {
         return Err(inconsistent());
     }
+    let outcome = if target_work_id.is_some() {
+        ControlAcknowledgementOutcome::Applied
+    } else {
+        ControlAcknowledgementOutcome::NoOp
+    };
+    let profiles = ChannelDeliveryProfileRegistry::try_new(request.delivery_profile.clone())
+        .map_err(|_| invalid())?;
+    if request
+        .delivery_profile
+        .as_ref()
+        .is_some_and(|profile| profile.provider_id() != &account.provider_id)
+    {
+        return Err(invalid());
+    }
+    let route = crate::ports::delivery_store::DeliveryRoute {
+        craxii_id: account.craxii_id,
+        conversation_binding_id: authorized.binding_id,
+        channel_account_id: request.channel_account_id,
+        provider_id: account.provider_id.clone(),
+        external_conversation_id: request.external_conversation_id.clone(),
+        external_thread_id: request.external_thread_id.clone(),
+        binding_active: true,
+        account_active: true,
+    };
+    let mut deliveries = plan_control_acknowledgement(
+        request.candidates.inbound_delivery_id,
+        outcome,
+        &route,
+        &profiles,
+        request.observed_at,
+    )
+    .map_err(|_| invalid())?;
+    let [delivery] = deliveries.as_mut_slice() else {
+        return Err(invalid());
+    };
+    delivery.outbound_delivery_id = request.candidates.outbound_delivery_id;
+    super::delivery::insert_delivery(transaction, delivery)
+        .await
+        .map_err(map_sqlite)?;
+
     let Some(row) = target else {
         return Ok(ClassifiedInbound::newly(
             DurableInboundOutcome::ControlNoOp {
                 inbound_delivery_id: request.candidates.inbound_delivery_id,
             },
-            InboundPostCommitEffect::None,
+            InboundPostCommitEffect::ControlAcknowledgementCommitted,
         ));
     };
     let work_id = target_work_id.ok_or_else(inconsistent)?;
@@ -675,12 +723,22 @@ async fn classify_control(
     .map_err(map_sqlite)?;
     let effect = match (mutation.resulting_state, mutation.committed_cursor) {
         (WorkState::CancelRequested, Some(cursor)) => {
-            InboundPostCommitEffect::ActiveCancellationCommitted { work_id, cursor }
+            InboundPostCommitEffect::ActiveCancellationCommitted {
+                work_id,
+                cursor,
+                delivery_created: true,
+            }
         }
         (WorkState::Cancelled, Some(cursor)) => {
-            InboundPostCommitEffect::DirectCancellationCommitted { work_id, cursor }
+            InboundPostCommitEffect::DirectCancellationCommitted {
+                work_id,
+                cursor,
+                delivery_created: true,
+            }
         }
-        (WorkState::CancelRequested, None) => InboundPostCommitEffect::None,
+        (WorkState::CancelRequested, None) => {
+            InboundPostCommitEffect::ControlAcknowledgementCommitted
+        }
         _ => return Err(inconsistent()),
     };
     Ok(ClassifiedInbound::newly(
@@ -754,7 +812,7 @@ async fn classify_inner(
             )
         }
         VerifiedInboundPayload::Text(_) if request.is_control => {
-            classify_control(&mut transaction, &request, &authorized).await?
+            classify_control(&mut transaction, &request, &authorized, &account).await?
         }
         VerifiedInboundPayload::Text(content) => {
             classify_message(&mut transaction, request, account, authorized, content).await?
@@ -765,6 +823,24 @@ async fn classify_inner(
 }
 
 impl ChannelIngressStore for SqliteStateStore {
+    fn load_channel_provider_id(
+        &self,
+        channel_account_id: crate::domain::ChannelAccountId,
+    ) -> ChannelProviderFuture<'_> {
+        Box::pin(async move {
+            let mut connection = self.runtime.acquire().await.map_err(map_sqlite)?;
+            let provider = sqlx::query_scalar::<_, String>(
+                "SELECT provider_key FROM channel_accounts WHERE channel_account_id = ?",
+            )
+            .bind(channel_account_id.to_string())
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(inconsistent)?;
+            ChannelProviderId::try_new(provider).map_err(|_| inconsistent())
+        })
+    }
+
     fn classify_inbound(&self, request: ClassifyInboundRequest) -> ChannelIngressFuture<'_> {
         Box::pin(async move { classify_inner(self, request).await })
     }

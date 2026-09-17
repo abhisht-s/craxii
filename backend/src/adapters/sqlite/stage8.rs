@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use sqlx::Row;
 
+use crate::application::delivery_planner::render_assistant_v1;
 use crate::domain::{
     ArtifactId, ArtifactProducer, ArtifactRecordedV1, ArtifactRetention, ArtifactStorageKey,
     AuthorityDecision, CleanupStatus, ConversationId, CorrelationId, CraxiiId, CurrentWorkAttempt,
@@ -179,7 +180,7 @@ async fn terminalize_owned_work(
 
 async fn commit_assistant_completion(
     store: &SqliteStateStore,
-    request: CommitAssistantCompletionRequest,
+    mut request: CommitAssistantCompletionRequest,
 ) -> Result<CommitReceipt, SqliteAdapterError> {
     if request.expected_work.state != WorkState::Running
         || request.expected_work.current_attempt != CurrentWorkAttempt::None
@@ -205,6 +206,11 @@ async fn commit_assistant_completion(
         || request.completion_event.correlation_id != context.correlation_id
     {
         return Err(invalid());
+    }
+    match context.reply_binding_id {
+        None if !request.deliveries.is_empty() => return Err(invalid()),
+        Some(_) if request.deliveries.is_empty() => return Err(invalid()),
+        _ => {}
     }
     let model_is_terminal: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM model_invocations WHERE model_invocation_id = ? AND work_id = ? \
@@ -285,6 +291,98 @@ async fn commit_assistant_completion(
         })?,
     )
     .await?;
+    if let Some(binding_id) = context.reply_binding_id {
+        let route = sqlx::query(
+            "SELECT b.craxii_id, b.channel_account_id, b.external_conversation_id, \
+                    b.external_thread_id, b.lifecycle_state AS binding_state, \
+                    a.provider_key, a.lifecycle_state AS account_state \
+             FROM conversation_bindings b JOIN channel_accounts a \
+               ON a.channel_account_id = b.channel_account_id AND a.craxii_id = b.craxii_id \
+             WHERE b.conversation_binding_id = ? AND b.conversation_id = ?",
+        )
+        .bind(binding_id.to_string())
+        .bind(context.conversation_id.to_string())
+        .fetch_optional(transaction.connection())
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?
+        .ok_or_else(invalid)?;
+        let account_id = route.try_get::<String, _>("channel_account_id")?;
+        let destination = route.try_get::<String, _>("external_conversation_id")?;
+        let thread = route.try_get::<Option<String>, _>("external_thread_id")?;
+        let provider = route.try_get::<String, _>("provider_key")?;
+        let route_inactive_failure = if route.try_get::<String, _>("binding_state")? != "active" {
+            Some(crate::domain::DeliveryFailureClass::BindingRevoked)
+        } else if route.try_get::<String, _>("account_state")? != "active" {
+            Some(crate::domain::DeliveryFailureClass::ChannelAccountDisabled)
+        } else {
+            None
+        };
+        let rendered =
+            render_assistant_v1(request.assistant_message.content()).map_err(|_| invalid())?;
+        if request
+            .deliveries
+            .iter()
+            .map(|delivery| delivery.payload_text.as_str())
+            .collect::<String>()
+            != rendered
+        {
+            return Err(invalid());
+        }
+        let expected_count = u16::try_from(request.deliveries.len()).map_err(|_| invalid())?;
+        let shared_deadline = request
+            .deliveries
+            .first()
+            .map(|delivery| delivery.delivery_deadline_at)
+            .ok_or_else(invalid)?;
+        for (index, delivery) in request.deliveries.iter_mut().enumerate() {
+            if delivery.craxii_id != context.craxii_id
+                || delivery.conversation_binding_id != binding_id
+                || delivery.channel_account_id.to_string() != account_id
+                || delivery.provider_id.as_str() != provider
+                || delivery.external_conversation_id.as_str() != destination
+                || delivery
+                    .external_thread_id
+                    .as_ref()
+                    .map(crate::domain::ExternalThreadId::as_str)
+                    != thread.as_deref()
+                || delivery.source
+                    != (crate::domain::DeliverySource::AssistantMessage {
+                        message_id: request.assistant_message.message_id(),
+                        work_id: request.expected_work.work_id,
+                    })
+                || delivery.created_at != request.assistant_message.committed_at()
+                || delivery.updated_at != request.assistant_message.committed_at()
+                || delivery.part_ordinal != u16::try_from(index + 1).map_err(|_| invalid())?
+                || delivery.part_count != expected_count
+                || delivery.delivery_deadline_at != shared_deadline
+            {
+                return Err(invalid());
+            }
+            if let Some(root_failure) = route_inactive_failure {
+                let failure = if index == 0 {
+                    root_failure
+                } else {
+                    crate::domain::DeliveryFailureClass::PriorPartPermanentFailure
+                };
+                delivery.state = crate::domain::OutboundDeliveryState::PermanentFailure;
+                delivery.failure = Some(crate::domain::DeliveryFailure::classified(failure));
+            } else {
+                match (delivery.state, delivery.failure.as_ref()) {
+                    (crate::domain::OutboundDeliveryState::Queued, None) => {}
+                    (crate::domain::OutboundDeliveryState::PermanentFailure, Some(failure))
+                        if expected_count == 1
+                            && matches!(
+                                failure.class(),
+                                crate::domain::DeliveryFailureClass::ProfileUnavailable
+                                    | crate::domain::DeliveryFailureClass::PayloadTooLarge
+                                    | crate::domain::DeliveryFailureClass::UnsupportedPayload
+                            ) => {}
+                    _ => return Err(invalid()),
+                }
+            }
+            super::delivery::insert_delivery(&mut transaction, delivery).await?;
+        }
+    }
     guarded_work_update(
         &mut transaction,
         &expected,
@@ -333,6 +431,7 @@ struct WorkContext {
     conversation_id: ConversationId,
     correlation_id: CorrelationId,
     started_at: UtcTimestamp,
+    reply_binding_id: Option<crate::domain::ConversationBindingId>,
 }
 
 async fn load_work_context(
@@ -340,7 +439,8 @@ async fn load_work_context(
     expected: WorkExpectation,
 ) -> Result<WorkContext, SqliteAdapterError> {
     let row = sqlx::query(
-        "SELECT craxii_id, conversation_id, correlation_id, started_at FROM work_items \
+        "SELECT craxii_id, conversation_id, correlation_id, started_at, reply_binding_id \
+         FROM work_items \
          WHERE work_id = ?",
     )
     .bind(expected.work_id.to_string())
@@ -366,6 +466,10 @@ async fn load_work_context(
                 .ok_or_else(corrupt)?,
         )
         .map_err(|_| corrupt())?,
+        reply_binding_id: row
+            .try_get::<Option<String>, _>("reply_binding_id")?
+            .map(|value| value.parse().map_err(|_| corrupt()))
+            .transpose()?,
     })
 }
 

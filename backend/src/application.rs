@@ -14,6 +14,8 @@ pub mod command_gateway;
 pub mod command_service;
 pub mod context_assembler;
 pub mod control_message_policy;
+pub mod delivery_planner;
+pub mod delivery_worker;
 pub mod device_provisioning;
 pub mod event_delivery;
 pub mod evidence_inspection;
