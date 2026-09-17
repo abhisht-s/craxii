@@ -6,7 +6,7 @@ use crate::bootstrap::credential::CredentialSourceConfig;
 
 use super::validated::{
     ConfigData, DeviceAuthSource, FailpointMode, ModelProvider, ShellEnvironmentPolicy,
-    TracingFilter, TracingFormat, WorkstationIdentitySource,
+    TelegramConfig, TracingFilter, TracingFormat, WorkstationIdentitySource,
 };
 
 const FINGERPRINT_VERSION_MARKER: &[u8] = b"craxii-config-fingerprint-v1\0";
@@ -80,6 +80,25 @@ impl ConfigFingerprint {
         );
         for credential in &config.credentials.declared {
             canonical.string("credentials.declared.item", credential.as_str());
+        }
+
+        if let TelegramConfig::Enabled(telegram) = &config.telegram {
+            canonical.bool("telegram.enabled", true);
+            canonical.string(
+                "telegram.channel_account_id",
+                &telegram.channel_account_id.to_string(),
+            );
+            canonical.string("telegram.credential", telegram.credential.as_str());
+            canonical.u64(
+                "telegram.expected_bot_user_id",
+                u64::try_from(telegram.expected_bot_user_id)
+                    .expect("validated Telegram bot identifier is positive"),
+            );
+            canonical.u64(
+                "telegram.owner_telegram_user_id",
+                u64::try_from(telegram.owner_telegram_user_id)
+                    .expect("validated Telegram owner identifier is positive"),
+            );
         }
 
         canonical.string("models.default_target", &config.models.default_target);

@@ -204,6 +204,13 @@ impl SqliteRuntime {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(crate) async fn acquire_for_test(
+        &self,
+    ) -> Result<sqlx::pool::PoolConnection<sqlx::Sqlite>, SqliteAdapterError> {
+        self.acquire().await
+    }
 }
 
 fn nonnegative_counter(value: i64) -> Result<u64, SqliteAdapterError> {

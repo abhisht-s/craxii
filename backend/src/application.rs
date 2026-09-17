@@ -10,6 +10,7 @@ pub mod agent_loop;
 pub mod authentication;
 pub mod authority;
 pub mod channel_ingress;
+pub mod channel_topology;
 pub mod command_gateway;
 pub mod command_service;
 pub mod context_assembler;

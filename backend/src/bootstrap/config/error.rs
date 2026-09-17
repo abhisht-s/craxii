@@ -47,6 +47,11 @@ pub enum ConfigError {
         credential: String,
         target: String,
     },
+    UndeclaredTelegramCredential,
+    InvalidTelegram {
+        field: &'static str,
+        reason: &'static str,
+    },
     DuplicateModelTarget {
         target: String,
     },
@@ -136,6 +141,15 @@ impl Display for ConfigError {
                 formatter,
                 "model target {target} references undeclared credential {credential}"
             ),
+            Self::UndeclaredTelegramCredential => {
+                formatter.write_str("Telegram references an undeclared credential")
+            }
+            Self::InvalidTelegram { field, reason } => {
+                write!(
+                    formatter,
+                    "invalid Telegram configuration {field}: {reason}"
+                )
+            }
             Self::DuplicateModelTarget { target } => {
                 write!(formatter, "duplicate model target {target}")
             }

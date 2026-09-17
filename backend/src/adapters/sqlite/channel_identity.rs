@@ -11,10 +11,12 @@ use crate::domain::{
 };
 use crate::ports::channel_identity::{
     ChannelIdentityFuture, ChannelIdentityStore, ChannelIdentityStoreError,
-    ChannelIdentityStoreErrorKind,
+    ChannelIdentityStoreErrorKind, EnsureChannelAccountAndIdentityRequest,
+    EnsureConversationBindingRequest, EnsuredChannelAccountAndIdentity,
 };
 
-use super::SqliteRuntime;
+use super::transaction::WriteTransaction;
+use super::{SqliteAdapterError, SqliteRuntime};
 
 #[derive(Clone, Debug)]
 pub struct SqliteChannelIdentityStore {
@@ -38,6 +40,315 @@ fn map_sqlx(error: sqlx::Error) -> ChannelIdentityStoreError {
     } else {
         ChannelIdentityStoreError::new(ChannelIdentityStoreErrorKind::Storage)
     }
+}
+
+fn map_transaction(error: SqliteAdapterError) -> ChannelIdentityStoreError {
+    match error.kind() {
+        super::SqliteFailureKind::BusyOrLocked | super::SqliteFailureKind::Storage => {
+            ChannelIdentityStoreError::new(ChannelIdentityStoreErrorKind::Storage)
+        }
+        _ => inconsistent(),
+    }
+}
+
+fn conflict() -> ChannelIdentityStoreError {
+    ChannelIdentityStoreError::new(ChannelIdentityStoreErrorKind::Conflict)
+}
+
+async fn ensure_account_and_identity_inner(
+    runtime: &SqliteRuntime,
+    request: EnsureChannelAccountAndIdentityRequest,
+) -> Result<EnsuredChannelAccountAndIdentity, ChannelIdentityStoreError> {
+    let mut transaction = WriteTransaction::begin(runtime, "ensure_channel_account_and_identity")
+        .await
+        .map_err(map_transaction)?;
+    let accounts = sqlx::query(
+        "SELECT channel_account_id, craxii_id, provider_key, external_account_id, lifecycle_state \
+         FROM channel_accounts WHERE channel_account_id = ? OR \
+         (craxii_id = ? AND provider_key = ? AND external_account_id = ?) \
+         ORDER BY channel_account_id ASC",
+    )
+    .bind(request.channel_account_id.to_string())
+    .bind(request.craxii_id.to_string())
+    .bind(request.provider_id.as_str())
+    .bind(request.external_account_id.as_str())
+    .fetch_all(transaction.connection())
+    .await
+    .map_err(map_sqlx)?;
+    match accounts.as_slice() {
+        [] => {
+            let principal = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM craxii_principals WHERE craxii_id = ?",
+            )
+            .bind(request.craxii_id.to_string())
+            .fetch_one(transaction.connection())
+            .await
+            .map_err(map_sqlx)?;
+            if principal != 1 {
+                return Err(inconsistent());
+            }
+            sqlx::query(
+                "INSERT INTO channel_accounts \
+                 (channel_account_id, craxii_id, provider_key, external_account_id, \
+                  lifecycle_state, created_at, disabled_at) \
+                 VALUES (?, ?, ?, ?, 'active', ?, NULL)",
+            )
+            .bind(request.channel_account_id.to_string())
+            .bind(request.craxii_id.to_string())
+            .bind(request.provider_id.as_str())
+            .bind(request.external_account_id.as_str())
+            .bind(request.created_at.to_string())
+            .execute(transaction.connection())
+            .await
+            .map_err(map_sqlx)?;
+        }
+        [account]
+            if account.try_get::<String, _>("channel_account_id")?
+                == request.channel_account_id.to_string()
+                && account.try_get::<String, _>("craxii_id")? == request.craxii_id.to_string()
+                && account.try_get::<String, _>("provider_key")?
+                    == request.provider_id.as_str()
+                && account.try_get::<String, _>("external_account_id")?
+                    == request.external_account_id.as_str()
+                && account.try_get::<String, _>("lifecycle_state")? == "active" => {}
+        [_] | [_, ..] => return Err(conflict()),
+    }
+
+    let identities = sqlx::query(
+        "SELECT external_identity_id, channel_account_id, craxii_id, user_id, \
+                external_subject_id, lifecycle_state \
+         FROM external_identities WHERE external_identity_id = ? OR \
+         (channel_account_id = ? AND external_subject_id = ?) \
+         ORDER BY external_identity_id ASC",
+    )
+    .bind(request.proposed_external_identity_id.to_string())
+    .bind(request.channel_account_id.to_string())
+    .bind(request.owner_external_subject_id.as_str())
+    .fetch_all(transaction.connection())
+    .await
+    .map_err(map_sqlx)?;
+    let external_identity_id = match identities.as_slice() {
+        [] => {
+            let user =
+                sqlx::query("SELECT craxii_id, lifecycle_state FROM users WHERE user_id = ?")
+                    .bind(request.owner_user_id.to_string())
+                    .fetch_optional(transaction.connection())
+                    .await
+                    .map_err(map_sqlx)?
+                    .ok_or_else(inconsistent)?;
+            if user.try_get::<String, _>("craxii_id")? != request.craxii_id.to_string()
+                || user.try_get::<String, _>("lifecycle_state")? != "active"
+            {
+                return Err(conflict());
+            }
+            sqlx::query(
+                "INSERT INTO external_identities \
+                 (external_identity_id, channel_account_id, craxii_id, user_id, \
+                  external_subject_id, lifecycle_state, created_at, revoked_at) \
+                 VALUES (?, ?, ?, ?, ?, 'active', ?, NULL)",
+            )
+            .bind(request.proposed_external_identity_id.to_string())
+            .bind(request.channel_account_id.to_string())
+            .bind(request.craxii_id.to_string())
+            .bind(request.owner_user_id.to_string())
+            .bind(request.owner_external_subject_id.as_str())
+            .bind(request.created_at.to_string())
+            .execute(transaction.connection())
+            .await
+            .map_err(map_sqlx)?;
+            request.proposed_external_identity_id
+        }
+        [identity]
+            if identity.try_get::<String, _>("channel_account_id")?
+                == request.channel_account_id.to_string()
+                && identity.try_get::<String, _>("craxii_id")? == request.craxii_id.to_string()
+                && identity.try_get::<String, _>("user_id")?
+                    == request.owner_user_id.to_string()
+                && identity.try_get::<String, _>("external_subject_id")?
+                    == request.owner_external_subject_id.as_str()
+                && identity.try_get::<String, _>("lifecycle_state")? == "active" =>
+        {
+            identity
+                .try_get::<String, _>("external_identity_id")?
+                .parse()
+                .map_err(|_| inconsistent())?
+        }
+        [_] | [_, ..] => return Err(conflict()),
+    };
+    transaction.commit().await.map_err(map_transaction)?;
+    Ok(EnsuredChannelAccountAndIdentity {
+        channel_account_id: request.channel_account_id,
+        external_identity_id,
+    })
+}
+
+async fn ensure_binding_inner(
+    runtime: &SqliteRuntime,
+    request: EnsureConversationBindingRequest,
+) -> Result<ConversationBinding, ChannelIdentityStoreError> {
+    let mut transaction = WriteTransaction::begin(runtime, "ensure_first_conversation_binding")
+        .await
+        .map_err(map_transaction)?;
+    let topology = sqlx::query(
+        "SELECT a.craxii_id AS account_craxii_id, a.lifecycle_state AS account_lifecycle, \
+                i.channel_account_id AS identity_account_id, i.craxii_id AS identity_craxii_id, \
+                i.user_id AS identity_user_id, i.lifecycle_state AS identity_lifecycle, \
+                u.craxii_id AS user_craxii_id, u.lifecycle_state AS user_lifecycle, \
+                c.craxii_id AS conversation_craxii_id, c.owner_user_id, \
+                c.kind, c.lifecycle_state AS conversation_lifecycle \
+         FROM channel_accounts a \
+         LEFT JOIN external_identities i ON i.external_identity_id = ? \
+         LEFT JOIN users u ON u.user_id = ? \
+         LEFT JOIN conversations c ON c.conversation_id = ? \
+         WHERE a.channel_account_id = ?",
+    )
+    .bind(request.external_identity_id.to_string())
+    .bind(request.user_id.to_string())
+    .bind(request.conversation_id.to_string())
+    .bind(request.channel_account_id.to_string())
+    .fetch_optional(transaction.connection())
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(inconsistent)?;
+    let exact_topology = topology.try_get::<String, _>("account_craxii_id")?
+        == request.craxii_id.to_string()
+        && topology.try_get::<String, _>("account_lifecycle")? == "active"
+        && topology
+            .try_get::<Option<String>, _>("identity_account_id")?
+            .as_deref()
+            == Some(request.channel_account_id.to_string().as_str())
+        && topology
+            .try_get::<Option<String>, _>("identity_craxii_id")?
+            .as_deref()
+            == Some(request.craxii_id.to_string().as_str())
+        && topology
+            .try_get::<Option<String>, _>("identity_user_id")?
+            .as_deref()
+            == Some(request.user_id.to_string().as_str())
+        && topology
+            .try_get::<Option<String>, _>("identity_lifecycle")?
+            .as_deref()
+            == Some("active")
+        && topology
+            .try_get::<Option<String>, _>("user_craxii_id")?
+            .as_deref()
+            == Some(request.craxii_id.to_string().as_str())
+        && topology
+            .try_get::<Option<String>, _>("user_lifecycle")?
+            .as_deref()
+            == Some("active")
+        && topology
+            .try_get::<Option<String>, _>("conversation_craxii_id")?
+            .as_deref()
+            == Some(request.craxii_id.to_string().as_str())
+        && topology
+            .try_get::<Option<String>, _>("owner_user_id")?
+            .as_deref()
+            == Some(request.user_id.to_string().as_str())
+        && topology.try_get::<Option<String>, _>("kind")?.as_deref() == Some("primary")
+        && topology
+            .try_get::<Option<String>, _>("conversation_lifecycle")?
+            .as_deref()
+            == Some("active");
+    if !exact_topology {
+        return Err(conflict());
+    }
+
+    let bindings = sqlx::query(
+        "SELECT * FROM conversation_bindings WHERE conversation_binding_id = ? OR \
+         (channel_account_id = ? AND external_identity_id = ?) OR \
+         (channel_account_id = ? AND external_conversation_id = ? \
+          AND COALESCE(external_thread_id, '') = COALESCE(?, '')) \
+         ORDER BY conversation_binding_id ASC",
+    )
+    .bind(request.proposed_conversation_binding_id.to_string())
+    .bind(request.channel_account_id.to_string())
+    .bind(request.external_identity_id.to_string())
+    .bind(request.channel_account_id.to_string())
+    .bind(request.external_conversation_id.as_str())
+    .bind(request.external_thread_id.as_ref().map(|id| id.as_str()))
+    .fetch_all(transaction.connection())
+    .await
+    .map_err(map_sqlx)?;
+    let binding = match bindings.as_slice() {
+        [] => {
+            sqlx::query(
+                "INSERT INTO conversation_bindings \
+                 (conversation_binding_id, channel_account_id, external_identity_id, craxii_id, \
+                  user_id, conversation_id, external_conversation_id, external_thread_id, \
+                  lifecycle_state, created_at, revoked_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, NULL)",
+            )
+            .bind(request.proposed_conversation_binding_id.to_string())
+            .bind(request.channel_account_id.to_string())
+            .bind(request.external_identity_id.to_string())
+            .bind(request.craxii_id.to_string())
+            .bind(request.user_id.to_string())
+            .bind(request.conversation_id.to_string())
+            .bind(request.external_conversation_id.as_str())
+            .bind(request.external_thread_id.as_ref().map(|id| id.as_str()))
+            .bind(request.created_at.to_string())
+            .execute(transaction.connection())
+            .await
+            .map_err(map_sqlx)?;
+            ConversationBinding {
+                conversation_binding_id: request.proposed_conversation_binding_id,
+                channel_account_id: request.channel_account_id,
+                external_identity_id: request.external_identity_id,
+                craxii_id: request.craxii_id,
+                user_id: request.user_id,
+                conversation_id: request.conversation_id,
+                external_conversation_id: request.external_conversation_id,
+                external_thread_id: request.external_thread_id,
+                lifecycle: ConversationBindingLifecycle::Active,
+                created_at: request.created_at,
+                revoked_at: None,
+            }
+        }
+        [row]
+            if row.try_get::<String, _>("channel_account_id")?
+                == request.channel_account_id.to_string()
+                && row.try_get::<String, _>("external_identity_id")?
+                    == request.external_identity_id.to_string()
+                && row.try_get::<String, _>("craxii_id")? == request.craxii_id.to_string()
+                && row.try_get::<String, _>("user_id")? == request.user_id.to_string()
+                && row.try_get::<String, _>("conversation_id")?
+                    == request.conversation_id.to_string()
+                && row.try_get::<String, _>("external_conversation_id")?
+                    == request.external_conversation_id.as_str()
+                && row
+                    .try_get::<Option<String>, _>("external_thread_id")?
+                    .as_deref()
+                    == request
+                        .external_thread_id
+                        .as_ref()
+                        .map(ExternalThreadId::as_str)
+                && row.try_get::<String, _>("lifecycle_state")? == "active" =>
+        {
+            ConversationBinding {
+                conversation_binding_id: row
+                    .try_get::<String, _>("conversation_binding_id")?
+                    .parse()
+                    .map_err(|_| inconsistent())?,
+                channel_account_id: request.channel_account_id,
+                external_identity_id: request.external_identity_id,
+                craxii_id: request.craxii_id,
+                user_id: request.user_id,
+                conversation_id: request.conversation_id,
+                external_conversation_id: request.external_conversation_id,
+                external_thread_id: request.external_thread_id,
+                lifecycle: ConversationBindingLifecycle::Active,
+                created_at: row
+                    .try_get::<String, _>("created_at")?
+                    .parse()
+                    .map_err(|_| inconsistent())?,
+                revoked_at: None,
+            }
+        }
+        [_] | [_, ..] => return Err(conflict()),
+    };
+    transaction.commit().await.map_err(map_transaction)?;
+    Ok(binding)
 }
 
 impl From<sqlx::Error> for ChannelIdentityStoreError {
@@ -97,6 +408,20 @@ fn validate_inbound_shape(value: &InboundDelivery) -> Result<(), ChannelIdentity
 }
 
 impl ChannelIdentityStore for SqliteChannelIdentityStore {
+    fn ensure_channel_account_and_identity(
+        &self,
+        request: EnsureChannelAccountAndIdentityRequest,
+    ) -> ChannelIdentityFuture<'_, EnsuredChannelAccountAndIdentity> {
+        Box::pin(async move { ensure_account_and_identity_inner(&self.runtime, request).await })
+    }
+
+    fn ensure_first_conversation_binding(
+        &self,
+        request: EnsureConversationBindingRequest,
+    ) -> ChannelIdentityFuture<'_, ConversationBinding> {
+        Box::pin(async move { ensure_binding_inner(&self.runtime, request).await })
+    }
+
     fn persist_channel_account(&self, account: ChannelAccount) -> ChannelIdentityFuture<'_, ()> {
         Box::pin(async move {
             lifecycle_shape(match account.lifecycle {

@@ -123,6 +123,7 @@ pub struct SchedulerHandle {
     registry: TaskRegistryView,
     claiming: Arc<AtomicBool>,
     claim_gate: Arc<tokio::sync::Mutex<()>>,
+    initial_scan: Option<tokio::sync::oneshot::Receiver<Result<(), SchedulerError>>>,
 }
 
 enum SchedulerCommand {
@@ -162,6 +163,15 @@ impl SchedulerHandle {
             let quiesced = claim_gate.lock().await;
             drop(quiesced);
         }
+    }
+
+    /// Waits until the first durable scan and any configured readiness transition complete.
+    pub async fn wait_initial_scan(&mut self) -> Result<(), SchedulerError> {
+        self.initial_scan
+            .take()
+            .ok_or(SchedulerError::TaskJoin)?
+            .await
+            .map_err(|_| SchedulerError::TaskJoin)?
     }
 
     pub fn begin_shutdown(&self) {
@@ -236,6 +246,7 @@ where
     let registry = TaskRegistryView::default();
     let claiming = Arc::new(AtomicBool::new(true));
     let claim_gate = Arc::new(tokio::sync::Mutex::new(()));
+    let (initial_scan_sender, initial_scan) = tokio::sync::oneshot::channel();
     let loop_registry = registry.clone();
     let scheduler_span = tracing::info_span!(
         "scheduler",
@@ -255,6 +266,7 @@ where
             Arc::clone(&claiming),
             Arc::clone(&claim_gate),
             start.readiness,
+            initial_scan_sender,
         )
         .instrument(scheduler_span),
     );
@@ -266,6 +278,7 @@ where
         registry,
         claiming,
         claim_gate,
+        initial_scan: Some(initial_scan),
     })
 }
 
@@ -283,6 +296,7 @@ async fn run_scheduler<S, R, C>(
     claiming: Arc<AtomicBool>,
     claim_gate: Arc<tokio::sync::Mutex<()>>,
     readiness: SchedulerReadiness,
+    initial_scan_sender: tokio::sync::oneshot::Sender<Result<(), SchedulerError>>,
 ) -> Result<(), SchedulerError>
 where
     S: SchedulerStateStore + 'static,
@@ -299,6 +313,7 @@ where
     let mut deadline_frozen = false;
     let mut control_open = true;
     let mut initial_scan_completed = false;
+    let mut initial_scan_sender = Some(initial_scan_sender);
 
     loop {
         if shutting_down && tasks.is_empty() {
@@ -363,6 +378,9 @@ where
                     &registry_view,
                     JoinDisposition::ReconcileDurably,
                 ).await {
+                    if let Some(sender) = initial_scan_sender.take() {
+                        let _ = sender.send(Err(error));
+                    }
                     claiming.store(false, Ordering::Release);
                     let _ = health.mark_fatal(FatalReasonCode::Internal);
                     let _ = fatal.send(true);
@@ -383,6 +401,9 @@ where
                     claiming.as_ref(),
                     claim_gate.as_ref(),
                 ).await {
+                    if let Some(sender) = initial_scan_sender.take() {
+                        let _ = sender.send(Err(error));
+                    }
                     claiming.store(false, Ordering::Release);
                     let _ = health.mark_fatal(FatalReasonCode::Internal);
                     let _ = fatal.send(true);
@@ -396,6 +417,11 @@ where
                         let _ = health.mark_fatal(FatalReasonCode::Internal);
                         let _ = fatal.send(true);
                         fatal_error = Some(SchedulerError::Health);
+                        if let Some(sender) = initial_scan_sender.take() {
+                            let _ = sender.send(Err(SchedulerError::Health));
+                        }
+                    } else if let Some(sender) = initial_scan_sender.take() {
+                        let _ = sender.send(Ok(()));
                     }
                 }
             }
@@ -412,6 +438,9 @@ where
                     claiming.as_ref(),
                     claim_gate.as_ref(),
                 ).await {
+                    if let Some(sender) = initial_scan_sender.take() {
+                        let _ = sender.send(Err(error));
+                    }
                     claiming.store(false, Ordering::Release);
                     let _ = health.mark_fatal(FatalReasonCode::Internal);
                     let _ = fatal.send(true);
@@ -425,6 +454,11 @@ where
                         let _ = health.mark_fatal(FatalReasonCode::Internal);
                         let _ = fatal.send(true);
                         fatal_error = Some(SchedulerError::Health);
+                        if let Some(sender) = initial_scan_sender.take() {
+                            let _ = sender.send(Err(SchedulerError::Health));
+                        }
+                    } else if let Some(sender) = initial_scan_sender.take() {
+                        let _ = sender.send(Ok(()));
                     }
                 }
             }
@@ -1129,7 +1163,7 @@ mod tests {
         });
         let health = Health::new();
         let (fatal, _) = tokio::sync::watch::channel(false);
-        let handle = start_scheduler(
+        let mut handle = start_scheduler(
             Arc::clone(&store),
             runner,
             test_clock(),
@@ -1141,6 +1175,7 @@ mod tests {
             },
         )
         .unwrap();
+        handle.wait_initial_scan().await.unwrap();
         started.notified().await;
         assert_eq!(health.snapshot().state(), HealthState::Ready);
         assert_eq!(handle.registry().snapshot()[0].work_id, work_id);

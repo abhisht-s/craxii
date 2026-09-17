@@ -7,13 +7,15 @@ use url::{Host, Url};
 
 use crate::bootstrap::compatibility::CONFIGURATION_VERSION;
 use crate::bootstrap::credential::{CredentialRef, CredentialSourceConfig};
+use crate::domain::ChannelAccountId;
 
 use super::error::ConfigError;
 use super::fingerprint::ConfigFingerprint;
 use super::raw::{
     RawAgentLimits, RawConfig, RawCredentials, RawDeviceAuth, RawFailpointMode, RawLimits,
     RawModelCapabilities, RawModelGateway, RawModelTarget, RawModels, RawPaths, RawProtocolLimits,
-    RawServer, RawShell, RawShutdown, RawSqlite, RawToolLimits, RawTracing, RawWorkstation,
+    RawServer, RawShell, RawShutdown, RawSqlite, RawTelegram, RawToolLimits, RawTracing,
+    RawWorkstation,
 };
 
 const MAX_POOL_CONNECTIONS: u64 = 4;
@@ -40,6 +42,7 @@ const MAX_PER_STREAM_PROJECTION_BYTES: u64 = 32_768;
 
 const MAX_WEBSOCKET_DURABLE_PAYLOAD_BYTES: u64 = 262_144;
 const MAX_USER_TEXT_MESSAGE_BYTES: u64 = 65_536;
+const MAX_TELEGRAM_ID: i64 = (1_i64 << 52) - 1;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct NormalizedUrl(String);
@@ -79,6 +82,7 @@ impl ValidatedConfig {
             sqlite: validate_sqlite(raw.sqlite)?,
             workstation: validate_workstation(raw.workstation)?,
             credentials: validate_credentials(raw.credentials)?,
+            telegram: TelegramConfig::Disabled,
             models: ModelsConfig {
                 default_target: String::new(),
                 targets: Vec::new(),
@@ -93,6 +97,7 @@ impl ValidatedConfig {
 
         let mut data = ConfigData {
             models: validate_models(raw.models, &data.credentials)?,
+            telegram: validate_telegram(raw.telegram, &data.credentials)?,
             ..data
         };
         validate_cross_field_limits(&data)?;
@@ -137,6 +142,10 @@ impl ValidatedConfig {
         &self.data.models
     }
 
+    pub fn telegram(&self) -> &TelegramConfig {
+        &self.data.telegram
+    }
+
     pub fn model_gateway(&self) -> &ModelGatewayConfig {
         &self.data.model_gateway
     }
@@ -175,6 +184,7 @@ pub(super) struct ConfigData {
     pub(super) sqlite: SqliteConfig,
     pub(super) workstation: WorkstationConfig,
     pub(super) credentials: CredentialsConfig,
+    pub(super) telegram: TelegramConfig,
     pub(super) models: ModelsConfig,
     pub(super) model_gateway: ModelGatewayConfig,
     pub(super) limits: LimitsConfig,
@@ -182,6 +192,82 @@ pub(super) struct ConfigData {
     pub(super) device_auth: DeviceAuthConfig,
     pub(super) tracing: TracingConfig,
     pub(super) shutdown: ShutdownConfig,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum TelegramConfig {
+    Disabled,
+    Enabled(TelegramEnabledConfig),
+}
+
+impl TelegramConfig {
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        matches!(self, Self::Enabled(_))
+    }
+
+    #[must_use]
+    pub const fn as_enabled(&self) -> Option<&TelegramEnabledConfig> {
+        match self {
+            Self::Disabled => None,
+            Self::Enabled(value) => Some(value),
+        }
+    }
+}
+
+impl fmt::Debug for TelegramConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Disabled => formatter.write_str("TelegramConfig::Disabled"),
+            Self::Enabled(value) => formatter
+                .debug_struct("TelegramConfig::Enabled")
+                .field("channel_account_id", &value.channel_account_id)
+                .field("credential", &value.credential)
+                .field("provider_ids", &"[REDACTED]")
+                .finish(),
+        }
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct TelegramEnabledConfig {
+    pub(super) channel_account_id: ChannelAccountId,
+    pub(super) credential: CredentialRef,
+    pub(super) expected_bot_user_id: i64,
+    pub(super) owner_telegram_user_id: i64,
+}
+
+impl TelegramEnabledConfig {
+    #[must_use]
+    pub const fn channel_account_id(&self) -> ChannelAccountId {
+        self.channel_account_id
+    }
+
+    #[must_use]
+    pub const fn credential(&self) -> &CredentialRef {
+        &self.credential
+    }
+
+    #[must_use]
+    pub const fn expected_bot_user_id(&self) -> i64 {
+        self.expected_bot_user_id
+    }
+
+    #[must_use]
+    pub const fn owner_telegram_user_id(&self) -> i64 {
+        self.owner_telegram_user_id
+    }
+}
+
+impl fmt::Debug for TelegramEnabledConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TelegramEnabledConfig")
+            .field("channel_account_id", &self.channel_account_id)
+            .field("credential", &self.credential)
+            .field("provider_ids", &"[REDACTED]")
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -965,6 +1051,84 @@ fn validate_credentials(raw: RawCredentials) -> Result<CredentialsConfig, Config
     Ok(CredentialsConfig { source, declared })
 }
 
+fn validate_telegram(
+    raw: Option<RawTelegram>,
+    credentials: &CredentialsConfig,
+) -> Result<TelegramConfig, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(TelegramConfig::Disabled);
+    };
+    if !raw.enabled {
+        if raw.channel_account_id.is_some()
+            || raw.credential.is_some()
+            || raw.expected_bot_user_id.is_some()
+            || raw.owner_telegram_user_id.is_some()
+        {
+            return Err(ConfigError::InvalidTelegram {
+                field: "telegram",
+                reason: "disabled Telegram configuration must not contain provider fields",
+            });
+        }
+        return Ok(TelegramConfig::Disabled);
+    }
+
+    let channel_account_id = raw
+        .channel_account_id
+        .ok_or(ConfigError::InvalidTelegram {
+            field: "telegram.channel_account_id",
+            reason: "is required when enabled",
+        })?
+        .parse::<ChannelAccountId>()
+        .map_err(|_| ConfigError::InvalidTelegram {
+            field: "telegram.channel_account_id",
+            reason: "must be a canonical UUIDv7",
+        })?;
+    let credential = raw.credential.ok_or(ConfigError::InvalidTelegram {
+        field: "telegram.credential",
+        reason: "is required when enabled",
+    })?;
+    if !is_logical_name(&credential) {
+        return Err(ConfigError::InvalidCredentialRef {
+            field: "telegram.credential",
+        });
+    }
+    if !credentials
+        .declared
+        .iter()
+        .any(|declared| declared.as_str() == credential)
+    {
+        return Err(ConfigError::UndeclaredTelegramCredential);
+    }
+    let expected_bot_user_id =
+        telegram_configured_id(raw.expected_bot_user_id, "telegram.expected_bot_user_id")?;
+    let owner_telegram_user_id = telegram_configured_id(
+        raw.owner_telegram_user_id,
+        "telegram.owner_telegram_user_id",
+    )?;
+    if expected_bot_user_id == owner_telegram_user_id {
+        return Err(ConfigError::InvalidTelegram {
+            field: "telegram",
+            reason: "bot and owner identifiers must differ",
+        });
+    }
+    Ok(TelegramConfig::Enabled(TelegramEnabledConfig {
+        channel_account_id,
+        credential: CredentialRef::new(credential),
+        expected_bot_user_id,
+        owner_telegram_user_id,
+    }))
+}
+
+fn telegram_configured_id(value: Option<i64>, field: &'static str) -> Result<i64, ConfigError> {
+    match value {
+        Some(value @ 1..=MAX_TELEGRAM_ID) => Ok(value),
+        _ => Err(ConfigError::InvalidTelegram {
+            field,
+            reason: "must be a positive Telegram identifier within 52 significant bits",
+        }),
+    }
+}
+
 fn validate_models(
     raw: RawModels,
     credentials: &CredentialsConfig,
@@ -1345,6 +1509,18 @@ fn validate_protocol_limits(raw: RawProtocolLimits) -> Result<ProtocolLimits, Co
 }
 
 fn validate_cross_field_limits(config: &ConfigData) -> Result<(), ConfigError> {
+    if let TelegramConfig::Enabled(telegram) = &config.telegram
+        && config
+            .models
+            .targets
+            .iter()
+            .any(|target| target.credential == telegram.credential)
+    {
+        return Err(ConfigError::InvalidTelegram {
+            field: "telegram.credential",
+            reason: "must be isolated from model credentials",
+        });
+    }
     if config.limits.agent.max_model_attempts_per_work
         < config.limits.agent.max_model_steps_per_work
     {

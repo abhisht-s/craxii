@@ -12,14 +12,23 @@ use crate::adapters::local_workstation::{
 };
 use crate::adapters::openai::{OpenAiConservativeEstimator, OpenAiProvider};
 use crate::adapters::runtime_observation::SystemRuntimeProcessObserver;
-use crate::adapters::sqlite::{SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore};
+use crate::adapters::sqlite::{
+    SqliteChannelIdentityStore, SqliteFailureKind, SqliteRuntimeGuard, SqliteStateStore,
+};
 use crate::adapters::system_clock::SystemClock;
+use crate::adapters::telegram::{
+    TELEGRAM_PROVIDER_KEY, TelegramClient, TelegramInboundProcessor,
+    TelegramLongPollingDriverHandle, TelegramOwnerTopology, TelegramStartupFailureBudget,
+    start_long_polling, startup_probe, telegram_delivery_profile, verify_startup_identity,
+};
 use crate::adapters::telemetry::{Telemetry, TelemetryError};
 use crate::application::ApplicationShell;
 use crate::application::agent_loop::{AgentLoop, AgentLoopLimits, AgentLoopRuntimeContext};
 use crate::application::authority::{
     AuthorityEvaluator, V0AuthorityConstraints, V0AuthorityEvaluator,
 };
+use crate::application::channel_ingress::ChannelIngressService;
+use crate::application::channel_topology::ChannelTopologyService;
 use crate::application::context_assembler::{
     ContextAssembler, ContextAssemblyVersions, VersionedInstructionSnapshot,
 };
@@ -35,19 +44,20 @@ use crate::application::runtime::{
 };
 use crate::application::tool_execution_service::{ToolExecutionService, ToolRuntimeLimits};
 use crate::application::tool_registry::{ToolRegistry, ToolSemanticPolicy};
-use crate::application::transport::{CursorBroadcaster, MutationAdmission};
+use crate::application::transport::{CommandCommitEffects, CursorBroadcaster, MutationAdmission};
 use crate::bootstrap::config;
 use crate::bootstrap::credential::{CredentialLoadErrorKind, load_credentials};
 use crate::bootstrap::health::Health;
 use crate::bootstrap::metadata::{BuildMetadata, ProcessMetadata};
 use crate::domain::model::RequiredModelCapabilities;
 use crate::domain::{
-    ConversationId, CorrelationId, CraxiiId, GitRevision, JournalEventId, PackageVersion,
-    RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput, SchemaVersion,
-    UtcTimestamp, WorkspaceId, WorkstationGeneration, WorkstationId,
+    ChannelProviderId, ConversationId, CorrelationId, CraxiiId, ExternalAccountId,
+    ExternalSubjectId, GitRevision, JournalEventId, PackageVersion, RuntimeInstanceId,
+    RuntimeStartEvidence, RuntimeStartEvidenceInput, SchemaVersion, UtcTimestamp, WorkspaceId,
+    WorkstationGeneration, WorkstationId,
 };
 use crate::ports::artifact_store::{ArtifactOrphanReport, ArtifactStore, ArtifactStoreErrorKind};
-use crate::ports::channel_delivery::ChannelDeliveryAdapterRegistry;
+use crate::ports::channel_delivery::{ChannelDeliveryAdapter, ChannelDeliveryAdapterRegistry};
 use crate::ports::clock::Clock;
 use crate::ports::context_source_store::ContextSourceStore;
 use crate::ports::delivery_store::{DeliveryStore, RecoverDeliveriesRequest};
@@ -85,6 +95,21 @@ pub async fn run(
 ) -> Result<RunningBootstrap, StartupError> {
     let cli = Cli::parse(arguments)?;
     let config = config::load(&cli.config_path).map_err(|_| StartupError::Configuration)?;
+    let telegram_client = if let Some(telegram) = config.telegram().as_enabled() {
+        let mut credentials = load_credentials(
+            config.credentials().source(),
+            std::iter::once(telegram.credential()),
+        )
+        .map_err(|_| StartupError::ProviderCredential)?;
+        let token = credentials
+            .remove(telegram.credential().as_str())
+            .ok_or(StartupError::ProviderCredential)?;
+        Some(Arc::new(
+            TelegramClient::try_new(token).map_err(|_| StartupError::TelegramStartup)?,
+        ))
+    } else {
+        None
+    };
     let model_targets = Arc::new(
         ModelTargetSnapshot::from_validated_config(config.models())
             .map_err(|_| StartupError::Configuration)?,
@@ -112,6 +137,9 @@ pub async fn run(
         })
         .transpose()
         .map_err(|_| StartupError::ProviderComposition)?;
+    if telegram_client.is_some() && model_provider.is_none() {
+        return Err(StartupError::ProviderComposition);
+    }
     if let Some(provider) = model_provider.as_ref() {
         let default_target = model_targets
             .target(model_targets.default_target())
@@ -301,14 +329,79 @@ pub async fn run(
         }
         return Err(StartupError::Telemetry(error));
     }
+    let mut telegram_startup_budget = TelegramStartupFailureBudget::default();
+    let telegram_composition = if let (Some(client), Some(telegram)) =
+        (telegram_client.as_ref(), config.telegram().as_enabled())
+    {
+        verify_startup_identity(
+            client.as_ref(),
+            telegram.expected_bot_user_id(),
+            &mut SystemJitter,
+            &mut telegram_startup_budget,
+        )
+        .await
+        .map_err(|_| StartupError::TelegramStartup)?;
+        let topology_store = Arc::new(SqliteChannelIdentityStore::new(
+            sqlite_runtime.runtime().clone(),
+        ));
+        let topology_service = Arc::new(ChannelTopologyService::new(topology_store));
+        let topology_created_at =
+            UtcTimestamp::from_offset_datetime(clock.utc_now().map_err(|_| StartupError::Clock)?)
+                .map_err(|_| StartupError::Clock)?;
+        let ensured = topology_service
+            .ensure_account_and_owner_identity(
+                telegram.channel_account_id(),
+                snapshot.identity.craxii_id,
+                ChannelProviderId::try_new(TELEGRAM_PROVIDER_KEY)
+                    .map_err(|_| StartupError::TelegramStartup)?,
+                ExternalAccountId::try_new(telegram.expected_bot_user_id().to_string())
+                    .map_err(|_| StartupError::TelegramStartup)?,
+                snapshot.identity.user_id,
+                ExternalSubjectId::try_new(telegram.owner_telegram_user_id().to_string())
+                    .map_err(|_| StartupError::TelegramStartup)?,
+                topology_created_at,
+            )
+            .await
+            .map_err(|_| StartupError::TelegramStartup)?;
+        Some((
+            Arc::clone(client),
+            topology_service,
+            TelegramOwnerTopology {
+                channel_account_id: ensured.channel_account_id,
+                external_identity_id: ensured.external_identity_id,
+                craxii_id: snapshot.identity.craxii_id,
+                user_id: snapshot.identity.user_id,
+                conversation_id: snapshot.identity.conversation_id,
+                owner_telegram_user_id: telegram.owner_telegram_user_id(),
+            },
+        ))
+    } else {
+        None
+    };
     let (fatal, fatal_receiver) = tokio::sync::watch::channel(false);
     let delivery_profiles = Arc::new(
-        ChannelDeliveryProfileRegistry::try_new(std::iter::empty())
-            .map_err(|_| StartupError::ProviderComposition)?,
+        ChannelDeliveryProfileRegistry::try_new(
+            telegram_composition
+                .as_ref()
+                .map(|_| telegram_delivery_profile()),
+        )
+        .map_err(|_| StartupError::ProviderComposition)?,
     );
     let delivery_adapters = Arc::new(
-        ChannelDeliveryAdapterRegistry::try_new(delivery_profiles.as_ref(), std::iter::empty())
-            .map_err(|_| StartupError::ProviderComposition)?,
+        ChannelDeliveryAdapterRegistry::try_new(
+            delivery_profiles.as_ref(),
+            telegram_composition.as_ref().map(|(client, _, topology)| {
+                let provider = ChannelProviderId::try_new(TELEGRAM_PROVIDER_KEY)
+                    .expect("fixed Telegram provider is valid");
+                let adapter: Arc<dyn ChannelDeliveryAdapter> =
+                    Arc::new(crate::adapters::telegram::TelegramDeliveryAdapter::new(
+                        topology.channel_account_id,
+                        Arc::clone(client),
+                    ));
+                (provider, adapter)
+            }),
+        )
+        .map_err(|_| StartupError::ProviderComposition)?,
     );
     let delivery_notifier = DeliveryNotifier::new();
     let delivery_clock: Arc<dyn Clock> = clock.clone();
@@ -455,7 +548,7 @@ pub async fn run(
             .map_err(|_| StartupError::ProviderComposition)?
             .with_delivery(Arc::clone(&delivery_profiles), delivery_notifier.clone()),
         );
-        let scheduler = crate::application::scheduler::start_scheduler(
+        let mut scheduler = crate::application::scheduler::start_scheduler(
             Arc::clone(&state_store),
             runner,
             Arc::clone(&clock),
@@ -463,16 +556,67 @@ pub async fn run(
             fatal.clone(),
             crate::application::scheduler::SchedulerStart {
                 runtime_instance_id: runtime.runtime_instance_id,
-                readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
+                readiness: if telegram_composition.is_some() {
+                    crate::application::scheduler::SchedulerReadiness::RemainLiveUnready
+                } else {
+                    crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan
+                },
             },
         )
         .map_err(|_| StartupError::RuntimeLifecycle)?;
+        scheduler
+            .wait_initial_scan()
+            .await
+            .map_err(|_| StartupError::RuntimeLifecycle)?;
         let notifier = scheduler.notifier();
         shutdown
             .install_scheduler(scheduler)
             .await
             .map_err(|_| StartupError::RuntimeLifecycle)?;
         Some(notifier)
+    } else {
+        None
+    };
+    let telegram_poller = if let Some((client, topology_service, topology)) = telegram_composition {
+        if scheduler_notifier.is_none() {
+            return Err(StartupError::ProviderComposition);
+        }
+        let post_commit = CommandCommitEffects::new(cursors.clone(), scheduler_notifier.clone());
+        let ingress = Arc::new(
+            ChannelIngressService::new(
+                Arc::clone(&state_store),
+                health.clone(),
+                mutation_admission.clone(),
+                post_commit,
+            )
+            .with_delivery(Arc::clone(&delivery_profiles), delivery_notifier.clone()),
+        );
+        let processor = Arc::new(TelegramInboundProcessor::new(
+            topology,
+            topology_service,
+            ingress,
+            Arc::clone(&clock),
+        ));
+        let initial_batch = startup_probe(
+            client.as_ref(),
+            &mut SystemJitter,
+            &mut telegram_startup_budget,
+        )
+        .await
+        .map_err(|_| StartupError::TelegramStartup)?;
+        let mut poller = start_long_polling(
+            client,
+            initial_batch,
+            processor,
+            health.clone(),
+            fatal.clone(),
+            SystemJitter,
+        );
+        poller
+            .wait_started()
+            .await
+            .map_err(|_| StartupError::TelegramStartup)?;
+        Some(poller)
     } else {
         None
     };
@@ -507,6 +651,7 @@ pub async fn run(
         server,
         fatal_receiver,
         delivery_worker,
+        telegram_poller,
     })
 }
 
@@ -639,6 +784,18 @@ impl DeliveryJitterSource for SystemJitter {
     }
 }
 
+impl crate::adapters::telegram::TelegramJitterSource for SystemJitter {
+    fn sample_inclusive(&mut self, lower_millis: u64, upper_millis: u64) -> u64 {
+        if lower_millis >= upper_millis {
+            return lower_millis;
+        }
+        lower_millis.saturating_add(FullJitterSource::sample_inclusive(
+            self,
+            upper_millis - lower_millis,
+        ))
+    }
+}
+
 /// Successful Stage 7 bootstrap ownership.
 ///
 /// This guard keeps the database pool and process lock alive without making the application layer
@@ -659,6 +816,7 @@ pub struct RunningBootstrap {
     server: ServerHandle,
     fatal_receiver: tokio::sync::watch::Receiver<bool>,
     delivery_worker: DeliveryWorkerHandle,
+    telegram_poller: Option<TelegramLongPollingDriverHandle>,
 }
 
 impl RunningBootstrap {
@@ -732,9 +890,14 @@ impl RunningBootstrap {
         }
     }
 
-    pub async fn shutdown(self) -> Result<(), StartupError> {
+    pub async fn shutdown(mut self) -> Result<(), StartupError> {
         let mut runtime_cleanup_failed = false;
         let deadline = self.shutdown.latch_shutdown_request();
+        if let Some(poller) = self.telegram_poller.take()
+            && poller.shutdown_before(deadline).await.is_err()
+        {
+            runtime_cleanup_failed = true;
+        }
         self.delivery_worker.stop_claiming_and_wait().await;
         match self.application.health().snapshot().state() {
             crate::bootstrap::health::HealthState::LiveUnready
@@ -824,6 +987,7 @@ pub enum StartupError {
     WorkstationLifecycle,
     ProviderCredential,
     ProviderComposition,
+    TelegramStartup,
     Telemetry(TelemetryError),
     ServerBind,
     ServerLifecycle(crate::adapters::http::ServerError),
@@ -891,6 +1055,7 @@ impl StartupError {
             Self::WorkstationLifecycle => "workstation_lifecycle_failure",
             Self::ProviderCredential => "provider_credential_unavailable",
             Self::ProviderComposition => "provider_composition_failure",
+            Self::TelegramStartup => "telegram_startup_failure",
             Self::Telemetry(TelemetryError::GlobalSubscriberConflict) => {
                 "telemetry_subscriber_conflict"
             }
@@ -1060,6 +1225,45 @@ mod tests {
             .expect("SQLite has an explicit final shutdown point");
         assert!(begin < join);
         assert!(join < sqlite_close);
+    }
+
+    #[test]
+    fn telegram_composition_precedes_delivery_scan_and_poller_follows_scheduler_readiness() {
+        let startup = include_str!("startup.rs");
+        let profiles = startup
+            .find("let delivery_profiles =")
+            .expect("Telegram delivery profiles have an explicit composition point");
+        let adapters = startup
+            .find("let delivery_adapters =")
+            .expect("Telegram delivery adapters have an explicit composition point");
+        let worker = startup
+            .find("let mut delivery_worker = start_delivery_worker(")
+            .expect("delivery worker has an explicit start point");
+        let delivery_scan = startup
+            .find("delivery_worker\n        .wait_initial_scan()")
+            .expect("delivery worker initial scan is awaited");
+        let scheduler_scan = startup
+            .find("scheduler\n            .wait_initial_scan()")
+            .expect("scheduler initial scan is awaited");
+        let probe = startup
+            .find("let initial_batch = startup_probe(")
+            .expect("Telegram startup probe has an explicit retained batch");
+        let poller = startup
+            .find("let mut poller = start_long_polling(")
+            .expect("Telegram poller has an explicit owned start point");
+        let handshake = startup
+            .find("poller\n            .wait_started()")
+            .expect("Telegram poller startup handshake is awaited");
+
+        assert!(
+            profiles < adapters
+                && adapters < worker
+                && worker < delivery_scan
+                && delivery_scan < scheduler_scan
+                && scheduler_scan < probe
+                && probe < poller
+                && poller < handshake
+        );
     }
 
     #[test]

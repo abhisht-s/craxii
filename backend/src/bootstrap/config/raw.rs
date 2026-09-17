@@ -11,6 +11,8 @@ pub(super) struct RawConfig {
     pub(super) sqlite: RawSqlite,
     pub(super) workstation: RawWorkstation,
     pub(super) credentials: RawCredentials,
+    #[serde(default)]
+    pub(super) telegram: Option<RawTelegram>,
     pub(super) models: RawModels,
     pub(super) model_gateway: RawModelGateway,
     pub(super) limits: RawLimits,
@@ -18,6 +20,16 @@ pub(super) struct RawConfig {
     pub(super) device_auth: RawDeviceAuth,
     pub(super) tracing: RawTracing,
     pub(super) shutdown: RawShutdown,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RawTelegram {
+    pub(super) enabled: bool,
+    pub(super) channel_account_id: Option<String>,
+    pub(super) credential: Option<String>,
+    pub(super) expected_bot_user_id: Option<i64>,
+    pub(super) owner_telegram_user_id: Option<i64>,
 }
 
 #[derive(Default, Deserialize)]

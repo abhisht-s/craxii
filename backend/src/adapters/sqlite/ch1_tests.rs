@@ -1,7 +1,9 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::application::channel_topology::{ChannelTopologyErrorKind, ChannelTopologyService};
 use crate::domain::{
     ChannelAccount, ChannelAccountId, ChannelAccountLifecycle, ChannelProviderId, ClientMessageId,
     ConversationBinding, ConversationBindingId, ConversationBindingLifecycle, ConversationId,
@@ -87,6 +89,368 @@ async fn fresh() -> (
         .unwrap()
         .identity;
     (root, guard, store, identity)
+}
+
+#[tokio::test]
+async fn exact_topology_account_and_owner_identity_are_idempotent_and_conflicts_fail_closed() {
+    let (_root, guard, _state, owner) = fresh().await;
+    let service = ChannelTopologyService::new(Arc::new(SqliteChannelIdentityStore::new(
+        guard.runtime().clone(),
+    )));
+    let account_id = ChannelAccountId::generate();
+    let provider = ChannelProviderId::try_new("telegram").unwrap();
+    let external_account = ExternalAccountId::try_new("10001").unwrap();
+    let subject = ExternalSubjectId::try_new("20002").unwrap();
+    let first = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            provider.clone(),
+            external_account.clone(),
+            owner.user_id,
+            subject.clone(),
+            at(),
+        )
+        .await
+        .unwrap();
+    let reused = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            provider.clone(),
+            external_account.clone(),
+            owner.user_id,
+            subject.clone(),
+            at(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, reused);
+
+    for result in [
+        service
+            .ensure_account_and_owner_identity(
+                ChannelAccountId::generate(),
+                owner.craxii_id,
+                provider.clone(),
+                external_account.clone(),
+                owner.user_id,
+                subject.clone(),
+                at(),
+            )
+            .await,
+        service
+            .ensure_account_and_owner_identity(
+                account_id,
+                owner.craxii_id,
+                provider,
+                ExternalAccountId::try_new("different-bot").unwrap(),
+                owner.user_id,
+                subject,
+                at(),
+            )
+            .await,
+        service
+            .ensure_account_and_owner_identity(
+                account_id,
+                CraxiiId::generate(),
+                ChannelProviderId::try_new("telegram").unwrap(),
+                external_account.clone(),
+                owner.user_id,
+                ExternalSubjectId::try_new("20002").unwrap(),
+                at(),
+            )
+            .await,
+        service
+            .ensure_account_and_owner_identity(
+                account_id,
+                owner.craxii_id,
+                ChannelProviderId::try_new("other-provider").unwrap(),
+                external_account.clone(),
+                owner.user_id,
+                ExternalSubjectId::try_new("20002").unwrap(),
+                at(),
+            )
+            .await,
+    ] {
+        assert_eq!(
+            result.unwrap_err().kind(),
+            ChannelTopologyErrorKind::Conflict
+        );
+    }
+
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM channel_accounts")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM external_identities")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query(
+        "UPDATE channel_accounts SET lifecycle_state = 'disabled', disabled_at = ? \
+         WHERE channel_account_id = ?",
+    )
+    .bind(T0)
+    .bind(account_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    let error = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            ChannelProviderId::try_new("telegram").unwrap(),
+            ExternalAccountId::try_new("10001").unwrap(),
+            owner.user_id,
+            ExternalSubjectId::try_new("20002").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), ChannelTopologyErrorKind::Conflict);
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn exact_owner_identity_never_rebinds_or_reactivates() {
+    let (_root, guard, _state, owner) = fresh().await;
+    let service = ChannelTopologyService::new(Arc::new(SqliteChannelIdentityStore::new(
+        guard.runtime().clone(),
+    )));
+    let account_id = ChannelAccountId::generate();
+    let ensured = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            ChannelProviderId::try_new("telegram").unwrap(),
+            ExternalAccountId::try_new("30003").unwrap(),
+            owner.user_id,
+            ExternalSubjectId::try_new("40004").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap();
+    let other_user = UserId::generate();
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (user_id, craxii_id, lifecycle_state, created_at) \
+         VALUES (?, ?, 'active', ?)",
+    )
+    .bind(other_user.to_string())
+    .bind(owner.craxii_id.to_string())
+    .bind(T0)
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    let wrong_user = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            ChannelProviderId::try_new("telegram").unwrap(),
+            ExternalAccountId::try_new("30003").unwrap(),
+            other_user,
+            ExternalSubjectId::try_new("40004").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(wrong_user.kind(), ChannelTopologyErrorKind::Conflict);
+
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    sqlx::query(
+        "UPDATE external_identities SET lifecycle_state = 'revoked', revoked_at = ? \
+         WHERE external_identity_id = ?",
+    )
+    .bind(T0)
+    .bind(ensured.external_identity_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    let revoked = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            ChannelProviderId::try_new("telegram").unwrap(),
+            ExternalAccountId::try_new("30003").unwrap(),
+            owner.user_id,
+            ExternalSubjectId::try_new("40004").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(revoked.kind(), ChannelTopologyErrorKind::Conflict);
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn first_binding_is_race_safe_exact_and_never_rebinds_or_reactivates() {
+    let (_root, guard, _state, owner) = fresh().await;
+    let service = Arc::new(ChannelTopologyService::new(Arc::new(
+        SqliteChannelIdentityStore::new(guard.runtime().clone()),
+    )));
+    let account_id = ChannelAccountId::generate();
+    let ensured = service
+        .ensure_account_and_owner_identity(
+            account_id,
+            owner.craxii_id,
+            ChannelProviderId::try_new("telegram").unwrap(),
+            ExternalAccountId::try_new("50005").unwrap(),
+            owner.user_id,
+            ExternalSubjectId::try_new("60006").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap();
+    let destination = ExternalConversationId::try_new("60006").unwrap();
+    let left = {
+        let service = Arc::clone(&service);
+        let destination = destination.clone();
+        tokio::spawn(async move {
+            service
+                .ensure_first_binding(
+                    account_id,
+                    ensured.external_identity_id,
+                    owner.craxii_id,
+                    owner.user_id,
+                    owner.conversation_id,
+                    destination,
+                    at(),
+                )
+                .await
+        })
+    };
+    let right = {
+        let service = Arc::clone(&service);
+        let destination = destination.clone();
+        tokio::spawn(async move {
+            service
+                .ensure_first_binding(
+                    account_id,
+                    ensured.external_identity_id,
+                    owner.craxii_id,
+                    owner.user_id,
+                    owner.conversation_id,
+                    destination,
+                    at(),
+                )
+                .await
+        })
+    };
+    let first = left.await.unwrap().unwrap();
+    let second = right.await.unwrap().unwrap();
+    assert_eq!(first, second);
+
+    let conflict = service
+        .ensure_first_binding(
+            account_id,
+            ensured.external_identity_id,
+            owner.craxii_id,
+            owner.user_id,
+            owner.conversation_id,
+            ExternalConversationId::try_new("different-chat").unwrap(),
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(conflict.kind(), ChannelTopologyErrorKind::Conflict);
+    for (user_id, conversation_id) in [
+        (UserId::generate(), owner.conversation_id),
+        (owner.user_id, ConversationId::generate()),
+    ] {
+        let error = service
+            .ensure_first_binding(
+                account_id,
+                ensured.external_identity_id,
+                owner.craxii_id,
+                user_id,
+                conversation_id,
+                destination.clone(),
+                at(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ChannelTopologyErrorKind::Conflict);
+    }
+
+    let identity_store = SqliteChannelIdentityStore::new(guard.runtime().clone());
+    let second_identity = ExternalIdentity {
+        external_identity_id: ExternalIdentityId::generate(),
+        channel_account_id: account_id,
+        craxii_id: owner.craxii_id,
+        user_id: owner.user_id,
+        external_subject_id: ExternalSubjectId::try_new("70007").unwrap(),
+        lifecycle: ExternalIdentityLifecycle::Active,
+        created_at: at(),
+        revoked_at: None,
+    };
+    identity_store
+        .persist_external_identity(second_identity.clone())
+        .await
+        .unwrap();
+    let destination_owned = service
+        .ensure_first_binding(
+            account_id,
+            second_identity.external_identity_id,
+            owner.craxii_id,
+            owner.user_id,
+            owner.conversation_id,
+            destination.clone(),
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(destination_owned.kind(), ChannelTopologyErrorKind::Conflict);
+
+    let mut connection = guard.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversations")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM conversation_bindings")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query(
+        "UPDATE conversation_bindings SET lifecycle_state = 'revoked', revoked_at = ? \
+         WHERE conversation_binding_id = ?",
+    )
+    .bind(T0)
+    .bind(first.conversation_binding_id.to_string())
+    .execute(&mut *connection)
+    .await
+    .unwrap();
+    drop(connection);
+    let revoked = service
+        .ensure_first_binding(
+            account_id,
+            ensured.external_identity_id,
+            owner.craxii_id,
+            owner.user_id,
+            owner.conversation_id,
+            destination,
+            at(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(revoked.kind(), ChannelTopologyErrorKind::Conflict);
+    guard.shutdown().await;
 }
 
 #[tokio::test]

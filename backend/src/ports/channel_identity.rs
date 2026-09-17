@@ -5,8 +5,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::domain::{
-    ChannelAccount, ChannelAccountId, ConversationBinding, ConversationBindingId, ExternalIdentity,
-    ExternalIdentityId, InboundDelivery, InboundDeliveryId,
+    ChannelAccount, ChannelAccountId, ChannelProviderId, ConversationBinding,
+    ConversationBindingId, ConversationId, CraxiiId, ExternalAccountId, ExternalConversationId,
+    ExternalIdentity, ExternalIdentityId, ExternalSubjectId, ExternalThreadId, InboundDelivery,
+    InboundDeliveryId, UserId, UtcTimestamp,
 };
 
 pub type ChannelIdentityFuture<'a, T> =
@@ -22,6 +24,35 @@ pub enum ChannelIdentityStoreErrorKind {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct ChannelIdentityStoreError {
     kind: ChannelIdentityStoreErrorKind,
+}
+
+pub struct EnsureChannelAccountAndIdentityRequest {
+    pub channel_account_id: ChannelAccountId,
+    pub proposed_external_identity_id: ExternalIdentityId,
+    pub craxii_id: CraxiiId,
+    pub provider_id: ChannelProviderId,
+    pub external_account_id: ExternalAccountId,
+    pub owner_user_id: UserId,
+    pub owner_external_subject_id: ExternalSubjectId,
+    pub created_at: UtcTimestamp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EnsuredChannelAccountAndIdentity {
+    pub channel_account_id: ChannelAccountId,
+    pub external_identity_id: ExternalIdentityId,
+}
+
+pub struct EnsureConversationBindingRequest {
+    pub proposed_conversation_binding_id: ConversationBindingId,
+    pub channel_account_id: ChannelAccountId,
+    pub external_identity_id: ExternalIdentityId,
+    pub craxii_id: CraxiiId,
+    pub user_id: UserId,
+    pub conversation_id: ConversationId,
+    pub external_conversation_id: ExternalConversationId,
+    pub external_thread_id: Option<ExternalThreadId>,
+    pub created_at: UtcTimestamp,
 }
 
 impl ChannelIdentityStoreError {
@@ -55,6 +86,16 @@ impl fmt::Debug for ChannelIdentityStoreError {
 impl std::error::Error for ChannelIdentityStoreError {}
 
 pub trait ChannelIdentityStore: Send + Sync {
+    fn ensure_channel_account_and_identity(
+        &self,
+        request: EnsureChannelAccountAndIdentityRequest,
+    ) -> ChannelIdentityFuture<'_, EnsuredChannelAccountAndIdentity>;
+
+    fn ensure_first_conversation_binding(
+        &self,
+        request: EnsureConversationBindingRequest,
+    ) -> ChannelIdentityFuture<'_, ConversationBinding>;
+
     fn persist_channel_account(&self, account: ChannelAccount) -> ChannelIdentityFuture<'_, ()>;
 
     fn load_channel_account(

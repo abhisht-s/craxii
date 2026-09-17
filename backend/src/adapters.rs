@@ -8,4 +8,5 @@ pub mod runtime_observation;
 pub mod scripted_provider;
 pub mod sqlite;
 pub mod system_clock;
+pub mod telegram;
 pub mod telemetry;

@@ -12,8 +12,9 @@ pub use validated::{
     AgentLimits, CredentialsConfig, DeviceAuthConfig, DeviceAuthSource, FailpointMode,
     LimitsConfig, ModelCapabilities, ModelGatewayConfig, ModelProvider, ModelTargetConfig,
     ModelsConfig, NormalizedUrl, PathsConfig, ProtocolLimits, ServerConfig, ShellConfig,
-    ShellEnvironmentPolicy, ShutdownConfig, SqliteConfig, ToolLimits, TracingConfig, TracingFilter,
-    TracingFormat, ValidatedConfig, WorkstationConfig, WorkstationIdentitySource,
+    ShellEnvironmentPolicy, ShutdownConfig, SqliteConfig, TelegramConfig, TelegramEnabledConfig,
+    ToolLimits, TracingConfig, TracingFilter, TracingFormat, ValidatedConfig, WorkstationConfig,
+    WorkstationIdentitySource,
 };
 
 pub fn parse(input: &str) -> Result<ValidatedConfig, ConfigError> {

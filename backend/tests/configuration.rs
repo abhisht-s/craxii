@@ -64,6 +64,27 @@ fn reverse_model_targets(input: &str) -> String {
     )
 }
 
+fn with_telegram(input: &str, body: &str) -> String {
+    format!(
+        "{}\n[telegram]\n{}\n",
+        input.replace(
+            "declared = [\"openai_primary\", \"openai_secondary\"]",
+            "declared = [\"openai_primary\", \"openai_secondary\", \"telegram_bot\", \"telegram_other\"]",
+        ),
+        body,
+    )
+}
+
+fn enabled_telegram() -> String {
+    with_telegram(
+        LOCAL,
+        &format!(
+            "enabled = true\nchannel_account_id = \"{}\"\ncredential = \"telegram_bot\"\nexpected_bot_user_id = 10001\nowner_telegram_user_id = 20002",
+            uuid::Uuid::now_v7()
+        ),
+    )
+}
+
 #[test]
 fn compatibility_constants_are_exact() {
     assert_eq!(ARCHITECTURE_VERSION, "V0.0.01");
@@ -181,6 +202,129 @@ fn defaults_expand_before_fingerprinting() {
     assert_eq!(omitted.failpoint_mode(), FailpointMode::Disabled);
     assert!(omitted.shell().inherited_variables().is_empty());
     assert_eq!(omitted.fingerprint(), explicit.fingerprint());
+}
+
+#[test]
+fn telegram_is_optional_and_explicit_disabled_is_a_hard_off_fingerprint_noop() {
+    let absent = valid(LOCAL);
+    assert!(!absent.telegram().enabled());
+    assert!(absent.telegram().as_enabled().is_none());
+
+    let disabled = valid(&format!("{LOCAL}\n[telegram]\nenabled = false\n"));
+    assert!(!disabled.telegram().enabled());
+    assert_eq!(absent.fingerprint(), disabled.fingerprint());
+}
+
+#[test]
+fn enabled_telegram_requires_strict_nonsecret_identity_configuration() {
+    let input = enabled_telegram();
+    let parsed = valid(&input);
+    let telegram = parsed.telegram().as_enabled().unwrap();
+    assert_eq!(telegram.expected_bot_user_id(), 10001);
+    assert_eq!(telegram.owner_telegram_user_id(), 20002);
+    assert_eq!(telegram.credential().as_str(), "telegram_bot");
+
+    for line in [
+        format!("channel_account_id = \"{}\"", telegram.channel_account_id()),
+        "credential = \"telegram_bot\"".to_owned(),
+        "expected_bot_user_id = 10001".to_owned(),
+        "owner_telegram_user_id = 20002".to_owned(),
+    ] {
+        assert!(matches!(
+            invalid(&input.replacen(&format!("{line}\n"), "", 1)),
+            ConfigError::InvalidTelegram { .. }
+        ));
+    }
+
+    for changed in [
+        input.replace(
+            &format!("channel_account_id = \"{}\"", telegram.channel_account_id()),
+            "channel_account_id = \"not-a-uuid\"",
+        ),
+        input.replace("expected_bot_user_id = 10001", "expected_bot_user_id = 0"),
+        input.replace(
+            "expected_bot_user_id = 10001",
+            "expected_bot_user_id = 4503599627370496",
+        ),
+        input.replace(
+            "owner_telegram_user_id = 20002",
+            "owner_telegram_user_id = -1",
+        ),
+        input.replace(
+            "owner_telegram_user_id = 20002",
+            "owner_telegram_user_id = 10001",
+        ),
+    ] {
+        assert!(matches!(
+            invalid(&changed),
+            ConfigError::InvalidTelegram { .. }
+        ));
+    }
+
+    let undeclared = input.replace("credential = \"telegram_bot\"", "credential = \"missing\"");
+    assert!(matches!(
+        invalid(&undeclared),
+        ConfigError::UndeclaredTelegramCredential
+    ));
+    let shared_with_model = input.replace(
+        "credential = \"telegram_bot\"",
+        "credential = \"openai_primary\"",
+    );
+    assert!(matches!(
+        invalid(&shared_with_model),
+        ConfigError::InvalidTelegram { .. }
+    ));
+}
+
+#[test]
+fn telegram_fingerprint_includes_logical_reference_and_ids_but_no_secret_material() {
+    let primary = enabled_telegram();
+    let alternate_ref = primary.replace(
+        "credential = \"telegram_bot\"",
+        "credential = \"telegram_other\"",
+    );
+    let alternate_owner = primary.replace(
+        "owner_telegram_user_id = 20002",
+        "owner_telegram_user_id = 20003",
+    );
+    let alternate_bot = primary.replace(
+        "expected_bot_user_id = 10001",
+        "expected_bot_user_id = 10002",
+    );
+    let original_account = valid(&primary)
+        .telegram()
+        .as_enabled()
+        .unwrap()
+        .channel_account_id();
+    let alternate_account = primary.replace(
+        &format!("channel_account_id = \"{original_account}\""),
+        &format!("channel_account_id = \"{}\"", uuid::Uuid::now_v7()),
+    );
+    assert_ne!(
+        valid(&primary).fingerprint(),
+        valid(&alternate_ref).fingerprint()
+    );
+    assert_ne!(
+        valid(&primary).fingerprint(),
+        valid(&alternate_owner).fingerprint()
+    );
+    assert_ne!(
+        valid(&primary).fingerprint(),
+        valid(&alternate_bot).fingerprint()
+    );
+    assert_ne!(
+        valid(&primary).fingerprint(),
+        valid(&alternate_account).fingerprint()
+    );
+
+    let rendered = format!(
+        "{:?}{:?}",
+        valid(&primary).telegram(),
+        valid(&primary).fingerprint()
+    );
+    for secret in ["synthetic-token-secret", "10001", "20002"] {
+        assert!(!rendered.contains(secret));
+    }
 }
 
 #[test]
