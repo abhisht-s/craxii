@@ -195,6 +195,40 @@ fn bind_failure_precedes_database_and_runtime_creation() {
 }
 
 #[test]
+fn ch6_startup_loads_synthetic_telegram_credential_without_emitting_or_persisting_it() {
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let authority = occupied.local_addr().unwrap().to_string();
+    let input = format!(
+        "{}\n[telegram]\nenabled = true\nchannel_account_id = \"{}\"\ncredential = \"telegram_bot\"\nexpected_bot_user_id = 10001\nowner_telegram_user_id = 20002\n",
+        LOCAL.replace(
+            "declared = [\"openai_primary\", \"openai_secondary\"]",
+            "declared = [\"openai_primary\", \"openai_secondary\", \"telegram_bot\"]",
+        ),
+        uuid::Uuid::now_v7(),
+    );
+    let config = TempConfig::new_with_authority(&input, &authority);
+    let token = [
+        "424244",
+        ":",
+        "CXR_FAKE_CH6_STARTUP_CREDENTIAL_CANARY_LOCAL_ONLY",
+    ]
+    .concat();
+    let credential = config.root.join("credentials/telegram_bot");
+    fs::write(&credential, &token).unwrap();
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = run(&["--config", config.path().to_str().unwrap()]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(text(&output.stderr), "craxii fatal: server_bind_failure\n");
+    assert!(!text(&output.stderr).contains(&token));
+    assert!(!format!("{output:?}").contains(&token));
+    assert!(!config.root.join("state/db/craxii.sqlite3").exists());
+    assert!(!config.root.join("state/artifacts").exists());
+    assert_eq!(fs::read_to_string(credential).unwrap(), token);
+}
+
+#[test]
 fn unsafe_provider_credential_fails_with_a_fixed_redacted_code() {
     let root = temporary_root();
     fs::create_dir_all(&root).unwrap();

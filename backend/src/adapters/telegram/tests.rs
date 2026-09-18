@@ -8,37 +8,68 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
 use serde_json::{Value, json};
 use sqlx::Row as _;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::instrument::WithSubscriber as _;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
+use crate::adapters::artifacts::LocalArtifactStore;
+use crate::adapters::local_workstation::{LocalWorkstation, LocalWorkstationOptions};
 use crate::adapters::sqlite::{SqliteChannelIdentityStore, SqliteRuntimeGuard, SqliteStateStore};
 use crate::application::channel_ingress::ChannelIngressService;
 use crate::application::channel_topology::ChannelTopologyService;
 use crate::application::command_service::CommandPostCommit;
 use crate::application::delivery_planner::ChannelDeliveryProfileRegistry;
-use crate::application::delivery_worker::DeliveryNotifier;
+use crate::application::delivery_worker::{
+    DeliveryJitterSource, DeliveryNotifier, start_delivery_worker,
+};
+use crate::application::runtime::bootstrap_runtime;
+use crate::application::scheduler::{
+    SchedulerReadiness, SchedulerStart, WorkCancellation, WorkRunner, WorkRunnerExit,
+    WorkRunnerFuture, WorkRunnerStartError, start_scheduler,
+};
 use crate::application::transport::MutationAdmission;
+use crate::bootstrap::credential::{CredentialRef, CredentialSourceConfig, load_credentials};
 use crate::bootstrap::health::{Health, HealthState};
 use crate::bootstrap::secret::SecretString;
 use crate::domain::{
     ChannelAccountId, ChannelDispatchResult, ChannelProviderId, CorrelationId, CraxiiId,
-    DeliveryFailureClass, ExternalAccountId, ExternalConversationId, ExternalSubjectId,
-    ExternalThreadId, JournalEventId, OutboundDeliveryAttemptId, OutboundDeliveryId,
-    PreparedChannelDispatch, Sha256Digest, UserId, WorkspaceId, WorkstationGeneration,
+    DeliveryFailureClass, DiagnosticPid, ExecutionId, ExternalAccountId, ExternalConversationId,
+    ExternalSubjectId, ExternalThreadId, GitRevision, JournalEventId, LinuxBootId,
+    LogicalPathReference, MonotonicDuration, OperationId, OutboundDeliveryAttemptId,
+    OutboundDeliveryId, OutboundDeliveryState, PackageVersion, PreparedChannelDispatch,
+    PrivilegeMode, RuntimeInstanceId, RuntimeStartEvidence, RuntimeStartEvidenceInput,
+    SchemaVersion, Sha256Digest, UserId, UtcTimestamp, WorkspaceId, WorkstationGeneration,
     WorkstationId,
 };
-use crate::ports::channel_delivery::ChannelDeliveryAdapter;
+use crate::ports::artifact_store::ArtifactStore;
+use crate::ports::channel_delivery::{
+    ChannelDeliveryAdapter, ChannelDeliveryAdapterRegistry, ChannelDeliveryFuture,
+};
 use crate::ports::channel_ingress::{
     ChannelIngressFuture, ChannelIngressStore, ChannelIngressStoreError,
     ChannelIngressStoreErrorKind, ChannelProviderFuture, ClassifyInboundRequest,
 };
-use crate::ports::clock::TestClock;
+use crate::ports::clock::{Clock, MonotonicInstant, TestClock};
+use crate::ports::delivery_store::{
+    ClaimDeliveryRequest, DeliveryClaim, DeliveryStore, ListDeliverySummariesRequest,
+    RecoverDeliveriesRequest,
+};
 use crate::ports::state_store::{
-    BootstrapObservation, BootstrapStateStore, ExecutionCapabilityObservation,
+    BootstrapObservation, BootstrapStateStore, ClaimedWork, ExecutionCapabilityObservation,
     LoadOrBootstrapIdentityRequest, V0IdentityReference,
+};
+use crate::ports::workstation::{
+    ExecutionCancellationRequest, ExecutionCancellationState, ExecutionCapturePolicy,
+    ExecutionCleanupPolicy, ExecutionRequest, ExecutionResult, ExecutionResultKind,
+    ExecutionStdinPolicy, HARD_EXECUTION_STREAM_CAPTURE_BYTES, HARD_FILE_READ_MAX_BYTES,
+    Workstation,
+};
+use crate::ports::workstation_preparation::{
+    RequiredWorkstationCapability, WorkstationPreparation, WorkstationPreparationRequest,
 };
 
 use super::client::TelegramClient;
@@ -240,6 +271,41 @@ fn telegram_profile_and_client_diagnostics_are_exact_and_secret_safe() {
         }
         assert!(!diagnostic.contains("http://"));
     }
+}
+
+#[test]
+fn ch6_telegram_server_adapter_loads_only_its_synthetic_credential_by_normal_mechanism() {
+    let root = TestRoot::new();
+    let token = [
+        "424243",
+        ":",
+        "CXR_FAKE_CH6_SERVER_ADAPTER_CANARY_LOCAL_ONLY",
+    ]
+    .concat();
+    let credential = root.path().join("telegram_bot");
+    fs::write(&credential, &token).unwrap();
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+    let reference = CredentialRef::new("telegram_bot".to_owned());
+    let mut loaded = load_credentials(
+        &CredentialSourceConfig::LocalDirectory {
+            directory: root.path().to_owned(),
+        },
+        [&reference],
+    )
+    .unwrap();
+    assert_eq!(loaded.len(), 1);
+    let client = Arc::new(
+        TelegramClient::for_test(
+            loaded.remove("telegram_bot").unwrap(),
+            "http://127.0.0.1:1/",
+        )
+        .unwrap(),
+    );
+    let adapter = TelegramDeliveryAdapter::new(ChannelAccountId::generate(), client);
+    let diagnostics = format!("{adapter:?}");
+    assert!(!diagnostics.contains(&token));
+    assert!(!diagnostics.contains(root.path().to_str().unwrap()));
+    assert_eq!(diagnostics.matches("[REDACTED]").count(), 1);
 }
 
 #[tokio::test]
@@ -608,6 +674,30 @@ struct FixedJitter;
 impl TelegramJitterSource for FixedJitter {
     fn sample_inclusive(&mut self, lower_millis: u64, _: u64) -> u64 {
         lower_millis
+    }
+}
+
+struct FixedDeliveryJitter(u64);
+
+impl DeliveryJitterSource for FixedDeliveryJitter {
+    fn sample_inclusive(&mut self, upper_bound_millis: u64) -> u64 {
+        self.0.min(upper_bound_millis)
+    }
+}
+
+struct CountingTelegramAdapter {
+    inner: TelegramDeliveryAdapter,
+    calls: Arc<AtomicUsize>,
+}
+
+impl ChannelDeliveryAdapter for CountingTelegramAdapter {
+    fn provider_id(&self) -> &ChannelProviderId {
+        self.inner.provider_id()
+    }
+
+    fn dispatch(&self, dispatch: PreparedChannelDispatch) -> ChannelDeliveryFuture<'_> {
+        self.calls.fetch_add(1, Ordering::AcqRel);
+        self.inner.dispatch(dispatch)
     }
 }
 
@@ -1221,6 +1311,249 @@ async fn inbound_fixture_with_health(health: Health) -> InboundFixture {
         )),
         health,
     }
+}
+
+fn delivery_profiles() -> Arc<ChannelDeliveryProfileRegistry> {
+    Arc::new(ChannelDeliveryProfileRegistry::try_new([telegram_delivery_profile()]).unwrap())
+}
+
+fn clock_at(value: &str) -> Arc<TestClock> {
+    Arc::new(TestClock::new(
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).unwrap(),
+        Duration::ZERO,
+    ))
+}
+
+async fn fresh_runtime(
+    store: &SqliteStateStore,
+    topology: TelegramOwnerTopology,
+    clock: &TestClock,
+) -> RuntimeInstanceId {
+    let snapshot = store.load_bootstrap_snapshot().await.unwrap();
+    let started_at = UtcTimestamp::from_offset_datetime(clock.utc_now().unwrap()).unwrap();
+    bootstrap_runtime(
+        store,
+        RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
+            runtime_instance_id: RuntimeInstanceId::generate(),
+            craxii_id: topology.craxii_id,
+            workstation_id: snapshot.workstation.workstation_id(),
+            workstation_generation: snapshot.workstation.generation(),
+            linux_boot_id: Some(LinuxBootId::try_new("ch6-local-restart").unwrap()),
+            diagnostic_pid: Some(DiagnosticPid::try_new(std::process::id().into()).unwrap()),
+            package_version: PackageVersion::try_new("0.0.1").unwrap(),
+            git_revision: GitRevision::try_new("ch6-local").unwrap(),
+            schema_version: SchemaVersion::try_new(7).unwrap(),
+            started_at,
+        }),
+        0,
+        clock,
+    )
+    .await
+    .unwrap()
+    .runtime_instance_id
+}
+
+async fn recover_deliveries(store: &SqliteStateStore, clock: &TestClock) {
+    store
+        .recover_stale_deliveries(RecoverDeliveriesRequest {
+            recovered_at: UtcTimestamp::from_offset_datetime(clock.utc_now().unwrap()).unwrap(),
+        })
+        .await
+        .unwrap();
+}
+
+fn telegram_registry(
+    account_id: ChannelAccountId,
+    client: Arc<TelegramClient>,
+    calls: Arc<AtomicUsize>,
+) -> Arc<ChannelDeliveryAdapterRegistry> {
+    let profiles = delivery_profiles();
+    let provider = ChannelProviderId::try_new(TELEGRAM_PROVIDER_KEY).unwrap();
+    let adapter: Arc<dyn ChannelDeliveryAdapter> = Arc::new(CountingTelegramAdapter {
+        inner: TelegramDeliveryAdapter::new(account_id, client),
+        calls,
+    });
+    Arc::new(ChannelDeliveryAdapterRegistry::try_new(&profiles, [(provider, adapter)]).unwrap())
+}
+
+async fn wait_for_single_delivery_state(guard: &SqliteRuntimeGuard, expected: &str) -> (i64, i64) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut connection = guard.runtime().acquire_for_test().await.unwrap();
+            let row = sqlx::query(
+                "SELECT state, attempt_count, \
+                        (SELECT COUNT(*) FROM outbound_delivery_attempts) AS attempts \
+                 FROM outbound_deliveries",
+            )
+            .fetch_optional(&mut *connection)
+            .await
+            .unwrap();
+            if let Some(row) = row
+                && row.try_get::<String, _>("state").unwrap() == expected
+            {
+                return (
+                    row.try_get::<i64, _>("attempt_count").unwrap(),
+                    row.try_get::<i64, _>("attempts").unwrap(),
+                );
+            }
+            drop(connection);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("delivery did not reach expected state")
+}
+
+fn reopened_processor(
+    guard: &SqliteRuntimeGuard,
+    topology: TelegramOwnerTopology,
+    clock: Arc<TestClock>,
+    notifier: DeliveryNotifier,
+) -> Arc<Processor> {
+    let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
+    let topology_service = Arc::new(ChannelTopologyService::new(Arc::new(
+        SqliteChannelIdentityStore::new(guard.runtime().clone()),
+    )));
+    let health = Health::new();
+    health.mark_ready().unwrap();
+    let ingress = Arc::new(
+        ChannelIngressService::new(store, health, MutationAdmission::new(), Effects)
+            .with_delivery(delivery_profiles(), notifier),
+    );
+    Arc::new(TelegramInboundProcessor::new(
+        topology,
+        topology_service,
+        ingress,
+        clock,
+    ))
+}
+
+struct CancellationProcessRunner {
+    workstation: Arc<LocalWorkstation>,
+    command: String,
+    result: Arc<Mutex<Option<ExecutionResult>>>,
+}
+
+impl WorkRunner for CancellationProcessRunner {
+    fn start(
+        &self,
+        claimed: ClaimedWork,
+        mut cancellation: WorkCancellation,
+    ) -> Result<WorkRunnerFuture, WorkRunnerStartError> {
+        let workstation = Arc::clone(&self.workstation);
+        let command = self.command.clone();
+        let result_slot = Arc::clone(&self.result);
+        let work_id = claimed.work.work_id();
+        let execution_id = ExecutionId::generate();
+        Ok(Box::pin(async move {
+            let requested_cwd = LogicalPathReference::workspace_relative("cwd").unwrap();
+            let preparation = workstation
+                .prepare(WorkstationPreparationRequest {
+                    operation_id: OperationId::generate(),
+                    workstation_id: workstation.workstation_id(),
+                    expected_generation: workstation.generation(),
+                    workspace_id: workstation.workspace_id(),
+                    requested_cwd: requested_cwd.clone(),
+                    required_capability: RequiredWorkstationCapability::ForegroundExecute,
+                    effective_privilege: PrivilegeMode::User,
+                })
+                .await;
+            let Ok(preparation) = preparation else {
+                return WorkRunnerExit::Abnormal;
+            };
+            let request = ExecutionRequest {
+                operation_id: OperationId::generate(),
+                execution_id,
+                work_id,
+                workstation_id: workstation.workstation_id(),
+                expected_generation: workstation.generation(),
+                workspace_id: workstation.workspace_id(),
+                command,
+                requested_cwd,
+                prepared_cwd: preparation.prepared_cwd,
+                effective_privilege: PrivilegeMode::User,
+                stdin: ExecutionStdinPolicy::Closed,
+                timeout: MonotonicDuration::from_millis(60_000),
+                deadline: MonotonicInstant::from_elapsed(Duration::from_secs(120)),
+                capture: ExecutionCapturePolicy {
+                    stdout_max_bytes: HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+                    stderr_max_bytes: HARD_EXECUTION_STREAM_CAPTURE_BYTES,
+                },
+                cleanup: ExecutionCleanupPolicy::ProcessGroupAndCgroup,
+            };
+            let mut execution = Box::pin(workstation.execute(request));
+            tokio::select! {
+                completed = &mut execution => {
+                    if let Ok(completed) = completed {
+                        *result_slot.lock().unwrap() = Some(completed);
+                    }
+                    WorkRunnerExit::Abnormal
+                }
+                () = cancellation.requested() => {
+                    let cancelled = workstation.cancel_execution(ExecutionCancellationRequest {
+                        operation_id: OperationId::generate(),
+                        execution_id,
+                        workstation_id: workstation.workstation_id(),
+                        expected_generation: workstation.generation(),
+                    }).await;
+                    let completed = execution.await;
+                    let confirmed = matches!(
+                        cancelled,
+                        Ok(value) if matches!(
+                            value.state,
+                            ExecutionCancellationState::Confirmed
+                                | ExecutionCancellationState::AlreadyTerminal
+                        )
+                    ) && matches!(
+                        completed,
+                        Ok(ref value)
+                            if value.result_kind == ExecutionResultKind::Cancelled
+                                && value.cancelled
+                                && value.cleanup.confirmed()
+                    );
+                    if let Ok(completed) = completed {
+                        *result_slot.lock().unwrap() = Some(completed);
+                    }
+                    if confirmed {
+                        WorkRunnerExit::CancellationConfirmed
+                    } else {
+                        WorkRunnerExit::Abnormal
+                    }
+                }
+            }
+        }))
+    }
+}
+
+async fn wait_for_work_state(guard: &SqliteRuntimeGuard, expected: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let mut connection = guard.runtime().acquire_for_test().await.unwrap();
+            let state = sqlx::query_scalar::<_, String>(
+                "SELECT state FROM work_items ORDER BY created_at LIMIT 1",
+            )
+            .fetch_optional(&mut *connection)
+            .await
+            .unwrap();
+            if state.as_deref() == Some(expected) {
+                return;
+            }
+            drop(connection);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("work did not reach expected state");
+}
+
+async fn wait_for_path(path: &Path) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("process marker was not created");
 }
 
 struct FirstClassificationGate {
@@ -1958,4 +2291,698 @@ async fn conflicting_owner_chat_is_durably_rejected_without_rebinding() {
     );
     drop(connection);
     fixture.guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn ch6_queued_delivery_process_restart_dispatches_once() {
+    let fixture = inbound_fixture().await;
+    fixture
+        .processor()
+        .process_update(text_update(600, "/cancel"))
+        .await
+        .unwrap();
+    assert_eq!(fixture.count("outbound_deliveries").await, 1);
+    assert_eq!(
+        wait_for_single_delivery_state(&fixture.guard, "queued").await,
+        (0, 0)
+    );
+
+    let root = fixture._root.path().to_owned();
+    let topology = fixture.topology;
+    fixture.guard.shutdown().await;
+
+    let guard = SqliteRuntimeGuard::start(&root, 4).await.unwrap();
+    let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
+    let clock = clock_at("2026-09-16T01:02:10.000000Z");
+    let runtime_id = fresh_runtime(store.as_ref(), topology, clock.as_ref()).await;
+    recover_deliveries(store.as_ref(), clock.as_ref()).await;
+    let (client, recorded, server) = client_with(vec![ResponseSpec::json(
+        200,
+        json!({"ok":true,"result":{"message_id":901,"date":1789516923,"chat":{"id":20002,"type":"private"}}}),
+    )])
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapters = telegram_registry(topology.channel_account_id, client, Arc::clone(&calls));
+    let delivery_clock: Arc<dyn Clock> = clock;
+    let (fatal, fatal_rx) = tokio::sync::watch::channel(false);
+    let mut worker = start_delivery_worker(
+        store.clone(),
+        adapters,
+        delivery_clock,
+        runtime_id,
+        DeliveryNotifier::new(),
+        FixedDeliveryJitter(1_000),
+        fatal,
+    );
+    worker.wait_initial_scan().await.unwrap();
+    assert_eq!(
+        wait_for_single_delivery_state(&guard, "accepted").await,
+        (1, 1)
+    );
+    worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert!(!*fatal_rx.borrow());
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    store.verify_delivery_consistency().await.unwrap();
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn ch6_retry_wait_process_restart_resumes_only_when_due() {
+    let fixture = inbound_fixture().await;
+    fixture
+        .processor()
+        .process_update(text_update(610, "/cancel"))
+        .await
+        .unwrap();
+    let topology = fixture.topology;
+    let first_clock = clock_at(T1);
+    let first_runtime = fresh_runtime(fixture.store.as_ref(), topology, first_clock.as_ref()).await;
+    let (first_client, first_recorded, first_server) = client_with(vec![ResponseSpec::json(
+        503,
+        json!({"ok":false,"error_code":503,"description":"synthetic known rejection"}),
+    )])
+    .await;
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let first_adapters = telegram_registry(
+        topology.channel_account_id,
+        first_client,
+        Arc::clone(&first_calls),
+    );
+    let first_worker_clock: Arc<dyn Clock> = first_clock;
+    let (first_fatal, first_fatal_rx) = tokio::sync::watch::channel(false);
+    let first_worker = start_delivery_worker(
+        fixture.store.clone(),
+        first_adapters,
+        first_worker_clock,
+        first_runtime,
+        DeliveryNotifier::new(),
+        FixedDeliveryJitter(1_000),
+        first_fatal,
+    );
+    assert_eq!(
+        wait_for_single_delivery_state(&fixture.guard, "retry_wait").await,
+        (1, 1)
+    );
+    first_worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    first_server.await.unwrap();
+    assert!(!*first_fatal_rx.borrow());
+    assert_eq!(first_calls.load(Ordering::Acquire), 1);
+    assert_eq!(first_recorded.lock().unwrap().len(), 1);
+
+    let root = fixture._root.path().to_owned();
+    fixture.guard.shutdown().await;
+    let guard = SqliteRuntimeGuard::start(&root, 4).await.unwrap();
+    let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
+    let clock = clock_at(T1);
+    let runtime_id = fresh_runtime(store.as_ref(), topology, clock.as_ref()).await;
+    recover_deliveries(store.as_ref(), clock.as_ref()).await;
+    let (client, recorded, server) = client_with(vec![ResponseSpec::json(
+        200,
+        json!({"ok":true,"result":{"message_id":902,"date":1789516923,"chat":{"id":20002,"type":"private"}}}),
+    )])
+    .await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapters = telegram_registry(topology.channel_account_id, client, Arc::clone(&calls));
+    let notifier = DeliveryNotifier::new();
+    let worker_clock: Arc<dyn Clock> = clock.clone();
+    let (fatal, fatal_rx) = tokio::sync::watch::channel(false);
+    let mut worker = start_delivery_worker(
+        store.clone(),
+        adapters,
+        worker_clock,
+        runtime_id,
+        notifier.clone(),
+        FixedDeliveryJitter(1_000),
+        fatal,
+    );
+    worker.wait_initial_scan().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        wait_for_single_delivery_state(&guard, "retry_wait").await,
+        (1, 1)
+    );
+
+    clock.advance_wall(time::Duration::seconds(1)).unwrap();
+    notifier.wake();
+    assert_eq!(
+        wait_for_single_delivery_state(&guard, "accepted").await,
+        (2, 2)
+    );
+    worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert!(!*fatal_rx.borrow());
+    assert_eq!(calls.load(Ordering::Acquire), 1);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    store.verify_delivery_consistency().await.unwrap();
+    guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn ch6_outcome_unknown_and_stale_dispatch_restart_never_resend() {
+    let fixture = inbound_fixture().await;
+    fixture
+        .processor()
+        .process_update(text_update(620, "/cancel"))
+        .await
+        .unwrap();
+    let topology = fixture.topology;
+    let first_clock = clock_at(T1);
+    let first_runtime = fresh_runtime(fixture.store.as_ref(), topology, first_clock.as_ref()).await;
+    let mut ambiguous = ResponseSpec::json(
+        200,
+        json!({"ok":true,"result":{"message_id":903,"date":1789516923,"chat":{"id":20002,"type":"private"}}}),
+    );
+    ambiguous.declared_length = Some(ambiguous.body.len() + 50);
+    let (first_client, first_recorded, first_server) = client_with(vec![ambiguous]).await;
+    let first_calls = Arc::new(AtomicUsize::new(0));
+    let first_adapters = telegram_registry(
+        topology.channel_account_id,
+        first_client,
+        Arc::clone(&first_calls),
+    );
+    let first_worker_clock: Arc<dyn Clock> = first_clock;
+    let (first_fatal, _) = tokio::sync::watch::channel(false);
+    let first_worker = start_delivery_worker(
+        fixture.store.clone(),
+        first_adapters,
+        first_worker_clock,
+        first_runtime,
+        DeliveryNotifier::new(),
+        FixedDeliveryJitter(1_000),
+        first_fatal,
+    );
+    assert_eq!(
+        wait_for_single_delivery_state(&fixture.guard, "outcome_unknown").await,
+        (1, 1)
+    );
+    first_worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    first_server.await.unwrap();
+    assert_eq!(first_calls.load(Ordering::Acquire), 1);
+    assert_eq!(first_recorded.lock().unwrap().len(), 1);
+
+    let root = fixture._root.path().to_owned();
+    fixture.guard.shutdown().await;
+    let guard = SqliteRuntimeGuard::start(&root, 4).await.unwrap();
+    let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
+    let clock = clock_at("2026-09-16T01:02:30.000000Z");
+    let runtime_id = fresh_runtime(store.as_ref(), topology, clock.as_ref()).await;
+    recover_deliveries(store.as_ref(), clock.as_ref()).await;
+    let (client, _recorded, server) = client_with(Vec::new()).await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let adapters = telegram_registry(topology.channel_account_id, client, Arc::clone(&calls));
+    let worker_clock: Arc<dyn Clock> = clock;
+    let (fatal, fatal_rx) = tokio::sync::watch::channel(false);
+    let mut worker = start_delivery_worker(
+        store.clone(),
+        adapters,
+        worker_clock,
+        runtime_id,
+        DeliveryNotifier::new(),
+        FixedDeliveryJitter(1_000),
+        fatal,
+    );
+    worker.wait_initial_scan().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        wait_for_single_delivery_state(&guard, "outcome_unknown").await,
+        (1, 1)
+    );
+    let summaries = store
+        .list_delivery_summaries(ListDeliverySummariesRequest {
+            states: vec![OutboundDeliveryState::OutcomeUnknown],
+            after: None,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(
+        summaries[0].failure_class,
+        Some(DeliveryFailureClass::ProviderOutcomeUnknown)
+    );
+    worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    assert!(!*fatal_rx.borrow());
+    guard.shutdown().await;
+
+    let stale = inbound_fixture().await;
+    stale
+        .processor()
+        .process_update(text_update(621, "/cancel"))
+        .await
+        .unwrap();
+    let stale_topology = stale.topology;
+    let stale_clock = clock_at(T1);
+    let stale_runtime =
+        fresh_runtime(stale.store.as_ref(), stale_topology, stale_clock.as_ref()).await;
+    assert!(matches!(
+        stale
+            .store
+            .claim_next_delivery(ClaimDeliveryRequest {
+                runtime_instance_id: stale_runtime,
+                outbound_delivery_attempt_id: OutboundDeliveryAttemptId::generate(),
+                now: T1.parse().unwrap(),
+            })
+            .await
+            .unwrap(),
+        DeliveryClaim::Dispatch(_)
+    ));
+    let stale_root = stale._root.path().to_owned();
+    stale.guard.shutdown().await;
+    let stale_guard = SqliteRuntimeGuard::start(&stale_root, 4).await.unwrap();
+    let stale_store = Arc::new(SqliteStateStore::new(stale_guard.runtime().clone()));
+    let recovered_clock = clock_at("2026-09-16T01:03:00.000000Z");
+    let recovered_runtime = fresh_runtime(
+        stale_store.as_ref(),
+        stale_topology,
+        recovered_clock.as_ref(),
+    )
+    .await;
+    let recovery = stale_store
+        .recover_stale_deliveries(RecoverDeliveriesRequest {
+            recovered_at: "2026-09-16T01:03:00.000000Z".parse().unwrap(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(recovery.dispatches_marked_unknown, 1);
+    let (stale_client, _, stale_server) = client_with(Vec::new()).await;
+    let stale_calls = Arc::new(AtomicUsize::new(0));
+    let stale_adapters = telegram_registry(
+        stale_topology.channel_account_id,
+        stale_client,
+        Arc::clone(&stale_calls),
+    );
+    let recovered_worker_clock: Arc<dyn Clock> = recovered_clock;
+    let (stale_fatal, _) = tokio::sync::watch::channel(false);
+    let mut stale_worker = start_delivery_worker(
+        stale_store.clone(),
+        stale_adapters,
+        recovered_worker_clock,
+        recovered_runtime,
+        DeliveryNotifier::new(),
+        FixedDeliveryJitter(1_000),
+        stale_fatal,
+    );
+    stale_worker.wait_initial_scan().await.unwrap();
+    assert_eq!(stale_calls.load(Ordering::Acquire), 0);
+    assert_eq!(
+        wait_for_single_delivery_state(&stale_guard, "outcome_unknown").await,
+        (1, 1)
+    );
+    stale_worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    stale_server.await.unwrap();
+    stale_store.verify_delivery_consistency().await.unwrap();
+    stale_guard.shutdown().await;
+}
+
+#[tokio::test]
+async fn ch6_duplicate_ingress_process_restart_is_one_message_work_and_binding() {
+    let fixture = inbound_fixture().await;
+    fixture
+        .processor()
+        .process_update(text_update(630, "one durable work"))
+        .await
+        .unwrap();
+    let root = fixture._root.path().to_owned();
+    let topology = fixture.topology;
+    fixture.guard.shutdown().await;
+
+    let guard = SqliteRuntimeGuard::start(&root, 4).await.unwrap();
+    let clock = clock_at("2026-09-16T01:02:30.000000Z");
+    let processor = reopened_processor(&guard, topology, clock, DeliveryNotifier::new());
+    processor
+        .process_update(text_update(630, "one durable work"))
+        .await
+        .unwrap();
+    let mut connection = guard.runtime().acquire_for_test().await.unwrap();
+    for table in [
+        "inbound_deliveries",
+        "messages",
+        "work_items",
+        "conversation_bindings",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM {table}"
+            )))
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+            1,
+            "unexpected duplicate in {table}"
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_items WHERE state = 'queued'",)
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let error = processor
+        .process_update(text_update(630, "contradictory material"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        TelegramPollerErrorKind::FatalContradictoryReplay
+    );
+    let mut connection = guard.runtime().acquire_for_test().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_items")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    guard.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ch6_cancel_composes_scheduler_process_cleanup_ack_delivery_and_restart_replay() {
+    let fixture = inbound_fixture().await;
+    let topology = fixture.topology;
+    let workspace = fixture._root.path().join("workspace");
+    let cwd = workspace.join("cwd");
+    fs::create_dir_all(&cwd).unwrap();
+    let artifact_store: Arc<dyn ArtifactStore> =
+        Arc::new(LocalArtifactStore::initialize(&fixture._root.path().join("artifacts")).unwrap());
+    let clock = clock_at(T1);
+    let snapshot = fixture.store.load_bootstrap_snapshot().await.unwrap();
+    let workstation = Arc::new(
+        LocalWorkstation::new(
+            &snapshot.workstation,
+            &snapshot.workspace,
+            LocalWorkstationOptions {
+                default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+                configured_workspace_root: workspace,
+                read_hard_limit: HARD_FILE_READ_MAX_BYTES,
+                artifact_store,
+                administrative_enabled: false,
+                user_switch_launcher: None,
+                credential_free_direct_execution: true,
+                delegated_cgroup_root: None,
+                clock: clock.clone(),
+            },
+        )
+        .unwrap(),
+    );
+    assert!(
+        workstation
+            .capabilities_snapshot()
+            .flags()
+            .foreground_execute()
+    );
+    let process_result = Arc::new(Mutex::new(None));
+    let runner = Arc::new(CancellationProcessRunner {
+        workstation: Arc::clone(&workstation),
+        command: "trap 'printf term > cancellation-term-observed; exit 0' TERM; \
+                  /bin/sleep 300 & printf '%s' \"$!\" > cancellation-descendant.pid; \
+                  printf started > cancellation-started; \
+                  while :; do /bin/sleep 1; done; \
+                  printf late > cancellation-late-side-effect"
+            .to_owned(),
+        result: Arc::clone(&process_result),
+    });
+    let runtime_id = fresh_runtime(fixture.store.as_ref(), topology, clock.as_ref()).await;
+    let (scheduler_fatal, scheduler_fatal_rx) = tokio::sync::watch::channel(false);
+    let mut scheduler = start_scheduler(
+        fixture.store.clone(),
+        runner,
+        clock.clone(),
+        fixture.health.clone(),
+        scheduler_fatal,
+        SchedulerStart {
+            runtime_instance_id: runtime_id,
+            readiness: SchedulerReadiness::RemainLiveUnready,
+        },
+    )
+    .unwrap();
+    scheduler.wait_initial_scan().await.unwrap();
+
+    let (client, recorded, server) = client_with(vec![ResponseSpec::json(
+        200,
+        json!({"ok":true,"result":{"message_id":904,"date":1789516923,"chat":{"id":20002,"type":"private"}}}),
+    )])
+    .await;
+    let delivery_calls = Arc::new(AtomicUsize::new(0));
+    let adapters = telegram_registry(
+        topology.channel_account_id,
+        client,
+        Arc::clone(&delivery_calls),
+    );
+    let delivery_notifier = DeliveryNotifier::new();
+    let delivery_clock: Arc<dyn Clock> = clock.clone();
+    let (delivery_fatal, delivery_fatal_rx) = tokio::sync::watch::channel(false);
+    let mut delivery_worker = start_delivery_worker(
+        fixture.store.clone(),
+        adapters,
+        delivery_clock,
+        runtime_id,
+        delivery_notifier.clone(),
+        FixedDeliveryJitter(1_000),
+        delivery_fatal,
+    );
+    delivery_worker.wait_initial_scan().await.unwrap();
+
+    let ingress = Arc::new(
+        ChannelIngressService::new(
+            fixture.store.clone(),
+            fixture.health.clone(),
+            MutationAdmission::new(),
+            scheduler.notifier(),
+        )
+        .with_delivery(delivery_profiles(), delivery_notifier),
+    );
+    let processor = TelegramInboundProcessor::new(
+        topology,
+        Arc::clone(&fixture.topology_service),
+        ingress,
+        clock.clone(),
+    );
+    processor
+        .process_update(text_update(640, "start cancellable local process"))
+        .await
+        .unwrap();
+    wait_for_path(&cwd.join("cancellation-started")).await;
+    wait_for_work_state(&fixture.guard, "running").await;
+
+    processor
+        .process_update(text_update(641, "/cancel"))
+        .await
+        .unwrap();
+    wait_for_work_state(&fixture.guard, "cancelled").await;
+    assert_eq!(
+        wait_for_single_delivery_state(&fixture.guard, "accepted").await,
+        (1, 1)
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while process_result.lock().unwrap().is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let result = process_result.lock().unwrap().clone().unwrap();
+    assert_eq!(result.result_kind, ExecutionResultKind::Cancelled);
+    assert!(result.cancelled);
+    assert!(result.cleanup.confirmed());
+    assert_eq!(
+        fs::read_to_string(cwd.join("cancellation-term-observed")).unwrap(),
+        "term"
+    );
+    assert!(!cwd.join("cancellation-late-side-effect").exists());
+    let descendant = fs::read_to_string(cwd.join("cancellation-descendant.pid"))
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    assert_eq!(
+        kill(Pid::from_raw(descendant), None),
+        Err(nix::errno::Errno::ESRCH)
+    );
+
+    let mut connection = fixture.guard.runtime().acquire_for_test().await.unwrap();
+    let acknowledgement = sqlx::query(
+        "SELECT d.classification, o.source_kind, o.control_outcome, o.payload_text, o.state, \
+                o.accepted_external_message_id \
+         FROM inbound_deliveries d JOIN outbound_deliveries o \
+           ON o.source_inbound_delivery_id = d.inbound_delivery_id \
+         WHERE d.external_event_id = '641'",
+    )
+    .fetch_one(&mut *connection)
+    .await
+    .unwrap();
+    assert_eq!(
+        acknowledgement
+            .try_get::<String, _>("classification")
+            .unwrap(),
+        "control"
+    );
+    assert_eq!(
+        acknowledgement.try_get::<String, _>("source_kind").unwrap(),
+        "control"
+    );
+    assert_eq!(
+        acknowledgement
+            .try_get::<String, _>("control_outcome")
+            .unwrap(),
+        "applied"
+    );
+    assert_eq!(
+        acknowledgement
+            .try_get::<String, _>("payload_text")
+            .unwrap(),
+        "Cancellation requested."
+    );
+    assert_eq!(
+        acknowledgement.try_get::<String, _>("state").unwrap(),
+        "accepted"
+    );
+    assert_eq!(
+        acknowledgement
+            .try_get::<Option<String>, _>("accepted_external_message_id")
+            .unwrap(),
+        Some("904".to_owned())
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE event_type IN \
+             ('work.cancel_requested','work.cancelled')",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    assert_eq!(delivery_calls.load(Ordering::Acquire), 1);
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+    let sent = serde_json::from_slice::<Value>(&recorded.lock().unwrap()[0].body).unwrap();
+    assert_eq!(
+        sent,
+        json!({"chat_id":20002,"text":"Cancellation requested."})
+    );
+    assert!(!*scheduler_fatal_rx.borrow());
+    assert!(!*delivery_fatal_rx.borrow());
+
+    scheduler.stop_and_join().await.unwrap();
+    delivery_worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    server.await.unwrap();
+    workstation
+        .shutdown_executions_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+
+    let root = fixture._root.path().to_owned();
+    fixture.guard.shutdown().await;
+    let guard = SqliteRuntimeGuard::start(&root, 4).await.unwrap();
+    let store = Arc::new(SqliteStateStore::new(guard.runtime().clone()));
+    let restarted_clock = clock_at("2026-09-16T01:03:00.000000Z");
+    let restarted_runtime = fresh_runtime(store.as_ref(), topology, restarted_clock.as_ref()).await;
+    recover_deliveries(store.as_ref(), restarted_clock.as_ref()).await;
+    let (replay_client, _, replay_server) = client_with(Vec::new()).await;
+    let replay_calls = Arc::new(AtomicUsize::new(0));
+    let replay_adapters = telegram_registry(
+        topology.channel_account_id,
+        replay_client,
+        Arc::clone(&replay_calls),
+    );
+    let replay_notifier = DeliveryNotifier::new();
+    let replay_worker_clock: Arc<dyn Clock> = restarted_clock.clone();
+    let (replay_fatal, _) = tokio::sync::watch::channel(false);
+    let mut replay_worker = start_delivery_worker(
+        store.clone(),
+        replay_adapters,
+        replay_worker_clock,
+        restarted_runtime,
+        replay_notifier.clone(),
+        FixedDeliveryJitter(1_000),
+        replay_fatal,
+    );
+    replay_worker.wait_initial_scan().await.unwrap();
+    let replay_processor = reopened_processor(&guard, topology, restarted_clock, replay_notifier);
+    replay_processor
+        .process_update(text_update(641, "/cancel"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(replay_calls.load(Ordering::Acquire), 0);
+    let mut connection = guard.runtime().acquire_for_test().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM inbound_deliveries WHERE external_event_id = '641'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM outbound_deliveries")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM outbound_delivery_attempts WHERE result_kind = 'accepted'",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM journal_events WHERE event_type IN \
+             ('work.cancel_requested','work.cancelled')",
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        2
+    );
+    drop(connection);
+    replay_worker
+        .shutdown_before(tokio::time::Instant::now() + Duration::from_secs(1))
+        .await
+        .unwrap();
+    replay_server.await.unwrap();
+    store.verify_delivery_consistency().await.unwrap();
+    guard.shutdown().await;
 }

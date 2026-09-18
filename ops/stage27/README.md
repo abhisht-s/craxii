@@ -370,6 +370,48 @@ The older `scripts/verify-stage13-ubuntu-target` suite remains a separate privil
 test. It now requires `CRAXII_STAGE13_CREDENTIAL_FREE_DISPOSABLE=1` and refuses the production
 `craxii-server.service` unit.
 
+## CH-6 local readiness and live handoff
+
+Run the focused local gate from a clean checkout before beginning any live CH-6 work:
+
+```sh
+scripts/verify-ch6-local
+```
+
+This gate is deterministic and local-only. It checks the Telegram backend and Stage-27 deployment
+assets; configuration, credential, recovery-copy, delivery-inspection, and account-administration
+contracts; process-style outbox restart for queued and retry-wait deliveries; conservative
+outcome-unknown and stale-dispatch recovery; duplicate ingress; `/cancel` through scheduler and
+real local process-tree cleanup; replay-safe acknowledgement delivery; and whole-path synthetic
+credential isolation. It does not invoke AWS, EC2, systemd, Telegram, OpenAI/Luna, XCUI, or the
+Stage-27 production mega-verifier.
+
+Passing it establishes only **LOCAL VERIFIED** readiness:
+
+- Telegram polling/delivery backend composition and deployment assets;
+- synthetic credential loading, isolation, installation, and rotation contracts;
+- stopped-service recovery-copy creation and validation behavior;
+- queued/retry/ambiguity restart and duplicate-ingress composition;
+- `/cancel` control, active-work cancellation, process cleanup, acknowledgement, and replay; and
+- redacted local delivery inspection and durable channel-account administration.
+
+The following remain **LIVE STILL REQUIRED** and must be performed only in a separately authorized
+live acceptance session:
+
+- obtain the real bot/token and record the real bot, owner, and stable channel-account IDs;
+- take and validate the actual stopped-host recovery copy;
+- deploy the exact candidate and apply its migrations on the real host;
+- verify real `getMe`, webhook absence, and long polling;
+- send the canonical message from the owner's real Telegram phone app;
+- observe real Luna/OpenAI, tools, and the Ubuntu workstation;
+- receive the durable response in the same private Telegram chat;
+- perform one focused real service restart around safe pending channel state; and
+- observe the production credential, log, artifact, model-context, child-environment, FD, and
+  process-isolation boundaries.
+
+Do not treat local readiness as live acceptance, deployment authorization, reboot certification,
+or a replacement-host restore rehearsal.
+
 ## User-switch decision
 
 Problem: a credential-bearing backend cannot execute model-controlled work under its own UID, and

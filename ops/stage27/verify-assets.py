@@ -29,6 +29,7 @@ INSTALLER = ASSETS / "install-telegram-credential.py"
 UPGRADE = ASSETS / "upgrade-release.sh"
 RECOVERY = ASSETS / "recovery-copy.py"
 RECOVERY_TESTS = ASSETS / "test_recovery_copy.py"
+LOCAL_READINESS = ROOT / "scripts" / "verify-ch6-local"
 SYNTHETIC_CHANNEL_ID = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"
 SYNTHETIC_BOT_ID = 10001
 SYNTHETIC_OWNER_ID = 20002
@@ -629,6 +630,51 @@ def verify_recovery_assets() -> None:
         )
 
 
+def verify_local_readiness_handoff() -> None:
+    require(LOCAL_READINESS.is_file(), "CH-6 local readiness checker is missing")
+    require(
+        stat.S_IMODE(LOCAL_READINESS.stat().st_mode) == 0o755,
+        "CH-6 local readiness checker is not executable mode 0755",
+    )
+    checker = LOCAL_READINESS.read_text(encoding="utf-8")
+    for contract in (
+        "ops/stage27/verify-assets.py",
+        "ops/stage27/test_recovery_copy.py",
+        "adapters::telegram::tests::ch6_",
+        "adapters::sqlite::ch6_tests::",
+        "--test ch6",
+        "--test startup ch6_",
+        "--test configuration telegram",
+        "delivery_inspection_output_is_bounded_and_redacted",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "CH6_LOCAL_READINESS=PASS",
+    ):
+        require(contract in checker, f"CH-6 local checker omits contract: {contract}")
+    for forbidden in (
+        "aws ",
+        "aws\n",
+        "systemctl",
+        "ssh ",
+        "verify-production-host",
+        "verify-stage27-linux-boundary",
+        "openai_live",
+        "xcodebuild",
+    ):
+        require(forbidden not in checker.lower(), f"CH-6 local checker contains live action: {forbidden}")
+
+    readme = (ASSETS / "README.md").read_text(encoding="utf-8")
+    for handoff in (
+        "CH-6 local readiness and live handoff",
+        "LOCAL VERIFIED",
+        "LIVE STILL REQUIRED",
+        "scripts/verify-ch6-local",
+        "real `getMe`, webhook absence, and long polling",
+        "same private Telegram chat",
+        "Do not treat local readiness as live acceptance",
+    ):
+        require(handoff in readme, f"README omits CH-6 handoff: {handoff}")
+
+
 def verify_canary_absence(canary: str, generated: str) -> None:
     require(canary not in generated, "synthetic token appeared in generated operator output")
     for path in (TEMPLATE, UNIT, ASSETS / "README.md"):
@@ -676,6 +722,7 @@ def main() -> int:
     preflight_canary = verify_upgrade_credential_preflight(installer, renderer)
     canary = verify_installer(installer)
     verify_recovery_assets()
+    verify_local_readiness_handoff()
     verify_canary_absence(canary, enabled_text)
     verify_canary_absence(preflight_canary, enabled_text)
     print("STAGE27_CH6_SLICE2_ASSETS=PASS")

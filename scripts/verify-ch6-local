@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+repository_root="$(CDPATH= cd -- "${script_dir}/.." && pwd)"
+cargo_bin_dir="${CARGO_HOME:-${HOME:?HOME must be set to locate Cargo}/.cargo}/bin"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${cargo_bin_dir}:${PATH:-}"
+export PYTHONDONTWRITEBYTECODE=1
+
+if ! command -v cargo >/dev/null 2>&1; then
+  printf '%s\n' 'error: cargo is required to run the CH-6 local readiness gate' >&2
+  exit 127
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+  printf '%s\n' 'error: python3 is required to run the CH-6 local readiness gate' >&2
+  exit 127
+fi
+
+cd "${repository_root}"
+
+printf '%s\n' 'CH-6 local: Stage-27 Telegram deployment and credential assets'
+python3 ops/stage27/verify-assets.py
+
+printf '%s\n' 'CH-6 local: stopped-service recovery-copy contract'
+python3 ops/stage27/test_recovery_copy.py
+
+printf '%s\n' 'CH-6 local: Telegram restart, replay, ambiguity, cancellation, and credential adapter composition'
+cargo test --locked -p craxii-server --lib 'adapters::telegram::tests::ch6_'
+
+printf '%s\n' 'CH-6 local: durable channel-account administration'
+cargo test --locked -p craxii-server --lib 'adapters::sqlite::ch6_tests::'
+
+printf '%s\n' 'CH-6 local: whole-path credential isolation, admin output, and recovery output'
+cargo test --locked -p craxii-server --test ch6
+
+printf '%s\n' 'CH-6 local: startup/config credential boundary'
+cargo test --locked -p craxii-server --test startup ch6_
+cargo test --locked -p craxii-server --test configuration telegram
+
+printf '%s\n' 'CH-6 local: bounded redacted delivery inspection'
+cargo test --locked -p craxii-server --bin craxii-admin delivery_inspection_output_is_bounded_and_redacted
+
+printf '%s\n' 'CH6_LOCAL_READINESS=PASS'
