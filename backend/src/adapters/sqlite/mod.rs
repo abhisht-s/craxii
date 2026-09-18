@@ -31,6 +31,8 @@ mod ch1_tests;
 #[cfg(test)]
 mod ch3_test_support;
 #[cfg(test)]
+mod ch6_tests;
+#[cfg(test)]
 mod channel_ingress_tests;
 #[cfg(test)]
 mod stage10_tests;

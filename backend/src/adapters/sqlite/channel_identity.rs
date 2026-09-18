@@ -11,8 +11,9 @@ use crate::domain::{
 };
 use crate::ports::channel_identity::{
     ChannelIdentityFuture, ChannelIdentityStore, ChannelIdentityStoreError,
-    ChannelIdentityStoreErrorKind, EnsureChannelAccountAndIdentityRequest,
-    EnsureConversationBindingRequest, EnsuredChannelAccountAndIdentity,
+    ChannelIdentityStoreErrorKind, DisableChannelAccountOutcome,
+    EnsureChannelAccountAndIdentityRequest, EnsureConversationBindingRequest,
+    EnsuredChannelAccountAndIdentity,
 };
 
 use super::transaction::WriteTransaction;
@@ -53,6 +54,84 @@ fn map_transaction(error: SqliteAdapterError) -> ChannelIdentityStoreError {
 
 fn conflict() -> ChannelIdentityStoreError {
     ChannelIdentityStoreError::new(ChannelIdentityStoreErrorKind::Conflict)
+}
+
+fn decode_channel_account(
+    row: &sqlx::sqlite::SqliteRow,
+) -> Result<ChannelAccount, ChannelIdentityStoreError> {
+    Ok(ChannelAccount {
+        channel_account_id: parse_id(&row.try_get::<String, _>("channel_account_id")?)?,
+        craxii_id: parse_id(&row.try_get::<String, _>("craxii_id")?)?,
+        provider_id: ChannelProviderId::try_new(row.try_get::<String, _>("provider_key")?)
+            .map_err(|_| inconsistent())?,
+        external_account_id: ExternalAccountId::try_new(
+            row.try_get::<String, _>("external_account_id")?,
+        )
+        .map_err(|_| inconsistent())?,
+        lifecycle: match row.try_get::<String, _>("lifecycle_state")?.as_str() {
+            "active" => ChannelAccountLifecycle::Active,
+            "disabled" => ChannelAccountLifecycle::Disabled,
+            _ => return Err(inconsistent()),
+        },
+        created_at: parse_id(&row.try_get::<String, _>("created_at")?)?,
+        disabled_at: row
+            .try_get::<Option<String>, _>("disabled_at")?
+            .map(|value| parse_id(&value))
+            .transpose()?,
+    })
+}
+
+async fn disable_channel_account_inner(
+    runtime: &SqliteRuntime,
+    id: ChannelAccountId,
+    disabled_at: crate::domain::UtcTimestamp,
+) -> Result<DisableChannelAccountOutcome, ChannelIdentityStoreError> {
+    let mut transaction = WriteTransaction::begin(runtime, "disable_channel_account")
+        .await
+        .map_err(map_transaction)?;
+    let row = sqlx::query("SELECT * FROM channel_accounts WHERE channel_account_id = ?")
+        .bind(id.to_string())
+        .fetch_optional(transaction.connection())
+        .await
+        .map_err(map_sqlx)?;
+    let Some(row) = row else {
+        transaction.commit().await.map_err(map_transaction)?;
+        return Ok(DisableChannelAccountOutcome::NotFound);
+    };
+    let mut account = decode_channel_account(&row)?;
+    match account.lifecycle {
+        ChannelAccountLifecycle::Disabled => {
+            if account
+                .disabled_at
+                .is_none_or(|persisted| persisted < account.created_at)
+            {
+                return Err(inconsistent());
+            }
+            transaction.commit().await.map_err(map_transaction)?;
+            Ok(DisableChannelAccountOutcome::AlreadyDisabled(account))
+        }
+        ChannelAccountLifecycle::Active => {
+            if account.disabled_at.is_some() || disabled_at < account.created_at {
+                return Err(conflict());
+            }
+            let changed = sqlx::query(
+                "UPDATE channel_accounts SET lifecycle_state = 'disabled', disabled_at = ? \
+                 WHERE channel_account_id = ? AND lifecycle_state = 'active' AND disabled_at IS NULL",
+            )
+            .bind(disabled_at.to_string())
+            .bind(id.to_string())
+            .execute(transaction.connection())
+            .await
+            .map_err(map_sqlx)?;
+            if changed.rows_affected() != 1 {
+                return Err(conflict());
+            }
+            account.lifecycle = ChannelAccountLifecycle::Disabled;
+            account.disabled_at = Some(disabled_at);
+            transaction.commit().await.map_err(map_transaction)?;
+            Ok(DisableChannelAccountOutcome::Disabled(account))
+        }
+    }
 }
 
 async fn ensure_account_and_identity_inner(
@@ -468,32 +547,16 @@ impl ChannelIdentityStore for SqliteChannelIdentityStore {
                 .fetch_optional(&mut *connection)
                 .await
                 .map_err(map_sqlx)?;
-            row.map(|row| {
-                Ok(ChannelAccount {
-                    channel_account_id: parse_id(&row.try_get::<String, _>("channel_account_id")?)?,
-                    craxii_id: parse_id(&row.try_get::<String, _>("craxii_id")?)?,
-                    provider_id: ChannelProviderId::try_new(
-                        row.try_get::<String, _>("provider_key")?,
-                    )
-                    .map_err(|_| inconsistent())?,
-                    external_account_id: ExternalAccountId::try_new(
-                        row.try_get::<String, _>("external_account_id")?,
-                    )
-                    .map_err(|_| inconsistent())?,
-                    lifecycle: match row.try_get::<String, _>("lifecycle_state")?.as_str() {
-                        "active" => ChannelAccountLifecycle::Active,
-                        "disabled" => ChannelAccountLifecycle::Disabled,
-                        _ => return Err(inconsistent()),
-                    },
-                    created_at: parse_id(&row.try_get::<String, _>("created_at")?)?,
-                    disabled_at: row
-                        .try_get::<Option<String>, _>("disabled_at")?
-                        .map(|value| parse_id(&value))
-                        .transpose()?,
-                })
-            })
-            .transpose()
+            row.map(|row| decode_channel_account(&row)).transpose()
         })
+    }
+
+    fn disable_channel_account(
+        &self,
+        id: ChannelAccountId,
+        disabled_at: crate::domain::UtcTimestamp,
+    ) -> ChannelIdentityFuture<'_, DisableChannelAccountOutcome> {
+        Box::pin(async move { disable_channel_account_inner(&self.runtime, id, disabled_at).await })
     }
 
     fn persist_external_identity(

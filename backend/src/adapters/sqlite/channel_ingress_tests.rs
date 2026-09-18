@@ -35,7 +35,7 @@ use crate::domain::{
 use crate::ports::channel_delivery::{
     ChannelDeliveryAdapter, ChannelDeliveryAdapterRegistry, ChannelDeliveryFuture,
 };
-use crate::ports::channel_identity::ChannelIdentityStore;
+use crate::ports::channel_identity::{ChannelIdentityStore, DisableChannelAccountOutcome};
 use crate::ports::clock::{Clock, ClockError, MonotonicInstant, TestClock};
 use crate::ports::delivery_store::{
     ClaimDeliveryRequest, DeliveryClaim, DeliveryRecoveryReceipt, DeliveryRoute, DeliveryStore,
@@ -3451,17 +3451,14 @@ async fn revoked_binding_disabled_account_and_corruption_fail_closed_before_netw
         .await
         .unwrap();
     let runtime_id = create_runtime(&disabled).await;
-    let mut connection = disabled.guard.runtime().acquire().await.unwrap();
-    sqlx::query(
-        "UPDATE channel_accounts SET lifecycle_state = 'disabled', disabled_at = ? \
-         WHERE channel_account_id = ?",
-    )
-    .bind(T1)
-    .bind(disabled.account.channel_account_id.to_string())
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    drop(connection);
+    let identity_store = SqliteChannelIdentityStore::new(disabled.guard.runtime().clone());
+    assert!(matches!(
+        identity_store
+            .disable_channel_account(disabled.account.channel_account_id, at(T1))
+            .await
+            .unwrap(),
+        DisableChannelAccountOutcome::Disabled(_)
+    ));
     assert!(matches!(
         disabled
             .store

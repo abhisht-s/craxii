@@ -55,6 +55,13 @@ pub struct EnsureConversationBindingRequest {
     pub created_at: UtcTimestamp,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisableChannelAccountOutcome {
+    Disabled(ChannelAccount),
+    AlreadyDisabled(ChannelAccount),
+    NotFound,
+}
+
 impl ChannelIdentityStoreError {
     #[must_use]
     pub const fn new(kind: ChannelIdentityStoreErrorKind) -> Self {
@@ -102,6 +109,12 @@ pub trait ChannelIdentityStore: Send + Sync {
         &self,
         id: ChannelAccountId,
     ) -> ChannelIdentityFuture<'_, Option<ChannelAccount>>;
+
+    fn disable_channel_account(
+        &self,
+        id: ChannelAccountId,
+        disabled_at: UtcTimestamp,
+    ) -> ChannelIdentityFuture<'_, DisableChannelAccountOutcome>;
 
     fn persist_external_identity(
         &self,

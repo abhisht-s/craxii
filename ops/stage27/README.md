@@ -195,6 +195,124 @@ the old credential, and fsyncs the directory. A failure before replacement leave
 intact; a failure leaves the service stopped for explicit operator recovery. There is deliberately
 no local Telegram call or token validation.
 
+## Minimum local operations
+
+All state-sensitive admin commands are offline operations. They acquire the same exclusive Craxii
+state lock as the server and fail closed if the server owns it. Use the fixed lifecycle and
+loopback readiness commands:
+
+    sudo systemctl start craxii-server.service
+    curl --fail --silent --show-error http://127.0.0.1:8080/health/ready >/dev/null
+
+    sudo systemctl stop craxii-server.service
+    systemctl show craxii-server.service --property=ActiveState --property=MainPID
+
+    sudo systemctl restart craxii-server.service
+    curl --fail --silent --show-error http://127.0.0.1:8080/health/ready >/dev/null
+
+Before an offline operation, the shown service state must be inactive or failed and MainPID must
+be 0. A readiness failure is not permission to continue with state mutation.
+
+To inspect only the operational outbound states, stop the service and run:
+
+    sudo /opt/craxii/current/craxii-admin \
+      --config /etc/craxii/config.toml delivery inspect \
+      --state queued --state retry_wait --state permanent_failure --state outcome_unknown \
+      --limit 100
+
+The output is bounded and contains internal IDs, state, part/attempt counts, retry/deadline timing,
+normalized failure class, and timestamps only. It never prints payload text, external Telegram
+IDs, provider descriptions, credentials, model context, or artifacts. Repeat with one --state
+for a narrower view; use the last internal delivery ID with --after for the next bounded page.
+
+Disabling a Telegram channel account is a durable, one-way local admin transition. First stop the
+service and install a validated Telegram hard-off config using the stopped-service
+render-config.py --disable-telegram flow above. Then use the stable internal
+ChannelAccountId—never a Telegram bot, chat, or user ID:
+
+    sudo /opt/craxii/current/craxii-admin \
+      --config /etc/craxii/config.toml channel-account disable \
+      '<stable-channel-account-uuidv7>'
+
+The only successful outcomes are disabled or deterministic already_disabled. There is no admin
+re-enable or delete command. Keep Telegram hard-off before starting the service again; enabled
+Telegram startup intentionally refuses the disabled account rather than reviving it.
+
+### Pre-deployment recovery copy
+
+Take a verified recovery copy before every deployment that may migrate SQLite, including V5→V7
+and V6→V7. Stop the service, verify MainPID=0, create a private destination directory, and choose
+new destination names. The helper rechecks service state, takes the Craxii exclusive lock, uses
+SQLite's backup API to include committed WAL state, and refuses overwrite:
+
+    sudo systemctl stop craxii-server.service
+    systemctl show craxii-server.service --property=ActiveState --property=MainPID
+    sudo install -d -o root -g root -m 0700 /var/lib/craxii/recovery
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/recovery-copy.py create \
+      --source-state-root /var/lib/craxii \
+      --destination-db /var/lib/craxii/recovery/<new-name>.sqlite3 \
+      --manifest /var/lib/craxii/recovery/<new-name>.manifest.json \
+      --repository-sha '<candidate-40-character-commit>'
+
+Never use a raw main-database file copy as a recovery method. The helper does not read or copy
+credentials, artifacts, workspace contents, or SQLite sidecars into the recovery bundle. It
+creates only a mode-0600 self-contained database and mode-0600 redacted manifest. Validate the
+pair independently before deployment:
+
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/recovery-copy.py validate \
+      --database /var/lib/craxii/recovery/<new-name>.sqlite3 \
+      --manifest /var/lib/craxii/recovery/<new-name>.manifest.json
+
+Validation requires both SQLite quick_check and full integrity_check, an empty foreign_key_check,
+exact contiguous SQLx migration descriptions/checksums, a supported schema version and ceiling,
+the manifest digest/size, no WAL dependency, and safe file permissions. Source truth is: a V5 candidate startup applies 0006 and 0007; V6 applies 0007; V7 applies none. The verified recovery
+copy is still mandatory before any of those deployment/startup actions.
+
+### Inactive-replacement restore boundary
+
+A CH-6 recovery copy is an inactive recovery point, not a second active authority or complete
+host backup. Never restore over /var/lib/craxii/db/craxii.sqlite3 or any database used by an
+active service. With the original service stopped, validate the selected recovery pair first,
+create a new private replacement state root, install the recovery database there, then validate
+the installed copy again before any candidate config points at it:
+
+    sudo install -d -o root -g root -m 0700 \
+      /var/lib/craxii-replacement /var/lib/craxii-replacement/db \
+      /var/lib/craxii-replacement/locks
+    sudo install -o root -g root -m 0600 \
+      /var/lib/craxii/recovery/<verified-name>.sqlite3 \
+      /var/lib/craxii-replacement/db/craxii.sqlite3
+    sudo install -o root -g root -m 0600 /dev/null \
+      /var/lib/craxii-replacement/locks/craxii.lock
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/recovery-copy.py validate \
+      --database /var/lib/craxii-replacement/db/craxii.sqlite3 \
+      --manifest /var/lib/craxii/recovery/<verified-name>.manifest.json
+
+Do not point a candidate at the replacement until that final validation passes. Never run a binary
+whose schema ceiling is older than the restored database. A full active-host restore rehearsal,
+artifact/workspace restoration, provider activation, and replacement-host automation remain
+outside CH-6.
+
+### Forward-only migration failure
+
+If startup reaches V6 and 0007 then fails, if a migration succeeds but the candidate later fails,
+or if the available rollback binary is older than the database schema:
+
+1. Stop the candidate and require MainPID=0.
+2. Preserve the failed state root and sanitized startup/migration evidence; do not modify it to
+   imitate an older schema.
+3. Do not start the older binary against that database and do not perform an in-place rollback.
+4. Choose either a compatible fix-forward candidate, or a new inactive replacement state root
+   populated from the verified pre-migration recovery copy and validated as above.
+5. Point exactly one compatible candidate at the chosen inactive state only after validation, then
+   start once and require loopback readiness.
+
+The same rule applies when V5→V6 succeeds but V6→V7 fails: the failed V6 state is evidence, not a
+valid target for the older V5 binary.
+
 Never store the Telegram token in TOML, `Environment=`, `EnvironmentFile=`, a shell argument, a
 repository file, or an operator log. Telegram uses outbound long polling, so enabling it does not
 change the loopback bind and requires no public listener, webhook, or Caddy route.

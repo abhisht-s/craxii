@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic local checks for the CH-6 Slice 1 Stage 27 assets."""
+"""Deterministic local checks for the CH-6 Stage 27 assets."""
 
 from __future__ import annotations
 
@@ -27,6 +27,8 @@ UNIT = ASSETS / "craxii-server.service"
 RENDERER = ASSETS / "render-config.py"
 INSTALLER = ASSETS / "install-telegram-credential.py"
 UPGRADE = ASSETS / "upgrade-release.sh"
+RECOVERY = ASSETS / "recovery-copy.py"
+RECOVERY_TESTS = ASSETS / "test_recovery_copy.py"
 SYNTHETIC_CHANNEL_ID = "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"
 SYNTHETIC_BOT_ID = 10001
 SYNTHETIC_OWNER_ID = 20002
@@ -567,6 +569,66 @@ def verify_installer(installer: ModuleType) -> str:
     return canary
 
 
+def verify_recovery_assets() -> None:
+    require(RECOVERY.is_file(), "recovery helper is missing")
+    require(RECOVERY_TESTS.is_file(), "recovery helper tests are missing")
+    require(
+        stat.S_IMODE(RECOVERY.stat().st_mode) == 0o755,
+        "recovery helper is not executable mode 0755",
+    )
+    helper = RECOVERY.read_text(encoding="utf-8")
+    readme = (ASSETS / "README.md").read_text(encoding="utf-8")
+    for contract in (
+        "source_connection.backup(destination_connection)",
+        "PRAGMA quick_check",
+        "PRAGMA integrity_check",
+        "PRAGMA foreign_key_check",
+        "fcntl.LOCK_EX | fcntl.LOCK_NB",
+        '"--property=MainPID"',
+        "os.O_EXCL",
+        'create.add_argument("--source-state-root"',
+        'create.add_argument("--destination-db"',
+        'create.add_argument("--manifest"',
+        'validate.add_argument("--database"',
+    ):
+        require(contract in helper, f"recovery helper omits contract: {contract}")
+    require("shutil.copy" not in helper, "recovery helper raw-copies the SQLite database")
+    require(
+        "/etc/craxii/credentials/openai_provider" not in helper
+        and "/etc/craxii/credentials/telegram_bot" not in helper,
+        "recovery helper references a credential source",
+    )
+    for procedure in (
+        "systemctl start craxii-server.service",
+        "systemctl stop craxii-server.service",
+        "systemctl restart craxii-server.service",
+        "delivery inspect",
+        "channel-account disable",
+        "recovery-copy.py create",
+        "recovery-copy.py validate",
+        "V5 candidate startup applies 0006 and 0007",
+        "V6 applies 0007",
+        "V7 applies none",
+        "Inactive-replacement restore boundary",
+        "Forward-only migration failure",
+        "Do not start the older binary",
+    ):
+        require(procedure in readme, f"README omits procedure: {procedure}")
+    require(
+        "/var/lib/craxii-replacement/db/craxii.sqlite3" in readme,
+        "restore procedure does not target a new inactive replacement",
+    )
+    for line in readme.splitlines():
+        command = line.strip()
+        require(
+            not (
+                command.startswith(("cp ", "sudo cp "))
+                and "/var/lib/craxii/db/craxii.sqlite3" in command
+            ),
+            "README presents raw copy of the active SQLite main database",
+        )
+
+
 def verify_canary_absence(canary: str, generated: str) -> None:
     require(canary not in generated, "synthetic token appeared in generated operator output")
     for path in (TEMPLATE, UNIT, ASSETS / "README.md"):
@@ -613,9 +675,10 @@ def main() -> int:
     verify_deployment_scripts()
     preflight_canary = verify_upgrade_credential_preflight(installer, renderer)
     canary = verify_installer(installer)
+    verify_recovery_assets()
     verify_canary_absence(canary, enabled_text)
     verify_canary_absence(preflight_canary, enabled_text)
-    print("STAGE27_CH6_SLICE1_ASSETS=PASS")
+    print("STAGE27_CH6_SLICE2_ASSETS=PASS")
     return 0
 
 
