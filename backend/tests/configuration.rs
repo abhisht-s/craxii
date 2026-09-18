@@ -8,13 +8,14 @@ use craxii_server::bootstrap::compatibility::{
     ARCHITECTURE_VERSION, CONFIGURATION_VERSION, MAX_SUPPORTED_SCHEMA_VERSION, PROTOCOL_VERSION,
 };
 use craxii_server::bootstrap::config::{
-    self, ConfigError, DeviceAuthSource, FailpointMode, ShellEnvironmentPolicy, TracingFilter,
-    TracingFormat, WorkstationIdentitySource,
+    self, ConfigError, DeviceAuthSource, FailpointMode, ShellEnvironmentPolicy, TelegramConfig,
+    TracingFilter, TracingFormat, WorkstationIdentitySource,
 };
 use craxii_server::bootstrap::credential::CredentialSourceConfig;
 
 const LOCAL: &str = include_str!("fixtures/config/valid/local.toml");
 const EC2_SHAPE: &str = include_str!("fixtures/config/valid/ec2-shape.toml");
+const STAGE27_PRODUCTION: &str = include_str!("../../ops/stage27/config.toml.template");
 type ErrorPredicate = fn(&ConfigError) -> bool;
 
 fn fixture_path(relative: &str) -> PathBuf {
@@ -91,6 +92,60 @@ fn compatibility_constants_are_exact() {
     assert_eq!(PROTOCOL_VERSION, 1);
     assert_eq!(CONFIGURATION_VERSION, 1);
     assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 7);
+}
+
+#[test]
+fn stage27_production_template_supports_disabled_and_exact_synthetic_enabled_telegram() {
+    let disabled = valid(STAGE27_PRODUCTION);
+    assert!(matches!(disabled.telegram(), TelegramConfig::Disabled));
+    assert_eq!(
+        disabled
+            .credentials()
+            .declared()
+            .iter()
+            .map(|credential| credential.as_str())
+            .collect::<Vec<_>>(),
+        ["openai_provider"]
+    );
+    assert!(!STAGE27_PRODUCTION.contains("TELEGRAM_BOT_TOKEN"));
+
+    let enabled_source = STAGE27_PRODUCTION
+        .replace(
+            "declared = [\"openai_provider\"]",
+            "declared = [\"openai_provider\", \"telegram_bot\"]",
+        )
+        .replace(
+            "[telegram]\nenabled = false",
+            concat!(
+                "[telegram]\n",
+                "enabled = true\n",
+                "channel_account_id = \"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d\"\n",
+                "credential = \"telegram_bot\"\n",
+                "expected_bot_user_id = 10001\n",
+                "owner_telegram_user_id = 20002",
+            ),
+        );
+    let enabled = valid(&enabled_source);
+    let telegram = enabled
+        .telegram()
+        .as_enabled()
+        .expect("synthetic production Telegram config must be enabled");
+    assert_eq!(
+        telegram.channel_account_id().to_string(),
+        "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d"
+    );
+    assert_eq!(telegram.credential().as_str(), "telegram_bot");
+    assert_eq!(telegram.expected_bot_user_id(), 10001);
+    assert_eq!(telegram.owner_telegram_user_id(), 20002);
+    assert_eq!(
+        enabled
+            .credentials()
+            .declared()
+            .iter()
+            .map(|credential| credential.as_str())
+            .collect::<Vec<_>>(),
+        ["openai_provider", "telegram_bot"]
+    );
 }
 
 #[test]

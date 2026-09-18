@@ -6,7 +6,7 @@ use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant};
 
 use craxii_server::bootstrap::config::{
-    self, DeviceAuthSource, ModelProvider, ShellEnvironmentPolicy,
+    self, DeviceAuthSource, ModelProvider, ShellEnvironmentPolicy, TelegramConfig,
 };
 use craxii_server::bootstrap::credential::CredentialSourceConfig;
 use craxii_server::bootstrap::metadata::{BuildMetadata, ReleaseProvenancePolicy};
@@ -473,6 +473,19 @@ async fn preflight(expectation: DurableStateExpectation) -> Result<Preflight> {
 }
 
 fn validate_configuration(configuration: &config::ValidatedConfig) -> Result<()> {
+    let declared = configuration
+        .credentials()
+        .declared()
+        .iter()
+        .map(|credential| credential.as_str())
+        .collect::<Vec<_>>();
+    let telegram_contract_matches = match configuration.telegram() {
+        TelegramConfig::Disabled => declared == ["openai_provider"],
+        TelegramConfig::Enabled(telegram) => {
+            declared == ["openai_provider", "telegram_bot"]
+                && telegram.credential().as_str() == "telegram_bot"
+        }
+    };
     if configuration.server().public_base_url().as_str() != PUBLIC_BASE_URL
         || configuration.server().bind_address().to_string() != "127.0.0.1:8080"
         || configuration.paths().state_root() != Path::new(STATE_ROOT)
@@ -483,8 +496,7 @@ fn validate_configuration(configuration: &config::ValidatedConfig) -> Result<()>
             configuration.credentials().source(),
             CredentialSourceConfig::Systemd
         )
-        || configuration.credentials().declared().len() != 1
-        || configuration.credentials().declared()[0].as_str() != "openai_provider"
+        || !telegram_contract_matches
         || !matches!(
             configuration.device_auth().source(),
             DeviceAuthSource::ProvisionedSqlite
@@ -1544,6 +1556,30 @@ mod tests {
             configuration.server().public_base_url().as_str(),
             PUBLIC_BASE_URL
         );
+        assert!(validate_configuration(&configuration).is_ok());
+    }
+
+    #[test]
+    fn enabled_telegram_production_configuration_satisfies_runner_contract() {
+        let source = include_str!("../../../ops/stage27/config.toml.template")
+            .replace(
+                "declared = [\"openai_provider\"]",
+                "declared = [\"openai_provider\", \"telegram_bot\"]",
+            )
+            .replace(
+                "[telegram]\nenabled = false",
+                concat!(
+                    "[telegram]\n",
+                    "enabled = true\n",
+                    "channel_account_id = \"01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c0d\"\n",
+                    "credential = \"telegram_bot\"\n",
+                    "expected_bot_user_id = 10001\n",
+                    "owner_telegram_user_id = 20002",
+                ),
+            );
+        let configuration = config::parse(&source)
+            .expect("enabled Telegram Stage 27 production configuration must parse");
+
         assert!(validate_configuration(&configuration).is_ok());
     }
 

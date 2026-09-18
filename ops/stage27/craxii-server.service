@@ -14,6 +14,7 @@ WorkingDirectory=/var/lib/craxii
 ExecStartPre=/usr/bin/mkdir -p /sys/fs/cgroup/system.slice/craxii-server.service/craxii-executions
 ExecStart=/opt/craxii/current/craxii-server --config /etc/craxii/config.toml
 LoadCredential=openai_provider:/etc/craxii/credentials/openai_provider
+LoadCredential=telegram_bot:/etc/craxii/credentials/telegram_bot
 Restart=on-failure
 RestartSec=2s
 KillSignal=SIGTERM

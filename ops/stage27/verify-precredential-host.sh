@@ -24,6 +24,7 @@ readonly benchmark_runner=/opt/craxii/current/craxii-stage27-luna-benchmark
 readonly config=/etc/craxii/config.toml
 readonly credential_directory=/etc/craxii/credentials
 readonly provider_credential=${credential_directory}/openai_provider
+readonly telegram_credential=${credential_directory}/telegram_bot
 readonly workspace=/srv/craxii/workspaces/primary
 readonly source_directory=/var/lib/craxii-build/source
 readonly synthetic_id="stage27-$$"
@@ -92,6 +93,8 @@ build_git() {
 # Exact service/config/release identities and precredential stop state.
 [[ ! -e "${provider_credential}" && ! -L "${provider_credential}" ]] ||
   fail "real provider credential exists before the checkpoint"
+[[ ! -e "${telegram_credential}" && ! -L "${telegram_credential}" ]] ||
+  fail "real Telegram credential exists before the checkpoint"
 ! systemctl is-active --quiet craxii-server.service || fail "service is active before credential install"
 ! systemctl is-enabled --quiet craxii-server.service || fail "service is enabled before credential install"
 [[ "$(id -un craxii-server)" == craxii-server ]]
@@ -128,6 +131,9 @@ grep -qx 'state_root = "/var/lib/craxii"' "${config}"
 grep -qx 'artifact_root = "/var/lib/craxii/artifacts"' "${config}"
 grep -qx 'primary_workspace_root = "/srv/craxii/workspaces/primary"' "${config}"
 grep -qx 'source = "systemd"' "${config}"
+grep -Fqx 'declared = ["openai_provider"]' "${config}"
+grep -qx '\[telegram\]' "${config}"
+grep -qx 'enabled = false' "${config}"
 grep -qx 'default_target = "stage27-openai"' "${config}"
 [[ "$(grep -c '^\[\[models.targets\]\]$' "${config}")" -eq 1 ]]
 grep -qx 'provider = "openai"' "${config}"
@@ -138,9 +144,10 @@ grep -qx 'delegated_cgroup_root = "/sys/fs/cgroup/system.slice/craxii-server.ser
 if grep -q '__REQUIRED_' "${config}"; then
   fail "production config contains an unresolved placeholder"
 fi
-if grep -Eiq 'fallback|OPENAI_API_KEY|(^|[^[:alnum:]])sk-[A-Za-z0-9_-]{16,}' "${config}"; then
+if grep -Eiq 'fallback|OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|(^|[^[:alnum:]])sk-[A-Za-z0-9_-]{16,}' "${config}"; then
   fail "production config contains fallback or credential material"
 fi
+runuser -u craxii-server -- "${trusted_admin}" --config "${config}" config validate >/dev/null
 
 grep -qx 'User=craxii-server' /etc/systemd/system/craxii-server.service
 grep -qx 'Group=craxii-server' /etc/systemd/system/craxii-server.service
@@ -156,19 +163,22 @@ grep -qx 'IPAddressDeny=169.254.169.254' /etc/systemd/system/craxii-server.servi
 grep -qx 'IPAddressDeny=fd00:ec2::254' /etc/systemd/system/craxii-server.service
 grep -qx 'LoadCredential=openai_provider:/etc/craxii/credentials/openai_provider' \
   /etc/systemd/system/craxii-server.service
+grep -qx 'LoadCredential=telegram_bot:/etc/craxii/credentials/telegram_bot' \
+  /etc/systemd/system/craxii-server.service
 if grep -Eq '^Environment(File)?=' /etc/systemd/system/craxii-server.service; then
   fail "systemd unit contains a global environment source"
 fi
 systemd-analyze verify /etc/systemd/system/craxii-server.service
 
 # No real OpenAI credential is accepted in known host configuration or any current process.
-if grep -RqsE 'OPENAI_API_KEY|(^|[^[:alnum:]])sk-[A-Za-z0-9_-]{16,}' \
+if grep -RqsE 'OPENAI_API_KEY|TELEGRAM_BOT_TOKEN|(^|[^[:alnum:]])sk-[A-Za-z0-9_-]{16,}' \
   /etc/craxii /etc/environment /etc/profile /etc/profile.d 2>/dev/null; then
   fail "OpenAI credential material was found in host configuration"
 fi
 while IFS= read -r process_environment; do
-  if tr '\0' '\n' <"${process_environment}" 2>/dev/null | grep -q '^OPENAI_API_KEY='; then
-    fail "OPENAI_API_KEY is present in a running process environment"
+  if tr '\0' '\n' <"${process_environment}" 2>/dev/null |
+    grep -Eq '^(OPENAI_API_KEY|TELEGRAM_BOT_TOKEN)='; then
+    fail "provider credential is present in a running process environment"
   fi
 done < <(find /proc -maxdepth 2 -path '/proc/[0-9]*/environ' -type f -print 2>/dev/null)
 
@@ -191,6 +201,7 @@ setfacl -m u:craxii-server:r-- "${synthetic_workspace}"
 runuser -u craxii-server -- /usr/bin/env -i \
   CRAXII_STAGE27_BACKEND_CANARY=synthetic-environment-canary \
   OPENAI_API_KEY=synthetic-openai-environment-canary \
+  TELEGRAM_BOT_TOKEN=synthetic-telegram-environment-canary \
   AWS_ACCESS_KEY_ID=synthetic-aws-access-key-canary \
   AWS_SECRET_ACCESS_KEY=synthetic-aws-secret-canary \
   AWS_SESSION_TOKEN=synthetic-aws-session-canary \
@@ -228,7 +239,8 @@ test \"\$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbi
 test -n \"\${CRAXII_WORK_ID-}\"; test -n \"\${CRAXII_WORKSPACE_ID-}\"; \
 test -z \"\${CRAXII_STAGE27_BACKEND_CANARY-}\"; \
 test -z \"\${CREDENTIALS_DIRECTORY-}\"; test -z \"\${CRAXII_BACKEND_AUTH_CANARY-}\"; \
-test -z \"\${OPENAI_API_KEY-}\"; test -z \"\${AWS_ACCESS_KEY_ID-}\"; \
+test -z \"\${OPENAI_API_KEY-}\"; test -z \"\${TELEGRAM_BOT_TOKEN-}\"; \
+test -z \"\${AWS_ACCESS_KEY_ID-}\"; \
 test -z \"\${AWS_SECRET_ACCESS_KEY-}\"; test -z \"\${AWS_SESSION_TOKEN-}\"; \
 test -z \"\${AWS_PROFILE-}\"; test -z \"\${AWS_SHARED_CREDENTIALS_FILE-}\"; \
 test -z \"\${AWS_WEB_IDENTITY_TOKEN_FILE-}\"; \
@@ -259,6 +271,7 @@ shell_output=$(/usr/bin/prlimit --core=0:0 /usr/bin/setpriv \
   CREDENTIALS_DIRECTORY=/synthetic/systemd-credentials \
   CRAXII_BACKEND_AUTH_CANARY=synthetic-backend-auth-canary \
   OPENAI_API_KEY=synthetic-openai-environment-canary \
+  TELEGRAM_BOT_TOKEN=synthetic-telegram-environment-canary \
   AWS_ACCESS_KEY_ID=synthetic-aws-access-key-canary \
   AWS_SECRET_ACCESS_KEY=synthetic-aws-secret-canary \
   AWS_SESSION_TOKEN=synthetic-aws-session-canary \

@@ -50,16 +50,37 @@ do not match it, preventing a clean checkout from lending identity to stale targ
 
 `bootstrap-security-boundary.sh` requires an already-built release and verified data layout. It
 installs users, permissions, binaries, the unit, and the non-secret production config, but leaves
-the unit stopped and disabled and does not create a provider credential.
+the unit stopped and disabled and does not create either provider credential. The checked-in
+configuration is an explicit Telegram hard-off default:
+
+    [credentials]
+    source = "systemd"
+    declared = ["openai_provider"]
+
+    [telegram]
+    enabled = false
+
+`render-config.py` renders this template before installation and the candidate `craxii-admin`
+validates the result with the normal Rust configuration contract. On upgrade, the renderer takes
+all non-Telegram settings from the new template while preserving the installed Telegram enabled
+state, ChannelAccountId, expected bot ID, and owner ID. An older config with no `[telegram]` table
+is treated as disabled. The renderer canonicalizes only these nonsecret fields; it never accepts a
+token. Deployed-asset verification reconstructs the expected config with the same preservation
+rule instead of requiring the host-owned config to remain byte-identical to the repository
+template.
 
 `upgrade-release.sh` is the post-provisioning immutable-release path. It requires an exact clean
-build checkout and matching build manifest, installs a new five-binary release plus the audited
-non-secret config/unit (never the credential), stages and validates the mutable assets before
-stopping the healthy service, or requires a failed/inactive recovery service to have no live
-MainPID, then atomically replaces each installed file, reloads systemd, and proves the manager has
-no pending reload before atomically advancing `/opt/craxii/current`. It clears any exhausted
-start-rate counter, performs one candidate start, and requires readiness and exact MainPID release
-identity before success.
+build checkout, then performs a metadata-only preflight of the mandatory
+`/etc/craxii/credentials/telegram_bot` source before it creates staging or release state, stops the
+service, replaces config/unit assets, or changes the active release pointer. The preflight requires
+the same directory ownership/mode and regular, single-link, nonempty credential ownership/mode as
+the installer and never opens the credential. Only after that gate does the upgrade verify the
+matching build manifest, install a new five-binary release plus the audited non-secret config/unit
+(never the credential), stage and validate the mutable assets before stopping the healthy service,
+or require a failed/inactive recovery service to have no live MainPID. It then atomically replaces
+each installed file, reloads systemd, and proves the manager has no pending reload before atomically
+advancing `/opt/craxii/current`. It clears any exhausted start-rate counter, performs one candidate
+start, and requires readiness and exact MainPID release identity before success.
 Once candidate startup has been attempted, any later deployment failure stops the unverified
 candidate instead of leaving it active or restart-looping.
 Schema V5 is forward-only: once the new binary applies it, the V4 release is not a valid rollback
@@ -75,6 +96,108 @@ credential. It uses synthetic canaries only and makes no provider or AWS request
 human may run it in the browser terminal. It reads without echo, does not use an argument or
 environment variable, refuses overwrite, and installs the systemd credential source as
 `craxii-server:craxii-server` mode `0600`. Running that script is outside the precredential run.
+
+## Telegram production configuration and credential
+
+The enabled configuration has exactly this additional contract; the three identity values are
+nonsecret and host-specific:
+
+    [credentials]
+    source = "systemd"
+    declared = ["openai_provider", "telegram_bot"]
+
+    [telegram]
+    enabled = true
+    channel_account_id = "<canonical UUIDv7>"
+    credential = "telegram_bot"
+    expected_bot_user_id = 10001
+    owner_telegram_user_id = 20002
+
+Generate the ChannelAccountId once with the repository-native UUIDv7 type, then preserve it for
+the lifetime of this Telegram channel account:
+
+    sudo /opt/craxii/current/craxii-admin \
+      --config /etc/craxii/config.toml channel-account-id generate
+
+Do not regenerate it during an upgrade. Record the printed UUIDv7 for the config-rendering step.
+The command reads neither credential and prints only the canonical ID to stdout.
+
+The fixed production service unit maps OpenAI and Telegram separately with `LoadCredential` and
+always declares both mappings. Systemd therefore requires both source files whenever that unit
+starts, even while application-level Telegram is disabled. The token is still not requested or
+read by the application while Telegram is disabled. First bootstrap remains safe before either
+credential is installed because bootstrap leaves the service stopped and disabled.
+
+For a legacy Telegram-disabled production upgrade, the supported order is:
+
+1. Keep the existing incumbent service running and healthy.
+2. Install the Telegram credential securely with the create-once installer. Creating this new,
+   unused source file does not disturb the legacy incumbent.
+3. Verify its metadata without reading its contents.
+4. Run the release upgrade. The preflight refuses to create deployment state or touch the
+   incumbent if the credential is absent or unsafe.
+5. Let the candidate start with Telegram disabled when the preserved config is disabled or has no
+   legacy `[telegram]` table.
+6. Later, when live Telegram is explicitly authorized, stop the service, render and validate the
+   enabled config, atomically install it, and restart the service.
+
+Steps 2 and 3 are:
+
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/install-telegram-credential.py --install
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/install-telegram-credential.py --verify
+
+The prompt is hidden. The token is never accepted in argv or an environment variable, and is
+installed only at `/etc/craxii/credentials/telegram_bot` as `craxii-server:craxii-server` mode
+`0600`. The installer refuses an existing file and never reads or overwrites `openai_provider`.
+Create-once installation is safe while the legacy incumbent is healthy because that process does
+not know or consume the new source file; explicit rotation still requires a stopped service.
+
+When later enabling live Telegram, stop the service and render the enabled config using the
+generated UUIDv7 and the real nonsecret numeric IDs. Use a new same-filesystem pending path so the
+final rename is atomic:
+
+    sudo systemctl stop craxii-server.service
+    pending=/etc/craxii/.config.toml.telegram.$$
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/render-config.py \
+      --template /etc/craxii/config.toml \
+      --enable-telegram \
+      --channel-account-id '<generated-once-uuidv7>' \
+      --expected-bot-user-id '<bot-numeric-id>' \
+      --owner-telegram-user-id '<owner-numeric-id>' \
+      --output "$pending"
+    sudo chown root:craxii-server "$pending"
+    sudo chmod 0640 "$pending"
+    sudo /opt/craxii/current/craxii-admin --config "$pending" config validate
+    sudo mv -Tf "$pending" /etc/craxii/config.toml
+    sudo systemctl start craxii-server.service
+    curl --fail --silent --show-error http://127.0.0.1:8080/health/ready >/dev/null
+
+To return to hard-off mode, repeat the stopped-service render/validate/atomic-rename flow with
+`--disable-telegram` and no Telegram identity arguments. The resulting config declares only
+`openai_provider` and contains only `enabled = false` under `[telegram]`. Keep the Telegram source
+file in place because the fixed unit mapping is mandatory; the Rust application does not load it
+while disabled.
+
+Rotation is a separate explicit operation. Stop the service first, rotate through another hidden
+prompt, then start it and require loopback readiness:
+
+    sudo systemctl stop craxii-server.service
+    sudo /usr/bin/python3 \
+      /var/lib/craxii-build/source/ops/stage27/install-telegram-credential.py --rotate
+    sudo systemctl start craxii-server.service
+    curl --fail --silent --show-error http://127.0.0.1:8080/health/ready >/dev/null
+
+Rotation writes and fsyncs a restrictive same-directory temporary file, atomically renames it over
+the old credential, and fsyncs the directory. A failure before replacement leaves the prior token
+intact; a failure leaves the service stopped for explicit operator recovery. There is deliberately
+no local Telegram call or token validation.
+
+Never store the Telegram token in TOML, `Environment=`, `EnvironmentFile=`, a shell argument, a
+repository file, or an operator log. Telegram uses outbound long polling, so enabling it does not
+change the loopback bind and requires no public listener, webhook, or Caddy route.
 
 `verify-production-host.sh` owns the final production-like Stage 27 restart/reboot gate. Its
 `--pre-reboot` mode creates two fixed non-secret persistence sentinels, captures a read-only

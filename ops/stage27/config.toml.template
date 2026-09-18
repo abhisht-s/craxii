@@ -1,4 +1,4 @@
-# Stage 27 production configuration. The provider credential is supplied only by systemd.
+# Stage 27 production configuration. Provider credentials are supplied only by systemd.
 configuration_version = 1
 failpoint_mode = "disabled"
 
@@ -24,6 +24,9 @@ primary_workspace_logical_name = "primary"
 [credentials]
 source = "systemd"
 declared = ["openai_provider"]
+
+[telegram]
+enabled = false
 
 [models]
 default_target = "stage27-openai"

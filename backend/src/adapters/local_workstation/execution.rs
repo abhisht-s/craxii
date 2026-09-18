@@ -1760,26 +1760,40 @@ pub(super) fn probe_cgroup_root(configured_root: Option<&Path>) -> Option<PathBu
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum UserSwitchLauncherProbeFailure {
+    #[cfg(not(target_os = "linux"))]
     UnsupportedPlatform,
+    #[cfg(target_os = "linux")]
     LauncherNotConfigured,
+    #[cfg(target_os = "linux")]
     ProbeCwdNotConfigured,
+    #[cfg(target_os = "linux")]
     LauncherPathInvalid,
+    #[cfg(target_os = "linux")]
     LauncherMetadataUnavailable,
+    #[cfg(target_os = "linux")]
     ReaderMetadataUnavailable,
+    #[cfg(target_os = "linux")]
     LauncherMetadataRejected,
+    #[cfg(target_os = "linux")]
     CgroupUnavailable,
+    #[cfg(target_os = "linux")]
     ExecutionCgroupCreateFailed,
+    #[cfg(target_os = "linux")]
     SpawnPermissionDenied,
+    #[cfg(target_os = "linux")]
     SpawnFailed,
+    #[cfg(target_os = "linux")]
     ChildRejected,
+    #[cfg(target_os = "linux")]
     UnexpectedOutput,
+    #[cfg(target_os = "linux")]
     CleanupUnconfirmed,
 }
 
 impl UserSwitchLauncherProbeFailure {
+    #[cfg(target_os = "linux")]
     pub(super) const fn diagnostic_code(self) -> &'static str {
         match self {
-            Self::UnsupportedPlatform => "launcher_probe_unsupported_platform",
             Self::LauncherNotConfigured => "launcher_probe_not_configured",
             Self::ProbeCwdNotConfigured => "launcher_probe_cwd_not_configured",
             Self::LauncherPathInvalid => "launcher_probe_path_invalid",
@@ -2073,13 +2087,10 @@ mod tests {
         PreparedCwdEvidence, PreparedCwdObjectIdentity, PreparedCwdObjectType,
     };
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn launcher_probe_failures_have_specific_safe_diagnostic_codes() {
         let cases = [
-            (
-                UserSwitchLauncherProbeFailure::UnsupportedPlatform,
-                "launcher_probe_unsupported_platform",
-            ),
             (
                 UserSwitchLauncherProbeFailure::LauncherNotConfigured,
                 "launcher_probe_not_configured",

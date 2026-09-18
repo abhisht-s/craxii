@@ -166,7 +166,15 @@ require(
     "bad workspace root",
 )
 require(value["credentials"]["source"] == "systemd", "bad credential source")
-require(value["credentials"]["declared"] == ["openai_provider"], "bad credential set")
+telegram = value.get("telegram", {"enabled": False})
+expected_credentials = (
+    ["openai_provider", "telegram_bot"]
+    if telegram["enabled"]
+    else ["openai_provider"]
+)
+require(value["credentials"]["declared"] == expected_credentials, "bad credential set")
+if telegram["enabled"]:
+    require(telegram["credential"] == "telegram_bot", "bad Telegram credential")
 require(value["models"]["default_target"] == "stage27-openai", "bad default target")
 targets = value["models"]["targets"]
 require(len(targets) == 1, "more than one production model target")

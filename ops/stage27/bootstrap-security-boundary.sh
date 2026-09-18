@@ -13,6 +13,18 @@ fi
 source_directory="$1"
 release_version="$2"
 asset_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+staging_directory=""
+
+cleanup() {
+  local status=$?
+  trap - EXIT
+  if [[ -n "${staging_directory}" &&
+        "${staging_directory}" == /run/craxii-stage27-bootstrap-[0-9]* ]]; then
+    rm -rf -- "${staging_directory}"
+  fi
+  exit "${status}"
+}
+trap cleanup EXIT
 
 fail() {
   echo "error: $*" >&2
@@ -23,7 +35,7 @@ fail() {
 [[ "$(uname -m)" == "x86_64" ]]
 grep -qx 'ID=ubuntu' /etc/os-release
 grep -qx 'VERSION_ID="24.04"' /etc/os-release
-for command in groupadd useradd getent install setfacl sha256sum runuser setpriv; do
+for command in groupadd useradd getent install python3 setfacl sha256sum runuser setpriv; do
   command -v "${command}" >/dev/null
 done
 for binary in \
@@ -39,8 +51,12 @@ else
   fail "release version does not carry the required build revision"
 fi
 "${asset_directory}/bootstrap-data-volume.sh" --verify-only
-[[ ! -e /etc/craxii/credentials/openai_provider ]] ||
+[[ ! -e /etc/craxii/credentials/openai_provider &&
+   ! -L /etc/craxii/credentials/openai_provider ]] ||
   fail "provider credential already exists; precredential bootstrap refused"
+[[ ! -e /etc/craxii/credentials/telegram_bot &&
+   ! -L /etc/craxii/credentials/telegram_bot ]] ||
+  fail "Telegram credential already exists; precredential bootstrap refused"
 if systemctl is-active --quiet craxii-server.service 2>/dev/null ||
   systemctl is-enabled --quiet craxii-server.service 2>/dev/null; then
   fail "craxii-server.service must be stopped and disabled before bootstrap"
@@ -110,7 +126,19 @@ mv -Tf "${temporary_link}" /opt/craxii/current
 
 install -d -o root -g craxii-server -m 0750 /etc/craxii
 install -d -o craxii-server -g craxii-server -m 0700 /etc/craxii/credentials
-install -o root -g craxii-server -m 0640 "${asset_directory}/config.toml.template" /etc/craxii/config.toml
+[[ -f "${asset_directory}/render-config.py" &&
+   ! -L "${asset_directory}/render-config.py" ]] ||
+  fail "production config renderer is absent or unsafe"
+staging_directory="/run/craxii-stage27-bootstrap-$$"
+[[ ! -e "${staging_directory}" && ! -L "${staging_directory}" ]] ||
+  fail "bootstrap staging path already exists"
+install -d -o root -g root -m 0700 "${staging_directory}"
+staged_config="${staging_directory}/config.toml"
+/usr/bin/python3 "${asset_directory}/render-config.py" \
+  --template "${asset_directory}/config.toml.template" \
+  --output "${staged_config}"
+"${source_directory}/craxii-admin" --config "${staged_config}" config validate >/dev/null
+install -o root -g craxii-server -m 0640 "${staged_config}" /etc/craxii/config.toml
 install -o root -g root -m 0644 "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service
 
 install -d -o craxii-server -g craxii-server -m 0700 /var/lib/craxii

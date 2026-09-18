@@ -200,6 +200,9 @@ require_independent_checks_passed() {
 verify_deployed_assets() {
   [[ -f /etc/craxii/config.toml && ! -L /etc/craxii/config.toml ]] ||
     fail "deployed config path is unsafe"
+  [[ -f "${asset_directory}/render-config.py" &&
+     ! -L "${asset_directory}/render-config.py" ]] ||
+    fail "production config renderer is absent or unsafe"
   [[ "$(stat -c '%U:%G:%a:%h' /etc/craxii/config.toml)" == root:craxii-server:640:1 ]] ||
     fail "deployed config metadata mismatch"
   [[ -f /etc/systemd/system/craxii-server.service &&
@@ -207,8 +210,11 @@ verify_deployed_assets() {
   [[ "$(stat -c '%U:%G:%a:%h' /etc/systemd/system/craxii-server.service)" == root:root:644:1 ]] ||
     fail "deployed systemd unit metadata mismatch"
   [[ -L /opt/craxii/current ]] || fail "active release pointer is not a symbolic link"
-  cmp -s "${asset_directory}/config.toml.template" /etc/craxii/config.toml ||
-    fail "deployed config differs from the audited template"
+  /usr/bin/python3 "${asset_directory}/render-config.py" \
+    --template "${asset_directory}/config.toml.template" \
+    --preserve-telegram-from /etc/craxii/config.toml \
+    --check /etc/craxii/config.toml ||
+    fail "deployed config differs from the rendered audited template"
   cmp -s "${asset_directory}/craxii-server.service" /etc/systemd/system/craxii-server.service ||
     fail "deployed systemd unit differs from the audited unit"
   [[ "$(systemctl show "${service}" --property FragmentPath --value)" == \

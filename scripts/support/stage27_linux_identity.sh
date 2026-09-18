@@ -156,6 +156,7 @@ server_gid="$(id -g craxii-server)"
     --ambient-caps=+kill \
     /usr/bin/env \
     OPENAI_API_KEY=synthetic-provider-environment-canary \
+    TELEGRAM_BOT_TOKEN=synthetic-telegram-environment-canary \
     CREDENTIALS_DIRECTORY=/synthetic/systemd-credentials \
     AWS_ACCESS_KEY_ID=synthetic-aws-access-key-canary \
     AWS_SECRET_ACCESS_KEY=synthetic-aws-environment-canary \

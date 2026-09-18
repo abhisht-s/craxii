@@ -15,7 +15,7 @@ use craxii_server::application::evidence_inspection::{
 };
 use craxii_server::bootstrap::config;
 use craxii_server::domain::{
-    DeviceDisplayName, DeviceId, RuntimeInstanceId, UserId, UtcTimestamp, WorkId,
+    ChannelAccountId, DeviceDisplayName, DeviceId, RuntimeInstanceId, UserId, UtcTimestamp, WorkId,
 };
 use craxii_server::ports::clock::Clock;
 use craxii_server::ports::device_credentials::RevokeDeviceOutcome;
@@ -45,6 +45,19 @@ async fn run(
 ) -> Result<(), AdminError> {
     let cli = Cli::parse(arguments)?;
     let config = config::load(&cli.config_path).map_err(|_| AdminError::Configuration)?;
+    match &cli.action {
+        Action::ValidateConfig => {
+            writeln!(stdout, "configuration_valid").map_err(|_| AdminError::Output)?;
+            stdout.flush().map_err(|_| AdminError::Output)?;
+            return Ok(());
+        }
+        Action::GenerateChannelAccountId => {
+            writeln!(stdout, "{}", ChannelAccountId::generate()).map_err(|_| AdminError::Output)?;
+            stdout.flush().map_err(|_| AdminError::Output)?;
+            return Ok(());
+        }
+        _ => {}
+    }
     let guard = if cli.action.is_evidence() {
         SqliteRuntimeGuard::start_read_only(config.paths().state_root())
             .await
@@ -212,6 +225,7 @@ async fn run(
                 )
                 .map_err(|_| AdminError::Output)?;
         }
+        Action::ValidateConfig | Action::GenerateChannelAccountId => unreachable!(),
     }
     stdout.flush().map_err(|_| AdminError::Output)?;
     guard.shutdown().await;
@@ -262,6 +276,8 @@ struct Cli {
 }
 
 enum Action {
+    ValidateConfig,
+    GenerateChannelAccountId,
     Provision(DeviceDisplayName),
     List,
     Revoke(DeviceId),
@@ -297,7 +313,17 @@ impl Cli {
             return Err(AdminError::Cli);
         }
         let group = arguments.next().ok_or(AdminError::Cli)?;
-        let action = if group == OsStr::new("device") {
+        let action = if group == OsStr::new("config") {
+            if arguments.next().as_deref() != Some(OsStr::new("validate")) {
+                return Err(AdminError::Cli);
+            }
+            Action::ValidateConfig
+        } else if group == OsStr::new("channel-account-id") {
+            if arguments.next().as_deref() != Some(OsStr::new("generate")) {
+                return Err(AdminError::Cli);
+            }
+            Action::GenerateChannelAccountId
+        } else if group == OsStr::new("device") {
             let command = arguments.next().ok_or(AdminError::Cli)?;
             parse_device_action(command, &mut arguments)?
         } else if group == OsStr::new("preflight") {
@@ -427,8 +453,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_accepts_device_and_stage23_offline_operations_only() {
+    fn cli_accepts_config_identity_device_and_stage23_offline_operations_only() {
         let config = OsString::from("/tmp/config.toml");
+        let validate = Cli::parse([
+            "admin".into(),
+            "--config".into(),
+            config.clone(),
+            "config".into(),
+            "validate".into(),
+        ])
+        .unwrap();
+        assert!(matches!(validate.action, Action::ValidateConfig));
+
+        let generate = Cli::parse([
+            "admin".into(),
+            "--config".into(),
+            config.clone(),
+            "channel-account-id".into(),
+            "generate".into(),
+        ])
+        .unwrap();
+        assert!(matches!(generate.action, Action::GenerateChannelAccountId));
+
         let list = Cli::parse([
             "admin".into(),
             "--config".into(),
@@ -551,5 +597,61 @@ mod tests {
             .is_err()
         );
         assert!(Cli::parse(["admin".into(), "device".into(), "list".into()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn config_validation_and_channel_account_generation_need_no_database_or_credential() {
+        let root =
+            std::env::temp_dir().join(format!("craxii-admin-config-only-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let config_path = root.join("config.toml");
+        std::fs::write(
+            &config_path,
+            include_str!("../../../ops/stage27/config.toml.template"),
+        )
+        .unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        run(
+            [
+                OsString::from("admin"),
+                OsString::from("--config"),
+                config_path.clone().into_os_string(),
+                OsString::from("config"),
+                OsString::from("validate"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stdout, b"configuration_valid\n");
+        assert!(stderr.is_empty());
+
+        stdout.clear();
+        run(
+            [
+                OsString::from("admin"),
+                OsString::from("--config"),
+                config_path.clone().into_os_string(),
+                OsString::from("channel-account-id"),
+                OsString::from("generate"),
+            ],
+            &mut stdout,
+            &mut stderr,
+        )
+        .await
+        .unwrap();
+        let generated = std::str::from_utf8(&stdout).unwrap().trim();
+        assert_eq!(
+            ChannelAccountId::parse_canonical(generated)
+                .unwrap()
+                .to_string(),
+            generated
+        );
+        assert!(stderr.is_empty());
+        std::fs::remove_file(config_path).unwrap();
+        std::fs::remove_dir(root).unwrap();
     }
 }

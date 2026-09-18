@@ -3502,6 +3502,7 @@ mod tests {
                     "test \"$PATH\" = /home/craxii/.local/bin:/home/craxii/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; ",
                     "test -n \"$CRAXII_WORK_ID\"; test -n \"$CRAXII_WORKSPACE_ID\"; ",
                     "test -z \"${{OPENAI_API_KEY-}}\"; ",
+                    "test -z \"${{TELEGRAM_BOT_TOKEN-}}\"; ",
                     "test -z \"${{CREDENTIALS_DIRECTORY-}}\"; ",
                     "test -z \"${{AWS_ACCESS_KEY_ID-}}\"; ",
                     "test -z \"${{AWS_SECRET_ACCESS_KEY-}}\"; ",

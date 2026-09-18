@@ -55,7 +55,6 @@ cleanup() {
   fi
   exit "${status}"
 }
-trap cleanup EXIT
 
 build_git() {
   runuser -u craxii-build -- /usr/bin/env -i \
@@ -68,13 +67,32 @@ build_git() {
   fail "build checkout does not match the requested commit"
 [[ -z "$(build_git status --porcelain=v1 --untracked-files=normal)" ]] ||
   fail "build checkout is dirty"
+[[ -f "${asset_directory}/install-telegram-credential.py" &&
+   ! -L "${asset_directory}/install-telegram-credential.py" ]] ||
+  fail "Telegram credential metadata verifier is absent or unsafe"
+if ! /usr/bin/python3 "${asset_directory}/install-telegram-credential.py" \
+  --verify >/dev/null 2>&1; then
+  fail "required Telegram credential /etc/craxii/credentials/telegram_bot is missing or unsafe; install it first with install-telegram-credential.py --install"
+fi
+
+# No cleanup trap is active until the mandatory credential preflight passes. Everything above is
+# read-only, so a legacy Telegram-disabled incumbent remains untouched on preflight failure.
+trap cleanup EXIT
+
 "${asset_directory}/verify-release-manifest.sh" "${source_directory}" "${commit}" >/dev/null
 [[ -f "${asset_directory}/config.toml.template" &&
    ! -L "${asset_directory}/config.toml.template" ]] ||
   fail "candidate production config is absent or unsafe"
+[[ -f "${asset_directory}/render-config.py" &&
+   ! -L "${asset_directory}/render-config.py" ]] ||
+  fail "candidate production config renderer is absent or unsafe"
 [[ -f "${asset_directory}/craxii-server.service" &&
    ! -L "${asset_directory}/craxii-server.service" ]] ||
   fail "candidate systemd unit is absent or unsafe"
+[[ -f "${installed_config}" && ! -L "${installed_config}" ]] ||
+  fail "installed production config is absent or unsafe"
+[[ "$(stat -c '%U:%G:%a:%h' "${installed_config}")" == root:craxii-server:640:1 ]] ||
+  fail "installed production config metadata mismatch"
 [[ -L "${current}" ]] || fail "active release symlink is absent"
 previous_release="$(readlink -f "${current}")"
 [[ "${previous_release}" == /opt/craxii/releases/* ]] ||
@@ -103,12 +121,17 @@ readonly staged_config="${staging_directory}/config.toml"
 readonly staged_unit="${staging_directory}/craxii-server.service"
 pending_config="/etc/craxii/.config.toml.${release_version}.$$"
 pending_unit="/etc/systemd/system/.craxii-server.service.${release_version}.$$"
-install -o root -g craxii-server -m 0640 \
-  "${asset_directory}/config.toml.template" "${staged_config}"
+/usr/bin/python3 "${asset_directory}/render-config.py" \
+  --template "${asset_directory}/config.toml.template" \
+  --preserve-telegram-from "${installed_config}" \
+  --output "${staged_config}"
+"${source_directory}/craxii-admin" --config "${staged_config}" config validate >/dev/null
 install -o root -g root -m 0644 \
   "${asset_directory}/craxii-server.service" "${staged_unit}"
-cmp -s "${asset_directory}/config.toml.template" "${staged_config}" ||
-  fail "staged production config differs from the candidate"
+/usr/bin/python3 "${asset_directory}/render-config.py" \
+  --template "${asset_directory}/config.toml.template" \
+  --preserve-telegram-from "${installed_config}" \
+  --check "${staged_config}"
 cmp -s "${asset_directory}/craxii-server.service" "${staged_unit}" ||
   fail "staged systemd unit differs from the candidate"
 systemd-analyze verify "${staged_unit}"
@@ -155,8 +178,10 @@ systemctl is-active --quiet "${service}" &&
   fail "service remained active after the deployment stop"
 mv -Tf "${pending_config}" "${installed_config}"
 mv -Tf "${pending_unit}" "${installed_unit}"
-cmp -s "${asset_directory}/config.toml.template" "${installed_config}" ||
-  fail "installed production config differs from the candidate"
+/usr/bin/python3 "${asset_directory}/render-config.py" \
+  --template "${asset_directory}/config.toml.template" \
+  --preserve-telegram-from "${installed_config}" \
+  --check "${installed_config}"
 cmp -s "${asset_directory}/craxii-server.service" "${installed_unit}" ||
   fail "installed systemd unit differs from the candidate"
 [[ "$(stat -c '%U:%G:%a' "${installed_config}")" == root:craxii-server:640 ]] ||
