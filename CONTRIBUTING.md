@@ -1,6 +1,6 @@
 # Contributing to Craxii
 
-Craxii is pre-alpha. Interfaces and internal implementation details can change quickly, but contributions should preserve the explicit durable-state, security, and protocol boundaries already implemented.
+Craxii is pre-alpha. Interfaces and internal implementation details can change quickly, but contributions should preserve the explicit durable-state, security, and protocol boundarialready implemented.
 
 ## Before you start
 
