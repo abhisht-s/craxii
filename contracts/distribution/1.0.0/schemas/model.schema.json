@@ -1,0 +1,1390 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:model",
+  "title": "Craxii distribution model",
+  "definitions": {
+    "InputItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "message",
+              "type": "string"
+            },
+            "role": {
+              "type": "string",
+              "enum": [
+                "system",
+                "developer",
+                "user"
+              ]
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "role",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "prior_assistant",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "historical_refusal",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "historical_reasoning_summary",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_call",
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "raw_arguments": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "call_id",
+            "name",
+            "raw_arguments"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_result",
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "result_json": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "call_id",
+            "result_json"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "structured_data",
+              "type": "string"
+            },
+            "data_json": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "data_json"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "synthetic_runtime_status",
+              "type": "string"
+            },
+            "status": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "details_json": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "status",
+            "details_json"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "provider_opaque_continuation",
+              "type": "string"
+            },
+            "provider_namespace": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "type_label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "opaque": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            },
+            "opaque_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "kind",
+            "provider_namespace",
+            "type_label",
+            "opaque",
+            "opaque_sha256"
+          ]
+        }
+      ]
+    },
+    "OutputItem": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "text",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "refusal",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "reasoning_summary",
+              "type": "string"
+            },
+            "content_parts": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 65536,
+                "format": "craxii_utf8_65536"
+              },
+              "minItems": 1,
+              "maxItems": 64
+            }
+          },
+          "required": [
+            "kind",
+            "content_parts"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_call",
+              "type": "string"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "raw_arguments": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "call_id",
+            "name",
+            "raw_arguments"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "structured_data",
+              "type": "string"
+            },
+            "data_json": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "data_json"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "provider_opaque",
+              "type": "string"
+            },
+            "provider_namespace": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "type_label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "opaque": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            },
+            "opaque_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "kind",
+            "provider_namespace",
+            "type_label",
+            "opaque",
+            "opaque_sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "unknown_provider_item",
+              "type": "string"
+            },
+            "provider_namespace": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "type_label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "opaque": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            },
+            "opaque_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "kind",
+            "provider_namespace",
+            "type_label",
+            "opaque",
+            "opaque_sha256"
+          ]
+        }
+      ]
+    },
+    "ToolDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "format": "craxii_utf8_64"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "schema_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "schema_json": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "format": "craxii_utf8_65536"
+        }
+      },
+      "required": [
+        "name",
+        "version",
+        "schema_version",
+        "schema_json"
+      ]
+    },
+    "ModelRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "instructions": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 65536,
+            "format": "craxii_utf8_65536"
+          },
+          "minItems": 0,
+          "maxItems": 16
+        },
+        "ordered_input_items": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/InputItem"
+          },
+          "minItems": 1,
+          "maxItems": 256
+        },
+        "tool_definitions": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ToolDefinition"
+          },
+          "minItems": 0,
+          "maxItems": 32
+        },
+        "requested_output_tokens": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "tool_choice": {
+          "type": "string",
+          "enum": [
+            "none",
+            "automatic"
+          ]
+        },
+        "parallel_tool_calls": {
+          "const": false,
+          "type": "boolean"
+        },
+        "reasoning_continuation": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "instructions",
+        "ordered_input_items",
+        "tool_definitions",
+        "requested_output_tokens",
+        "tool_choice",
+        "parallel_tool_calls",
+        "reasoning_continuation"
+      ]
+    },
+    "ModelInvocationMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "invocation_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "period_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "model_config_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "price_config_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "receipt_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "local_work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "logical_invocation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "attempt_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "context_manifest_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "material_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "attempt_ordinal": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "retry_of_attempt_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "retry_authorization_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "model_config_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "price_config_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "request": {
+          "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelRequest"
+        }
+      },
+      "required": [
+        "invocation_version",
+        "environment",
+        "customer_id",
+        "logical_agent_id",
+        "work_id",
+        "period_id",
+        "model_config_id",
+        "price_config_id",
+        "receipt_id",
+        "local_work_id",
+        "logical_invocation_id",
+        "attempt_id",
+        "context_manifest_id",
+        "material_digest",
+        "attempt_ordinal",
+        "model_config_digest",
+        "price_config_digest",
+        "request"
+      ]
+    },
+    "ModelInvoke": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "model_invoke",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "invocation": {
+              "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelInvocationMaterial"
+            },
+            "invocation_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "compute_grant_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "authorization_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "profile_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "invocation",
+            "invocation_digest",
+            "compute_grant_id",
+            "authorization_epoch"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "UsageOutcome": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usage_status": {
+              "const": "reported",
+              "type": "string"
+            },
+            "evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "evidence_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/PriceCategory"
+              },
+              "minItems": 1,
+              "maxItems": 32
+            },
+            "settlement_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "usage_status",
+            "evidence_id",
+            "evidence_digest",
+            "categories",
+            "settlement_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "usage_status": {
+              "type": "string",
+              "enum": [
+                "unavailable",
+                "unknown"
+              ]
+            },
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "liability": {
+              "const": "retained",
+              "type": "string"
+            }
+          },
+          "required": [
+            "usage_status",
+            "reservation_id",
+            "liability"
+          ]
+        }
+      ]
+    },
+    "StreamEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "response_started",
+              "type": "string"
+            },
+            "model_config_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "model_config_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "evidence_ref": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "kind",
+            "model_config_id",
+            "reservation_id",
+            "model_config_digest"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "text_delta",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "delta": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "reasoning_summary_delta",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "delta": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "refusal_delta",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "delta": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_call_started",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "call_id",
+            "name"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_argument_delta",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "delta": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "call_id",
+            "delta"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "tool_call_completed",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "call_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "raw_arguments": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "call_id",
+            "name",
+            "raw_arguments"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "refusal_completed",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "structured_data",
+              "type": "string"
+            },
+            "item_ordinal": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "data_json": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            }
+          },
+          "required": [
+            "kind",
+            "item_ordinal",
+            "data_json"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "usage",
+              "type": "string"
+            },
+            "outcome": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "usage_status": {
+                  "const": "reported",
+                  "type": "string"
+                },
+                "evidence_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "evidence_digest": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+                },
+                "categories": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/PriceCategory"
+                  },
+                  "minItems": 1,
+                  "maxItems": 32
+                },
+                "settlement_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                }
+              },
+              "required": [
+                "usage_status",
+                "evidence_id",
+                "evidence_digest",
+                "categories",
+                "settlement_id"
+              ]
+            }
+          },
+          "required": [
+            "kind",
+            "outcome"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "usage_unavailable",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "completed",
+              "type": "string"
+            },
+            "output_items": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/OutputItem"
+              },
+              "minItems": 0,
+              "maxItems": 64
+            },
+            "stop_reason": {
+              "type": "string",
+              "enum": [
+                "completed",
+                "tool_continuation",
+                "refusal",
+                "incomplete_provider_limit",
+                "cancelled",
+                "provider_failure"
+              ]
+            },
+            "usage": {
+              "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/UsageOutcome"
+            }
+          },
+          "required": [
+            "kind",
+            "output_items",
+            "stop_reason",
+            "usage"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "provider_error",
+              "type": "string"
+            },
+            "error_kind": {
+              "type": "string",
+              "enum": [
+                "authentication",
+                "authorization",
+                "invalid_request",
+                "unknown_model",
+                "rate_limited",
+                "temporarily_unavailable",
+                "transport_before_response",
+                "transport_after_possible_processing",
+                "timeout_before_output",
+                "timeout_after_output",
+                "malformed_response",
+                "malformed_completed_tool_arguments",
+                "output_too_large",
+                "unsupported_response_item",
+                "context_error",
+                "safety_refusal",
+                "cancelled",
+                "provider_outcome_unknown",
+                "internal_provider_error",
+                "script_mismatch",
+                "invalid_scripted_provider_program"
+              ]
+            },
+            "certainty": {
+              "type": "string",
+              "enum": [
+                "definitely_not_sent",
+                "definite_provider_failure",
+                "semantic_output_observed",
+                "outcome_unknown"
+              ]
+            },
+            "resolution": {
+              "$ref": "urn:craxii:distribution:1.0.0:error#/definitions/SafeError"
+            }
+          },
+          "required": [
+            "kind",
+            "error_kind",
+            "certainty",
+            "resolution"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "unknown_provider_event",
+              "type": "string"
+            },
+            "provider_namespace": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "type_label": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "opaque": {
+              "type": "string",
+              "minLength": 0,
+              "maxLength": 65536,
+              "format": "craxii_utf8_65536"
+            },
+            "opaque_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "kind",
+            "provider_namespace",
+            "type_label",
+            "opaque",
+            "opaque_sha256"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "outcome_unknown",
+              "type": "string"
+            },
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "liability": {
+              "const": "retained",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "reservation_id",
+            "liability"
+          ]
+        }
+      ]
+    },
+    "ModelEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "model_event",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "logical_invocation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "event_sequence": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "event": {
+              "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/StreamEvent"
+            }
+          },
+          "required": [
+            "attempt_id",
+            "logical_invocation_id",
+            "event_sequence",
+            "event"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ModelOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "model_outcome",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "logical_invocation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "outcome": {
+              "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/UsageOutcome"
+            }
+          },
+          "required": [
+            "attempt_id",
+            "logical_invocation_id",
+            "outcome"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelInvoke"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelEvent"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelOutcome"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/InputItem"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/OutputItem"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ToolDefinition"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelRequest"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/ModelInvocationMaterial"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/UsageOutcome"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:model#/definitions/StreamEvent"
+    }
+  ]
+}

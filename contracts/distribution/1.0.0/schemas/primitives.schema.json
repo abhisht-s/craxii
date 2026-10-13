@@ -1,0 +1,299 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:primitives",
+  "title": "Craxii distribution primitives",
+  "definitions": {
+    "U4": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "format": "craxii_U4"
+    },
+    "U7": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "format": "craxii_U7"
+    },
+    "Uuid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "format": "craxii_Uuid"
+    },
+    "D0": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 19,
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "format": "craxii_D0"
+    },
+    "Dp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 19,
+      "pattern": "^[1-9][0-9]*$",
+      "format": "craxii_Dp"
+    },
+    "U64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20,
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "format": "craxii_U64"
+    },
+    "ChatId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 20,
+      "pattern": "^-?[1-9][0-9]*$",
+      "format": "craxii_ChatId"
+    },
+    "Digest": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$",
+      "format": "craxii_Digest"
+    },
+    "Timestamp": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 27,
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{6}Z$",
+      "format": "craxii_Timestamp"
+    },
+    "Binary32": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 43,
+      "pattern": "^[A-Za-z0-9_-]{43}$",
+      "format": "craxii_Binary32"
+    },
+    "Binary64": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 86,
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "format": "craxii_Binary64"
+    },
+    "Environment": {
+      "type": "string",
+      "enum": [
+        "development",
+        "production"
+      ]
+    },
+    "Version": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "major": {
+          "const": 1,
+          "type": "integer"
+        },
+        "minor": {
+          "const": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ]
+    },
+    "AdvertisedVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "major": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "minor": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "required": [
+        "major",
+        "minor"
+      ]
+    },
+    "Authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "session_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        }
+      },
+      "required": [
+        "customer_id",
+        "logical_agent_id",
+        "installation_id",
+        "generation",
+        "session_id"
+      ]
+    },
+    "ReplyBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "binding_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "binding_version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        }
+      },
+      "required": [
+        "binding_id",
+        "binding_version"
+      ]
+    },
+    "TextBlock": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "text",
+          "type": "string"
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 65536,
+          "format": "craxii_utf8_65536"
+        }
+      },
+      "required": [
+        "type",
+        "text"
+      ]
+    },
+    "Content": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/TextBlock"
+          },
+          "minItems": 1,
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "version",
+        "blocks"
+      ]
+    },
+    "Extensions": {
+      "type": "object",
+      "maxProperties": 8,
+      "propertyNames": {
+        "pattern": "^x_[a-z0-9_]{1,32}$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 0,
+            "maxLength": 128,
+            "format": "craxii_utf8_128"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2147483647
+          }
+        ]
+      }
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U64"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ChatId"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary64"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/AdvertisedVersion"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/TextBlock"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+    }
+  ]
+}

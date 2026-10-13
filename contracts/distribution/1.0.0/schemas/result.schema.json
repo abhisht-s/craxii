@@ -1,0 +1,692 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:result",
+  "title": "Craxii distribution result",
+  "definitions": {
+    "ArtifactRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "artifact_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "payload_sha256": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "byte_count": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "media_type": {
+          "type": "string",
+          "enum": [
+            "text/plain",
+            "application/json",
+            "application/octet-stream"
+          ]
+        },
+        "display_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        }
+      },
+      "required": [
+        "artifact_id",
+        "payload_sha256",
+        "byte_count",
+        "media_type"
+      ]
+    },
+    "ResultSnapshot": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "snapshot_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "origin_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "local_work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "reply_binding": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "completed_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "content": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+            },
+            "content_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "artifact_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ArtifactRef"
+              },
+              "minItems": 0,
+              "maxItems": 16
+            },
+            "work_state": {
+              "const": "completed",
+              "type": "string"
+            },
+            "terminal_reason": {
+              "type": "string",
+              "enum": [
+                "answered",
+                "refused"
+              ]
+            },
+            "local_message_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            }
+          },
+          "required": [
+            "snapshot_version",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "work_id",
+            "conversation_id",
+            "origin_installation_id",
+            "receipt_id",
+            "local_work_id",
+            "export_id",
+            "material_digest",
+            "origin_generation",
+            "reply_binding",
+            "export_revision",
+            "work_state_revision",
+            "completed_at",
+            "content",
+            "content_sha256",
+            "work_state",
+            "terminal_reason",
+            "local_message_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "snapshot_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "origin_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "local_work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "reply_binding": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "completed_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "content": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+            },
+            "content_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "artifact_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ArtifactRef"
+              },
+              "minItems": 0,
+              "maxItems": 16
+            },
+            "work_state": {
+              "const": "failed",
+              "type": "string"
+            },
+            "terminal_reason": {
+              "type": "string",
+              "enum": [
+                "context_limit",
+                "model_attempts_exhausted",
+                "agent_loop_limit",
+                "tool_calls_limit",
+                "provider_failure",
+                "invalid_model_output",
+                "internal_failure"
+              ]
+            }
+          },
+          "required": [
+            "snapshot_version",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "work_id",
+            "conversation_id",
+            "origin_installation_id",
+            "receipt_id",
+            "local_work_id",
+            "export_id",
+            "material_digest",
+            "origin_generation",
+            "reply_binding",
+            "export_revision",
+            "work_state_revision",
+            "completed_at",
+            "content",
+            "content_sha256",
+            "work_state",
+            "terminal_reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "snapshot_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "origin_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "local_work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "reply_binding": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "completed_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "content": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+            },
+            "content_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "artifact_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ArtifactRef"
+              },
+              "minItems": 0,
+              "maxItems": 16
+            },
+            "work_state": {
+              "const": "cancelled",
+              "type": "string"
+            },
+            "terminal_reason": {
+              "type": "string",
+              "enum": [
+                "user_request",
+                "authorization_expired",
+                "operator_stop",
+                "graceful_shutdown"
+              ]
+            }
+          },
+          "required": [
+            "snapshot_version",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "work_id",
+            "conversation_id",
+            "origin_installation_id",
+            "receipt_id",
+            "local_work_id",
+            "export_id",
+            "material_digest",
+            "origin_generation",
+            "reply_binding",
+            "export_revision",
+            "work_state_revision",
+            "completed_at",
+            "content",
+            "content_sha256",
+            "work_state",
+            "terminal_reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "snapshot_version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "origin_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "local_work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "reply_binding": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "completed_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "content": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+            },
+            "content_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "artifact_refs": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ArtifactRef"
+              },
+              "minItems": 0,
+              "maxItems": 16
+            },
+            "work_state": {
+              "const": "interrupted",
+              "type": "string"
+            },
+            "terminal_reason": {
+              "type": "string",
+              "enum": [
+                "runtime_ownership_lost",
+                "provider_outcome_unknown",
+                "tool_interrupted_before_dispatch",
+                "tool_outcome_unknown",
+                "cleanup_unconfirmed"
+              ]
+            }
+          },
+          "required": [
+            "snapshot_version",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "work_id",
+            "conversation_id",
+            "origin_installation_id",
+            "receipt_id",
+            "local_work_id",
+            "export_id",
+            "material_digest",
+            "origin_generation",
+            "reply_binding",
+            "export_revision",
+            "work_state_revision",
+            "completed_at",
+            "content",
+            "content_sha256",
+            "work_state",
+            "terminal_reason"
+          ]
+        }
+      ]
+    },
+    "ResultExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "result_export",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "snapshot": {
+              "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ResultSnapshot"
+            },
+            "export_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "upload_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "lineage_authorization_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "snapshot",
+            "export_digest",
+            "upload_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ResultQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "result_query",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "export_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "work_id",
+            "export_id",
+            "export_revision",
+            "export_digest"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ResultAcceptance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "result_acceptance",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "export_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "export_revision": {
+              "const": "1",
+              "type": "string"
+            },
+            "export_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "acceptance_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "outbox_source_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "accepted_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "duplicate": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "work_id",
+            "export_id",
+            "export_revision",
+            "export_digest",
+            "acceptance_id",
+            "outbox_source_id",
+            "accepted_at",
+            "duplicate"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ResultExport"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ResultQuery"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ResultAcceptance"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ArtifactRef"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:result#/definitions/ResultSnapshot"
+    }
+  ]
+}

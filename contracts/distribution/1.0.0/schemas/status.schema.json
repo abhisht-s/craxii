@@ -1,0 +1,421 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:status",
+  "title": "Craxii distribution status",
+  "definitions": {
+    "Storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "disk_lineage_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "filesystem_uuid": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+        },
+        "sqlite_schema": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "recovery": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "complete",
+            "failed"
+          ]
+        },
+        "binds_verified": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "disk_lineage_id",
+        "filesystem_uuid",
+        "sqlite_schema",
+        "recovery",
+        "binds_verified"
+      ]
+    },
+    "Heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "heartbeat",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "runtime_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "heartbeat_sequence": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "observed_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "storage": {
+              "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/Storage"
+            },
+            "readiness": {
+              "type": "string",
+              "enum": [
+                "unready",
+                "storage_ready",
+                "acceptance_ready",
+                "operational_ready",
+                "draining",
+                "degraded"
+              ]
+            },
+            "readiness_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "model_config_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "active_work_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "queued_work_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "pending_receipt_ack_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "pending_export_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "descendant_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "uncommitted_state": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "power_operation_id",
+            "boot_id",
+            "runtime_id",
+            "heartbeat_sequence",
+            "observed_at",
+            "storage",
+            "readiness",
+            "readiness_revision",
+            "active_work_count",
+            "queued_work_count",
+            "pending_receipt_ack_count",
+            "pending_export_count",
+            "descendant_count",
+            "uncommitted_state"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "WorkStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "work_status",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "work_state": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "running",
+                "waiting_on_model",
+                "waiting_on_tool",
+                "cancel_requested",
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted"
+              ]
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "work_id",
+            "receipt_id",
+            "work_state",
+            "work_state_revision"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "CustomerIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "issuer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "format": "craxii_utf8_512"
+        },
+        "subject": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "format": "craxii_utf8_256"
+        },
+        "account_state": {
+          "type": "string",
+          "enum": [
+            "active",
+            "disabled",
+            "deleting"
+          ]
+        },
+        "revision": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        }
+      },
+      "required": [
+        "customer_id",
+        "issuer",
+        "subject",
+        "account_state",
+        "revision"
+      ]
+    },
+    "CustomerStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "account_state": {
+          "type": "string",
+          "enum": [
+            "active",
+            "disabled",
+            "deleting"
+          ]
+        },
+        "entitlement_state": {
+          "type": "string",
+          "enum": [
+            "absent",
+            "trial",
+            "paid",
+            "expired",
+            "exhausted",
+            "suspended"
+          ]
+        },
+        "activation_phase": {
+          "type": "string",
+          "enum": [
+            "awaiting_link",
+            "queued",
+            "provisioning",
+            "enrolled",
+            "storage_ready",
+            "ready"
+          ]
+        },
+        "machine_power": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "pending",
+            "running",
+            "stopping",
+            "stopped",
+            "terminated"
+          ]
+        },
+        "readiness": {
+          "type": "string",
+          "enum": [
+            "unready",
+            "storage_ready",
+            "acceptance_ready",
+            "operational_ready",
+            "draining",
+            "degraded"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "delayed",
+            "degraded",
+            "support_needed",
+            "normal"
+          ]
+        },
+        "status_revision": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "available_compute_seconds": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "available_model_usd_micros": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "schema_invalid",
+            "unsupported_version",
+            "unsupported_canonicalization",
+            "unsupported_signature",
+            "unsupported_capability",
+            "unauthenticated",
+            "session_expired",
+            "unauthorized_scope",
+            "customer_mismatch",
+            "installation_mismatch",
+            "stale_generation",
+            "revoked_authority",
+            "stale_lease",
+            "stale_resource_fence",
+            "stale_resource_revision",
+            "digest_conflict",
+            "result_conflict",
+            "result_revision_invalid",
+            "provider_effect_unknown",
+            "reconciliation_required",
+            "restored_interval_missing",
+            "backend_unavailable",
+            "temporary_failure",
+            "manual_resolution",
+            "compute_budget_exhausted",
+            "model_budget_unavailable",
+            "entitlement_expired",
+            "policy_unapproved",
+            "proof_missing",
+            "proof_expired",
+            "consent_required",
+            "compute_authorization_expired",
+            "authorization_epoch_stale",
+            "terminal_cancellation",
+            "attempt_budget_exhausted",
+            "not_found",
+            "schema_incompatible"
+          ]
+        }
+      },
+      "required": [
+        "customer_id",
+        "logical_agent_id",
+        "account_state",
+        "entitlement_state",
+        "activation_phase",
+        "machine_power",
+        "readiness",
+        "disposition",
+        "status_revision",
+        "available_compute_seconds",
+        "available_model_usd_micros",
+        "reason"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/Heartbeat"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/WorkStatus"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/Storage"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/CustomerIdentity"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:status#/definitions/CustomerStatus"
+    }
+  ]
+}

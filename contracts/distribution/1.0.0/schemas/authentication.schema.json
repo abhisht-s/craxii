@@ -1,0 +1,830 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:authentication",
+  "title": "Craxii distribution authentication",
+  "definitions": {
+    "EnrollmentChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "enrollment_challenge",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9:._-]+$",
+              "format": "craxii_utf8_128"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "challenge_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "selection_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "nonce": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "enrollment_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "expected_instance_ref": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "purpose": {
+              "const": "enroll",
+              "type": "string"
+            }
+          },
+          "required": [
+            "audience",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "installation_id",
+            "generation",
+            "challenge_id",
+            "selection_id",
+            "nonce",
+            "issued_at",
+            "expires_at",
+            "enrollment_id",
+            "expected_instance_ref",
+            "purpose"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "EnrollmentSigned": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9:._-]+$",
+          "format": "craxii_utf8_128"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "challenge_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "selection_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "nonce": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+        },
+        "issued_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "enrollment_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "expected_instance_ref": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "signature_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "enrollment",
+          "type": "string"
+        },
+        "key_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "public_key": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+        },
+        "instance_identity_document_sha256": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "instance_identity_signature_sha256": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        }
+      },
+      "required": [
+        "audience",
+        "environment",
+        "customer_id",
+        "logical_agent_id",
+        "installation_id",
+        "generation",
+        "challenge_id",
+        "selection_id",
+        "nonce",
+        "issued_at",
+        "expires_at",
+        "enrollment_id",
+        "expected_instance_ref",
+        "signature_version",
+        "purpose",
+        "key_id",
+        "public_key",
+        "instance_identity_document_sha256",
+        "instance_identity_signature_sha256"
+      ]
+    },
+    "EnrollmentProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "enrollment_proof",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "signed": {
+              "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/EnrollmentSigned"
+            },
+            "instance_identity_document_b64": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 21846,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "format": "craxii_utf8_21846"
+            },
+            "instance_identity_signature_b64": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 10923,
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "format": "craxii_utf8_10923"
+            },
+            "proof_signature": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary64"
+            }
+          },
+          "required": [
+            "signed",
+            "instance_identity_document_b64",
+            "instance_identity_signature_b64",
+            "proof_signature"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "EnrollmentAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "enrollment_ack",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enrollment_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "binding_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "key_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "bound_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "duplicate": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "enrollment_id",
+            "binding_id",
+            "installation_id",
+            "generation",
+            "key_id",
+            "bound_at",
+            "duplicate"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "SessionChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "session_challenge",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9:._-]+$",
+              "format": "craxii_utf8_128"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "challenge_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "selection_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "nonce": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "purpose": {
+              "const": "session",
+              "type": "string"
+            },
+            "key_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "receipt_commit",
+                  "result_export",
+                  "status",
+                  "drain",
+                  "cancel",
+                  "model_invoke",
+                  "compute_renew"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true
+            },
+            "revocation_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "audience",
+            "environment",
+            "customer_id",
+            "logical_agent_id",
+            "installation_id",
+            "generation",
+            "challenge_id",
+            "selection_id",
+            "nonce",
+            "issued_at",
+            "expires_at",
+            "purpose",
+            "key_id",
+            "scopes",
+            "revocation_epoch"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "SessionSigned": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9:._-]+$",
+          "format": "craxii_utf8_128"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "challenge_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "selection_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "nonce": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+        },
+        "issued_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "purpose": {
+          "const": "session",
+          "type": "string"
+        },
+        "key_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "receipt_commit",
+              "result_export",
+              "status",
+              "drain",
+              "cancel",
+              "model_invoke",
+              "compute_renew"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true
+        },
+        "revocation_epoch": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "signature_version": {
+          "const": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "audience",
+        "environment",
+        "customer_id",
+        "logical_agent_id",
+        "installation_id",
+        "generation",
+        "challenge_id",
+        "selection_id",
+        "nonce",
+        "issued_at",
+        "expires_at",
+        "purpose",
+        "key_id",
+        "scopes",
+        "revocation_epoch",
+        "signature_version"
+      ]
+    },
+    "SessionProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "session_proof",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "signed": {
+              "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SessionSigned"
+            },
+            "proof_signature": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary64"
+            }
+          },
+          "required": [
+            "signed",
+            "proof_signature"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "SessionGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "session_grant",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "session_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "selection_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "session_credential": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+            },
+            "key_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "scopes": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "receipt_commit",
+                  "result_export",
+                  "status",
+                  "drain",
+                  "cancel",
+                  "model_invoke",
+                  "compute_renew"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 16,
+              "uniqueItems": true
+            },
+            "revocation_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            }
+          },
+          "required": [
+            "customer_id",
+            "logical_agent_id",
+            "installation_id",
+            "generation",
+            "session_id",
+            "selection_id",
+            "session_credential",
+            "key_id",
+            "scopes",
+            "revocation_epoch",
+            "issued_at",
+            "expires_at"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "SensitiveSigned": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "signature_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "purpose": {
+          "const": "sensitive_request",
+          "type": "string"
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9:._-]+$",
+          "format": "craxii_utf8_128"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "session_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "challenge_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "revocation_epoch": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "key_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "nonce": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary32"
+        },
+        "operation_type": {
+          "type": "string",
+          "enum": [
+            "work_receipt",
+            "cancel_receipt",
+            "result_export",
+            "drain_ack",
+            "model_invoke",
+            "compute_renew"
+          ]
+        },
+        "request_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "issued_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        }
+      },
+      "required": [
+        "signature_version",
+        "purpose",
+        "audience",
+        "environment",
+        "session_id",
+        "installation_id",
+        "challenge_id",
+        "request_id",
+        "generation",
+        "revocation_epoch",
+        "key_id",
+        "nonce",
+        "operation_type",
+        "request_digest",
+        "issued_at",
+        "expires_at"
+      ]
+    },
+    "SensitiveRequestProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "sensitive_request_proof",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "signed": {
+              "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SensitiveSigned"
+            },
+            "proof_signature": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary64"
+            }
+          },
+          "required": [
+            "signed",
+            "proof_signature"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/EnrollmentChallenge"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/EnrollmentProof"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/EnrollmentAck"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SessionChallenge"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SessionProof"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SessionGrant"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SensitiveRequestProof"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/EnrollmentSigned"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SessionSigned"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:authentication#/definitions/SensitiveSigned"
+    }
+  ]
+}

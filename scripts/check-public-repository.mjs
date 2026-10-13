@@ -214,3 +214,5 @@ assert(!verifier.includes('scripts/check-repository.mjs'), 'scripts/verify still
 assert(!verifier.includes('render-implementation-plan'), 'scripts/verify still depends on a non-public documentation renderer');
 
 console.log(`PUBLIC_REPOSITORY_CHECK: PASSED files=${trackedFiles.length} dependencies=${declaredDependencies.size} fixtures=${fixtureNames.length}`);
+
+run(process.execPath, ['scripts/check-distribution-contracts.mjs']);

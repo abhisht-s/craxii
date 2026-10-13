@@ -4,6 +4,7 @@ compile_error!("test-failpoints cannot be enabled when debug assertions are disa
 pub mod adapters;
 pub mod application;
 pub mod bootstrap;
+pub mod distribution_contracts;
 pub mod domain;
 pub mod ports;
 pub mod protocol;

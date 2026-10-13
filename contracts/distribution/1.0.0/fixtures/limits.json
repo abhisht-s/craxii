@@ -1,0 +1,289 @@
+{
+  "fixture_version": 1,
+  "group": "limits",
+  "cases": [
+    {
+      "case_id": "limit.text.65535",
+      "kind": "content_text",
+      "size": 65535,
+      "valid": true
+    },
+    {
+      "case_id": "limit.text.65536",
+      "kind": "content_text",
+      "size": 65536,
+      "valid": true
+    },
+    {
+      "case_id": "limit.text.65537",
+      "kind": "content_text",
+      "size": 65537,
+      "valid": false
+    },
+    {
+      "case_id": "limit.raw.16383",
+      "kind": "raw_bytes",
+      "size": 16383,
+      "valid": true
+    },
+    {
+      "case_id": "limit.raw.16384",
+      "kind": "raw_bytes",
+      "size": 16384,
+      "valid": true
+    },
+    {
+      "case_id": "limit.raw.16385",
+      "kind": "raw_bytes",
+      "size": 16385,
+      "valid": false
+    },
+    {
+      "case_id": "limit.depth.31",
+      "kind": "depth",
+      "size": 31,
+      "valid": true
+    },
+    {
+      "case_id": "limit.depth.32",
+      "kind": "depth",
+      "size": 32,
+      "valid": true
+    },
+    {
+      "case_id": "limit.depth.33",
+      "kind": "depth",
+      "size": 33,
+      "valid": false
+    },
+    {
+      "case_id": "limit.nodes.4095",
+      "kind": "nodes",
+      "size": 4095,
+      "valid": true
+    },
+    {
+      "case_id": "limit.nodes.4096",
+      "kind": "nodes",
+      "size": 4096,
+      "valid": true
+    },
+    {
+      "case_id": "limit.nodes.4097",
+      "kind": "nodes",
+      "size": 4097,
+      "valid": false
+    },
+    {
+      "case_id": "limit.rational.rounding",
+      "kind": "cost",
+      "categories": [
+        {
+          "quantity": "9007199254740993",
+          "numerator": "1",
+          "denominator": "1000000"
+        }
+      ],
+      "expected": "9007199255",
+      "valid": true
+    },
+    {
+      "case_id": "limit.rational.overflow",
+      "kind": "cost",
+      "categories": [
+        {
+          "quantity": "9223372036854775807",
+          "numerator": "9223372036854775807",
+          "denominator": "1"
+        }
+      ],
+      "valid": false
+    },
+    {
+      "case_id": "limit.rational.negative",
+      "kind": "cost",
+      "categories": [
+        {
+          "quantity": "-1",
+          "numerator": "1",
+          "denominator": "1"
+        }
+      ],
+      "valid": false
+    },
+    {
+      "case_id": "limit.rational.zero_denominator",
+      "kind": "cost",
+      "categories": [
+        {
+          "quantity": "1",
+          "numerator": "1",
+          "denominator": "0"
+        }
+      ],
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.error.4095",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.error.0",
+      "size": 4095,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.error.4096",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.error.0",
+      "size": 4096,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.error.4097",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.error.0",
+      "size": 4097,
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.enrollmentproof.65535",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.enrollmentproof.0",
+      "size": 65535,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.enrollmentproof.65536",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.enrollmentproof.0",
+      "size": 65536,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.enrollmentproof.65537",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.enrollmentproof.0",
+      "size": 65537,
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.workdelivery.524287",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.workdelivery.0",
+      "size": 524287,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.workdelivery.524288",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.workdelivery.0",
+      "size": 524288,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.workdelivery.524289",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.workdelivery.0",
+      "size": 524289,
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.resultexport.524287",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.resultexport.0",
+      "size": 524287,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.resultexport.524288",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.resultexport.0",
+      "size": 524288,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.resultexport.524289",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.resultexport.0",
+      "size": 524289,
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.modelinvoke.1048575",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelinvoke.0",
+      "size": 1048575,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.modelinvoke.1048576",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelinvoke.0",
+      "size": 1048576,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.modelinvoke.1048577",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelinvoke.0",
+      "size": 1048577,
+      "valid": false
+    },
+    {
+      "case_id": "limit.wire.modelevent.65535",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelevent.0",
+      "size": 65535,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.modelevent.65536",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelevent.0",
+      "size": 65536,
+      "valid": true
+    },
+    {
+      "case_id": "limit.wire.modelevent.65537",
+      "kind": "wire_raw",
+      "base_case_id": "envelope.modelevent.0",
+      "size": 65537,
+      "valid": false
+    },
+    {
+      "case_id": "limit.large_nodes.32767",
+      "kind": "nodes_large",
+      "size": 32767,
+      "valid": true
+    },
+    {
+      "case_id": "limit.large_nodes.32768",
+      "kind": "nodes_large",
+      "size": 32768,
+      "valid": true
+    },
+    {
+      "case_id": "limit.large_nodes.32769",
+      "kind": "nodes_large",
+      "size": 32769,
+      "valid": false
+    },
+    {
+      "case_id": "limit.escaped_content.65535",
+      "kind": "content_escaped",
+      "size": 65535,
+      "valid": true
+    },
+    {
+      "case_id": "limit.escaped_content.65536",
+      "kind": "content_escaped",
+      "size": 65536,
+      "valid": true
+    },
+    {
+      "case_id": "limit.escaped_content.65537",
+      "kind": "content_escaped",
+      "size": 65537,
+      "valid": false
+    }
+  ]
+}

@@ -1,0 +1,1299 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:fixture",
+  "definitions": {
+    "Projection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": [
+            "absent",
+            "acceptance_only",
+            "accepted",
+            "active",
+            "cancel_future",
+            "cancelled_before_admission",
+            "centrally_recorded",
+            "completed",
+            "dispatch_intended",
+            "dispatching",
+            "drained",
+            "enrolled",
+            "expected",
+            "expired",
+            "export_pending",
+            "key_bound",
+            "outcome_unknown",
+            "paid",
+            "provisioning",
+            "queued",
+            "ready",
+            "receipt_pending",
+            "reconciliation_required",
+            "released",
+            "reserved",
+            "restore_verified",
+            "retired",
+            "retry_wait",
+            "revoked",
+            "session",
+            "settled",
+            "snapshot_complete",
+            "stop_dispatched",
+            "streaming",
+            "transferred",
+            "uncertain",
+            "wake_after_stop"
+          ]
+        },
+        "work_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "material_digest": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "receipt_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "local_work_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "work_state": {
+          "type": "string",
+          "enum": [
+            "absent",
+            "queued",
+            "running",
+            "waiting_on_model",
+            "waiting_on_tool",
+            "cancel_requested",
+            "completed",
+            "failed",
+            "cancelled",
+            "interrupted"
+          ]
+        },
+        "export_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "export_digest": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "acceptance_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "outbox_source_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "installation_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "boot_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "epoch": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "ingress_revision": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "allowance": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "consumed": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "reserved": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "amount": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "settled_amount": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "period_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "ends_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "execution_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "outbox_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "dispatch_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "settlement_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "nonce_consumed": {
+          "type": "boolean"
+        },
+        "restored_missing": {
+          "type": "boolean"
+        },
+        "route_revoked": {
+          "type": "boolean"
+        },
+        "restore_verified": {
+          "type": "boolean"
+        },
+        "event_sequence": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "tool_arguments": {
+          "type": "string",
+          "maxLength": 65536,
+          "format": "craxii_utf8_65536"
+        },
+        "call_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "stream_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "reservation_period_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        }
+      },
+      "required": [
+        "status",
+        "work_id",
+        "material_digest",
+        "receipt_id",
+        "local_work_id",
+        "work_state",
+        "export_id",
+        "export_digest",
+        "acceptance_id",
+        "outbox_source_id",
+        "installation_id",
+        "generation",
+        "boot_id",
+        "epoch",
+        "ingress_revision",
+        "allowance",
+        "consumed",
+        "reserved",
+        "amount",
+        "settled_amount",
+        "period_id",
+        "ends_at",
+        "execution_count",
+        "outbox_count",
+        "dispatch_count",
+        "settlement_count",
+        "nonce_consumed",
+        "restored_missing",
+        "route_revoked",
+        "restore_verified",
+        "event_sequence",
+        "tool_arguments",
+        "call_id",
+        "stream_bytes",
+        "reservation_period_id"
+      ]
+    },
+    "Context": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "environment": {
+          "type": "string",
+          "enum": [
+            "development",
+            "production"
+          ]
+        },
+        "principal": {
+          "type": "string",
+          "enum": [
+            "worker",
+            "customer",
+            "operator"
+          ]
+        },
+        "customer_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expected_customer_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "logical_agent_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expected_agent_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "installation_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "generation": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "boot_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "epoch": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "job_fence": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expected_job_fence": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "resource_fence": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expected_resource_fence": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "resource_revision": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expected_resource_revision": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "now": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "issued_at": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "expires_at": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "max_ttl_ms": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "authenticated": {
+          "type": "boolean"
+        },
+        "request_proof": {
+          "type": "boolean"
+        },
+        "lineage_authorized": {
+          "type": "boolean"
+        },
+        "entitlement": {
+          "type": "boolean"
+        },
+        "policy_approved": {
+          "type": "boolean"
+        },
+        "proof_current": {
+          "type": "boolean"
+        },
+        "consent_current": {
+          "type": "boolean"
+        },
+        "provider_verified": {
+          "type": "boolean"
+        },
+        "no_effect": {
+          "type": "boolean"
+        },
+        "cleanup": {
+          "type": "boolean"
+        },
+        "storage_recovered": {
+          "type": "boolean"
+        },
+        "binds_verified": {
+          "type": "boolean"
+        },
+        "model_qualified": {
+          "type": "boolean"
+        },
+        "claims_closed": {
+          "type": "boolean"
+        },
+        "active_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "pending_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "descendants": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        },
+        "uncommitted": {
+          "type": "boolean"
+        },
+        "operator_scope": {
+          "type": "boolean"
+        },
+        "replay_evidence": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "environment",
+        "principal",
+        "customer_id",
+        "expected_customer_id",
+        "logical_agent_id",
+        "expected_agent_id",
+        "installation_id",
+        "generation",
+        "boot_id",
+        "epoch",
+        "job_fence",
+        "expected_job_fence",
+        "resource_fence",
+        "expected_resource_fence",
+        "resource_revision",
+        "expected_resource_revision",
+        "now",
+        "issued_at",
+        "expires_at",
+        "max_ttl_ms",
+        "authenticated",
+        "request_proof",
+        "lineage_authorized",
+        "entitlement",
+        "policy_approved",
+        "proof_current",
+        "consent_current",
+        "provider_verified",
+        "no_effect",
+        "cleanup",
+        "storage_recovered",
+        "binds_verified",
+        "model_qualified",
+        "claims_closed",
+        "active_count",
+        "pending_count",
+        "descendants",
+        "uncommitted",
+        "operator_scope",
+        "replay_evidence"
+      ]
+    },
+    "Event": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "accept",
+            "ack",
+            "activate",
+            "authorize",
+            "cancel",
+            "cancel_renewal",
+            "charge",
+            "cleanup",
+            "cleanup_unknown",
+            "cloud_running",
+            "complete",
+            "crash",
+            "create",
+            "delete",
+            "deliver",
+            "delta",
+            "dispatch",
+            "drain",
+            "expire",
+            "heartbeat",
+            "ingress",
+            "link",
+            "next_part",
+            "payment",
+            "prepare",
+            "proof",
+            "provider_ack",
+            "ready",
+            "release",
+            "renew_period",
+            "renewal_failed",
+            "replace",
+            "reserve",
+            "restore_gap",
+            "restore_verified",
+            "retry",
+            "revoke",
+            "revoke_route",
+            "session",
+            "settle",
+            "snapshot_complete",
+            "start",
+            "stop",
+            "stream_complete",
+            "stream_start",
+            "timeout",
+            "tool_complete",
+            "tool_start",
+            "transfer",
+            "unreachable"
+          ]
+        },
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "digest": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "amount": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "actual": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "epoch": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "generation": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "installation_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "boot_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "ingress_revision": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "period_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "ends_at": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "sequence": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "call_id": {
+          "type": "string",
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "delta": {
+          "type": "string",
+          "maxLength": 65536,
+          "format": "craxii_utf8_65536"
+        },
+        "categories": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "quantity": {
+                "type": "string",
+                "maxLength": 19,
+                "format": "craxii_utf8_19"
+              },
+              "numerator": {
+                "type": "string",
+                "maxLength": 19,
+                "format": "craxii_utf8_19"
+              },
+              "denominator": {
+                "type": "string",
+                "maxLength": 19,
+                "format": "craxii_utf8_19"
+              }
+            },
+            "required": [
+              "quantity",
+              "numerator",
+              "denominator"
+            ]
+          },
+          "maxItems": 32
+        }
+      },
+      "required": [
+        "kind"
+      ]
+    },
+    "Transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "allowed",
+            "rejected",
+            "no_op"
+          ]
+        },
+        "code": {
+          "type": "string",
+          "enum": [
+            "database_busy",
+            "dispatch_disabled",
+            "invalid_contract",
+            "lease_lost",
+            "not_found",
+            "operation_identity_conflict",
+            "outcome_unknown",
+            "ownership_denied",
+            "retry_exhausted",
+            "schema_incompatible",
+            "support_needed"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "schema_invalid",
+            "unsupported_version",
+            "unsupported_canonicalization",
+            "unsupported_signature",
+            "unsupported_capability",
+            "unauthenticated",
+            "session_expired",
+            "unauthorized_scope",
+            "customer_mismatch",
+            "installation_mismatch",
+            "stale_generation",
+            "revoked_authority",
+            "stale_lease",
+            "stale_resource_fence",
+            "stale_resource_revision",
+            "digest_conflict",
+            "result_conflict",
+            "result_revision_invalid",
+            "provider_effect_unknown",
+            "reconciliation_required",
+            "restored_interval_missing",
+            "backend_unavailable",
+            "temporary_failure",
+            "manual_resolution",
+            "compute_budget_exhausted",
+            "model_budget_unavailable",
+            "entitlement_expired",
+            "policy_unapproved",
+            "proof_missing",
+            "proof_expired",
+            "consent_required",
+            "compute_authorization_expired",
+            "authorization_epoch_stale",
+            "terminal_cancellation",
+            "attempt_budget_exhausted",
+            "not_found",
+            "schema_incompatible"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "reject",
+            "reauthenticate",
+            "retry_same_identity",
+            "query_same_identity",
+            "reconcile",
+            "hold",
+            "support",
+            "terminal"
+          ]
+        },
+        "next": {
+          "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Projection"
+        },
+        "required_commits": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 64,
+            "format": "craxii_utf8_64"
+          },
+          "maxItems": 16
+        },
+        "forbidden_effects": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 64,
+            "format": "craxii_utf8_64"
+          },
+          "maxItems": 16
+        }
+      },
+      "required": [
+        "outcome",
+        "disposition",
+        "next",
+        "required_commits",
+        "forbidden_effects"
+      ]
+    },
+    "Case": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "machine": {
+              "type": "string",
+              "enum": [
+                "admission",
+                "receipt",
+                "execution",
+                "cancellation",
+                "export",
+                "acceptance",
+                "telegram",
+                "provisioning",
+                "enrollment",
+                "power",
+                "compute",
+                "spend",
+                "trial",
+                "period",
+                "backup",
+                "model_stream",
+                "profile"
+              ]
+            },
+            "initial": {
+              "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Projection"
+            },
+            "steps": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "event": {
+                    "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Event"
+                  },
+                  "context": {
+                    "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Context"
+                  },
+                  "expected": {
+                    "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Transition"
+                  }
+                },
+                "required": [
+                  "event",
+                  "context",
+                  "expected"
+                ]
+              },
+              "maxItems": 128
+            }
+          },
+          "required": [
+            "case_id",
+            "machine",
+            "initial",
+            "steps"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "family": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "definition": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "value": {},
+            "valid": {
+              "type": "boolean"
+            },
+            "code": {
+              "type": "string",
+              "enum": [
+                "invalid_contract",
+                "ownership_denied"
+              ]
+            }
+          },
+          "required": [
+            "case_id",
+            "family",
+            "definition",
+            "value",
+            "valid"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "base_case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "mutation": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "remove",
+                    "set"
+                  ]
+                },
+                "path": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "maxLength": 128,
+                        "format": "craxii_utf8_128"
+                      },
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 2147483647
+                      }
+                    ]
+                  },
+                  "maxItems": 32
+                },
+                "value": {}
+              },
+              "required": [
+                "kind",
+                "path"
+              ]
+            },
+            "valid": {
+              "type": "boolean"
+            },
+            "code": {
+              "const": "invalid_contract"
+            }
+          },
+          "required": [
+            "case_id",
+            "base_case_id",
+            "mutation",
+            "valid"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "value": {},
+            "canonical_utf8_hex": {
+              "type": "string",
+              "maxLength": 2097152,
+              "format": "craxii_utf8_2097152"
+            },
+            "canonical_sha256": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "domain": {
+              "type": "string",
+              "enum": [
+                "work",
+                "cancel",
+                "result",
+                "model-invocation",
+                "authenticated-request",
+                "execution-profile",
+                "compute-grant",
+                "normalized-ingress",
+                "neutral-evidence"
+              ]
+            },
+            "digest": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            }
+          },
+          "required": [
+            "case_id",
+            "value",
+            "canonical_utf8_hex",
+            "canonical_sha256",
+            "domain",
+            "digest"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "primitive": {
+              "type": "string",
+              "enum": [
+                "U4",
+                "U7",
+                "Uuid",
+                "D0",
+                "Dp",
+                "U64",
+                "ChatId",
+                "Timestamp",
+                "Binary32",
+                "Binary64",
+                "Digest"
+              ]
+            },
+            "value": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "valid": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "case_id",
+            "primitive",
+            "value",
+            "valid"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "raw_utf8_hex": {
+              "type": "string",
+              "maxLength": 2097152,
+              "format": "craxii_utf8_2097152"
+            },
+            "valid": {
+              "type": "boolean"
+            },
+            "canonical_utf8_hex": {
+              "type": "string",
+              "maxLength": 2097152,
+              "format": "craxii_utf8_2097152"
+            }
+          },
+          "required": [
+            "case_id",
+            "raw_utf8_hex",
+            "valid"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "peer": {},
+            "policy": {},
+            "expected": {}
+          },
+          "required": [
+            "case_id",
+            "peer",
+            "policy",
+            "expected"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "content_text",
+                "raw_bytes",
+                "depth",
+                "nodes",
+                "cost",
+                "wire_raw",
+                "nodes_large",
+                "content_escaped"
+              ]
+            },
+            "size": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2147483647
+            },
+            "categories": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "quantity": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "format": "craxii_utf8_20"
+                  },
+                  "numerator": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "format": "craxii_utf8_20"
+                  },
+                  "denominator": {
+                    "type": "string",
+                    "maxLength": 20,
+                    "format": "craxii_utf8_20"
+                  }
+                },
+                "required": [
+                  "quantity",
+                  "numerator",
+                  "denominator"
+                ]
+              },
+              "maxItems": 32
+            },
+            "expected": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "valid": {
+              "type": "boolean"
+            },
+            "base_case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            }
+          },
+          "required": [
+            "case_id",
+            "kind",
+            "valid"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "kind": {
+              "type": "string",
+              "enum": [
+                "internal_digest",
+                "gate_uuid",
+                "local_id",
+                "content_digest",
+                "command_digest",
+                "work_state"
+              ]
+            },
+            "value": {},
+            "expected": {
+              "type": "string",
+              "maxLength": 256,
+              "format": "craxii_utf8_256"
+            },
+            "valid": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "case_id",
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "purpose": {
+              "type": "string",
+              "enum": [
+                "enrollment",
+                "session",
+                "sensitive_request",
+                "compute_authorization",
+                "execution_profile",
+                "standard"
+              ]
+            },
+            "public_test_seed_hex": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "public_key_hex": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "public_key_base64url": {
+              "type": "string",
+              "maxLength": 43,
+              "format": "craxii_utf8_43"
+            },
+            "signed_object": {},
+            "signature_input_hex": {
+              "type": "string",
+              "maxLength": 2097152,
+              "format": "craxii_utf8_2097152"
+            },
+            "signature_input_sha256": {
+              "type": "string",
+              "maxLength": 64,
+              "format": "craxii_utf8_64"
+            },
+            "signature_hex": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "signature_base64url": {
+              "type": "string",
+              "maxLength": 86,
+              "format": "craxii_utf8_86"
+            }
+          },
+          "required": [
+            "case_id",
+            "purpose",
+            "public_test_seed_hex",
+            "public_key_hex",
+            "public_key_base64url",
+            "signature_input_hex",
+            "signature_input_sha256",
+            "signature_hex",
+            "signature_base64url"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "case_id",
+            "kind",
+            "before",
+            "after",
+            "expected"
+          ],
+          "properties": {
+            "case_id": {
+              "type": "string",
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "kind": {
+              "const": "schema_evolution"
+            },
+            "before": {},
+            "after": {},
+            "expected": {
+              "enum": [
+                "identical",
+                "breaking",
+                "requires_negotiated_minor"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fixture_version": {
+      "const": 1
+    },
+    "group": {
+      "type": "string",
+      "enum": [
+        "admission-cancel",
+        "authority-lifecycle",
+        "budgets-model",
+        "canonical",
+        "envelopes",
+        "legacy-regression",
+        "limits",
+        "negotiation",
+        "neutral-policy-lineage",
+        "primitives",
+        "raw-invalid",
+        "result-delivery",
+        "signatures"
+      ]
+    },
+    "cases": {
+      "type": "array",
+      "items": {
+        "$ref": "urn:craxii:distribution:1.0.0:fixture#/definitions/Case"
+      },
+      "maxItems": 8192
+    }
+  },
+  "required": [
+    "fixture_version",
+    "group",
+    "cases"
+  ]
+}

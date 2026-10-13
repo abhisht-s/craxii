@@ -1,0 +1,246 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:compute",
+  "title": "Craxii distribution compute",
+  "definitions": {
+    "ComputeGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "grant_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "audience": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9:._-]+$",
+          "format": "craxii_utf8_128"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "grant_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "power_operation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "period_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "compute_reservation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "authorization_epoch": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "max_elapsed_ms": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "boot_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+        },
+        "issued_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "expires_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "permitted_work_ids": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+          },
+          "minItems": 0,
+          "maxItems": 32,
+          "uniqueItems": true
+        },
+        "scopes": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "status",
+              "receipt",
+              "export",
+              "cancel",
+              "bounded_execute"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 5,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "grant_version",
+        "audience",
+        "environment",
+        "grant_id",
+        "customer_id",
+        "logical_agent_id",
+        "installation_id",
+        "power_operation_id",
+        "period_id",
+        "compute_reservation_id",
+        "generation",
+        "authorization_epoch",
+        "max_elapsed_ms",
+        "boot_id",
+        "issued_at",
+        "expires_at",
+        "permitted_work_ids",
+        "scopes"
+      ]
+    },
+    "ComputeAuthorization": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "compute_authorization",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "grant": {
+              "$ref": "urn:craxii:distribution:1.0.0:compute#/definitions/ComputeGrant"
+            },
+            "signature": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Binary64"
+            },
+            "key_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "grant",
+            "signature",
+            "key_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ComputeRenew": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "compute_renew",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "grant_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "authorization_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            }
+          },
+          "required": [
+            "grant_id",
+            "period_id",
+            "power_operation_id",
+            "authorization_epoch",
+            "boot_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:compute#/definitions/ComputeAuthorization"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:compute#/definitions/ComputeRenew"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:compute#/definitions/ComputeGrant"
+    }
+  ]
+}

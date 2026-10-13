@@ -1,0 +1,911 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:work",
+  "title": "Craxii distribution work",
+  "definitions": {
+    "WorkMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "material_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "conversation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "ingress_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "conversation_sequence": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "reply_binding": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ReplyBinding"
+        },
+        "content": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Content"
+        },
+        "created_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "material_version",
+        "environment",
+        "customer_id",
+        "logical_agent_id",
+        "work_id",
+        "conversation_id",
+        "ingress_id",
+        "conversation_sequence",
+        "reply_binding",
+        "content",
+        "created_at"
+      ]
+    },
+    "WorkDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "work_delivery",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delivery_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "delivery_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "admission_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "material": {
+              "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/WorkMaterial"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "execution_authorization": {
+              "$ref": "urn:craxii:distribution:1.0.0:execution-profile#/definitions/ExecutionAuthorization"
+            },
+            "lineage_authorization_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "delivery_id",
+            "power_operation_id",
+            "delivery_revision",
+            "boot_id",
+            "issued_at",
+            "expires_at",
+            "admission_operation_id",
+            "material",
+            "material_digest",
+            "execution_authorization"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "Receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "origin_installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "receipt_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "local_work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "local_message_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "local_conversation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+        },
+        "conversation_sequence": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "local_work_ordinal": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "journal_offset": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "origin_generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "material_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "admitted_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        }
+      },
+      "required": [
+        "work_id",
+        "origin_installation_id",
+        "receipt_id",
+        "local_work_id",
+        "local_message_id",
+        "local_conversation_id",
+        "conversation_sequence",
+        "local_work_ordinal",
+        "journal_offset",
+        "origin_generation",
+        "material_digest",
+        "admitted_at"
+      ]
+    },
+    "WorkReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "work_receipt",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "receipt": {
+              "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/Receipt"
+            },
+            "duplicate": {
+              "type": "boolean"
+            },
+            "current_work_state": {
+              "type": "string",
+              "enum": [
+                "queued",
+                "running",
+                "waiting_on_model",
+                "waiting_on_tool",
+                "cancel_requested",
+                "completed",
+                "failed",
+                "cancelled",
+                "interrupted"
+              ]
+            },
+            "work_state_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "receipt",
+            "duplicate",
+            "current_work_state",
+            "work_state_revision"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "receipt_query",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "work_id",
+            "material_digest"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "ReceiptStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "receipt_status",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "const": "committed",
+                  "type": "string"
+                },
+                "receipt": {
+                  "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/Receipt"
+                }
+              },
+              "required": [
+                "status",
+                "receipt"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "not_found",
+                    "reconciliation_required"
+                  ]
+                }
+              },
+              "required": [
+                "status"
+              ]
+            }
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "CancelMaterial": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "control_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "work_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "material_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "command": {
+          "const": "cancel",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "user_request",
+            "authorization_expired",
+            "operator_stop"
+          ]
+        }
+      },
+      "required": [
+        "control_id",
+        "customer_id",
+        "logical_agent_id",
+        "work_id",
+        "material_digest",
+        "command",
+        "reason"
+      ]
+    },
+    "CancelDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "cancel_delivery",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delivery_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "delivery_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "control": {
+              "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/CancelMaterial"
+            },
+            "control_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            }
+          },
+          "required": [
+            "delivery_id",
+            "power_operation_id",
+            "delivery_revision",
+            "boot_id",
+            "issued_at",
+            "expires_at",
+            "control",
+            "control_digest"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "CancelReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "cancel_receipt",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "control_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "work_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "control_digest": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+                },
+                "cleanup_pending": {
+                  "const": false,
+                  "type": "boolean"
+                },
+                "committed_at": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+                },
+                "outcome": {
+                  "const": "cancelled_before_admission",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "control_id",
+                "work_id",
+                "control_digest",
+                "cleanup_pending",
+                "committed_at",
+                "outcome"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "control_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "work_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "control_digest": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+                },
+                "cleanup_pending": {
+                  "type": "boolean"
+                },
+                "committed_at": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+                },
+                "outcome": {
+                  "type": "string",
+                  "enum": [
+                    "requested",
+                    "cancelled",
+                    "already_requested",
+                    "already_terminal"
+                  ]
+                },
+                "local_work_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+                },
+                "work_state": {
+                  "type": "string",
+                  "enum": [
+                    "queued",
+                    "running",
+                    "waiting_on_model",
+                    "waiting_on_tool",
+                    "cancel_requested",
+                    "completed",
+                    "failed",
+                    "cancelled",
+                    "interrupted"
+                  ]
+                },
+                "work_state_revision": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+                }
+              },
+              "required": [
+                "control_id",
+                "work_id",
+                "control_digest",
+                "cleanup_pending",
+                "committed_at",
+                "outcome",
+                "local_work_id",
+                "work_state",
+                "work_state_revision"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "control_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "work_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+                },
+                "control_digest": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+                },
+                "cleanup_pending": {
+                  "type": "boolean"
+                },
+                "committed_at": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+                },
+                "outcome": {
+                  "const": "reconciliation_required",
+                  "type": "string"
+                },
+                "local_work_id": {
+                  "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+                }
+              },
+              "required": [
+                "control_id",
+                "work_id",
+                "control_digest",
+                "cleanup_pending",
+                "committed_at",
+                "outcome"
+              ]
+            }
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "NormalizedIngress": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "ingress_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "provider": {
+              "const": "telegram",
+              "type": "string"
+            },
+            "bot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "user_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "chat_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ChatId"
+            },
+            "update_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "message_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "provider_occurred_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "received_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "event_kind": {
+              "const": "text",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "accepted",
+              "type": "string"
+            },
+            "reply_binding_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "reply_binding_version": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "canonical_work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "conversation_sequence": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "version",
+            "ingress_id",
+            "environment",
+            "provider",
+            "bot_id",
+            "user_id",
+            "chat_id",
+            "update_id",
+            "message_id",
+            "received_at",
+            "material_digest",
+            "event_kind",
+            "disposition",
+            "reply_binding_id",
+            "reply_binding_version",
+            "canonical_work_id",
+            "conversation_id",
+            "conversation_sequence"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "version": {
+              "const": 1,
+              "type": "integer"
+            },
+            "ingress_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "environment": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+            },
+            "provider": {
+              "const": "telegram",
+              "type": "string"
+            },
+            "bot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "user_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "chat_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/ChatId"
+            },
+            "update_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "message_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "provider_occurred_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "received_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "material_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "event_kind": {
+              "type": "string",
+              "enum": [
+                "cancel",
+                "link",
+                "unsupported",
+                "binding_revoked",
+                "text"
+              ]
+            },
+            "disposition": {
+              "type": "string",
+              "enum": [
+                "control",
+                "link_pending",
+                "unsupported",
+                "denied",
+                "held"
+              ]
+            },
+            "reply_binding_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "reply_binding_version": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "version",
+            "ingress_id",
+            "environment",
+            "provider",
+            "bot_id",
+            "user_id",
+            "chat_id",
+            "update_id",
+            "message_id",
+            "received_at",
+            "material_digest",
+            "event_kind",
+            "disposition"
+          ]
+        }
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/WorkDelivery"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/WorkReceipt"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/ReceiptQuery"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/ReceiptStatus"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/CancelDelivery"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/CancelReceipt"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/WorkMaterial"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/Receipt"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/CancelMaterial"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:work#/definitions/NormalizedIngress"
+    }
+  ]
+}

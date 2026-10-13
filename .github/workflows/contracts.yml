@@ -1,0 +1,30 @@
+name: Distribution contracts
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: distribution-contracts-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy
+      - name: Check bundle and focused conformance
+        run: |
+          node scripts/check-distribution-contracts.mjs
+          cargo fmt --all --check
+          cargo test --locked -p craxii-server --test distribution_contracts
+      - name: Check dependency policy
+        run: |
+          cargo install cargo-deny --version 0.20.2 --locked
+          cargo deny --locked check advisories -D warnings
+          cargo deny --locked check licenses bans sources
+          node scripts/check-public-repository.mjs

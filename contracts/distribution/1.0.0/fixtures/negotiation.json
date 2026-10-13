@@ -1,0 +1,857 @@
+{
+  "fixture_version": 1,
+  "group": "negotiation",
+  "cases": [
+    {
+      "case_id": "negotiation.exact",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "version": {
+          "major": 1,
+          "minor": 0
+        }
+      }
+    },
+    {
+      "case_id": "negotiation.major",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 2,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_version"
+      }
+    },
+    {
+      "case_id": "negotiation.minor",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 1
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_version"
+      }
+    },
+    {
+      "case_id": "negotiation.downgrade",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 0,
+            "minor": 9
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_version"
+      }
+    },
+    {
+      "case_id": "negotiation.canonical",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "other"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_canonicalization"
+      }
+    },
+    {
+      "case_id": "negotiation.signature",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "other"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_signature"
+      }
+    },
+    {
+      "case_id": "negotiation.capability",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_capability"
+      }
+    },
+    {
+      "case_id": "negotiation.unknown_capability",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1",
+          "arbitrary_execute"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "unsupported_capability"
+      }
+    },
+    {
+      "case_id": "negotiation.release",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": false,
+        "reason": "revoked_authority"
+      }
+    },
+    {
+      "case_id": "negotiation.old_peer_after_additive",
+      "peer": {
+        "supported_versions": [
+          {
+            "major": 1,
+            "minor": 1
+          },
+          {
+            "major": 1,
+            "minor": 0
+          }
+        ],
+        "capabilities": [
+          "admission_v1",
+          "cancel_v1",
+          "result_v1",
+          "status_v1",
+          "drain_v1",
+          "compute_v1",
+          "model_v1",
+          "signed_request_v1"
+        ],
+        "canonicalization_versions": [
+          "craxii.cjson/1"
+        ],
+        "signature_versions": [
+          "craxii.signature/1"
+        ],
+        "release_id": "synthetic-1",
+        "release_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "policy": {
+        "requiredCapabilities": [
+          "admission_v1",
+          "signed_request_v1"
+        ],
+        "eligibleReleases": {
+          "synthetic-1": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      },
+      "expected": {
+        "accepted": true,
+        "version": {
+          "major": 1,
+          "minor": 0
+        }
+      }
+    },
+    {
+      "case_id": "evolution.same",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "identical"
+    },
+    {
+      "case_id": "evolution.required_added",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id",
+          "status"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    },
+    {
+      "case_id": "evolution.required_removed",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    },
+    {
+      "case_id": "evolution.optional_added",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          },
+          "note": {
+            "type": "string",
+            "maxLength": 128
+          }
+        }
+      },
+      "expected": "requires_negotiated_minor"
+    },
+    {
+      "case_id": "evolution.enum_removed",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    },
+    {
+      "case_id": "evolution.bound_narrowed",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 35
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    },
+    {
+      "case_id": "evolution.const_changed",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "different"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    },
+    {
+      "case_id": "evolution.unknown_fields_allowed",
+      "kind": "schema_evolution",
+      "before": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "after": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": [
+          "type",
+          "id"
+        ],
+        "properties": {
+          "type": {
+            "const": "synthetic"
+          },
+          "id": {
+            "type": "string",
+            "maxLength": 36
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "done"
+            ]
+          }
+        }
+      },
+      "expected": "breaking"
+    }
+  ]
+}
