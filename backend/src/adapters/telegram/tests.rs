@@ -1342,7 +1342,10 @@ async fn fresh_runtime(
             diagnostic_pid: Some(DiagnosticPid::try_new(std::process::id().into()).unwrap()),
             package_version: PackageVersion::try_new("0.0.1").unwrap(),
             git_revision: GitRevision::try_new("ch6-local").unwrap(),
-            schema_version: SchemaVersion::try_new(7).unwrap(),
+            schema_version: SchemaVersion::try_new(
+                crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+            )
+            .unwrap(),
             started_at,
         }),
         0,

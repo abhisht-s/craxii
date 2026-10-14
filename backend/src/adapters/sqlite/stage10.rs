@@ -335,6 +335,20 @@ async fn claim_next(
         transaction.commit().await?;
         return Ok(None);
     };
+    // Distribution admission is receipt-only until trusted isolation/compute/model
+    // authority is supplied. A legacy composition must not claim these same rows.
+    if sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM distribution_receipts WHERE local_work_id=?",
+    )
+    .bind(candidate.try_get::<String, _>("work_id")?)
+    .fetch_one(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?
+        != 0
+    {
+        transaction.commit().await?;
+        return Ok(None);
+    }
     let candidate_work_id = WorkId::parse_canonical(&candidate.try_get::<String, _>("work_id")?)
         .map_err(|_| inconsistent())?;
     let candidate_conversation_id =

@@ -47,6 +47,9 @@ pub(super) enum CanonicalMessageOrigin {
         device_id: DeviceId,
         client_message_id: ClientMessageId,
     },
+    Distribution {
+        receipt_id: JournalEventId,
+    },
     Channel {
         inbound_delivery_id: InboundDeliveryId,
     },
@@ -97,6 +100,10 @@ where
 {
     let topology = request.topology;
     let correlation_id = CorrelationId::for_work(request.candidates.work_id);
+    let distribution_receipt_id = match request.origin {
+        CanonicalMessageOrigin::Distribution { receipt_id } => Some(receipt_id),
+        _ => None,
+    };
     let (device_id, client_message_id, inbound_delivery_id, journal_origin) = match request.origin {
         CanonicalMessageOrigin::Native {
             device_id,
@@ -110,6 +117,12 @@ where
                 client_message_id,
             },
         ),
+        CanonicalMessageOrigin::Distribution { receipt_id } => (
+            None,
+            None,
+            None,
+            MessageAcceptedOriginV2::Distribution { receipt_id },
+        ),
         CanonicalMessageOrigin::Channel {
             inbound_delivery_id,
         } => (
@@ -121,19 +134,22 @@ where
             },
         ),
     };
-    let message = Message::try_new(MessageInput {
-        message_id: request.candidates.message_id,
-        craxii_id: topology.craxii_id,
-        conversation_id: topology.conversation_id,
-        role: MessageRole::User,
-        content: request.content,
-        author_user_id: Some(topology.user_id),
-        produced_by_work_id: None,
-        device_id,
-        client_message_id,
-        inbound_delivery_id,
-        committed_at: request.admitted_at,
-    })
+    let message = Message::try_new_with_distribution(
+        MessageInput {
+            message_id: request.candidates.message_id,
+            craxii_id: topology.craxii_id,
+            conversation_id: topology.conversation_id,
+            role: MessageRole::User,
+            content: request.content,
+            author_user_id: Some(topology.user_id),
+            produced_by_work_id: None,
+            device_id,
+            client_message_id,
+            inbound_delivery_id,
+            committed_at: request.admitted_at,
+        },
+        distribution_receipt_id,
+    )
     .map_err(|_| invalid())?;
     let work = WorkItem::new(WorkItemInputData {
         work_id: request.candidates.work_id,
@@ -159,7 +175,7 @@ where
     sqlx::query(
         "INSERT INTO messages (message_id, craxii_id, conversation_id, role, content_json, \
                 content_sha256, author_user_id, produced_by_work_id, client_device_id, client_message_id, \
-                inbound_delivery_id, committed_at) VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, ?, ?)",
+                inbound_delivery_id, committed_at,distribution_receipt_id) VALUES (?, ?, ?, 'user', ?, ?, ?, NULL, ?, ?, ?, ?, ?)",
     )
     .bind(message.message_id().to_string())
     .bind(message.craxii_id().to_string())
@@ -171,11 +187,23 @@ where
     .bind(client_message_id.map(|id| id.to_string()))
     .bind(inbound_delivery_id.map(|id| id.to_string()))
     .bind(request.admitted_at.to_string())
+    .bind(distribution_receipt_id.map(|id|id.to_string()))
     .execute(transaction.connection())
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
     after_step(CanonicalMessageAdmissionStep::MessageInserted)?;
 
+    let accepted_payload = MessageCommittedV2 {
+        message_id: message.message_id(),
+        craxii_id: message.craxii_id(),
+        conversation_id: message.conversation_id(),
+        role: message.role(),
+        content: message.content().clone(),
+        content_sha256: message.content_sha256(),
+        author_user_id: topology.user_id,
+        origin: journal_origin,
+        committed_at: request.admitted_at,
+    };
     append_event(
         transaction,
         prepare_event(JournalAppendIntent {
@@ -188,17 +216,11 @@ where
             correlation_id,
             actor: JournalActor::UserV2(topology.user_id),
             runtime_instance_id: None,
-            payload: JournalEventPayload::MessageAcceptedV2(MessageCommittedV2 {
-                message_id: message.message_id(),
-                craxii_id: message.craxii_id(),
-                conversation_id: message.conversation_id(),
-                role: message.role(),
-                content: message.content().clone(),
-                content_sha256: message.content_sha256(),
-                author_user_id: topology.user_id,
-                origin: journal_origin,
-                committed_at: request.admitted_at,
-            }),
+            payload: if distribution_receipt_id.is_some() {
+                JournalEventPayload::MessageAcceptedV3(accepted_payload)
+            } else {
+                JournalEventPayload::MessageAcceptedV2(accepted_payload)
+            },
             recorded_at: request.admitted_at,
             occurred_at: None,
         })?,

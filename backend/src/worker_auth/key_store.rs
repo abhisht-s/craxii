@@ -207,6 +207,21 @@ impl KeyStore {
             service_uid: uid,
         })
     }
+    pub fn distribution_config(
+        &self,
+    ) -> AuthResult<crate::distribution::startup::DistributionConfig> {
+        let mut file = open_at(&self.directory, "distribution.json", nix::libc::O_RDONLY, 0)?;
+        regular(&file, self.service_uid, 16384)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| AuthError::UnsafeStorage)?;
+        let value = crate::distribution_contracts::raw_json::parse_bounded(
+            &bytes,
+            crate::distribution_contracts::raw_json::CONTROL_LIMITS,
+        )
+        .map_err(|_| AuthError::InvalidContext)?;
+        serde_json::from_value(value).map_err(|_| AuthError::InvalidContext)
+    }
     pub fn public_key(&self) -> String {
         URL_SAFE_NO_PAD.encode(self.key.public_key().as_ref())
     }

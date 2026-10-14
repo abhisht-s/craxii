@@ -280,12 +280,14 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
                 "committed_at": message.committed_at,
             }),
         ),
-        JournalEventPayload::MessageAcceptedV2(message) => {
+        JournalEventPayload::MessageAcceptedV2(message)
+        | JournalEventPayload::MessageAcceptedV3(message) => {
             let client_message_id = match message.origin {
                 crate::domain::MessageAcceptedOriginV2::Native {
                     client_message_id, ..
                 } => Some(client_message_id),
-                crate::domain::MessageAcceptedOriginV2::InboundDelivery { .. } => None,
+                crate::domain::MessageAcceptedOriginV2::InboundDelivery { .. }
+                | crate::domain::MessageAcceptedOriginV2::Distribution { .. } => None,
             };
             (
                 "message.accepted",
@@ -340,6 +342,10 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
             "work.cancel_requested",
             json!({"state": transition.to_state, "transitioned_at": transition.transitioned_at}),
         ),
+        JournalEventPayload::WorkCancelRequestedV3(cancellation) => (
+            "work.cancel_requested",
+            json!({"state":cancellation.transition.to_state,"transitioned_at":cancellation.transition.transitioned_at}),
+        ),
         JournalEventPayload::WorkCancelRequestedV2(cancellation) => (
             "work.cancel_requested",
             json!({"state": cancellation.transition.to_state, "transitioned_at": cancellation.transition.transitioned_at}),
@@ -351,6 +357,10 @@ fn map_public_event(event: JournalEvent) -> Result<Option<DurableEventEnvelope>,
                 "terminal_reason": transition.terminal_reason,
                 "transitioned_at": transition.transitioned_at,
             }),
+        ),
+        JournalEventPayload::WorkCancelledV3(cancellation) => (
+            "work.cancelled",
+            json!({"state":cancellation.transition.to_state,"terminal_reason":cancellation.transition.terminal_reason,"transitioned_at":cancellation.transition.transitioned_at}),
         ),
         JournalEventPayload::WorkCancelledV2(cancellation) => (
             "work.cancelled",

@@ -21,6 +21,7 @@ pub struct ProjectedMessage {
     pub message: MessageCommittedV1,
     pub author_user_id: Option<UserId>,
     pub inbound_delivery_id: Option<InboundDeliveryId>,
+    pub distribution_receipt_id: Option<JournalEventId>,
 }
 
 /// One journal-derived conversation, including the creation evidence needed to
@@ -191,7 +192,11 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
                 && event.craxii_id == payload.craxii_id
                 && event.work_id == payload.produced_by_work_id
         }
-        (JournalEventPayload::MessageAcceptedV2(payload), JournalStreamId::Conversation(id)) => {
+        (
+            JournalEventPayload::MessageAcceptedV2(payload)
+            | JournalEventPayload::MessageAcceptedV3(payload),
+            JournalStreamId::Conversation(id),
+        ) => {
             id == payload.conversation_id
                 && event.conversation_id == Some(payload.conversation_id)
                 && event.craxii_id == payload.craxii_id
@@ -210,6 +215,15 @@ fn validate_stream_and_links(event: &JournalEvent) -> Result<(), JournalContract
                 && event.conversation_id == Some(payload.conversation_id)
                 && event.craxii_id == payload.craxii_id
                 && event.correlation_id == payload.correlation_id
+        }
+        (
+            JournalEventPayload::WorkCancelRequestedV3(payload)
+            | JournalEventPayload::WorkCancelledV3(payload),
+            JournalStreamId::Work(id),
+        ) => {
+            id == payload.transition.work_id
+                && event.work_id == Some(id)
+                && matches!(event.actor, JournalActor::UserV2(_))
         }
         (
             JournalEventPayload::WorkCancelRequestedV2(payload)
@@ -292,6 +306,7 @@ fn message_v1_from_v2(
             device_id,
             client_message_id,
         } => (Some(device_id), Some(client_message_id), None),
+        MessageAcceptedOriginV2::Distribution { .. } => (None, None, None),
         MessageAcceptedOriginV2::InboundDelivery {
             inbound_delivery_id,
         } => (None, None, Some(inbound_delivery_id)),
@@ -486,9 +501,11 @@ fn apply_event(
                     message: payload.clone(),
                     author_user_id: None,
                     inbound_delivery_id: None,
+                    distribution_receipt_id: None,
                 });
         }
-        JournalEventPayload::MessageAcceptedV2(payload) => {
+        JournalEventPayload::MessageAcceptedV2(payload)
+        | JournalEventPayload::MessageAcceptedV3(payload) => {
             let (message, inbound_delivery_id) = message_v1_from_v2(payload);
             if payload.validate_contract().is_err()
                 || event.actor != JournalActor::UserV2(payload.author_user_id)
@@ -518,6 +535,10 @@ fn apply_event(
                     message,
                     author_user_id: Some(payload.author_user_id),
                     inbound_delivery_id,
+                    distribution_receipt_id: match payload.origin {
+                        MessageAcceptedOriginV2::Distribution { receipt_id } => Some(receipt_id),
+                        _ => None,
+                    },
                 });
         }
         JournalEventPayload::AssistantMessageCommitted(payload) => {
@@ -555,6 +576,7 @@ fn apply_event(
                     message: payload.clone(),
                     author_user_id: None,
                     inbound_delivery_id: None,
+                    distribution_receipt_id: None,
                 });
         }
         JournalEventPayload::WorkQueued(payload) => {
@@ -568,6 +590,16 @@ fn apply_event(
                 work_v1_from_v2(payload),
                 payload.reply_binding_id,
             )?;
+        }
+        JournalEventPayload::WorkCancelRequestedV3(payload)
+        | JournalEventPayload::WorkCancelledV3(payload) => {
+            require_work_context(state, event, payload.transition.work_id)?;
+            if !matches!(event.actor, JournalActor::UserV2(_))
+                || event.runtime_instance_id != payload.transition.runtime_owner
+            {
+                return Err(JournalContractError::InvalidEnvelope);
+            }
+            apply_work_transition(state, event.correlation_id, &payload.transition)?;
         }
         JournalEventPayload::WorkCancelRequestedV2(payload)
         | JournalEventPayload::WorkCancelledV2(payload) => {

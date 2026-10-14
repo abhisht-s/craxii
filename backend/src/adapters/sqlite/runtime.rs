@@ -391,7 +391,7 @@ impl SqliteRuntimeGuard {
         );
         let mut migration_observation = SqliteOperationObservation::new(migration_span.clone());
         prepare_ch1_owner_seed(&mut bootstrap, existing_migration_count).await?;
-        if existing_migration_count < 6 {
+        if existing_migration_count < 8 {
             sqlx::query("PRAGMA foreign_keys = OFF")
                 .execute(&mut bootstrap)
                 .await
@@ -401,7 +401,7 @@ impl SqliteRuntimeGuard {
             .run(&mut bootstrap)
             .instrument(migration_span.clone())
             .await;
-        if existing_migration_count < 6 {
+        if existing_migration_count < 8 {
             sqlx::query("PRAGMA foreign_keys = ON")
                 .execute(&mut bootstrap)
                 .await
@@ -1558,7 +1558,7 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn fresh_database_is_empty_before_migrations_run() {
-        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 7);
+        assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 8);
         let root = TestRoot::new();
         let paths = StatePaths::prepare(root.path()).unwrap();
         let mut connection = connection_options(&paths.database).connect().await.unwrap();
@@ -1585,7 +1585,7 @@ pub(super) mod tests {
     #[tokio::test]
     async fn newer_dirty_malformed_and_unexpected_schema_fail_closed() {
         let newer = TestRoot::new();
-        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (8, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
+        mutate_database(&newer, "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) VALUES (9, 'future', 1, X'000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0)").await;
         assert_eq!(
             SqliteRuntimeGuard::start(newer.path(), 1)
                 .await

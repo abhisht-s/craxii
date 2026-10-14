@@ -969,6 +969,7 @@ async fn compare_message_projection(
             || event
                 .author_user_id
                 .is_some_and(|author| stored.author_user_id() != Some(author))
+            || event.distribution_receipt_id != stored.distribution_receipt_id()
             || event.inbound_delivery_id != stored.inbound_delivery_id()
             || payload.committed_at != stored.committed_at()
         {

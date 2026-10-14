@@ -7,6 +7,7 @@ mod channel_ingress;
 mod codec;
 mod context_source_store;
 mod delivery;
+mod distribution;
 mod error;
 mod evidence_query;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.
@@ -34,6 +35,8 @@ mod ch3_test_support;
 mod ch6_tests;
 #[cfg(test)]
 mod channel_ingress_tests;
+#[cfg(all(test, feature = "test-failpoints", debug_assertions))]
+mod distribution_tests;
 #[cfg(test)]
 mod stage10_tests;
 #[cfg(test)]
@@ -54,3 +57,5 @@ pub use evidence_query::SqliteEvidenceQueryStore;
 pub use runtime::{CheckpointReport, SqliteRuntime, SqliteRuntimeGuard};
 pub use schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION};
 pub use state_store::SqliteStateStore;
+
+pub use distribution::DistributionAdmission;

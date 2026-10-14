@@ -628,19 +628,26 @@ pub(super) fn decode_message_row(row: &SqliteRow) -> Result<Message, SqliteAdapt
     )?;
     let committed_at = decode_timestamp(&row.try_get::<String, _>("committed_at")?)?;
 
-    Message::try_new(MessageInput {
-        message_id,
-        craxii_id,
-        conversation_id,
-        role,
-        content,
-        author_user_id,
-        produced_by_work_id,
-        device_id,
-        client_message_id,
-        inbound_delivery_id,
-        committed_at,
-    })
+    let distribution_receipt_id = row
+        .try_get::<Option<String>, _>("distribution_receipt_id")?
+        .map(|id| crate::domain::JournalEventId::parse_canonical(&id).map_err(|_| corrupt_row()))
+        .transpose()?;
+    Message::try_new_with_distribution(
+        MessageInput {
+            message_id,
+            craxii_id,
+            conversation_id,
+            role,
+            content,
+            author_user_id,
+            produced_by_work_id,
+            device_id,
+            client_message_id,
+            inbound_delivery_id,
+            committed_at,
+        },
+        distribution_receipt_id,
+    )
     .map_err(|_| corrupt_row())
 }
 

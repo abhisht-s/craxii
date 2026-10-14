@@ -30,6 +30,7 @@ struct Session {
     clock_seen: SystemTime,
     credential: String,
     deadline: Instant,
+    scopes: Vec<String>,
 }
 impl std::fmt::Debug for WorkerClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -136,6 +137,13 @@ impl WorkerClient {
         credential: Option<(&str, &str)>,
     ) -> AuthResult<Value> {
         self.active()?;
+        let response_limit = if path == "/v1/worker/poll" {
+            1048576
+        } else if path.starts_with("/v1/worker/enrollment/") {
+            MAX_RESPONSE
+        } else {
+            16384
+        };
         let url = self
             .origin
             .join(path)
@@ -145,7 +153,13 @@ impl WorkerClient {
         }
         let mut request = if let Some(body) = body {
             let bytes = canonical_bytes(body).map_err(|_| AuthError::InvalidContext)?;
-            if bytes.len() > 65536 {
+            if bytes.len()
+                > if path.starts_with("/v1/worker/enrollment/") {
+                    65536
+                } else {
+                    16384
+                }
+            {
                 return Err(AuthError::InvalidContext);
             }
             self.http
@@ -165,13 +179,13 @@ impl WorkerClient {
         let status = response.status();
         if response
             .content_length()
-            .is_some_and(|n| n > MAX_RESPONSE as u64)
+            .is_some_and(|n| n > response_limit as u64)
         {
             return Err(AuthError::InvalidContext);
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| AuthError::Transport)? {
-            if bytes.len() + chunk.len() > MAX_RESPONSE {
+            if bytes.len() + chunk.len() > response_limit {
                 return Err(AuthError::InvalidContext);
             }
             bytes.extend_from_slice(&chunk);
@@ -179,10 +193,17 @@ impl WorkerClient {
         // Shared raw decoder rejects duplicate keys and ambiguous canonical bytes.
         let value = crate::distribution_contracts::raw_json::parse_bounded(
             &bytes,
-            crate::distribution_contracts::raw_json::CONTROL_LIMITS,
+            crate::distribution_contracts::raw_json::Limits {
+                bytes: response_limit,
+                nodes: if response_limit > 65536 { 32768 } else { 4096 },
+                depth: 32,
+            },
         )
         .map_err(|_| AuthError::InvalidContext)?;
         if !status.is_success() {
+            if bytes.len() > 4096 {
+                return Err(AuthError::InvalidContext);
+            }
             return Err(match value["reason"].as_str() {
                 Some("session_expired" | "unauthenticated") => AuthError::SessionExpired,
                 Some("revoked_authority") => AuthError::Revoked,
@@ -389,7 +410,7 @@ impl WorkerClient {
         let body = &challenge["body"];
         self.context(body, "session")?;
         if field(body, "key_id")? != self.key.key_id()
-            || body["scopes"] != json!(["status"])
+            || !scope_policy(&body["scopes"])
             || field(body, "revocation_epoch")?
                 .parse::<i64>()
                 .map_err(|_| AuthError::InvalidContext)?
@@ -453,6 +474,16 @@ impl WorkerClient {
             clock_seen: SystemTime::now(),
             credential: field(body, "session_credential")?.to_owned(),
             deadline: started + Duration::from_micros((expires - issued) as u64),
+            scopes: body["scopes"]
+                .as_array()
+                .ok_or(AuthError::InvalidContext)?
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or(AuthError::InvalidContext)
+                })
+                .collect::<AuthResult<Vec<_>>>()?,
         });
         Ok(())
     }
@@ -555,4 +586,196 @@ impl WorkerClient {
         }
         result
     }
+    pub fn current_authority(&self) -> AuthResult<Value> {
+        self.check_session()?;
+        let session = self.session.as_ref().ok_or(AuthError::SessionExpired)?;
+        Ok(
+            json!({"customer_id":self.state.customer_id,"logical_agent_id":self.state.logical_agent_id,"installation_id":self.state.installation_id,"generation":self.state.generation,"session_id":session.id}),
+        )
+    }
+    fn check_session(&self) -> AuthResult<()> {
+        self.active()?;
+        let s = self.session.as_ref().ok_or(AuthError::SessionExpired)?;
+        let now = crate::distribution::now().map_err(|_| AuthError::SessionExpired)?;
+        if Instant::now() >= s.deadline
+            || SystemTime::now() < s.clock_seen
+            || now >= timestamp_micros(&s.expires_at).map_err(|_| AuthError::InvalidContext)?
+        {
+            return Err(AuthError::SessionExpired);
+        }
+        Ok(())
+    }
+    async fn session_exchange(&mut self, path: &str, request: &Value) -> AuthResult<Value> {
+        self.check_session()?;
+        let credential = self
+            .session
+            .as_ref()
+            .ok_or(AuthError::SessionExpired)?
+            .credential
+            .clone();
+        let result = self
+            .exchange(path, Some(request), Some(("CraxiiWorker", &credential)))
+            .await;
+        if let Err(error) = result {
+            if matches!(error, AuthError::Revoked | AuthError::Stale) {
+                self.state.disposition = if error == AuthError::Revoked {
+                    Disposition::Revoked
+                } else {
+                    Disposition::Stale
+                };
+                self.state.persist(&self.key)?;
+            }
+            if matches!(
+                error,
+                AuthError::SessionExpired | AuthError::Revoked | AuthError::Stale
+            ) {
+                self.session = None;
+            }
+        }
+        result
+    }
+    pub async fn poll(
+        &mut self,
+        boot: &str,
+        power: &str,
+        profile_key: &str,
+    ) -> AuthResult<Vec<crate::distribution::ValidatedDelivery>> {
+        self.check_session()?;
+        let s = self.session.as_ref().ok_or(AuthError::SessionExpired)?;
+        if !["status", "receipt_commit", "cancel"]
+            .iter()
+            .all(|scope| s.scopes.iter().any(|s| s == scope))
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
+        let authority = self.current_authority()?;
+        let request = json!({"contract_version":1,"request_id":id,"authority":authority,"boot_id":boot,"power_operation_id":power,"max_items":4,"wait_ms":0});
+        let response = self.session_exchange("/v1/worker/poll", &request).await?;
+        let items = crate::distribution::transport::poll_response(&response, &id)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let mut result = Vec::new();
+        for message in items.iter().filter(|m| m["type"] != "execution_profile") {
+            let profile = items
+                .iter()
+                .find(|p| {
+                    p["type"] == "execution_profile"
+                        && p["body"]["profile"]["work_id"] == message["body"]["material"]["work_id"]
+                })
+                .cloned();
+            result.push(
+                crate::distribution::ValidatedDelivery::from_authenticated(
+                    message.clone(),
+                    profile,
+                    profile_key.to_owned(),
+                    &authority,
+                    boot,
+                    power,
+                )
+                .map_err(|_| AuthError::InvalidContext)?,
+            );
+        }
+        Ok(result)
+    }
+    pub async fn send_receipt(&mut self, body: &Value, control: bool) -> AuthResult<Value> {
+        let authority = self.current_authority()?;
+        let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
+        let kind = if control {
+            "cancel_receipt"
+        } else {
+            "work_receipt"
+        };
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":kind,"request_id":id,"environment":"development","authority":authority,"body":body});
+        decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let signed = self
+            .session_exchange(
+                "/v1/worker/requests/challenge",
+                &json!({"contract_version":1,"request":request}),
+            )
+            .await?;
+        let expected_digest = crate::distribution_contracts::canonical::digest_material(
+            crate::distribution_contracts::canonical::DigestDomain::AuthenticatedRequest,
+            &request,
+        )
+        .map_err(|_| AuthError::InvalidContext)?;
+        if signed["purpose"] != "sensitive_request"
+            || signed["signature_version"] != 1
+            || signed["audience"] != AUDIENCE
+            || signed["environment"] != "development"
+            || signed["session_id"] != authority["session_id"]
+            || signed["installation_id"] != authority["installation_id"]
+            || signed["generation"] != authority["generation"]
+            || signed["key_id"] != self.key.key_id()
+            || signed["revocation_epoch"] != self.state.highest_epoch
+            || signed["request_id"] != id
+            || signed["operation_type"] != kind
+            || signed["request_digest"] != expected_digest
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let proof = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"sensitive_request_proof","request_id":id,"environment":"development","authority":authority,"body":{"signed":signed,"proof_signature":self.key.sign(SignaturePurpose::SensitiveRequest,&signed)?}});
+        decode_message(&canonical_bytes(&proof).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let issued = timestamp_micros(field(&signed, "issued_at")?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let expiry = timestamp_micros(field(&signed, "expires_at")?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let now = crate::distribution::now().map_err(|_| AuthError::InvalidContext)?;
+        if issued > now || expiry <= now || expiry - issued > 60_000_000 {
+            return Err(AuthError::InvalidContext);
+        }
+        let response = self
+            .session_exchange(
+                if control {
+                    "/v1/worker/control-receipts"
+                } else {
+                    "/v1/worker/receipts"
+                },
+                &json!({"contract_version":1,"request":request,"proof":proof}),
+            )
+            .await?;
+        if control {
+            let o = object(&response)?;
+            if o.len() != 5
+                || o.keys().any(|k| {
+                    !matches!(
+                        k.as_str(),
+                        "contract_version"
+                            | "request_id"
+                            | "control_id"
+                            | "control_digest"
+                            | "accepted"
+                    )
+                })
+                || response["contract_version"] != 1
+                || response["request_id"] != id
+                || response["control_id"] != body["control_id"]
+                || response["control_digest"] != body["control_digest"]
+                || response["accepted"] != true
+            {
+                return Err(AuthError::InvalidContext);
+            }
+        } else {
+            decode_message(&canonical_bytes(&response).map_err(|_| AuthError::InvalidContext)?)
+                .map_err(|_| AuthError::InvalidContext)?;
+            if response["type"] != "receipt_status"
+                || response["request_id"] != id
+                || response["authority"] != authority
+                || response["body"]["status"] != "committed"
+                || response["body"]["receipt"] != body["receipt"]
+            {
+                return Err(AuthError::InvalidContext);
+            }
+        }
+        Ok(response)
+    }
+}
+
+fn scope_policy(value: &Value) -> bool {
+    let Some(scopes) = value.as_array() else {
+        return false;
+    };
+    scopes == &vec![json!("status")]
+        || scopes == &vec![json!("status"), json!("receipt_commit"), json!("cancel")]
 }

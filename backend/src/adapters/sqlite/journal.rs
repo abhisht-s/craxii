@@ -13,10 +13,10 @@ use crate::domain::{
     ProjectionVersion, RuntimeInstanceId, RuntimeRecoveryPerformedV1, RuntimeShutdownReason,
     RuntimeStartedV1, RuntimeStoppingV1, SchemaVersion, Sha256Digest, StreamSeq,
     ToolExecutionEventV1, ToolExecutionId, ToolExecutionState, ToolResultClass, UserId,
-    UtcTimestamp, WorkCancellationReason, WorkCancellationV2, WorkId, WorkInputActor,
-    WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkKind, WorkQueuedV1, WorkQueuedV2,
-    WorkState, WorkTransitionV1, WorkspaceId, WorkstationGeneration, WorkstationId,
-    resolve_event_version,
+    UtcTimestamp, WorkCancellationReason, WorkCancellationV2, WorkDistributionCancellationV3,
+    WorkId, WorkInputActor, WorkInputFactV1, WorkInputOrdinal, WorkInputRelationship, WorkKind,
+    WorkQueuedV1, WorkQueuedV2, WorkState, WorkTransitionV1, WorkspaceId, WorkstationGeneration,
+    WorkstationId, resolve_event_version,
 };
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
@@ -304,6 +304,9 @@ enum StoredMessageAcceptedOriginV2 {
         device_id: DeviceId,
         client_message_id: ClientMessageId,
     },
+    Distribution {
+        receipt_id: JournalEventId,
+    },
     InboundDelivery {
         inbound_delivery_id: InboundDeliveryId,
     },
@@ -319,6 +322,9 @@ impl From<MessageAcceptedOriginV2> for StoredMessageAcceptedOriginV2 {
                 device_id,
                 client_message_id,
             },
+            MessageAcceptedOriginV2::Distribution { receipt_id } => {
+                Self::Distribution { receipt_id }
+            }
             MessageAcceptedOriginV2::InboundDelivery {
                 inbound_delivery_id,
             } => Self::InboundDelivery {
@@ -338,6 +344,9 @@ impl From<StoredMessageAcceptedOriginV2> for MessageAcceptedOriginV2 {
                 device_id,
                 client_message_id,
             },
+            StoredMessageAcceptedOriginV2::Distribution { receipt_id } => {
+                Self::Distribution { receipt_id }
+            }
             StoredMessageAcceptedOriginV2::InboundDelivery {
                 inbound_delivery_id,
             } => Self::InboundDelivery {
@@ -674,6 +683,31 @@ impl TryFrom<StoredWorkTransitionV1> for WorkTransitionV1 {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct StoredWorkDistributionCancellationV3 {
+    transition: StoredWorkTransitionV1,
+    control_id: String,
+}
+impl From<&WorkDistributionCancellationV3> for StoredWorkDistributionCancellationV3 {
+    fn from(v: &WorkDistributionCancellationV3) -> Self {
+        Self {
+            transition: (&v.transition).into(),
+            control_id: v.control_id.clone(),
+        }
+    }
+}
+impl TryFrom<StoredWorkDistributionCancellationV3> for WorkDistributionCancellationV3 {
+    type Error = SqliteAdapterError;
+    fn try_from(v: StoredWorkDistributionCancellationV3) -> Result<Self, Self::Error> {
+        crate::distribution_contracts::primitives::uuid(&v.control_id, Some(4))
+            .map_err(|_| inconsistent())?;
+        Ok(Self {
+            transition: v.transition.try_into()?,
+            control_id: v.control_id,
+        })
+    }
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredWorkCancellationV2 {
     transition: StoredWorkTransitionV1,
     inbound_delivery_id: InboundDeliveryId,
@@ -994,6 +1028,7 @@ enum StoredEventPayloadV1 {
     WorkQueuedV2(StoredWorkQueuedV2),
     WorkTransition(StoredWorkTransitionV1),
     WorkCancellationV2(StoredWorkCancellationV2),
+    WorkCancellationV3(StoredWorkDistributionCancellationV3),
     Model(StoredModelInvocationEventV1),
     Tool(StoredToolExecutionEventV1),
     Artifact(StoredArtifactRecordedV1),
@@ -1034,12 +1069,17 @@ pub(super) fn encode_event_payload(
         | JournalEventPayload::AssistantMessageCommitted(value) => {
             StoredEventPayloadV1::Message(value.into())
         }
-        JournalEventPayload::MessageAcceptedV2(value) => {
+        JournalEventPayload::MessageAcceptedV2(value)
+        | JournalEventPayload::MessageAcceptedV3(value) => {
             StoredEventPayloadV1::MessageV2(value.into())
         }
         JournalEventPayload::WorkQueued(value) => StoredEventPayloadV1::WorkQueued(value.into()),
         JournalEventPayload::WorkQueuedV2(value) => {
             StoredEventPayloadV1::WorkQueuedV2(value.into())
+        }
+        JournalEventPayload::WorkCancelRequestedV3(value)
+        | JournalEventPayload::WorkCancelledV3(value) => {
+            StoredEventPayloadV1::WorkCancellationV3(value.into())
         }
         JournalEventPayload::WorkCancelRequestedV2(value)
         | JournalEventPayload::WorkCancelledV2(value) => {
@@ -1092,6 +1132,7 @@ pub(super) fn encode_event_payload(
         StoredEventPayloadV1::WorkQueued(value) => to_json(value)?,
         StoredEventPayloadV1::WorkQueuedV2(value) => to_json(value)?,
         StoredEventPayloadV1::WorkTransition(value) => to_json(value)?,
+        StoredEventPayloadV1::WorkCancellationV3(value) => to_json(value)?,
         StoredEventPayloadV1::WorkCancellationV2(value) => to_json(value)?,
         StoredEventPayloadV1::Model(value) => to_json(value)?,
         StoredEventPayloadV1::Tool(value) => to_json(value)?,
@@ -1137,9 +1178,24 @@ pub(super) fn decode_event_payload(
                 from_json::<StoredMessageCommittedV1>(payload_json)?.try_into()?,
             )
         }
-        JournalEventKind::MessageAccepted => JournalEventPayload::MessageAcceptedV2(
-            from_json::<StoredMessageCommittedV2>(payload_json)?.try_into()?,
-        ),
+        JournalEventKind::MessageAccepted if event_version == 3 => {
+            JournalEventPayload::MessageAcceptedV3(
+                from_json::<StoredMessageCommittedV2>(payload_json)?.try_into()?,
+            )
+        }
+        JournalEventKind::MessageAccepted => {
+            let message: MessageCommittedV2 =
+                from_json::<StoredMessageCommittedV2>(payload_json)?.try_into()?;
+            // Historical V2 only supports native and channel provenance. User
+            // content is opaque; distribution origin was introduced in V3.
+            match message.origin {
+                MessageAcceptedOriginV2::Native { .. }
+                | MessageAcceptedOriginV2::InboundDelivery { .. } => {
+                    JournalEventPayload::MessageAcceptedV2(message)
+                }
+                MessageAcceptedOriginV2::Distribution { .. } => return Err(inconsistent()),
+            }
+        }
         JournalEventKind::WorkQueued if event_version == 1 => JournalEventPayload::WorkQueued(
             from_json::<StoredWorkQueuedV1>(payload_json)?.try_into()?,
         ),
@@ -1163,12 +1219,22 @@ pub(super) fn decode_event_payload(
                 from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
             )
         }
+        JournalEventKind::WorkCancelRequested if event_version == 3 => {
+            JournalEventPayload::WorkCancelRequestedV3(
+                from_json::<StoredWorkDistributionCancellationV3>(payload_json)?.try_into()?,
+            )
+        }
         JournalEventKind::WorkCancelRequested => JournalEventPayload::WorkCancelRequestedV2(
             from_json::<StoredWorkCancellationV2>(payload_json)?.try_into()?,
         ),
         JournalEventKind::WorkCancelled if event_version == 1 => {
             JournalEventPayload::WorkCancelled(
                 from_json::<StoredWorkTransitionV1>(payload_json)?.try_into()?,
+            )
+        }
+        JournalEventKind::WorkCancelled if event_version == 3 => {
+            JournalEventPayload::WorkCancelledV3(
+                from_json::<StoredWorkDistributionCancellationV3>(payload_json)?.try_into()?,
             )
         }
         JournalEventKind::WorkCancelled => JournalEventPayload::WorkCancelledV2(
@@ -1282,7 +1348,8 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         JournalEventPayload::MessageAccepted(value) => {
             value.role == MessageRole::User && value.validate_contract().is_ok()
         }
-        JournalEventPayload::MessageAcceptedV2(value) => value.validate_contract().is_ok(),
+        JournalEventPayload::MessageAcceptedV2(value)
+        | JournalEventPayload::MessageAcceptedV3(value) => value.validate_contract().is_ok(),
         JournalEventPayload::AssistantMessageCommitted(value) => {
             value.role == MessageRole::Assistant && value.validate_contract().is_ok()
         }
@@ -1310,6 +1377,12 @@ fn validate_payload_kind(payload: &JournalEventPayload) -> Result<(), SqliteAdap
         JournalEventPayload::WorkResumed(value) => value.to_state == WorkState::Running,
         JournalEventPayload::WorkCancelRequested(value) => {
             value.to_state == WorkState::CancelRequested
+        }
+        JournalEventPayload::WorkCancelRequestedV3(value) => {
+            value.transition.to_state == WorkState::CancelRequested
+        }
+        JournalEventPayload::WorkCancelledV3(value) => {
+            value.transition.to_state == WorkState::Cancelled
         }
         JournalEventPayload::WorkCancelRequestedV2(value) => {
             value.transition.to_state == WorkState::CancelRequested
@@ -1467,7 +1540,11 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
                 && intent.work_id == value.produced_by_work_id
                 && intent.actor == JournalActor::User(value.device_id)
         }
-        (JournalEventPayload::MessageAcceptedV2(value), JournalStreamId::Conversation(id)) => {
+        (
+            JournalEventPayload::MessageAcceptedV2(value)
+            | JournalEventPayload::MessageAcceptedV3(value),
+            JournalStreamId::Conversation(id),
+        ) => {
             id == value.conversation_id
                 && intent.craxii_id == value.craxii_id
                 && intent.conversation_id == Some(value.conversation_id)
@@ -1501,6 +1578,15 @@ fn validate_intent(intent: &JournalAppendIntent) -> Result<(), SqliteAdapterErro
                 && intent.correlation_id == value.correlation_id
                 && intent.causation_event_id == Some(value.trigger.input_event_id)
                 && intent.actor == JournalActor::Craxii(value.craxii_id)
+        }
+        (
+            JournalEventPayload::WorkCancelRequestedV3(value)
+            | JournalEventPayload::WorkCancelledV3(value),
+            JournalStreamId::Work(id),
+        ) => {
+            id == value.transition.work_id
+                && intent.work_id == Some(id)
+                && matches!(intent.actor, JournalActor::UserV2(_))
         }
         (
             JournalEventPayload::WorkCancelRequestedV2(value)
@@ -1759,7 +1845,7 @@ fn payload_field_names(kind: JournalEventKind, version: i64) -> &'static str {
         JournalEventKind::ConversationCreated => {
             "conversation_id,craxii_id,kind,lifecycle,next_work_ordinal,state_version,created_at"
         }
-        JournalEventKind::MessageAccepted if version == 2 => {
+        JournalEventKind::MessageAccepted if version >= 2 => {
             "message_id,craxii_id,conversation_id,role,content,content_sha256,author_user_id,origin,committed_at"
         }
         JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
@@ -1770,6 +1856,9 @@ fn payload_field_names(kind: JournalEventKind, version: i64) -> &'static str {
         }
         JournalEventKind::WorkQueued => {
             "work_id,craxii_id,conversation_id,conversation_work_ordinal,kind,priority,workspace_id,correlation_id,state_version,created_at,queued_at,trigger"
+        }
+        JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 3 => {
+            "transition,control_id"
         }
         JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 2 => {
             "transition,inbound_delivery_id"
@@ -1863,7 +1952,7 @@ fn payload_shape_is_valid(kind: JournalEventKind, version: i64, payload_json: &s
         JournalEventKind::ConversationCreated => {
             serde_json::from_str::<StoredConversationCreatedV1>(payload_json).is_ok()
         }
-        JournalEventKind::MessageAccepted if version == 2 => {
+        JournalEventKind::MessageAccepted if version >= 2 => {
             serde_json::from_str::<StoredMessageCommittedV2>(payload_json).is_ok()
         }
         JournalEventKind::MessageAccepted | JournalEventKind::AssistantMessageCommitted => {
@@ -1874,6 +1963,9 @@ fn payload_shape_is_valid(kind: JournalEventKind, version: i64, payload_json: &s
         }
         JournalEventKind::WorkQueued => {
             serde_json::from_str::<StoredWorkQueuedV1>(payload_json).is_ok()
+        }
+        JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 3 => {
+            serde_json::from_str::<StoredWorkDistributionCancellationV3>(payload_json).is_ok()
         }
         JournalEventKind::WorkCancelRequested | JournalEventKind::WorkCancelled if version == 2 => {
             serde_json::from_str::<StoredWorkCancellationV2>(payload_json).is_ok()
@@ -2509,7 +2601,7 @@ mod tests {
             JournalEventKind::RuntimeStarted,
             JournalEventKind::RuntimeRecoveryPerformed,
         ] {
-            for schema_version in [3, 4, 5, 6] {
+            for schema_version in [3, 4, 5, 6, 7] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {
@@ -2528,7 +2620,7 @@ mod tests {
                 assert!(validate_current_payload_kind(&payload).is_err());
             }
 
-            for schema_version in [2, 8] {
+            for schema_version in [2, 9] {
                 let mut payload = sample(kind);
                 match &mut payload {
                     JournalEventPayload::RuntimeStarted(value) => {
@@ -2718,6 +2810,108 @@ mod tests {
                 payload
             );
         }
+    }
+
+    fn origin_fixture(origin: MessageAcceptedOriginV2, text: &str) -> MessageCommittedV2 {
+        let content = MessageContent::try_new(vec![ContentBlock::text(text).unwrap()]).unwrap();
+        MessageCommittedV2 {
+            message_id: id(),
+            craxii_id: id(),
+            conversation_id: id(),
+            role: MessageRole::User,
+            content_sha256: content.content_sha256(),
+            content,
+            author_user_id: id(),
+            origin,
+            committed_at: at(),
+        }
+    }
+
+    #[test]
+    fn distribution_origin_preserves_ordinary_v2_content() {
+        for origin in [
+            MessageAcceptedOriginV2::Native {
+                device_id: id(),
+                client_message_id: id(),
+            },
+            MessageAcceptedOriginV2::InboundDelivery {
+                inbound_delivery_id: id(),
+            },
+        ] {
+            for text in [
+                "distribution",
+                "Explain probability distributions.",
+                "How does distributed computing work?",
+                "Describe the distribution of tasks across workers.",
+                r#"{"origin":{"type":"distribution","receipt_id":"user text"}}"#,
+            ] {
+                let payload = JournalEventPayload::MessageAcceptedV2(origin_fixture(origin, text));
+                let (json, digest) = encode_event_payload(&payload).unwrap();
+                assert_eq!(
+                    decode_event_payload("message.accepted", 2, &json, &digest.to_string())
+                        .unwrap(),
+                    payload
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn distribution_origin_requires_supported_typed_provenance() {
+        let payload = JournalEventPayload::MessageAcceptedV3(origin_fixture(
+            MessageAcceptedOriginV2::Distribution { receipt_id: id() },
+            "distribution",
+        ));
+        let (json, digest) = encode_event_payload(&payload).unwrap();
+        assert_eq!(
+            decode_event_payload("message.accepted", 3, &json, &digest.to_string()).unwrap(),
+            payload
+        );
+        assert!(decode_event_payload("message.accepted", 2, &json, &digest.to_string()).is_err());
+        let mut stored: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for origin in [
+            serde_json::json!({"type":"distribution"}),
+            serde_json::json!({"type":"distribution","receipt_id":id::<JournalEventId>(),"device_id":id::<DeviceId>()}),
+            serde_json::json!({"type":"native","device_id":id::<DeviceId>(),"client_message_id":id::<ClientMessageId>(),"receipt_id":id::<JournalEventId>()}),
+            serde_json::json!({"type":"unknown","receipt_id":id::<JournalEventId>()}),
+        ] {
+            stored["origin"] = origin;
+            let malformed = serde_json::to_string(&stored).unwrap();
+            let hash = Sha256Digest::hash_bytes(malformed.as_bytes());
+            for version in [2, 3] {
+                assert!(
+                    decode_event_payload(
+                        "message.accepted",
+                        version,
+                        &malformed,
+                        &hash.to_string()
+                    )
+                    .is_err()
+                );
+            }
+        }
+        // Neither the outer journal digest nor the content digest may be bypassed.
+        assert!(
+            decode_event_payload(
+                "message.accepted",
+                3,
+                &json,
+                &Sha256Digest::hash_bytes(b"wrong").to_string()
+            )
+            .is_err()
+        );
+        stored = serde_json::from_str(&json).unwrap();
+        stored["content"]["blocks"][0]["text"] = serde_json::json!("changed");
+        let changed = serde_json::to_string(&stored).unwrap();
+        assert!(
+            decode_event_payload(
+                "message.accepted",
+                3,
+                &changed,
+                &Sha256Digest::hash_bytes(changed.as_bytes()).to_string()
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -157,7 +157,7 @@ impl JournalActor {
         kind: &str,
         id: Option<&str>,
     ) -> Result<Self, JournalContractError> {
-        if event_version == 2
+        if matches!(event_version, 2 | 3)
             && matches!(
                 event_kind,
                 JournalEventKind::MessageAccepted
@@ -206,11 +206,8 @@ macro_rules! event_kinds {
             #[must_use]
             pub const fn current_version(self) -> i64 {
                 match self {
-                    Self::ConversationCreated
-                    | Self::MessageAccepted
-                    | Self::WorkQueued
-                    | Self::WorkCancelRequested
-                    | Self::WorkCancelled => 2,
+                    Self::ConversationCreated | Self::WorkQueued => 2,
+                    Self::MessageAccepted | Self::WorkCancelRequested | Self::WorkCancelled => 3,
                     _ => 1,
                 }
             }
@@ -271,6 +268,13 @@ pub fn resolve_event_version(event_type: &str, version: i64) -> JournalVersionRe
     match JournalEventKind::parse(event_type) {
         Ok(kind)
             if version == kind.current_version()
+                || (version == 2
+                    && matches!(
+                        kind,
+                        JournalEventKind::MessageAccepted
+                            | JournalEventKind::WorkCancelRequested
+                            | JournalEventKind::WorkCancelled
+                    ))
                 || (version == 1
                     && matches!(
                         kind,
@@ -377,6 +381,9 @@ pub enum MessageAcceptedOriginV2 {
     Native {
         device_id: DeviceId,
         client_message_id: ClientMessageId,
+    },
+    Distribution {
+        receipt_id: JournalEventId,
     },
     InboundDelivery {
         inbound_delivery_id: InboundDeliveryId,
@@ -492,6 +499,12 @@ pub struct WorkTransitionV1 {
 
 /// Channel-origin cancellation evidence keeps the existing transition and links its ingress.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkDistributionCancellationV3 {
+    pub transition: WorkTransitionV1,
+    pub control_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkCancellationV2 {
     pub transition: WorkTransitionV1,
     pub inbound_delivery_id: InboundDeliveryId,
@@ -599,6 +612,7 @@ pub enum JournalEventPayload {
     ConversationCreatedV2(ConversationCreatedV2),
     MessageAccepted(MessageCommittedV1),
     MessageAcceptedV2(MessageCommittedV2),
+    MessageAcceptedV3(MessageCommittedV2),
     WorkQueued(WorkQueuedV1),
     WorkQueuedV2(WorkQueuedV2),
     WorkStarted(WorkTransitionV1),
@@ -607,8 +621,10 @@ pub enum JournalEventPayload {
     WorkResumed(WorkTransitionV1),
     WorkCancelRequested(WorkTransitionV1),
     WorkCancelRequestedV2(WorkCancellationV2),
+    WorkCancelRequestedV3(WorkDistributionCancellationV3),
     WorkCancelled(WorkTransitionV1),
     WorkCancelledV2(WorkCancellationV2),
+    WorkCancelledV3(WorkDistributionCancellationV3),
     WorkCompleted(WorkTransitionV1),
     WorkFailed(WorkTransitionV1),
     WorkInterrupted(WorkTransitionV1),
@@ -637,7 +653,9 @@ impl JournalEventPayload {
             Self::ConversationCreated(_) => JournalEventKind::ConversationCreated,
             Self::ConversationCreatedV2(_) => JournalEventKind::ConversationCreated,
             Self::MessageAccepted(_) => JournalEventKind::MessageAccepted,
-            Self::MessageAcceptedV2(_) => JournalEventKind::MessageAccepted,
+            Self::MessageAcceptedV2(_) | Self::MessageAcceptedV3(_) => {
+                JournalEventKind::MessageAccepted
+            }
             Self::WorkQueued(_) => JournalEventKind::WorkQueued,
             Self::WorkQueuedV2(_) => JournalEventKind::WorkQueued,
             Self::WorkStarted(_) => JournalEventKind::WorkStarted,
@@ -645,9 +663,11 @@ impl JournalEventPayload {
             Self::WorkWaitingOnTool(_) => JournalEventKind::WorkWaitingOnTool,
             Self::WorkResumed(_) => JournalEventKind::WorkResumed,
             Self::WorkCancelRequested(_) => JournalEventKind::WorkCancelRequested,
-            Self::WorkCancelRequestedV2(_) => JournalEventKind::WorkCancelRequested,
+            Self::WorkCancelRequestedV2(_) | Self::WorkCancelRequestedV3(_) => {
+                JournalEventKind::WorkCancelRequested
+            }
             Self::WorkCancelled(_) => JournalEventKind::WorkCancelled,
-            Self::WorkCancelledV2(_) => JournalEventKind::WorkCancelled,
+            Self::WorkCancelledV2(_) | Self::WorkCancelledV3(_) => JournalEventKind::WorkCancelled,
             Self::WorkCompleted(_) => JournalEventKind::WorkCompleted,
             Self::WorkFailed(_) => JournalEventKind::WorkFailed,
             Self::WorkInterrupted(_) => JournalEventKind::WorkInterrupted,
@@ -674,6 +694,9 @@ impl JournalEventPayload {
     #[must_use]
     pub const fn version(&self) -> i64 {
         match self {
+            Self::MessageAcceptedV3(_)
+            | Self::WorkCancelRequestedV3(_)
+            | Self::WorkCancelledV3(_) => 3,
             Self::ConversationCreatedV2(_)
             | Self::MessageAcceptedV2(_)
             | Self::WorkQueuedV2(_)
@@ -781,10 +804,10 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), 28);
         assert_eq!(JournalEventKind::ConversationCreated.current_version(), 2);
-        assert_eq!(JournalEventKind::MessageAccepted.current_version(), 2);
+        assert_eq!(JournalEventKind::MessageAccepted.current_version(), 3);
         assert_eq!(JournalEventKind::WorkQueued.current_version(), 2);
-        assert_eq!(JournalEventKind::WorkCancelRequested.current_version(), 2);
-        assert_eq!(JournalEventKind::WorkCancelled.current_version(), 2);
+        assert_eq!(JournalEventKind::WorkCancelRequested.current_version(), 3);
+        assert_eq!(JournalEventKind::WorkCancelled.current_version(), 3);
         assert_eq!(JournalEventKind::WorkStarted.current_version(), 1);
         assert_eq!(
             resolve_event_version("message.accepted", 1),

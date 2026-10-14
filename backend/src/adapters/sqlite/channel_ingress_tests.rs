@@ -523,7 +523,10 @@ async fn create_runtime(fixture: &Fixture) -> RuntimeInstanceId {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: crate::domain::GitRevision::try_new("ch2-test").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 started_at: at(T1),
             }),
             event_id: JournalEventId::generate(),
@@ -3592,4 +3595,186 @@ fn generic_ingress_sources_remain_provider_neutral_and_outbound_free() {
             "found forbidden term: {forbidden}"
         );
     }
+}
+
+#[tokio::test]
+async fn distribution_populated_v7_upgrade_preserves_native_and_channel_history() {
+    use sqlx::{ConnectOptions, Connection};
+    let source = fixture().await;
+    source
+        .service()
+        .classify(source.event("v7-channel-event", "v7-channel-message", "distribution"))
+        .await
+        .unwrap();
+    // Native and channel formats are unchanged V2 facts. Construct a separate V7
+    // fixture with the seven published migrations and copy only legacy columns.
+    let mut source_connection = source.guard.runtime().acquire().await.unwrap();
+    let device = crate::domain::DeviceId::generate();
+    sqlx::query("INSERT INTO client_devices(device_id,user_id,display_name,token_hash,created_at) VALUES(?,?,'fixture',?,?)").bind(device.to_string()).bind(source.owner.user_id.to_string()).bind("a".repeat(64)).bind(T0).execute(&mut *source_connection).await.unwrap();
+    drop(source_connection);
+    let mut tx = super::transaction::WriteTransaction::begin(
+        source.guard.runtime(),
+        "native_upgrade_fixture",
+    )
+    .await
+    .unwrap();
+    let row=sqlx::query("SELECT c.next_work_ordinal,c.state_version,p.default_workspace_id,je.event_id FROM conversations c JOIN craxii_principals p ON p.craxii_id=c.craxii_id JOIN journal_events je ON je.conversation_id=c.conversation_id AND je.event_type='conversation.created' WHERE c.conversation_id=?").bind(source.owner.conversation_id.to_string()).fetch_one(tx.connection()).await.unwrap();
+    super::message_admission::admit_canonical_message(
+        &mut tx,
+        super::message_admission::CanonicalMessageAdmission {
+            topology: super::message_admission::CanonicalMessageTopology {
+                craxii_id: source.owner.craxii_id,
+                user_id: source.owner.user_id,
+                conversation_id: source.owner.conversation_id,
+                workspace_id: row
+                    .get::<String, _>("default_workspace_id")
+                    .parse()
+                    .unwrap(),
+                next_ordinal: crate::domain::ConversationWorkOrdinal::try_new(
+                    row.get("next_work_ordinal"),
+                )
+                .unwrap(),
+                conversation_version: crate::domain::ProjectionVersion::try_new(
+                    row.get("state_version"),
+                )
+                .unwrap(),
+                conversation_created_event_id: row.get::<String, _>("event_id").parse().unwrap(),
+            },
+            origin: super::message_admission::CanonicalMessageOrigin::Native {
+                device_id: device,
+                client_message_id: uuid::Uuid::now_v7().to_string().parse().unwrap(),
+            },
+            content: text("distribution"),
+            reply_binding_id: None,
+            admitted_at: at(T1),
+            candidates: super::message_admission::CanonicalMessageCandidates {
+                message_id: crate::domain::MessageId::generate(),
+                work_id: WorkId::generate(),
+                acceptance_event_id: JournalEventId::generate(),
+                queued_event_id: JournalEventId::generate(),
+            },
+        },
+        |_| Ok(()),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    source.store.verify_application_consistency().await.unwrap();
+    let target = TestRoot::new();
+    let directory = target.path().join("db");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let database = directory.join("craxii.sqlite3");
+    let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .foreign_keys(false)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("CREATE TEMP TABLE ch1_owner_seed(user_id TEXT NOT NULL)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR.iter().take(7).cloned().collect(),
+    )
+    .run(&mut connection)
+    .await
+    .unwrap();
+    let mut snapshots = Vec::new();
+    let mut src = source.guard.runtime().acquire().await.unwrap();
+    for table in super::schema::V7_PRODUCT_TABLES {
+        let columns = sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA table_info({table})")))
+            .fetch_all(&mut connection)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        let columns = columns.join(",");
+        let quoted = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM {table} ORDER BY {}",
+            columns
+                .split(',')
+                .map(|c| format!("quote({c})"))
+                .collect::<Vec<_>>()
+                .join("||','||"),
+            columns
+        )))
+        .fetch_all(&mut *src)
+        .await
+        .unwrap();
+        for values in &quoted {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO {table}({columns}) VALUES({values})"
+            )))
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        }
+        snapshots.push((*table, columns, quoted));
+    }
+    drop(src);
+    connection.close().await.unwrap();
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+    let upgraded = SqliteRuntimeGuard::start(target.path(), 2).await.unwrap();
+    let store = SqliteStateStore::new(upgraded.runtime().clone());
+    store.verify_application_consistency().await.unwrap();
+    store.verify_distribution_consistency().await.unwrap();
+    let mut connection = upgraded.runtime().acquire().await.unwrap();
+    for (table, columns, before) in snapshots {
+        let after = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT {} FROM {table} ORDER BY {}",
+            columns
+                .split(',')
+                .map(|c| format!("quote({c})"))
+                .collect::<Vec<_>>()
+                .join("||','||"),
+            columns
+        )))
+        .fetch_all(&mut *connection)
+        .await
+        .unwrap();
+        assert_eq!(before, after, "{table}");
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap(),
+        8
+    );
+    let historical = sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR.iter().take(7).cloned().collect(),
+    );
+    assert!(historical.run(&mut *connection).await.is_err());
+    drop(connection);
+    upgraded.shutdown().await;
+    let reopened = SqliteRuntimeGuard::start(target.path(), 2).await.unwrap();
+    let store = SqliteStateStore::new(reopened.runtime().clone());
+    store.verify_application_consistency().await.unwrap();
+    store.verify_distribution_consistency().await.unwrap();
+    let mut connection = reopened.runtime().acquire().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM messages WHERE role='user' AND content_json LIKE '%distribution%'"
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT (SELECT count(*) FROM model_invocations)+(SELECT count(*) FROM tool_executions)"
+        )
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap(),
+        0
+    );
+    drop(connection);
+    reopened.shutdown().await;
+    source.guard.shutdown().await;
 }

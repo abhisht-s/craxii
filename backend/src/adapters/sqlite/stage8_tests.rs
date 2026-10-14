@@ -185,7 +185,10 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -4826,7 +4829,10 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -4866,7 +4872,10 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),

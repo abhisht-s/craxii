@@ -13,3 +13,5 @@ pub mod protocol;
 pub mod test_failpoints;
 
 pub mod worker_auth;
+
+pub mod distribution;

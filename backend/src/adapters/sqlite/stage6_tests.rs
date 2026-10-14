@@ -399,7 +399,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 7);
+    assert_eq!(migrations.len(), 8);
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -479,7 +479,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
 }
 
 #[tokio::test]
-async fn empty_migration_metadata_database_migrates_forward_to_current_version_seven() {
+async fn empty_migration_metadata_database_migrates_forward_to_current_version_eight() {
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
@@ -531,14 +531,14 @@ async fn empty_migration_metadata_database_migrates_forward_to_current_version_s
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        7
+        8
     );
     drop(connection);
     migrated.shutdown().await;
 }
 
 #[tokio::test]
-async fn genuine_v6_database_migrates_to_v7_without_backfill_or_data_loss() {
+async fn genuine_v6_database_migrates_to_current_without_backfill_or_data_loss() {
     let root = TestRoot::new();
     let database_directory = root.path().join("db");
     fs::create_dir(&database_directory).unwrap();
@@ -599,7 +599,7 @@ async fn genuine_v6_database_migrates_to_v7_without_backfill_or_data_loss() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        7
+        8
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
@@ -1963,7 +1963,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (8, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (9, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

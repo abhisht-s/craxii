@@ -201,6 +201,10 @@ pub(super) enum CancellationJournalOrigin {
     Native {
         device_id: DeviceId,
     },
+    Distribution {
+        user_id: UserId,
+        control_id: uuid::Uuid,
+    },
     Channel {
         user_id: UserId,
         inbound_delivery_id: InboundDeliveryId,
@@ -253,6 +257,27 @@ pub(super) async fn apply_cancellation_decision(
                             JournalEventPayload::WorkCancelRequested(transition)
                         }
                         WorkState::Cancelled => JournalEventPayload::WorkCancelled(transition),
+                        _ => return Err(invalid()),
+                    },
+                ),
+                CancellationJournalOrigin::Distribution {
+                    user_id,
+                    control_id,
+                } => (
+                    JournalActor::UserV2(user_id),
+                    match next.state() {
+                        WorkState::CancelRequested => JournalEventPayload::WorkCancelRequestedV3(
+                            crate::domain::WorkDistributionCancellationV3 {
+                                transition,
+                                control_id: control_id.to_string(),
+                            },
+                        ),
+                        WorkState::Cancelled => JournalEventPayload::WorkCancelledV3(
+                            crate::domain::WorkDistributionCancellationV3 {
+                                transition,
+                                control_id: control_id.to_string(),
+                            },
+                        ),
                         _ => return Err(invalid()),
                     },
                 ),
