@@ -11,3 +11,5 @@ pub mod protocol;
 
 #[cfg(feature = "test-failpoints")]
 pub mod test_failpoints;
+
+pub mod worker_auth;

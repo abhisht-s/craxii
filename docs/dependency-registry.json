@@ -360,7 +360,7 @@
     {
       "package": "aws-lc-rs",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "dependency_kind": "dev",
+      "dependency_kind": "normal",
       "approved_compatible_requirement": "^1.18.1",
       "enabled_features": [],
       "default_features": true,

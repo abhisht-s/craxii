@@ -11,6 +11,7 @@ default = []
 test-failpoints = []
 
 [dependencies]
+aws-lc-rs = "1.18.1"
 base64 = "0.22.1"
 jsonschema = { version = "0.58.6", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "tracing", "ws"] }
@@ -32,6 +33,5 @@ url = "2.5"
 uuid = { version = "1.26", default-features = false, features = ["std", "v7"] }
 
 [dev-dependencies]
-aws-lc-rs = "1.18.1"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 tokio-tungstenite = { version = "0.29.0", default-features = false, features = ["connect"] }

@@ -1,7 +1,7 @@
 # `aws-lc-rs` dependency decision
 
 - Package: crates.io `aws-lc-rs`, compatible requirement `1.18.1`, resolved1.18.1.
-- Kind/layer: dev dependency; real local Ed25519 signing/verification goldens only.
+- Kind/layer: runtime dependency; worker Ed25519 key generation/signing and local verification goldens.
 - Owner: project owner; engineering selection under explicit autonomous
   implementation authorization,2026-10-13. Independent verification pending.
 - Need/alternatives: standard Rust has no Ed25519 implementation. Reuse the existing
@@ -17,8 +17,8 @@
   management API, account access, provider call or credential discovery. The public
   RFC8032 seed is test-only and cannot enter deployment trust/configuration.
 - Parsing/persistence:32-byte keys and64-byte signatures; exact purpose-separated
-  message bytes, no prehash. No runtime key/session generation or enrollment is added.
-- Removal: test implementation can change only while preserving standard and protocol
-  signature vectors; actual runtime authentication remains a separate integration.
+  message bytes, no prehash. Worker keys use OS-backed SystemRandom and PKCS8 in protected service storage.
+- Removal: signing implementation can change only while preserving standard and protocol
+  signature vectors; worker key recovery must preserve the enrolled public identity.
 - Evidence: focused tests independently sign/verify all five purposes and reject
   mutated context/input; consolidated supply-chain checks required before handoff.
