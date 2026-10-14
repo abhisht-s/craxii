@@ -399,7 +399,7 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 8);
+    assert_eq!(migrations.len(), 9);
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -450,7 +450,16 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
         .await
         .unwrap();
         for foreign_key in foreign_keys {
-            assert_eq!(foreign_key.get::<String, _>("on_update"), "RESTRICT");
+            let deferred_terminal_reference = *table == "distribution_results"
+                && foreign_key.get::<String, _>("table") == "work_items";
+            assert_eq!(
+                foreign_key.get::<String, _>("on_update"),
+                if deferred_terminal_reference {
+                    "NO ACTION"
+                } else {
+                    "RESTRICT"
+                }
+            );
             assert_eq!(foreign_key.get::<String, _>("on_delete"), "RESTRICT");
             if *table == "work_items" {
                 let from = foreign_key.get::<String, _>("from");
@@ -1963,7 +1972,7 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (9, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (10, 'future migration', 1, zeroblob(48), 0)",
     )
     .execute(&mut *connection)
     .await

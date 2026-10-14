@@ -555,6 +555,23 @@ impl AgentLoop {
                     .await;
             }
         };
+        match self
+            .state_store
+            .completion_content_supported(work_item.work_id(), content.clone())
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                return self
+                    .fail_snapshot(
+                        attempt.work,
+                        work_item.correlation_id(),
+                        WorkFailureReason::InvalidModelOutput(ModelOutputFailure::ProviderFailed),
+                    )
+                    .await;
+            }
+            Err(_) => return WorkRunnerExit::Abnormal,
+        }
         let committed_at = match self.wall_now() {
             Ok(value) => value,
             Err(_) => return WorkRunnerExit::Abnormal,

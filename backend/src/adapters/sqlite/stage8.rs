@@ -147,6 +147,13 @@ async fn terminalize_owned_work(
     if request.event.causation_event_id.map(|id| id.to_string()) != latest {
         return Err(conflict());
     }
+    super::distribution_results::prepare(
+        &mut transaction,
+        &request.work_next,
+        request.event.event_id,
+        request.terminal_at,
+    )
+    .await?;
     guarded_work_update(
         &mut transaction,
         &expected,
@@ -199,6 +206,41 @@ async fn commit_assistant_completion(
     let expected = expected_snapshot(request.expected_work)?;
     let mut transaction =
         WriteTransaction::begin(&store.runtime, "commit_assistant_completion").await?;
+    if let Some(original) = sqlx::query(
+        "SELECT e.*,a.journal_offset AS assistant_offset,t.journal_offset AS terminal_offset, \
+         a.causation_event_id AS model_cause,a.correlation_id AS original_correlation, \
+         m.craxii_id AS original_craxii_id,m.conversation_id AS original_conversation_id, \
+         m.content_json AS original_content_json, \
+         json_extract(t.payload_json,'$.expected_runtime_owner') AS original_runtime, \
+         json_extract(t.payload_json,'$.expected_state_version') AS original_prior_version \
+         FROM distribution_results e JOIN messages m ON m.message_id=e.assistant_message_id \
+         JOIN journal_events a ON a.work_id=e.local_work_id AND a.event_type='assistant.message_committed' \
+         JOIN journal_events t ON t.event_id=e.terminal_event_id WHERE e.local_work_id=?",
+    ).bind(request.expected_work.work_id.to_string()).fetch_optional(transaction.connection()).await.map_err(SqliteAdapterError::from_sqlx)? {
+        let original_content=super::codec::decode_message_content(&original.try_get::<String,_>("original_content_json")?,&original.try_get::<String,_>("native_content_sha256")?)?;
+        if original.try_get::<String,_>("original_craxii_id")?!=request.assistant_message.craxii_id().to_string()
+            || original.try_get::<String,_>("original_conversation_id")?!=request.assistant_message.conversation_id().to_string()
+            || original_content!=*request.assistant_message.content()
+            || original.try_get::<String,_>("original_runtime")?!=runtime_id.to_string()
+            || original.try_get::<String,_>("original_correlation")?!=request.assistant_event.correlation_id.to_string()
+            || request.assistant_event.correlation_id!=request.completion_event.correlation_id
+            || original.try_get::<i64,_>("original_prior_version")?!=request.expected_work.version.get()
+            || original.try_get::<String,_>("terminal_reason")?!=super::distribution_results::reason(&request.work_next)?
+            || original.try_get::<String,_>("work_state")?!="completed"
+            || original.try_get::<String,_>("assistant_message_id")?!=request.assistant_message.message_id().to_string()
+            || original.try_get::<String,_>("native_content_sha256")?!=request.assistant_message.content_sha256().to_string()
+            || original.try_get::<i64,_>("state_version")?!=request.work_next.projection_version().get()
+            || original.try_get::<String,_>("terminal_at")?!=request.assistant_message.committed_at().to_string()
+            || original.try_get::<String,_>("model_cause")?!=request.assistant_event.causation_event_id.ok_or_else(invalid)?.to_string()
+            || !request.deliveries.is_empty() {return Err(conflict())}
+        let proven:i64=sqlx::query_scalar("SELECT count(*) FROM journal_events WHERE event_id=? AND work_id=? AND event_type='model.invocation_completed' AND json_extract(payload_json,'$.model_invocation_id')=?")
+            .bind(request.assistant_event.causation_event_id.ok_or_else(invalid)?.to_string()).bind(request.expected_work.work_id.to_string()).bind(request.expected_model.model_invocation_id.to_string()).fetch_one(transaction.connection()).await.map_err(SqliteAdapterError::from_sqlx)?;
+        if proven!=1{return Err(conflict())}
+        let first=crate::domain::JournalOffset::try_new(original.try_get("assistant_offset")?).map_err(|_|corrupt())?;
+        let last=crate::domain::JournalOffset::try_new(original.try_get("terminal_offset")?).map_err(|_|corrupt())?;
+        transaction.commit().await?;
+        return Ok(CommitReceipt{committed_version:Some(request.work_next.projection_version()),events:Some(CommittedEventRange{first,last})});
+    }
     let context = load_work_context(&mut transaction, request.expected_work).await?;
     if request.assistant_message.craxii_id() != context.craxii_id
         || request.assistant_message.conversation_id() != context.conversation_id
@@ -383,6 +425,13 @@ async fn commit_assistant_completion(
             super::delivery::insert_delivery(&mut transaction, delivery).await?;
         }
     }
+    super::distribution_results::prepare(
+        &mut transaction,
+        &request.work_next,
+        request.completion_event.event_id,
+        request.assistant_message.committed_at(),
+    )
+    .await?;
     guarded_work_update(
         &mut transaction,
         &expected,
@@ -1948,6 +1997,13 @@ async fn finish_model(
         return Err(conflict());
     }
     let expected = expected_snapshot(request.expected_work)?;
+    super::distribution_results::prepare(
+        &mut transaction,
+        &request.work_next,
+        request.work_event.event_id,
+        request.outcome.completed_at,
+    )
+    .await?;
     guarded_work_update(
         &mut transaction,
         &expected,
@@ -2695,6 +2751,13 @@ async fn finish_tool(
         return Err(conflict());
     }
     let expected = expected_snapshot(request.expected_work)?;
+    super::distribution_results::prepare(
+        &mut transaction,
+        &request.work_next,
+        request.work_event.event_id,
+        outcome.completed_at,
+    )
+    .await?;
     guarded_work_update(
         &mut transaction,
         &expected,
@@ -3767,6 +3830,24 @@ impl ModelStateStore for SqliteStateStore {
 }
 
 impl CompletionStateStore for SqliteStateStore {
+    fn completion_content_supported(
+        &self,
+        work: crate::domain::WorkId,
+        content: crate::domain::MessageContent,
+    ) -> StateStoreFuture<'_, bool> {
+        Box::pin(async move {
+            let n: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM distribution_receipts WHERE local_work_id=?",
+            )
+            .bind(work.to_string())
+            .fetch_one(&self.runtime.inner.pool)
+            .await
+            .map_err(SqliteAdapterError::from_sqlx)
+            .map_err(map_port_error)?;
+            Ok(n == 0 || content.blocks().len() <= 64)
+        })
+    }
+
     fn commit_assistant_completion(
         &self,
         request: CommitAssistantCompletionRequest,

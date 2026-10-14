@@ -154,7 +154,12 @@ impl WorkerClient {
         let mut request = if let Some(body) = body {
             let bytes = canonical_bytes(body).map_err(|_| AuthError::InvalidContext)?;
             if bytes.len()
-                > if path.starts_with("/v1/worker/enrollment/") {
+                > if path == "/v1/worker/results"
+                    || path == "/v1/worker/requests/challenge"
+                        && body["request"]["type"] == "result_export"
+                {
+                    557056
+                } else if path.starts_with("/v1/worker/enrollment/") {
                     65536
                 } else {
                     16384
@@ -208,6 +213,8 @@ impl WorkerClient {
                 Some("session_expired" | "unauthenticated") => AuthError::SessionExpired,
                 Some("revoked_authority") => AuthError::Revoked,
                 Some("stale_generation") => AuthError::Stale,
+                Some("reconciliation_required") => AuthError::ResultMissing,
+                Some("result_conflict") => AuthError::ResultConflict,
                 _ if status.is_server_error() => AuthError::Unavailable,
                 _ => AuthError::InvalidContext,
             });
@@ -688,43 +695,9 @@ impl WorkerClient {
         let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":kind,"request_id":id,"environment":"development","authority":authority,"body":body});
         decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
             .map_err(|_| AuthError::InvalidContext)?;
-        let signed = self
-            .session_exchange(
-                "/v1/worker/requests/challenge",
-                &json!({"contract_version":1,"request":request}),
-            )
+        let proof = self
+            .sensitive_proof(&request, &authority, &id, kind)
             .await?;
-        let expected_digest = crate::distribution_contracts::canonical::digest_material(
-            crate::distribution_contracts::canonical::DigestDomain::AuthenticatedRequest,
-            &request,
-        )
-        .map_err(|_| AuthError::InvalidContext)?;
-        if signed["purpose"] != "sensitive_request"
-            || signed["signature_version"] != 1
-            || signed["audience"] != AUDIENCE
-            || signed["environment"] != "development"
-            || signed["session_id"] != authority["session_id"]
-            || signed["installation_id"] != authority["installation_id"]
-            || signed["generation"] != authority["generation"]
-            || signed["key_id"] != self.key.key_id()
-            || signed["revocation_epoch"] != self.state.highest_epoch
-            || signed["request_id"] != id
-            || signed["operation_type"] != kind
-            || signed["request_digest"] != expected_digest
-        {
-            return Err(AuthError::InvalidContext);
-        }
-        let proof = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"sensitive_request_proof","request_id":id,"environment":"development","authority":authority,"body":{"signed":signed,"proof_signature":self.key.sign(SignaturePurpose::SensitiveRequest,&signed)?}});
-        decode_message(&canonical_bytes(&proof).map_err(|_| AuthError::InvalidContext)?)
-            .map_err(|_| AuthError::InvalidContext)?;
-        let issued = timestamp_micros(field(&signed, "issued_at")?)
-            .map_err(|_| AuthError::InvalidContext)?;
-        let expiry = timestamp_micros(field(&signed, "expires_at")?)
-            .map_err(|_| AuthError::InvalidContext)?;
-        let now = crate::distribution::now().map_err(|_| AuthError::InvalidContext)?;
-        if issued > now || expiry <= now || expiry - issued > 60_000_000 {
-            return Err(AuthError::InvalidContext);
-        }
         let response = self
             .session_exchange(
                 if control {
@@ -770,6 +743,103 @@ impl WorkerClient {
         }
         Ok(response)
     }
+    async fn sensitive_proof(
+        &mut self,
+        request: &Value,
+        authority: &Value,
+        id: &str,
+        kind: &str,
+    ) -> AuthResult<Value> {
+        let signed = self
+            .session_exchange(
+                "/v1/worker/requests/challenge",
+                &json!({"contract_version":1,"request":request}),
+            )
+            .await?;
+        let expected_digest = crate::distribution_contracts::canonical::digest_material(
+            crate::distribution_contracts::canonical::DigestDomain::AuthenticatedRequest,
+            request,
+        )
+        .map_err(|_| AuthError::InvalidContext)?;
+        if signed["purpose"] != "sensitive_request"
+            || signed["signature_version"] != 1
+            || signed["audience"] != AUDIENCE
+            || signed["environment"] != "development"
+            || signed["session_id"] != authority["session_id"]
+            || signed["installation_id"] != authority["installation_id"]
+            || signed["generation"] != authority["generation"]
+            || signed["key_id"] != self.key.key_id()
+            || signed["revocation_epoch"] != self.state.highest_epoch
+            || signed["request_id"] != id
+            || signed["operation_type"] != kind
+            || signed["request_digest"] != expected_digest
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let proof = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"sensitive_request_proof","request_id":id,"environment":"development","authority":authority,"body":{"signed":signed,"proof_signature":self.key.sign(SignaturePurpose::SensitiveRequest,&signed)?}});
+        decode_message(&canonical_bytes(&proof).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let issued = timestamp_micros(field(&signed, "issued_at")?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let expiry = timestamp_micros(field(&signed, "expires_at")?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let now = crate::distribution::now().map_err(|_| AuthError::InvalidContext)?;
+        if issued > now || expiry <= now || expiry - issued > 60_000_000 {
+            return Err(AuthError::InvalidContext);
+        }
+        Ok(proof)
+    }
+    pub async fn query_result(&mut self, body: &Value) -> AuthResult<Value> {
+        let s = &body["snapshot"];
+        let query = json!({"work_id":s["work_id"],"export_id":s["export_id"],"export_revision":"1","export_digest":body["export_digest"]});
+        let authority = self.current_authority()?;
+        let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_query","request_id":id,"environment":"development","authority":authority,"body":query});
+        let response = self
+            .session_exchange("/v1/worker/result-status", &request)
+            .await?;
+        self.validate_result_acceptance(&response, &authority, &id, body)?;
+        Ok(response)
+    }
+    pub async fn send_result(&mut self, body: &Value) -> AuthResult<Value> {
+        let authority = self.current_authority()?;
+        let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_export","request_id":id,"environment":"development","authority":authority,"body":body});
+        decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let proof = self
+            .sensitive_proof(&request, &authority, &id, "result_export")
+            .await?;
+        let response = self
+            .session_exchange(
+                "/v1/worker/results",
+                &json!({"contract_version":1,"request":request,"proof":proof}),
+            )
+            .await?;
+        self.validate_result_acceptance(&response, &authority, &id, body)?;
+        Ok(response)
+    }
+    fn validate_result_acceptance(
+        &self,
+        r: &Value,
+        a: &Value,
+        id: &str,
+        b: &Value,
+    ) -> AuthResult<()> {
+        decode_message(&canonical_bytes(r).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        if r["type"] != "result_acceptance"
+            || r["authority"] != *a
+            || r["request_id"] != id
+            || r["body"]["work_id"] != b["snapshot"]["work_id"]
+            || r["body"]["export_id"] != b["snapshot"]["export_id"]
+            || r["body"]["export_revision"] != "1"
+            || r["body"]["export_digest"] != b["export_digest"]
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        Ok(())
+    }
 }
 
 fn scope_policy(value: &Value) -> bool {
@@ -778,4 +848,11 @@ fn scope_policy(value: &Value) -> bool {
     };
     scopes == &vec![json!("status")]
         || scopes == &vec![json!("status"), json!("receipt_commit"), json!("cancel")]
+        || scopes
+            == &vec![
+                json!("status"),
+                json!("receipt_commit"),
+                json!("cancel"),
+                json!("result_export"),
+            ]
 }

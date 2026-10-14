@@ -61,7 +61,6 @@ async fn main() {
             .await
             .map_err(|e| {
                 eprintln!("distribution_fixture_startup_{e:?}");
-                ()
             })?;
         let mut client = WorkerClient::isolated_tls_fixture(
             text("origin")?,
@@ -93,7 +92,6 @@ async fn main() {
         } else {
             runtime.reconnect(&mut client).await.map_err(|e| {
                 eprintln!("distribution_fixture_reconnect_{e:?}");
-                ()
             })?;
         }
         if input["action"] == "commit" {
@@ -106,6 +104,23 @@ async fn main() {
                 .map_err(|_| ())?;
             std::io::stdout().flush().map_err(|_| ())?;
             std::future::pending::<()>().await;
+        } else if input["action"] == "terminal" || input["action"] == "terminal_commit" {
+            runtime
+                .isolated_terminal_once(&mut client)
+                .await
+                .map_err(|e| {
+                    eprintln!("distribution_fixture_terminal_{e:?}");
+                })?;
+            if input["action"] == "terminal_commit" {
+                std::io::stdout()
+                    .write_all(b"distribution_terminal_commit\n")
+                    .map_err(|_| ())?;
+                std::io::stdout().flush().map_err(|_| ())?;
+                std::future::pending::<()>().await;
+            }
+            runtime.transfer_pending(&mut client).await.map_err(|e| {
+                eprintln!("distribution_fixture_export_{e:?}");
+            })?;
         } else if input["action"] != "enroll" {
             runtime
                 .transfer_pending(&mut client)
@@ -135,7 +150,7 @@ async fn main() {
             .await
             .map_err(|_| ())?
             .len();
-        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":false});
+        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":false,"exports":runtime.export_observation().await.map_err(|_|())?});
         runtime.shutdown().await.map_err(|_| ())?;
         Ok::<Value, ()>(result)
     };

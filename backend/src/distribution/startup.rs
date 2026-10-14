@@ -71,6 +71,7 @@ pub struct DistributionRuntime {
     runtime: RuntimeBootstrapReceipt,
     config: DistributionConfig,
     pub boot_id: String,
+    in_flight_exports: std::sync::atomic::AtomicUsize,
 }
 impl DistributionRuntime {
     pub async fn open(config: DistributionConfig) -> DistributionResult<Self> {
@@ -142,7 +143,15 @@ impl DistributionRuntime {
             .verify_application_consistency()
             .await
             .map_err(|_| DistributionError::Journal)?;
+        store
+            .reconcile_distribution_results()
+            .await
+            .map_err(|_| DistributionError::Reconciliation)?;
         store.verify_distribution_consistency().await?;
+        store
+            .verify_distribution_results()
+            .await
+            .map_err(|_| DistributionError::Reconciliation)?;
         let refs = store
             .load_referenced_artifacts()
             .await
@@ -172,7 +181,7 @@ impl DistributionRuntime {
             package_version: PackageVersion::try_new(build.package_version())
                 .map_err(|_| invalid())?,
             git_revision: GitRevision::try_new(build.git_revision()).map_err(|_| invalid())?,
-            schema_version: SchemaVersion::try_new(8).map_err(|_| invalid())?,
+            schema_version: SchemaVersion::try_new(9).map_err(|_| invalid())?,
             started_at: timestamp()?,
         });
         let runtime = bootstrap_runtime(
@@ -187,7 +196,15 @@ impl DistributionRuntime {
             .verify_application_consistency()
             .await
             .map_err(|_| DistributionError::Journal)?;
+        store
+            .reconcile_distribution_results()
+            .await
+            .map_err(|_| DistributionError::Reconciliation)?;
         store.verify_distribution_consistency().await?;
+        store
+            .verify_distribution_results()
+            .await
+            .map_err(|_| DistributionError::Reconciliation)?;
         // No AgentLoop, model/tool provider, executable scheduler or legacy delivery worker.
         Ok(Self {
             store,
@@ -195,10 +212,11 @@ impl DistributionRuntime {
             runtime,
             config,
             boot_id,
+            in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
         })
     }
     pub fn hello(&self) -> Value {
-        json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"8","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}})
+        json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"9","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}})
     }
     pub async fn reconnect(&self, client: &mut WorkerClient) -> Result<(), AuthError> {
         client.negotiate(&self.hello(), None).await?;
@@ -234,7 +252,56 @@ impl DistributionRuntime {
                 .await
                 .map_err(|_| AuthError::Unavailable)?;
         }
+        for body in self
+            .store
+            .pending_distribution_results()
+            .await
+            .map_err(|_| AuthError::Unavailable)?
+        {
+            self.in_flight_exports
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let result = async {
+                let ack = match client.query_result(&body).await {
+                    Ok(ack) => ack,
+                    Err(AuthError::ResultMissing) => client.send_result(&body).await?,
+                    Err(e) => return Err(e),
+                };
+                self.store
+                    .acknowledge_distribution_result(&ack["body"])
+                    .await
+                    .map_err(|_| AuthError::Unavailable)
+            }
+            .await;
+            self.in_flight_exports
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if let Err(error) = result {
+                self.store
+                    .record_distribution_result_transfer_failure(
+                        body["snapshot"]["export_id"]
+                            .as_str()
+                            .ok_or(AuthError::InvalidContext)?,
+                        matches!(error, AuthError::Transport | AuthError::Unavailable),
+                        error == AuthError::ResultConflict,
+                    )
+                    .await
+                    .map_err(|_| AuthError::Unavailable)?;
+                return Err(error);
+            }
+        }
         Ok(())
+    }
+    pub async fn export_observation(&self) -> DistributionResult<Value> {
+        let mut observation = self.store.distribution_observation().await?;
+        let in_flight = self
+            .in_flight_exports
+            .load(std::sync::atomic::Ordering::SeqCst);
+        observation["in_flight_export_count"] = json!(in_flight.to_string());
+        observation["export_drained"] = json!(
+            in_flight == 0
+                && observation["pending_export_count"] == "0"
+                && observation["unresolved_export_count"] == "0"
+        );
+        Ok(observation)
     }
     async fn transfer(
         &self,
@@ -324,6 +391,53 @@ impl DistributionRuntime {
             }
         }
         Err(AuthError::Unavailable)
+    }
+    #[cfg(all(feature = "test-failpoints", debug_assertions))]
+    pub async fn isolated_terminal_once(&self, client: &mut WorkerClient) -> Result<(), AuthError> {
+        let items = client
+            .poll(
+                &self.boot_id,
+                &self.config.power_operation_id,
+                &self.config.profile_public_key,
+            )
+            .await?;
+        let d = items
+            .iter()
+            .find(|d| d.message["type"] == "work_delivery")
+            .ok_or(AuthError::Unavailable)?;
+        d.verify_profile().map_err(|_| AuthError::InvalidContext)?;
+        if d.profile
+            .as_ref()
+            .is_none_or(|p| p["body"]["profile"]["deterministic_program_id"] != "terminal_text_v1")
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let receipt = self
+            .store
+            .admit_distribution(d)
+            .await
+            .map_err(|_| AuthError::InvalidContext)?;
+        self.transfer(client, receipt).await?;
+        let claimed = self
+            .store
+            .isolated_claim_distribution(
+                crate::ports::state_store::ClaimNextWorkRequest {
+                    runtime_id: self.runtime.runtime_instance_id,
+                    claimed_at: timestamp().map_err(|_| AuthError::Unavailable)?,
+                    event_id: JournalEventId::generate(),
+                },
+                d,
+            )
+            .await
+            .map_err(|_| AuthError::InvalidContext)?
+            .ok_or(AuthError::InvalidContext)?;
+        super::fixture::complete(&self.store, &self.config, claimed)
+            .await
+            .map_err(|e| {
+                eprintln!("distribution_fixture_{e}");
+                AuthError::InvalidContext
+            })?;
+        Ok(())
     }
     #[cfg(all(feature = "test-failpoints", debug_assertions))]
     pub async fn isolated_crash_close(self) {

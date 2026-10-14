@@ -1020,6 +1020,15 @@ pub trait ToolStateStore: Send + Sync {
 
 /// Stage 17 terminal assistant completion capability.
 pub trait CompletionStateStore: Send + Sync {
+    /// Native content remains compatible; a distributed result must also fit the frozen wire.
+    fn completion_content_supported(
+        &self,
+        _work: crate::domain::WorkId,
+        _content: crate::domain::MessageContent,
+    ) -> StateStoreFuture<'_, bool> {
+        Box::pin(async { Ok(true) })
+    }
+
     fn commit_assistant_completion(
         &self,
         request: CommitAssistantCompletionRequest,

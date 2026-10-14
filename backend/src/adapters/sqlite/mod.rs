@@ -8,6 +8,7 @@ mod codec;
 mod context_source_store;
 mod delivery;
 mod distribution;
+mod distribution_results;
 mod error;
 mod evidence_query;
 #[allow(dead_code)] // Stage 7 owns the primitive; later stages compose additional emitters.

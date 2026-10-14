@@ -1,4 +1,6 @@
 //! Receipt-only outbound distribution. No scheduler, model provider or tool runner is composed.
+#[cfg(all(feature = "test-failpoints", debug_assertions))]
+pub(crate) mod fixture;
 pub mod startup;
 pub mod transport;
 use crate::distribution_contracts::{
@@ -75,12 +77,15 @@ impl ValidatedDelivery {
         let p = &profile["body"]["profile"];
         let a = &delivery["authority"];
         let m = &body["material"];
-        let expected=sha256(&canonical_bytes(&json!({"program":"receipt_only_v1","tools":[],"model_dispatch":false,"tool_dispatch":false})).map_err(|_|invalid())?);
+        let program = text(p, "deterministic_program_id")?;
+        let terminal = cfg!(all(feature = "test-failpoints", debug_assertions))
+            && program == "terminal_text_v1";
+        let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":[],"model_dispatch":terminal,"tool_dispatch":false})).map_err(|_|invalid())?);
         if profile["authority"] != *a
             || p["kind"] != "development_fixture"
             || p["environment"] != "development"
             || p["audience"] != "craxii.worker:development"
-            || p["deterministic_program_id"] != "receipt_only_v1"
+            || (program != "receipt_only_v1" && !terminal)
             || p["allowed_tool_ids"] != json!([])
             || p["max_tool_duration_ms"] != "1"
             || p["config_digest"] != expected

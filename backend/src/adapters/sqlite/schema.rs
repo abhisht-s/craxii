@@ -3,7 +3,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 8;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 9;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
 pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
@@ -23,6 +23,8 @@ pub(super) const DISTRIBUTION_RECEIPTS_MIGRATION_VERSION: i64 = 8;
 pub(super) const DISTRIBUTION_RECEIPTS_MIGRATION_DESCRIPTION: &str = "distribution receipts";
 pub(super) const DURABLE_CHANNEL_DELIVERY_MIGRATION_VERSION: i64 = 7;
 pub(super) const DURABLE_CHANNEL_DELIVERY_MIGRATION_DESCRIPTION: &str = "durable channel delivery";
+pub(super) const DISTRIBUTION_RESULTS_MIGRATION_VERSION: i64 = 9;
+pub(super) const DISTRIBUTION_RESULTS_MIGRATION_DESCRIPTION: &str = "distribution results";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -483,6 +485,16 @@ pub(super) async fn classify_schema(
         }
         Some(DISTRIBUTION_RECEIPTS_MIGRATION_VERSION) => {
             if migrations.len() != 8
+                || !has_exact_objects(&objects, V8_PRODUCT_TABLES, V8_PRODUCT_INDEXES)
+                || !schema_matches(connection, V8_PRODUCT_TABLES, V8_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::Current)
+            }
+        }
+        Some(DISTRIBUTION_RESULTS_MIGRATION_VERSION) => {
+            if migrations.len() != 9
                 || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
                 || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
             {
@@ -564,6 +576,10 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
             DISTRIBUTION_RECEIPTS_MIGRATION_VERSION,
             DISTRIBUTION_RECEIPTS_MIGRATION_DESCRIPTION,
         ),
+        (
+            DISTRIBUTION_RESULTS_MIGRATION_VERSION,
+            DISTRIBUTION_RESULTS_MIGRATION_DESCRIPTION,
+        ),
     ];
     if embedded_contracts.iter().any(|(version, description)| {
         !MIGRATOR.iter().any(|migration| {
@@ -599,6 +615,16 @@ fn has_exact_objects(
     let expected = std::iter::once(("_sqlx_migrations", "table"))
         .chain(product_tables.iter().copied().map(|name| (name, "table")))
         .chain(product_indexes.iter().copied().map(|name| (name, "index")))
+        .chain(
+            if product_tables == PRODUCT_TABLES {
+                PRODUCT_TRIGGERS
+            } else {
+                &[]
+            }
+            .iter()
+            .copied()
+            .map(|name| (name, "trigger")),
+        )
         .map(|(name, object_type)| (name.to_owned(), object_type.to_owned()))
         .collect::<std::collections::BTreeSet<_>>();
     objects
@@ -924,6 +950,7 @@ pub(super) const PRODUCT_TABLES: &[&str] = &[
     "distribution_conversations",
     "distribution_owners",
     "distribution_receipts",
+    "distribution_results",
     "external_identities",
     "inbound_deliveries",
     "journal_events",
@@ -942,6 +969,106 @@ pub(super) const PRODUCT_TABLES: &[&str] = &[
 ];
 
 pub(super) const PRODUCT_INDEXES: &[&str] = &[
+    "ix_artifacts_content",
+    "ix_artifacts_producer_kind_id",
+    "ix_artifacts_producing_work",
+    "ix_artifacts_storage_key",
+    "ix_client_devices_user_id",
+    "ix_context_manifest_sources_artifact",
+    "ix_context_manifest_sources_event",
+    "ix_context_manifests_work_created",
+    "ix_distribution_controls_pending",
+    "ix_distribution_controls_target",
+    "ix_distribution_receipts_pending",
+    "ix_distribution_results_pending",
+    "ix_journal_events_conversation_offset",
+    "ix_journal_events_work_offset",
+    "ix_messages_author_user_id",
+    "ix_messages_conversation",
+    "ix_model_invocations_context_attempt",
+    "ix_model_invocations_runtime_nonterminal",
+    "ix_outbound_deliveries_due",
+    "ix_outbound_deliveries_state_updated",
+    "ix_outbound_delivery_attempts_runtime_open",
+    "ix_runtime_instances_craxii_state",
+    "ix_tool_executions_runtime_nonterminal",
+    "ix_users_craxii_id",
+    "ix_work_items_nonterminal_by_runtime",
+    "ix_work_items_queued_fifo",
+    "ix_workspaces_craxii_id",
+    "ix_workstations_craxii_id",
+    "ux_client_devices_token_hash",
+    "ux_context_manifests_logical_invocation",
+    "ux_conversation_bindings_active_destination",
+    "ux_conversations_craxii_owner_kind",
+    "ux_external_identities_active_subject",
+    "ux_inbound_deliveries_account_event",
+    "ux_inbound_deliveries_account_message",
+    "ux_journal_events_event_id",
+    "ux_journal_events_stream_sequence",
+    "ux_messages_client_identity",
+    "ux_messages_distribution_receipt",
+    "ux_messages_inbound_delivery",
+    "ux_messages_produced_by_work",
+    "ux_model_invocations_logical_attempt",
+    "ux_model_invocations_one_nonterminal_per_work",
+    "ux_model_invocations_retry_of",
+    "ux_model_invocations_work_step_attempt",
+    "ux_outbound_deliveries_account_provider_message",
+    "ux_outbound_deliveries_assistant_source_part",
+    "ux_outbound_deliveries_control_source_part",
+    "ux_outbound_delivery_attempts_delivery_number",
+    "ux_outbound_delivery_attempts_one_open",
+    "ux_tool_executions_execution_id",
+    "ux_tool_executions_one_nonterminal_per_work",
+    "ux_tool_executions_source_ordinal",
+    "ux_tool_executions_source_provider_call",
+    "ux_tool_executions_work_step_ordinal",
+    "ux_distribution_receipts_result_owner",
+    "ux_work_items_terminal_reference",
+    "ux_work_item_inputs_work_ordinal",
+    "ux_work_items_conversation_ordinal",
+    "ux_work_items_current_model_invocation",
+    "ux_work_items_current_tool_execution",
+    "ux_work_items_one_active_per_conversation",
+    "ux_workspaces_workstation_logical_name",
+];
+
+const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "87372507e6a10401cbb24db6c7d8d313de774e596dfc99cc9cbb993eefd8e01d";
+
+pub(super) const V8_PRODUCT_TABLES: &[&str] = &[
+    "artifacts",
+    "channel_accounts",
+    "client_commands",
+    "client_devices",
+    "context_manifest_sources",
+    "context_manifests",
+    "conversation_bindings",
+    "conversations",
+    "craxii_principals",
+    "distribution_controls",
+    "distribution_conversations",
+    "distribution_owners",
+    "distribution_receipts",
+    "external_identities",
+    "inbound_deliveries",
+    "journal_events",
+    "messages",
+    "model_invocations",
+    "outbound_deliveries",
+    "outbound_delivery_attempts",
+    "runtime_instances",
+    "stream_heads",
+    "tool_executions",
+    "users",
+    "work_item_inputs",
+    "work_items",
+    "workspaces",
+    "workstations",
+];
+
+pub(super) const V8_PRODUCT_INDEXES: &[&str] = &[
     "ix_artifacts_content",
     "ix_artifacts_producer_kind_id",
     "ix_artifacts_producing_work",
@@ -1004,5 +1131,13 @@ pub(super) const PRODUCT_INDEXES: &[&str] = &[
     "ux_workspaces_workstation_logical_name",
 ];
 
-const CURRENT_SCHEMA_FINGERPRINT: &str =
+const V8_SCHEMA_FINGERPRINT: &str =
     "7850e130fddec6f482bd32e45c88adb16fd0b9b855853fc3d6c7629a9cb3b8ed";
+
+const PRODUCT_TRIGGERS: &[&str] = &[
+    "distribution_terminal_export_guard",
+    "distribution_result_immutable",
+    "distribution_result_delete_guard",
+    "distribution_result_message_update_guard",
+    "distribution_result_message_delete_guard",
+];

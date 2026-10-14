@@ -13,6 +13,8 @@ pub enum AuthError {
     Revoked,
     Stale,
     Unavailable,
+    ResultMissing,
+    ResultConflict,
 }
 impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -25,6 +27,8 @@ impl fmt::Display for AuthError {
             Self::Revoked => "worker authority revoked",
             Self::Stale => "worker installation stale",
             Self::Unavailable => "worker service unavailable",
+            Self::ResultMissing => "worker result reconciliation required",
+            Self::ResultConflict => "worker result conflict",
         })
     }
 }

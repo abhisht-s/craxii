@@ -234,6 +234,7 @@ pub(super) async fn apply_cancellation_decision(
         CancellationDecision::DirectCancelled { transition, .. }
         | CancellationDecision::CancellationRequested { transition, .. } => {
             let next = transition.next();
+            super::distribution_results::prepare(transaction, next, event_id, requested_at).await?;
             guarded_work_update(
                 transaction,
                 &work.snapshot,
