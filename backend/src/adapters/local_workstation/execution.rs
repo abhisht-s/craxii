@@ -275,6 +275,28 @@ impl ExecutionRuntime {
         })
     }
 
+    pub(super) fn observe_boundary(&self) -> crate::guest_boundary::ExecutionBoundaryObservation {
+        let registry = lock(&self.registry);
+        let active = registry
+            .entries
+            .values()
+            .filter(|entry| !entry.is_terminal())
+            .count() as u64;
+        let cleanup = registry
+            .entries
+            .values()
+            .filter(|entry| lock(&entry.lifecycle).phase == ExecutionPhase::Terminating)
+            .count() as u64;
+        let descendants = crate::guest_boundary::storage::tool_descendant_count().ok();
+        crate::guest_boundary::ExecutionBoundaryObservation {
+            active_executions: active,
+            descendants,
+            pending_cleanup: cleanup.saturating_add(u64::from(
+                self.shutdown_cleanup_failed.load(Ordering::Acquire),
+            )),
+            visibility_complete: descendants.is_some(),
+        }
+    }
     pub(super) fn foreground_capable(&self) -> bool {
         cfg!(target_os = "macos") || self.config.cgroup_root.is_some()
     }
@@ -501,6 +523,11 @@ impl ExecutionRuntime {
     }
 
     fn validate_request(&self, request: &ExecutionRequest) -> Result<(), WorkstationError> {
+        if self.shutdown_cleanup_failed.load(Ordering::Acquire) {
+            return Err(WorkstationError::uncertain(
+                WorkstationErrorKind::CleanupFailed,
+            ));
+        }
         let timeout_ms = request.timeout.as_duration().as_millis();
         if request.command.is_empty()
             || request.command.len() > HARD_EXECUTION_COMMAND_MAX_BYTES
@@ -585,7 +612,6 @@ async fn manager_loop(
                     Ok((task_id, (execution_id, entry, result))) => {
                         task_execution_ids.remove(&task_id);
                         if let Some(runtime) = runtime.upgrade()
-                            && lock(&runtime.shutdown_deadline).is_some()
                             && !result.cleanup.confirmed()
                         {
                             runtime
@@ -603,11 +629,7 @@ async fn manager_loop(
                         if let Some(execution_id) = task_execution_ids.remove(&task_id)
                             && let Some(runtime) = runtime.upgrade()
                         {
-                            if lock(&runtime.shutdown_deadline).is_some() {
-                                runtime
-                                    .shutdown_cleanup_failed
-                                    .store(true, Ordering::Release);
-                            }
+                            runtime.shutdown_cleanup_failed.store(true, Ordering::Release);
                             if let Some(entry) = lock(&runtime.registry)
                                 .entries
                                 .get(&execution_id)
@@ -679,6 +701,19 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
     // state after fork.
     unsafe {
         command.as_std_mut().pre_exec(move || {
+            let nofile = nix::libc::rlimit {
+                rlim_cur: 1024,
+                rlim_max: 1024,
+            };
+            let core = nix::libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if nix::libc::setrlimit(nix::libc::RLIMIT_NOFILE, &nofile) != 0
+                || nix::libc::setrlimit(nix::libc::RLIMIT_CORE, &core) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
             if nix::libc::fchdir(cwd_fd) != 0 || nix::libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -1072,8 +1107,16 @@ fn build_command(config: &ExecutionRuntimeConfig, request: &ExecutionRequest) ->
     let mut command = if let Some(launcher) = &config.user_switch_launcher {
         let mut command = Command::new(launcher);
         command.env_clear();
+        if config.cgroup_root.as_deref()
+            == Some(Path::new(crate::guest_boundary::storage::TOOLS_CGROUP))
+        {
+            command
+                .arg("guest-shell")
+                .arg(request.execution_id.to_string());
+        } else {
+            command.arg("shell");
+        }
         command
-            .arg("shell")
             .arg(request.work_id.to_string())
             .arg(request.workspace_id.to_string())
             .arg(&request.command);
@@ -1646,6 +1689,25 @@ impl ExecutionCgroup {
             let root = configured_root.ok_or(WorkstationErrorKind::UnsupportedCapability)?;
             let path = root.join(execution_id.to_string());
             std::fs::create_dir(&path).map_err(|_| WorkstationErrorKind::SpawnFailed)?;
+            // Missing/enforcement-incapable controllers refuse before spawn. No unlimited fallback.
+            let limits = [
+                ("pids.max", "64"),
+                ("memory.max", "268435456"),
+                ("memory.swap.max", "0"),
+                ("cpu.max", "100000 100000"),
+            ];
+            for (name, value) in limits {
+                let control = path.join(name);
+                if !control.is_file()
+                    || std::fs::write(&control, value).is_err()
+                    || std::fs::read_to_string(&control)
+                        .ok()
+                        .is_none_or(|v| v.trim() != value)
+                {
+                    let _ = std::fs::remove_dir(&path);
+                    return Err(WorkstationErrorKind::UnsupportedCapability);
+                }
+            }
             let procs = path.join("cgroup.procs");
             let procs_cstring = CString::new(procs.as_os_str().as_bytes())
                 .map_err(|_| WorkstationErrorKind::SpawnFailed)?;
@@ -1680,6 +1742,52 @@ impl ExecutionCgroup {
         }
     }
 
+    fn installed_scratch(&self) -> bool {
+        self.path.parent() == Some(Path::new(crate::guest_boundary::storage::TOOLS_CGROUP))
+    }
+
+    fn scratch_absent(&self) -> bool {
+        if !self.installed_scratch() {
+            return true;
+        }
+        let Some(id) = self.path.file_name() else {
+            return false;
+        };
+        ["/tmp", "/var/tmp", "/dev/shm"].iter().all(|base| {
+            matches!(std::fs::symlink_metadata(Path::new(base).join("craxii-tools").join(id)), Err(error) if error.kind()==std::io::ErrorKind::NotFound)
+        })
+    }
+
+    async fn clean_scratch(&self, budget: Duration) -> bool {
+        if self.path.parent() != Some(Path::new(crate::guest_boundary::storage::TOOLS_CGROUP)) {
+            return true;
+        }
+        let Some(id) = self.path.file_name() else {
+            return false;
+        };
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut command = Command::new("/opt/craxii/current/craxii-workstation-launcher");
+        command
+            .env_clear()
+            .args([std::ffi::OsStr::new("guest-clean-scratch"), id])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(status) => status.is_ok_and(|s| s.success()),
+            Err(_) => {
+                let _ = child.start_kill();
+                // Drop retains Tokio's owned reaping and kill-on-drop. Remaining UID/cgroup
+                // evidence and the sticky failure prohibit quiescence or another dispatch.
+                false
+            }
+        }
+    }
+
     async fn finish_cleanup(
         self,
         runtime: &ExecutionRuntime,
@@ -1695,7 +1803,16 @@ impl ExecutionCgroup {
             tokio::time::sleep(budget.min(GROUP_POLL_INTERVAL)).await;
         }
         let empty = self.is_empty();
-        let removed = empty && std::fs::remove_dir(&self.path).is_ok();
+        let scratch_clean = if !empty {
+            false
+        } else if !self.installed_scratch() {
+            true
+        } else if let Some(budget) = runtime.effective_cleanup_remaining(request_deadline) {
+            self.clean_scratch(budget).await
+        } else {
+            false
+        };
+        let removed = empty && scratch_clean && std::fs::remove_dir(&self.path).is_ok();
         #[cfg(feature = "test-failpoints")]
         stage13_marker("after_cleanup");
         CgroupCleanup {
@@ -1706,7 +1823,9 @@ impl ExecutionCgroup {
 
     fn cleanup_after_spawn_failure(self) -> CgroupCleanup {
         let empty = self.is_empty();
-        let removed = empty && std::fs::remove_dir(&self.path).is_ok();
+        // An exec failure occurs before the launcher can create scratch. Never run an
+        // unbudgeted helper here; unexpected preexisting scratch remains unsafe.
+        let removed = empty && self.scratch_absent() && std::fs::remove_dir(&self.path).is_ok();
         CgroupCleanup {
             empty: Some(empty),
             removed: Some(removed),
@@ -1944,8 +2063,8 @@ fn user_switch_launcher_probe_command(execution_id: ExecutionId) -> String {
             "/usr/bin/grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status && ",
             "/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status && ",
             "/usr/bin/grep -Fq '/{}' /proc/self/cgroup && ",
-            "test \"$(umask)\" = 0077 && test \"$(ulimit -n)\" = 65536 && ",
-            "test \"$(ulimit -u)\" = 16384 && test \"$(ulimit -c)\" = 0 && ",
+            "test \"$(umask)\" = 0077 && test \"$(ulimit -n)\" = 1024 && ",
+            "test \"$(ulimit -c)\" = 0 && ",
             "test \"$HOME\" = /home/craxii && test \"$USER\" = craxii && ",
             "test \"$LOGNAME\" = craxii && test \"$SHELL\" = /bin/bash && ",
             "test \"$LANG\" = C.UTF-8 && ",

@@ -1,6 +1,14 @@
 //! Fixed privileged launcher for the Linux Stage 27 workstation identity boundary.
 
 #[cfg(target_os = "linux")]
+#[path = "workstation_launcher/scratch.rs"]
+mod scratch;
+
+#[cfg(target_os = "linux")]
+#[path = "workstation_launcher/ipc.rs"]
+mod ipc;
+
+#[cfg(target_os = "linux")]
 mod linux {
     use std::ffi::{CStr, OsString};
     use std::os::unix::process::CommandExt as _;
@@ -38,10 +46,15 @@ mod linux {
     }
 
     enum Operation {
+        CheckGuestIpc,
         Shell {
+            scratch_id: Option<String>,
             work_id: OsString,
             workspace_id: OsString,
             command: OsString,
+        },
+        CleanScratch {
+            execution_id: String,
         },
         ReadFile {
             path: OsString,
@@ -67,6 +80,7 @@ mod linux {
         let workstation = lookup_user(WORKSTATION_USER)?;
         let workstation_group = lookup_group(WORKSTATION_GROUP)?;
         if workstation.uid == 0
+            || workstation.gid == 0
             || workstation.uid == server.uid
             || workstation.gid != workstation_group
         {
@@ -80,10 +94,48 @@ mod linux {
             return Err(());
         }
         mark_unrelated_descriptors_close_on_exec()?;
+        if matches!(
+            &operation,
+            Operation::CheckGuestIpc
+                | Operation::Shell {
+                    scratch_id: Some(_),
+                    ..
+                }
+        ) {
+            verify_guest_network()?;
+        }
+        if let Operation::CleanScratch { execution_id } = &operation {
+            unsafe {
+                libc::alarm(10);
+            }
+            if unsafe { libc::seteuid(server.uid) } != 0 {
+                return Err(());
+            }
+            super::scratch::verify_empty(execution_id)?;
+            if unsafe { libc::seteuid(0) } != 0 {
+                return Err(());
+            }
+        }
         drop_to_workstation(workstation)?;
+        if matches!(&operation, Operation::CheckGuestIpc) {
+            super::ipc::probe()?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        if let Operation::CleanScratch { execution_id } = &operation {
+            super::scratch::cleanup(execution_id, workstation.uid)?;
+            return Ok(ExitCode::SUCCESS);
+        }
+        if let Operation::Shell {
+            scratch_id: Some(id),
+            ..
+        } = &operation
+        {
+            super::scratch::create(id)?;
+        }
 
         let error = match operation {
             Operation::Shell {
+                scratch_id,
                 work_id,
                 workspace_id,
                 command,
@@ -94,8 +146,21 @@ mod linux {
                 if unsafe { libc::chdir(c".".as_ptr()) } != 0 {
                     return Err(());
                 }
-                Command::new(BASH_PATH)
-                    .env_clear()
+                if let Some(id) = &scratch_id {
+                    super::scratch::restrict(id)?;
+                    super::ipc::verify_stdio()?;
+                    super::ipc::restrict()?;
+                }
+                let mut shell = Command::new(BASH_PATH);
+                shell.env_clear();
+                if let Some(id) = scratch_id {
+                    let path = format!("/tmp/craxii-tools/{id}");
+                    shell
+                        .env("TMPDIR", &path)
+                        .env("TMP", &path)
+                        .env("TEMP", &path);
+                }
+                shell
                     .env("HOME", USER_HOME)
                     .env("USER", "craxii")
                     .env("LOGNAME", "craxii")
@@ -133,6 +198,7 @@ mod linux {
                     .arg(expected_inode)
                     .exec()
             }
+            Operation::CleanScratch { .. } | Operation::CheckGuestIpc => return Err(()),
         };
         let _ = error;
         Err(())
@@ -142,7 +208,15 @@ mod linux {
         let mut arguments = std::env::args_os();
         let _program = arguments.next().ok_or(())?;
         match arguments.next().and_then(|value| value.into_string().ok()) {
-            Some(mode) if mode == "shell" => {
+            Some(mode) if mode == "guest-check-ipc" && arguments.next().is_none() => {
+                Ok(Operation::CheckGuestIpc)
+            }
+            Some(mode) if mode == "shell" || mode == "guest-shell" => {
+                let scratch_id = if mode == "guest-shell" {
+                    Some(super::scratch::id(&arguments.next().ok_or(())?)?)
+                } else {
+                    None
+                };
                 let work_id = arguments.next().ok_or(())?;
                 let workspace_id = arguments.next().ok_or(())?;
                 let command = arguments.next().ok_or(())?;
@@ -150,10 +224,18 @@ mod linux {
                     return Err(());
                 }
                 Ok(Operation::Shell {
+                    scratch_id,
                     work_id,
                     workspace_id,
                     command,
                 })
+            }
+            Some(mode) if mode == "guest-clean-scratch" => {
+                let execution_id = super::scratch::id(&arguments.next().ok_or(())?)?;
+                if arguments.next().is_some() {
+                    return Err(());
+                }
+                Ok(Operation::CleanScratch { execution_id })
             }
             Some(mode) if mode == "read-file" => {
                 let path = arguments.next().ok_or(())?;
@@ -171,6 +253,42 @@ mod linux {
                 })
             }
             _ => Err(()),
+        }
+    }
+
+    fn verify_guest_network() -> Result<(), ()> {
+        // The launcher's transition-only capability bound deliberately has no NET_ADMIN.
+        // Ask PID1 to run one fixed root-owned read-only checker; no command/config/UID is
+        // supplied by the caller. The oneshot does not remain active, so every launch checks
+        // the current kernel rules, including launches after a worker has already started.
+        let mut child = Command::new("/usr/bin/systemctl")
+            .args([
+                "--no-ask-password",
+                "--quiet",
+                "start",
+                "craxii-guest-network-check.service",
+            ])
+            .env_clear()
+            .uid(0)
+            .gid(0)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|_| ())?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return status.success().then_some(()).ok_or(()),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(());
+                }
+            }
         }
     }
 
@@ -224,6 +342,19 @@ mod linux {
     }
 
     fn drop_to_workstation(identity: Identity) -> Result<(), ()> {
+        let nofile = libc::rlimit {
+            rlim_cur: 1024,
+            rlim_max: 1024,
+        };
+        let core = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &nofile) } != 0
+            || unsafe { libc::setrlimit(libc::RLIMIT_CORE, &core) } != 0
+        {
+            return Err(());
+        }
         if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
             return Err(());
         }

@@ -1,0 +1,16 @@
+[Unit]
+Description=Craxii exact persistent disk bootstrap
+Before=craxii-distribution.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/craxii/guest/bootstrap-data-volume.py
+ExecStartPost=/usr/bin/python3 /opt/craxii/guest/security-boundary.py configure
+RemainAfterExit=yes
+UMask=0077
+LimitCORE=0
+StandardOutput=null
+StandardError=journal

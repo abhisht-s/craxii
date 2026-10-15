@@ -1,0 +1,40 @@
+[Unit]
+Description=Craxii trusted outbound distribution worker
+Requires=craxii-guest-bootstrap.service
+After=craxii-guest-bootstrap.service network-online.target
+Wants=network-online.target
+RequiresMountsFor=/srv/craxii-data /var/lib/craxii /srv/craxii/workspaces /home/craxii
+
+[Service]
+Type=simple
+User=craxii-server
+Group=craxii-server
+SupplementaryGroups=craxii-observe
+WorkingDirectory=/var/lib/craxii
+# Root read-only verification precedes the service guard. No credential loading or legacy listener.
+ExecStartPre=+/usr/bin/python3 /opt/craxii/guest/security-boundary.py prepare
+ExecStartPre=/opt/craxii/current/craxii-workstation-launcher guest-check-ipc
+ExecStartPre=/opt/craxii/current/craxii-guest-guard verify
+ExecStart=/opt/craxii/current/craxii-server distribution
+ExecReload=+/usr/bin/python3 -I -B /opt/craxii/guest/security-boundary.py reload-network
+Delegate=cpu memory pids
+DelegateSubgroup=supervisor
+AmbientCapabilities=CAP_KILL
+CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP
+# Parent NNP must remain disabled for the fixed setuid launcher; child sets NNP itself.
+NoNewPrivileges=no
+KillMode=control-group
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+Restart=on-failure
+RestartSec=3s
+UMask=0077
+LimitCORE=0
+LimitNOFILE=4096
+TasksMax=256
+MemoryMax=2G
+MemorySwapMax=0
+IPAddressDeny=169.254.169.254
+IPAddressDeny=fd00:ec2::254
+StandardOutput=null
+StandardError=journal

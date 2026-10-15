@@ -72,9 +72,23 @@ pub struct DistributionRuntime {
     config: DistributionConfig,
     pub boot_id: String,
     in_flight_exports: std::sync::atomic::AtomicUsize,
+    boundary: Option<crate::guest_boundary::config::GuestConfig>,
 }
 impl DistributionRuntime {
     pub async fn open(config: DistributionConfig) -> DistributionResult<Self> {
+        crate::guest_boundary::storage::harden_worker_process()
+            .map_err(|_| DistributionError::Storage)?;
+        config.validate()?;
+        let boundary = crate::guest_boundary::storage::load_installed()
+            .map_err(|_| DistributionError::Storage)?;
+        crate::guest_boundary::storage::verify_installed(&boundary)
+            .map_err(|_| DistributionError::Storage)?;
+        if config.state_root != crate::guest_boundary::storage::STATE
+            || config.artifact_root != crate::guest_boundary::storage::ARTIFACTS
+            || config.workspace_root != crate::guest_boundary::storage::WORKSPACE
+        {
+            return Err(DistributionError::Storage);
+        }
         let observation = crate::adapters::runtime_observation::SystemRuntimeProcessObserver
             .observe()
             .map_err(|_| invalid())?;
@@ -82,6 +96,7 @@ impl DistributionRuntime {
             config,
             observation.linux_boot_id.as_str().to_owned(),
             Some(observation.process_id),
+            Some(boundary),
         )
         .await
     }
@@ -96,6 +111,7 @@ impl DistributionRuntime {
             config,
             synthetic_boot_id,
             Some(DiagnosticPid::try_new(i64::from(std::process::id())).map_err(|_| invalid())?),
+            None,
         )
         .await
     }
@@ -103,8 +119,13 @@ impl DistributionRuntime {
         config: DistributionConfig,
         boot_id: String,
         pid: Option<DiagnosticPid>,
+        boundary: Option<crate::guest_boundary::config::GuestConfig>,
     ) -> DistributionResult<Self> {
         config.validate()?;
+        if let Some(c) = &boundary {
+            crate::guest_boundary::storage::prepare_journal_open(c)
+                .map_err(|_| DistributionError::Storage)?;
+        }
         let guard = SqliteRuntimeGuard::start(Path::new(&config.state_root), 2)
             .await
             .map_err(|_| DistributionError::Sqlite)?;
@@ -213,12 +234,22 @@ impl DistributionRuntime {
             config,
             boot_id,
             in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
+            boundary,
         })
+    }
+    fn recheck_boundary(&self) -> DistributionResult<()> {
+        if let Some(c) = &self.boundary {
+            crate::guest_boundary::storage::verify_installed(c)
+                .map_err(|_| DistributionError::Storage)?;
+        }
+        Ok(())
     }
     pub fn hello(&self) -> Value {
         json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"9","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}})
     }
     pub async fn reconnect(&self, client: &mut WorkerClient) -> Result<(), AuthError> {
+        self.recheck_boundary()
+            .map_err(|_| AuthError::Unavailable)?;
         client.negotiate(&self.hello(), None).await?;
         client.renew().await?;
         client.status().await?;
@@ -303,6 +334,62 @@ impl DistributionRuntime {
         );
         Ok(observation)
     }
+    pub async fn quiescence_observation(
+        &self,
+    ) -> DistributionResult<crate::guest_boundary::QuiescenceObservation> {
+        let v = self.export_observation().await?;
+        let count = |name: &str| {
+            v[name]
+                .as_str()
+                .and_then(|n| n.parse::<u64>().ok())
+                .ok_or(DistributionError::Storage)
+        };
+        let checkpoint = self
+            .guard
+            .runtime()
+            .checkpoint_passive()
+            .await
+            .map_err(|_| DistributionError::Sqlite)?;
+        let descendants = crate::guest_boundary::storage::tool_descendant_count().ok();
+        let cleanup = crate::guest_boundary::storage::pending_execution_cleanup().ok();
+        Ok(crate::guest_boundary::QuiescenceObservation {
+            active_tasks: count("active_work_count")?.saturating_add(count("queued_work_count")?),
+            descendants,
+            pending_cleanup: count("cancel_requested_count")?.saturating_add(cleanup.unwrap_or(0)),
+            pending_receipts: count("pending_receipt_ack_count")?
+                .saturating_add(count("pending_control_ack_count")?),
+            pending_exports: count("pending_export_count")?
+                .saturating_add(count("in_flight_export_count")?),
+            uncertain_exports: count("uncertain_export_count")?
+                .saturating_add(count("unresolved_export_count")?),
+            journal_flushed: checkpoint.busy() == 0
+                && checkpoint.log_frames() == checkpoint.checkpointed_frames(),
+            storage_healthy: self.boundary.is_some()
+                && self.recheck_boundary().is_ok()
+                && crate::guest_boundary::storage::pressure().is_ok(),
+            visibility_complete: descendants.is_some() && cleanup.is_some(),
+        })
+    }
+    /// The receipt-only composition has no executor. A composition with tools must also
+    /// merge its actual registry, including reservation and failed-cleanup observations.
+    pub async fn quiescence_with_execution(
+        &self,
+        execution: crate::guest_boundary::ExecutionBoundaryObservation,
+    ) -> DistributionResult<crate::guest_boundary::QuiescenceObservation> {
+        let mut observed = self.quiescence_observation().await?;
+        observed.active_tasks = observed
+            .active_tasks
+            .saturating_add(execution.active_executions);
+        observed.pending_cleanup = observed
+            .pending_cleanup
+            .saturating_add(execution.pending_cleanup);
+        observed.descendants = observed
+            .descendants
+            .zip(execution.descendants)
+            .map(|(a, b)| a.max(b));
+        observed.visibility_complete &= execution.visibility_complete;
+        Ok(observed)
+    }
     async fn transfer(
         &self,
         client: &mut WorkerClient,
@@ -332,6 +419,13 @@ impl DistributionRuntime {
         Ok(())
     }
     pub async fn poll_once(&self, client: &mut WorkerClient) -> Result<usize, AuthError> {
+        self.recheck_boundary()
+            .map_err(|_| AuthError::Unavailable)?;
+        if self.boundary.is_some() {
+            // Existing durable duties retain their narrow cleanup authority under disk pressure.
+            self.transfer_pending(client).await?;
+            crate::guest_boundary::storage::pressure().map_err(|_| AuthError::Unavailable)?;
+        }
         let items = client
             .poll(
                 &self.boot_id,
@@ -339,6 +433,8 @@ impl DistributionRuntime {
                 &self.config.profile_public_key,
             )
             .await?;
+        self.recheck_boundary()
+            .map_err(|_| AuthError::Unavailable)?;
         let count = items.len();
         // Commit controls first; a same-batch cancelled sequence is reconciled without a message.
         for item in items
@@ -495,6 +591,12 @@ impl DistributionRuntime {
     }
 }
 pub async fn run_protected() -> DistributionResult<()> {
+    crate::guest_boundary::storage::harden_worker_process()
+        .map_err(|_| DistributionError::Storage)?;
+    let guest =
+        crate::guest_boundary::storage::load_installed().map_err(|_| DistributionError::Storage)?;
+    crate::guest_boundary::storage::verify_installed(&guest)
+        .map_err(|_| DistributionError::Storage)?;
     // Trusted OS-root key/config descriptor checks precede all content/runtime composition.
     let uid = unsafe { nix::libc::geteuid() };
     let name = std::ffi::CString::new("craxii").map_err(|_| invalid())?;
@@ -509,6 +611,13 @@ pub async fn run_protected() -> DistributionResult<()> {
     let state = IdentityState::load(&key)
         .map_err(|_| invalid())?
         .ok_or_else(invalid)?;
+    if state.customer_id != guest.text("customer_id")
+        || state.logical_agent_id != guest.text("logical_agent_id")
+        || state.installation_id != guest.text("installation_id")
+        || state.generation != guest.text("generation")
+    {
+        return Err(DistributionError::Storage);
+    }
     let client = WorkerClient::new(&config.origin, key, state).map_err(|_| invalid())?;
     DistributionRuntime::open(config).await?.run(client).await
 }

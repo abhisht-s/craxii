@@ -562,6 +562,18 @@ async fn distribution_result_cancel_notice_ack_and_sleep_blocker() {
             .unwrap()["export_drained"],
         false
     );
+    let quiescence = f
+        .runtime
+        .as_ref()
+        .unwrap()
+        .quiescence_observation()
+        .await
+        .unwrap();
+    assert!(quiescence.pending_exports > 0);
+    assert_eq!(
+        quiescence.state(),
+        crate::guest_boundary::QuiescenceState::Busy
+    );
     let ack = json!({"work_id":result["snapshot"]["work_id"],"export_id":result["snapshot"]["export_id"],"export_revision":"1","export_digest":result["export_digest"],"acceptance_id":request_id().unwrap(),"outbox_source_id":request_id().unwrap(),"accepted_at":crate::distribution::timestamp().unwrap().to_string(),"duplicate":false});
     let mut conflict = ack.clone();
     conflict["export_digest"] = json!("f".repeat(64));
@@ -1075,4 +1087,133 @@ async fn distribution_result_failure_and_confirmed_active_cancellation_are_truth
         store.verify_distribution_results().await.unwrap();
         f.close().await;
     }
+}
+
+/// Uses the standard installed runtime and its real mounted schema9 journal. No fixture
+/// constructor/path override is used. Execute only after the launcher qualification cases.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "owned credential-free installed systemd guest only"]
+async fn installed_quiescence_tracks_journal_receipts_exports_and_flush() {
+    use crate::guest_boundary::{QuiescenceState, storage};
+    use sqlx::Connection;
+    assert_eq!(
+        std::fs::read_to_string("/etc/craxii-v001-fixture-instance")
+            .unwrap()
+            .trim(),
+        "13131313-1313-4313-8313-131313131314"
+    );
+    storage::require_worker_principal().unwrap();
+    let guest = storage::load_installed().unwrap();
+    let key = Ed25519KeyPair::from_pkcs8(
+        Ed25519KeyPair::generate_pkcs8(&aws_lc_rs::rand::SystemRandom::new())
+            .unwrap()
+            .as_ref(),
+    )
+    .unwrap();
+    let power = request_id().unwrap();
+    let runtime = DistributionRuntime::open(DistributionConfig {
+        contract_version: 1,
+        environment: "development".into(),
+        origin: "https://127.0.0.1:19443".into(),
+        state_root: storage::STATE.into(),
+        artifact_root: storage::ARTIFACTS.into(),
+        workspace_root: storage::WORKSPACE.into(),
+        profile_public_key: URL_SAFE_NO_PAD.encode(key.public_key().as_ref()),
+        power_operation_id: power.clone(),
+        release_id: "qualification-only".into(),
+        release_sha256: "1".repeat(64),
+    })
+    .await
+    .unwrap();
+    let mut f = Fixture {
+        root: "/no-generic-installed-fixture-cleanup".into(),
+        boot: runtime.boot_id.clone(),
+        runtime: Some(runtime),
+        key,
+        authority: json!({"customer_id":guest.text("customer_id"),"logical_agent_id":guest.text("logical_agent_id"),"installation_id":guest.text("installation_id"),"generation":guest.text("generation"),"session_id":request_id().unwrap()}),
+        power,
+        conversation: request_id().unwrap(),
+    };
+    // Qualification restarts preserve the existing journal. Reuse its established central
+    // conversation and next sequence instead of attempting a conflicting second mapping.
+    let existing: Option<(String, i64)> = sqlx::query_as(
+        "SELECT central_conversation_id,next_sequence FROM distribution_conversations",
+    )
+    .fetch_optional(&f.runtime.as_ref().unwrap().store.runtime.inner.pool)
+    .await
+    .unwrap();
+    let sequence = if let Some((conversation, next)) = existing {
+        f.conversation = conversation;
+        next
+    } else {
+        1
+    };
+    let rt = f.runtime.as_ref().unwrap();
+    assert_eq!(
+        rt.quiescence_observation().await.unwrap().state(),
+        QuiescenceState::LocallyQuiescent
+    );
+    let mut reader =
+        sqlx::SqliteConnection::connect("sqlite:///var/lib/craxii/db/craxii.sqlite3?mode=ro")
+            .await
+            .unwrap();
+    sqlx::query("BEGIN").execute(&mut reader).await.unwrap();
+    sqlx::query("SELECT count(*) FROM journal_events")
+        .fetch_one(&mut reader)
+        .await
+        .unwrap();
+    let work = f.delivery(&request_id().unwrap(), sequence);
+    rt.store.admit_distribution(&work).await.unwrap();
+    let q = rt.quiescence_observation().await.unwrap();
+    assert!(q.active_tasks > 0 && q.pending_receipts > 0);
+    assert_eq!(q.state(), QuiescenceState::Busy);
+    rt.store
+        .cancel_distribution(&f.control(&work))
+        .await
+        .unwrap();
+    for admission in rt.store.pending_distribution_receipts().await.unwrap() {
+        let DistributionAdmission::Receipt { receipt, .. } = admission else {
+            panic!("unexpected receipt type");
+        };
+        rt.store
+            .acknowledge_distribution(&receipt, false)
+            .await
+            .unwrap();
+    }
+    for receipt in rt.store.pending_distribution_controls().await.unwrap() {
+        rt.store
+            .acknowledge_distribution(&receipt, true)
+            .await
+            .unwrap();
+    }
+    let pending = rt.store.pending_distribution_results().await.unwrap();
+    assert_eq!(pending.len(), 1);
+    let result = &pending[0];
+    rt.store
+        .record_distribution_result_transfer_failure(
+            result["snapshot"]["export_id"].as_str().unwrap(),
+            true,
+            false,
+        )
+        .await
+        .unwrap();
+    let q = rt.quiescence_observation().await.unwrap();
+    assert!(q.pending_exports > 0 && q.uncertain_exports > 0);
+    assert_eq!(q.state(), QuiescenceState::Busy);
+    let ack = json!({"work_id":result["snapshot"]["work_id"],"export_id":result["snapshot"]["export_id"],"export_revision":"1","export_digest":result["export_digest"],"acceptance_id":request_id().unwrap(),"outbox_source_id":request_id().unwrap(),"accepted_at":crate::distribution::timestamp().unwrap().to_string(),"duplicate":false});
+    rt.store
+        .acknowledge_distribution_result(&ack)
+        .await
+        .unwrap();
+    let q = rt.quiescence_observation().await.unwrap();
+    assert!(!q.journal_flushed);
+    assert_eq!(q.state(), QuiescenceState::Unknown);
+    sqlx::query("ROLLBACK").execute(&mut reader).await.unwrap();
+    reader.close().await.unwrap();
+    assert_eq!(
+        rt.quiescence_observation().await.unwrap().state(),
+        QuiescenceState::LocallyQuiescent
+    );
+    f.runtime.take().unwrap().shutdown().await.unwrap();
 }

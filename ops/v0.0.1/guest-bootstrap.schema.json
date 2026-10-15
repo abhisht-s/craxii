@@ -1,0 +1,429 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://craxii.com/contracts/guest-bootstrap/1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "environment",
+    "bootstrap_operation_id",
+    "customer_id",
+    "logical_agent_id",
+    "installation_id",
+    "generation",
+    "account_id",
+    "region",
+    "availability_zone",
+    "instance_id",
+    "ami_id",
+    "volume_id",
+    "size_bytes",
+    "volume_type",
+    "encrypted",
+    "disk_lineage_id",
+    "filesystem_uuid",
+    "mode",
+    "marker",
+    "marker_sha256",
+    "restore",
+    "layout",
+    "principals",
+    "hardening",
+    "hardening_sha256",
+    "resources",
+    "resources_sha256",
+    "private_networks",
+    "provenance"
+  ],
+  "properties": {
+    "contract_version": {
+      "const": 1
+    },
+    "environment": {
+      "const": "development"
+    },
+    "bootstrap_operation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "customer_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "logical_agent_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "installation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "generation": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$",
+      "maxLength": 128
+    },
+    "account_id": {
+      "type": "string",
+      "pattern": "^[0-9]{12}$",
+      "maxLength": 128
+    },
+    "region": {
+      "type": "string",
+      "pattern": "^[a-z]{2}-[a-z]+-[1-9]$",
+      "maxLength": 128
+    },
+    "availability_zone": {
+      "type": "string",
+      "pattern": "^[a-z]{2}-[a-z]+-[1-9][a-z]$",
+      "maxLength": 128
+    },
+    "instance_id": {
+      "type": "string",
+      "pattern": "^i-[0-9a-f]{17}$",
+      "maxLength": 128
+    },
+    "ami_id": {
+      "type": "string",
+      "pattern": "^ami-[0-9a-f]{17}$",
+      "maxLength": 128
+    },
+    "volume_id": {
+      "type": "string",
+      "pattern": "^vol-[0-9a-f]{17}$",
+      "maxLength": 128
+    },
+    "size_bytes": {
+      "const": "85899345920"
+    },
+    "volume_type": {
+      "const": "gp3"
+    },
+    "encrypted": {
+      "const": true
+    },
+    "disk_lineage_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "filesystem_uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 128
+    },
+    "mode": {
+      "enum": [
+        "initialize_blank",
+        "adopt_existing",
+        "adopt_restored"
+      ]
+    },
+    "marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "customer_id",
+        "logical_agent_id",
+        "disk_lineage_id",
+        "filesystem_uuid",
+        "birth_volume_id",
+        "birth_installation_id",
+        "birth_operation_id"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "customer_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "logical_agent_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "disk_lineage_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "filesystem_uuid": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "birth_volume_id": {
+          "type": "string",
+          "pattern": "^vol-[0-9a-f]{17}$",
+          "maxLength": 128
+        },
+        "birth_installation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "birth_operation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        }
+      }
+    },
+    "marker_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "maxLength": 128
+    },
+    "restore": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source_snapshot_id",
+            "source_volume_id",
+            "authorization_id",
+            "disk_lineage_id"
+          ],
+          "properties": {
+            "source_snapshot_id": {
+              "type": "string",
+              "pattern": "^snap-[0-9a-f]{17}$",
+              "maxLength": 128
+            },
+            "source_volume_id": {
+              "type": "string",
+              "pattern": "^vol-[0-9a-f]{17}$",
+              "maxLength": 128
+            },
+            "authorization_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "maxLength": 128
+            },
+            "disk_lineage_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+              "maxLength": 128
+            }
+          }
+        }
+      ]
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "data",
+        "state",
+        "workspace",
+        "home",
+        "identity"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "data": {
+          "const": "/srv/craxii-data"
+        },
+        "state": {
+          "const": "/var/lib/craxii"
+        },
+        "workspace": {
+          "const": "/srv/craxii/workspaces"
+        },
+        "home": {
+          "const": "/home/craxii"
+        },
+        "identity": {
+          "const": "/var/lib/craxii-worker/identity"
+        }
+      }
+    },
+    "principals": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bootstrap",
+        "worker",
+        "tool",
+        "observation_group"
+      ],
+      "properties": {
+        "bootstrap": {
+          "const": "root"
+        },
+        "worker": {
+          "const": "craxii-server"
+        },
+        "tool": {
+          "const": "craxii"
+        },
+        "observation_group": {
+          "const": "craxii-observe"
+        }
+      }
+    },
+    "hardening": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "proc_hidepid",
+        "ptrace_scope",
+        "core_bytes",
+        "nofile",
+        "term_grace_ms",
+        "tool_timeout_ms",
+        "hard_timeout_ms",
+        "output_bytes",
+        "startup_policy"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "proc_hidepid": {
+          "const": 2
+        },
+        "ptrace_scope": {
+          "const": 2
+        },
+        "core_bytes": {
+          "const": 0
+        },
+        "nofile": {
+          "const": 1024
+        },
+        "term_grace_ms": {
+          "const": 5000
+        },
+        "tool_timeout_ms": {
+          "const": 120000
+        },
+        "hard_timeout_ms": {
+          "const": 900000
+        },
+        "output_bytes": {
+          "const": "8388608"
+        },
+        "startup_policy": {
+          "const": "required_before_writes"
+        }
+      }
+    },
+    "hardening_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "maxLength": 128
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "pids",
+        "memory_bytes",
+        "cpu_quota_us",
+        "cpu_period_us",
+        "temp_bytes",
+        "disk_quota_bytes",
+        "inode_quota",
+        "reserve_bytes",
+        "reserve_inodes"
+      ],
+      "properties": {
+        "version": {
+          "const": 1
+        },
+        "pids": {
+          "const": 64
+        },
+        "memory_bytes": {
+          "const": "268435456"
+        },
+        "cpu_quota_us": {
+          "const": 100000
+        },
+        "cpu_period_us": {
+          "const": 100000
+        },
+        "temp_bytes": {
+          "const": "268435456"
+        },
+        "disk_quota_bytes": {
+          "const": "68719476736"
+        },
+        "inode_quota": {
+          "const": 1000000
+        },
+        "reserve_bytes": {
+          "const": "4294967296"
+        },
+        "reserve_inodes": {
+          "const": 65536
+        }
+      }
+    },
+    "resources_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "maxLength": 128
+    },
+    "private_networks": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "maxLength": 43
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "observation_id",
+        "resource_reference_id",
+        "binding_sha256"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "synthetic_fixture",
+            "trusted_infrastructure"
+          ]
+        },
+        "observation_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "resource_reference_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+          "maxLength": 128
+        },
+        "binding_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 128
+        }
+      }
+    }
+  }
+}
