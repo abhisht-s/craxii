@@ -112,12 +112,41 @@ impl LocalWorkstation {
         }
         let mut adapter = Self::new(workstation, workspace, options)?;
         adapter.guest_config = Some(c);
+        #[cfg(target_os = "linux")]
+        adapter.execution.require_compute();
         Ok(adapter)
+    }
+    /// Only the owned debug Stage 13 regression fixture may inspect unchanged security
+    /// primitives without claiming customer execution or budget acceptance.
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub fn isolated_unmetered_installed(
+        workstation: &WorkstationIdentity,
+        workspace: &WorkspaceIdentity,
+        options: LocalWorkstationOptions,
+    ) -> Result<Self, WorkstationError> {
+        let adapter = Self::new_installed(workstation, workspace, options)?;
+        adapter.execution.isolated_unmetered();
+        Ok(adapter)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_compute_permit(
+        self,
+        permit: crate::compute::worker::WorkPermit,
+    ) -> Result<Self, WorkstationError> {
+        if self.guest_config.is_none() {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
+        self.execution.attach_compute(permit)?;
+        Ok(self)
     }
     pub fn execution_observation(&self) -> crate::guest_boundary::ExecutionBoundaryObservation {
         self.execution.observe_boundary()
     }
     fn check_guest(&self) -> Result<(), WorkstationError> {
+        #[cfg(target_os = "linux")]
+        self.execution.prepare_compute()?;
         if let Some(c) = &self.guest_config {
             crate::guest_boundary::storage::verify_installed(c)
                 .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;

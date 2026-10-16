@@ -1,0 +1,37 @@
+[Unit]
+Description=Craxii independent funded running watchdog
+StartLimitIntervalSec=10s
+StartLimitBurst=3
+Before=craxii-guest-bootstrap.service craxii-distribution.service
+OnFailure=craxii-compute-failsafe.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+Group=craxii-server
+ExecStart=/opt/craxii/current/craxii-compute-watchdog
+Restart=always
+RestartSec=100ms
+WatchdogSec=3s
+TimeoutStartSec=15s
+TimeoutStopSec=2s
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/craxii-compute
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LimitCORE=0
+LimitNOFILE=64
+TasksMax=16
+MemoryMax=64M
+CPUQuota=25%
+StandardOutput=null
+StandardError=null

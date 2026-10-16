@@ -34,13 +34,40 @@ async fn main() {
         .map_err(|_| ())?;
         let text = |k: &str| input[k].as_str().ok_or(());
         let uid = unsafe { nix::libc::geteuid() };
-        let key = KeyStore::isolated_fixture(
-            Path::new(text("store")?),
-            uid,
-            uid + 10000,
-            input["first_enrollment"] == true,
-        )
-        .map_err(|_| ())?;
+        #[cfg(target_os = "linux")]
+        let installed = input["installed"] == true;
+        #[cfg(not(target_os = "linux"))]
+        let installed = false;
+        let key = if installed {
+            if std::fs::read_to_string("/etc/craxii-v001-fixture-instance")
+                .map_err(|_| ())?
+                .trim()
+                != "13131313-1313-4313-8313-131313131314"
+            {
+                return Err(());
+            }
+            #[cfg(target_os = "linux")]
+            {
+                KeyStore::open(
+                    uid,
+                    unsafe { (*nix::libc::getpwnam(c"craxii".as_ptr())).pw_uid },
+                    false,
+                )
+                .map_err(|_| ())?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(());
+            }
+        } else {
+            KeyStore::isolated_fixture(
+                Path::new(text("store")?),
+                uid,
+                uid + 10000,
+                input["first_enrollment"] == true,
+            )
+            .map_err(|_| ())?
+        };
         let state = IdentityState::load(&key)
             .map_err(|_| ())?
             .unwrap_or(IdentityState {
@@ -57,11 +84,32 @@ async fn main() {
             });
         let config: DistributionConfig =
             serde_json::from_value(input["config"].clone()).map_err(|_| ())?;
-        let runtime = DistributionRuntime::isolated_fixture(config, text("boot_id")?.into())
-            .await
-            .map_err(|e| {
-                eprintln!("distribution_fixture_startup_{e:?}");
-            })?;
+        let runtime = if installed {
+            DistributionRuntime::open(config).await
+        } else {
+            DistributionRuntime::isolated_fixture(config, text("boot_id")?.into()).await
+        }
+        .map_err(|_| ())?;
+        if installed && input["action"] == "local_recover" {
+            runtime
+                .store
+                .reconcile_distribution_results()
+                .await
+                .map_err(|_| ())?;
+            runtime
+                .store
+                .verify_application_consistency()
+                .await
+                .map_err(|_| ())?;
+            runtime
+                .store
+                .verify_distribution_consistency()
+                .await
+                .map_err(|_| ())?;
+            let result = json!({"key_id":key.key_id(),"local_recovery":true,"exports":runtime.export_observation().await.map_err(|_|())?});
+            runtime.shutdown().await.map_err(|_| ())?;
+            return Ok::<Value, ()>(result);
+        }
         let mut client = WorkerClient::isolated_tls_fixture(
             text("origin")?,
             key,
@@ -94,7 +142,38 @@ async fn main() {
                 eprintln!("distribution_fixture_reconnect_{e:?}");
             })?;
         }
-        if input["action"] == "commit" {
+        #[cfg(target_os = "linux")]
+        if input["action"] == "compute_refresh" {
+            let compute = craxii_server::compute::worker::InstalledCompute::load(
+                text("customer_id")?,
+                text("logical_agent_id")?,
+                text("installation_id")?,
+                text("generation")?,
+                &input["config"]["power_operation_id"].as_str().ok_or(())?,
+            )
+            .map_err(|_| ())?;
+            compute
+                .refresh(&mut client, &runtime.boot_id)
+                .await
+                .map_err(|error| {
+                    // AuthError has only a closed set of unit variants; never payloads.
+                    eprintln!("compute_fixture_refresh_{error:?}");
+                })?;
+        }
+        #[cfg(target_os = "linux")]
+        if input["action"] == "bounded" {
+            runtime
+                .isolated_bounded_once(&mut client)
+                .await
+                .map_err(|e| {
+                    eprintln!("distribution_fixture_bounded_{e:?}");
+                })?;
+        }
+        if input["action"] == "exports" {
+            runtime.transfer_pending(&mut client).await.map_err(|e| {
+                eprintln!("distribution_fixture_export_{e:?}");
+            })?;
+        } else if input["action"] == "commit" {
             runtime
                 .isolated_commit_without_ack(&mut client)
                 .await
@@ -121,13 +200,21 @@ async fn main() {
             runtime.transfer_pending(&mut client).await.map_err(|e| {
                 eprintln!("distribution_fixture_export_{e:?}");
             })?;
-        } else if input["action"] != "enroll" {
+        } else if input["action"] != "enroll"
+            && input["action"] != "compute_refresh"
+            && input["action"] != "bounded"
+        {
             runtime
                 .transfer_pending(&mut client)
                 .await
                 .map_err(|_| ())?;
             runtime.poll_once(&mut client).await.map_err(|_| ())?;
         }
+        runtime
+            .store
+            .reconcile_distribution_results()
+            .await
+            .map_err(|_| ())?;
         runtime
             .store
             .verify_application_consistency()
@@ -150,7 +237,7 @@ async fn main() {
             .await
             .map_err(|_| ())?
             .len();
-        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":false,"exports":runtime.export_observation().await.map_err(|_|())?});
+        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":input["action"]=="bounded","exports":runtime.export_observation().await.map_err(|_|())?});
         runtime.shutdown().await.map_err(|_| ())?;
         Ok::<Value, ()>(result)
     };

@@ -1,0 +1,137 @@
+{
+  "contract_version": 1,
+  "provenance": "synthetic_test",
+  "binding": {
+    "customer_id": "00000001-1414-4414-8414-141414141414",
+    "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+    "installation_id": "00000003-1414-4414-8414-141414141414",
+    "generation": "1",
+    "authorization_epoch": "1",
+    "power_operation_id": "00000004-1414-4414-8414-141414141414",
+    "period_id": "00000005-1414-4414-8414-141414141414",
+    "public_key": "xxL_k-gNSIjnGfT57TnXI_eMmkniAbTGlhReMpwQBc0"
+  },
+  "bootstrap": {
+    "permit": {
+      "contract_version": 1,
+      "environment": "development",
+      "audience": "craxii.compute-watchdog",
+      "permit_id": "00000012-1414-4414-8414-141414141414",
+      "run_id": "00000013-1414-4414-8414-141414141414",
+      "power_operation_id": "00000004-1414-4414-8414-141414141414",
+      "period_id": "00000005-1414-4414-8414-141414141414",
+      "compute_reservation_id": "00000007-1414-4414-8414-141414141414",
+      "customer_id": "00000001-1414-4414-8414-141414141414",
+      "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+      "installation_id": "00000003-1414-4414-8414-141414141414",
+      "generation": "1",
+      "authorization_epoch": "1",
+      "issued_at": "2026-10-15T00:00:00.000000Z",
+      "expires_at": "2026-10-15T00:02:00.000000Z",
+      "max_elapsed_ms": "120000",
+      "permitted_scope": "bootstrap_only",
+      "request_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "key_id": "c66e7e1958fc757601013265e91871d698b8b622e35d2a5721acf32785d108fc",
+    "signature": "CZvj0jw3A3yR6gUNd1pEG1xDjP65f3pePIiUMc-vXmCJWGTML8f70s8oDf7yeoVAYAO94BOgptIoHg7wQh8IDw"
+  },
+  "grant": {
+    "protocol": "craxii.worker",
+    "version": {
+      "major": 1,
+      "minor": 0
+    },
+    "type": "compute_authorization",
+    "request_id": "00000010-1414-4414-8414-141414141414",
+    "environment": "development",
+    "authority": {
+      "customer_id": "00000001-1414-4414-8414-141414141414",
+      "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+      "installation_id": "00000003-1414-4414-8414-141414141414",
+      "generation": "1",
+      "session_id": "00000011-1414-4414-8414-141414141414"
+    },
+    "body": {
+      "grant": {
+        "grant_version": 1,
+        "audience": "craxii.worker:development",
+        "environment": "development",
+        "grant_id": "00000006-1414-4414-8414-141414141414",
+        "customer_id": "00000001-1414-4414-8414-141414141414",
+        "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+        "installation_id": "00000003-1414-4414-8414-141414141414",
+        "generation": "1",
+        "authorization_epoch": "1",
+        "power_operation_id": "00000004-1414-4414-8414-141414141414",
+        "period_id": "00000005-1414-4414-8414-141414141414",
+        "compute_reservation_id": "00000007-1414-4414-8414-141414141414",
+        "max_elapsed_ms": "120000",
+        "boot_id": "00000008-1414-4414-8414-141414141414",
+        "issued_at": "2026-10-15T00:00:01.000000Z",
+        "expires_at": "2026-10-15T00:02:01.000000Z",
+        "permitted_work_ids": [
+          "00000009-1414-4414-8414-141414141414"
+        ],
+        "scopes": [
+          "status",
+          "receipt",
+          "export",
+          "cancel",
+          "bounded_execute"
+        ]
+      },
+      "key_id": "c66e7e1958fc757601013265e91871d698b8b622e35d2a5721acf32785d108fc",
+      "signature": "VYLHmIV_cZfzI7JHrmXyz5tmzvY9xKYektPr1TX5XslfM_Kb-8mgwwDN7uIt7RoU8aI5avdICecUWyiK7BzCBw"
+    }
+  },
+  "renewal": {
+    "protocol": "craxii.worker",
+    "version": {
+      "major": 1,
+      "minor": 0
+    },
+    "type": "compute_authorization",
+    "request_id": "00000010-1414-4414-8414-141414141414",
+    "environment": "development",
+    "authority": {
+      "customer_id": "00000001-1414-4414-8414-141414141414",
+      "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+      "installation_id": "00000003-1414-4414-8414-141414141414",
+      "generation": "1",
+      "session_id": "00000011-1414-4414-8414-141414141414"
+    },
+    "body": {
+      "grant": {
+        "grant_version": 1,
+        "audience": "craxii.worker:development",
+        "environment": "development",
+        "grant_id": "00000014-1414-4414-8414-141414141414",
+        "customer_id": "00000001-1414-4414-8414-141414141414",
+        "logical_agent_id": "00000002-1414-4414-8414-141414141414",
+        "installation_id": "00000003-1414-4414-8414-141414141414",
+        "generation": "1",
+        "authorization_epoch": "1",
+        "power_operation_id": "00000004-1414-4414-8414-141414141414",
+        "period_id": "00000005-1414-4414-8414-141414141414",
+        "compute_reservation_id": "00000007-1414-4414-8414-141414141414",
+        "max_elapsed_ms": "180000",
+        "boot_id": "00000008-1414-4414-8414-141414141414",
+        "issued_at": "2026-10-15T00:00:02.000000Z",
+        "expires_at": "2026-10-15T00:03:02.000000Z",
+        "permitted_work_ids": [
+          "00000009-1414-4414-8414-141414141414"
+        ],
+        "scopes": [
+          "status",
+          "receipt",
+          "export",
+          "cancel",
+          "bounded_execute"
+        ]
+      },
+      "key_id": "c66e7e1958fc757601013265e91871d698b8b622e35d2a5721acf32785d108fc",
+      "signature": "TRNdKZNa4elTd0hFPi4S_n0sA3R3c_uMAmMVLsnjjgiwE9iQ2arrJ9dLTiPSH65rOlKRfX_8z8De_Rz8VChyBQ"
+    }
+  }
+}

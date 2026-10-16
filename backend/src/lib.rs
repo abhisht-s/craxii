@@ -17,3 +17,5 @@ pub mod worker_auth;
 pub mod distribution;
 
 pub mod guest_boundary;
+
+pub mod compute;

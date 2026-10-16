@@ -641,6 +641,66 @@ impl WorkerClient {
         }
         result
     }
+    /// Retrieve committed authority without spending. The caller verifies the central
+    /// signature and hands the exact response to the independent root supervisor.
+    pub async fn compute_authorization(&mut self, boot: &str, power: &str) -> AuthResult<Value> {
+        let authority = self.current_authority()?;
+        let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
+        let q = json!({"contract_version":1,"request_id":id,"authority":authority,"boot_id":boot,"power_operation_id":power});
+        let response = self
+            .session_exchange("/v1/worker/compute-authorization", &q)
+            .await?;
+        self.check_compute_response(&response, &authority, &id)?;
+        Ok(response)
+    }
+    /// Stable request ID/body must be persisted by the caller before attempting renewal.
+    /// A failed exchange does not modify any deadline. One attempt per call uses existing
+    /// 5s total/2s connect timeouts and the same sensitive Ed25519 challenge transport.
+    pub async fn renew_compute(&mut self, id: &str, body: &Value) -> AuthResult<Value> {
+        let authority = self.current_authority()?;
+        if !self
+            .session
+            .as_ref()
+            .ok_or(AuthError::SessionExpired)?
+            .scopes
+            .iter()
+            .any(|s| s == "compute_renew")
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"compute_renew","request_id":id,"environment":"development","authority":authority,"body":body});
+        decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let proof = self
+            .sensitive_proof(&request, &authority, id, "compute_renew")
+            .await?;
+        let response = self
+            .session_exchange(
+                "/v1/worker/compute-renew",
+                &json!({"contract_version":1,"request":request,"proof":proof}),
+            )
+            .await?;
+        self.check_compute_response(&response, &authority, id)?;
+        Ok(response)
+    }
+    fn check_compute_response(
+        &self,
+        response: &Value,
+        authority: &Value,
+        id: &str,
+    ) -> AuthResult<()> {
+        decode_message(&canonical_bytes(response).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        if response["type"] != "compute_authorization"
+            || response["authority"] != *authority
+            || response["request_id"] != id
+            || response["environment"] != "development"
+            || response["body"]["grant"]["authorization_epoch"] != self.state.highest_epoch
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        Ok(())
+    }
     pub async fn poll(
         &mut self,
         boot: &str,
@@ -846,7 +906,15 @@ fn scope_policy(value: &Value) -> bool {
     let Some(scopes) = value.as_array() else {
         return false;
     };
-    scopes == &vec![json!("status")]
+    scopes
+        == &vec![
+            json!("status"),
+            json!("receipt_commit"),
+            json!("cancel"),
+            json!("result_export"),
+            json!("compute_renew"),
+        ]
+        || scopes == &vec![json!("status")]
         || scopes == &vec![json!("status"), json!("receipt_commit"), json!("cancel")]
         || scopes
             == &vec![

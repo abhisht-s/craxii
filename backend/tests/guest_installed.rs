@@ -1,6 +1,6 @@
 //! Explicitly ignored, credential-free installed Linux qualification. No fixture backend is
 //! selected in the product: these tests call the standard installed constructors.
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
 use craxii_server::{
     adapters::{
         artifacts::LocalArtifactStore,
@@ -36,7 +36,7 @@ fn fixture() {
     assert_eq!(std::env::consts::ARCH, "x86_64");
 }
 fn config() -> DistributionConfig {
-    DistributionConfig {
+    let mut config = DistributionConfig {
         contract_version: 1,
         environment: "development".into(),
         origin: "https://127.0.0.1:19443".into(),
@@ -47,7 +47,17 @@ fn config() -> DistributionConfig {
         power_operation_id: "11111111-1111-4111-8111-111111111111".into(),
         release_id: "qualification-only".into(),
         release_sha256: "1".repeat(64),
-    }
+    };
+    let policy = craxii_server::compute::watchdog::Policy::parse(
+        &craxii_server::compute::watchdog::protected_read(
+            Path::new("/etc/craxii/compute-watchdog.json"),
+            0,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    config.power_operation_id = policy.binding.power_operation_id;
+    config
 }
 #[test]
 #[ignore = "owned disposable installed guest only; before guard readiness"]
@@ -140,7 +150,7 @@ async fn installed() -> (DistributionRuntime, LocalWorkstation, Arc<SystemClock>
     );
     let snapshot = runtime.store.load_bootstrap_snapshot().await.unwrap();
     let clock = Arc::new(SystemClock::new());
-    let w = LocalWorkstation::new_installed(
+    let w = LocalWorkstation::isolated_unmetered_installed(
         &snapshot.workstation,
         &snapshot.workspace,
         LocalWorkstationOptions {
@@ -788,4 +798,36 @@ async fn installed_reader_denies_trusted_state() {
     }
     runtime.shutdown().await.unwrap();
     println!("PASS actual-reader-workspace-control-trusted-key-journal-config-symlink-denial");
+}
+
+#[tokio::test]
+#[ignore = "owned installed guest; mandatory compute permit gate"]
+async fn installed_compute_requires_grant() {
+    let (runtime, fixture_adapter, clock) = installed().await;
+    let snapshot = runtime.store.load_bootstrap_snapshot().await.unwrap();
+    let normal = LocalWorkstation::new_installed(
+        &snapshot.workstation,
+        &snapshot.workspace,
+        LocalWorkstationOptions {
+            default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+            configured_workspace_root: Path::new(storage::WORKSPACE).into(),
+            read_hard_limit: HARD_FILE_READ_MAX_BYTES,
+            artifact_store: Arc::new(
+                LocalArtifactStore::initialize(Path::new(storage::ARTIFACTS)).unwrap(),
+            ),
+            administrative_enabled: false,
+            user_switch_launcher: Some("/opt/craxii/current/craxii-workstation-launcher".into()),
+            credential_free_direct_execution: false,
+            delegated_cgroup_root: Some(storage::TOOLS_CGROUP.into()),
+            clock: clock.clone(),
+        },
+    )
+    .unwrap();
+    let canary = format!("compute-missing-permit-{}", ExecutionId::generate());
+    let req = request(&fixture_adapter, &clock, &format!("touch {canary}"), 1000).await;
+    assert!(normal.execute(req).await.is_err());
+    assert!(!Path::new(storage::WORKSPACE).join(canary).exists());
+    assert_eq!(storage::model_process_count().unwrap(), 0);
+    runtime.shutdown().await.unwrap();
+    println!("PASS installed mandatory compute permit refused before tool effect");
 }

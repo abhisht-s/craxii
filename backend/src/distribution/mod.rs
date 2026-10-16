@@ -55,9 +55,17 @@ pub struct ValidatedDelivery {
     pub(crate) profile_key: String,
     pub(crate) deadline: Instant,
     pub(crate) clock_seen: SystemTime,
+    #[cfg(target_os = "linux")]
+    pub(crate) compute: Option<std::sync::Arc<crate::compute::worker::InstalledCompute>>,
 }
 impl ValidatedDelivery {
     pub fn check_fresh(&self) -> DistributionResult<()> {
+        #[cfg(target_os = "linux")]
+        if self.message["type"] == "work_delivery" {
+            if let Some(c) = &self.compute {
+                c.running().map_err(|_| DistributionError::Expired)?;
+            }
+        }
         let b = &self.message["body"];
         let t = now()?;
         let expires = timestamp_micros(text(b, "expires_at")?).map_err(|_| invalid())?;
@@ -75,19 +83,35 @@ impl ValidatedDelivery {
             .ok_or(DistributionError::Reconciliation)?;
         decode_message(&canonical_bytes(profile).map_err(|_| invalid())?).map_err(|_| invalid())?;
         let p = &profile["body"]["profile"];
+        #[cfg(target_os = "linux")]
+        if let Some(c) = &self.compute {
+            c.check_work(text(p, "work_id")?, text(p, "compute_grant_id")?, 1)
+                .map_err(|_| DistributionError::Expired)?;
+        }
         let a = &delivery["authority"];
         let m = &body["material"];
         let program = text(p, "deterministic_program_id")?;
         let terminal = cfg!(all(feature = "test-failpoints", debug_assertions))
             && program == "terminal_text_v1";
-        let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":[],"model_dispatch":terminal,"tool_dispatch":false})).map_err(|_|invalid())?);
+        let tool = cfg!(all(feature = "test-failpoints", debug_assertions))
+            && program == "bounded_tool_v1";
+        #[cfg(target_os = "linux")]
+        let tool = tool && self.compute.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let tool = tool && false;
+        let tools = if tool {
+            json!(["run_shell"])
+        } else {
+            json!([])
+        };
+        let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":tools,"model_dispatch":terminal,"tool_dispatch":tool})).map_err(|_|invalid())?);
         if profile["authority"] != *a
             || p["kind"] != "development_fixture"
             || p["environment"] != "development"
             || p["audience"] != "craxii.worker:development"
-            || (program != "receipt_only_v1" && !terminal)
-            || p["allowed_tool_ids"] != json!([])
-            || p["max_tool_duration_ms"] != "1"
+            || (program != "receipt_only_v1" && !terminal && !tool)
+            || p["allowed_tool_ids"] != tools
+            || p["max_tool_duration_ms"] != if tool { "5000" } else { "1" }
             || p["config_digest"] != expected
             || p["model_config_digest"] != expected
             || p["price_config_digest"] != expected
@@ -166,6 +190,8 @@ impl ValidatedDelivery {
             deadline: Instant::now()
                 + Duration::from_micros(u64::try_from(expiry - t).map_err(|_| invalid())?),
             clock_seen: SystemTime::now(),
+            #[cfg(target_os = "linux")]
+            compute: None,
         };
         result.check_fresh()?;
         Ok(result)

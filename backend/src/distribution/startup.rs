@@ -65,6 +65,12 @@ impl DistributionConfig {
         Ok(())
     }
 }
+struct ExportFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+impl Drop for ExportFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 pub struct DistributionRuntime {
     pub store: SqliteStateStore,
     guard: SqliteRuntimeGuard,
@@ -73,6 +79,8 @@ pub struct DistributionRuntime {
     pub boot_id: String,
     in_flight_exports: std::sync::atomic::AtomicUsize,
     boundary: Option<crate::guest_boundary::config::GuestConfig>,
+    #[cfg(target_os = "linux")]
+    compute: Option<std::sync::Arc<crate::compute::worker::InstalledCompute>>,
 }
 impl DistributionRuntime {
     pub async fn open(config: DistributionConfig) -> DistributionResult<Self> {
@@ -226,6 +234,21 @@ impl DistributionRuntime {
             .verify_distribution_results()
             .await
             .map_err(|_| DistributionError::Reconciliation)?;
+        #[cfg(target_os = "linux")]
+        let compute = if let Some(g) = &boundary {
+            Some(std::sync::Arc::new(
+                crate::compute::worker::InstalledCompute::load(
+                    g.text("customer_id"),
+                    g.text("logical_agent_id"),
+                    g.text("installation_id"),
+                    g.text("generation"),
+                    &config.power_operation_id,
+                )
+                .map_err(|_| DistributionError::Storage)?,
+            ))
+        } else {
+            None
+        };
         // No AgentLoop, model/tool provider, executable scheduler or legacy delivery worker.
         Ok(Self {
             store,
@@ -235,6 +258,8 @@ impl DistributionRuntime {
             boot_id,
             in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
             boundary,
+            #[cfg(target_os = "linux")]
+            compute,
         })
     }
     fn recheck_boundary(&self) -> DistributionResult<()> {
@@ -245,7 +270,16 @@ impl DistributionRuntime {
         Ok(())
     }
     pub fn hello(&self) -> Value {
-        json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"9","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}})
+        #[allow(unused_mut)]
+        let mut hello = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"9","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}});
+        #[cfg(target_os = "linux")]
+        if self.compute.is_some() {
+            hello["body"]["capabilities"]
+                .as_array_mut()
+                .expect("hello capabilities")
+                .push(json!("compute_v1"));
+        }
+        hello
     }
     pub async fn reconnect(&self, client: &mut WorkerClient) -> Result<(), AuthError> {
         self.recheck_boundary()
@@ -291,6 +325,19 @@ impl DistributionRuntime {
         {
             self.in_flight_exports
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _flight = ExportFlight(&self.in_flight_exports);
+            // Persist ambiguity before network I/O. SIGTERM, timeout or process death
+            // cannot make a possibly accepted export look definitely unsent.
+            self.store
+                .record_distribution_result_transfer_failure(
+                    body["snapshot"]["export_id"]
+                        .as_str()
+                        .ok_or(AuthError::InvalidContext)?,
+                    true,
+                    false,
+                )
+                .await
+                .map_err(|_| AuthError::Unavailable)?;
             let result = async {
                 let ack = match client.query_result(&body).await {
                     Ok(ack) => ack,
@@ -303,15 +350,15 @@ impl DistributionRuntime {
                     .map_err(|_| AuthError::Unavailable)
             }
             .await;
-            self.in_flight_exports
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
             if let Err(error) = result {
                 self.store
                     .record_distribution_result_transfer_failure(
                         body["snapshot"]["export_id"]
                             .as_str()
                             .ok_or(AuthError::InvalidContext)?,
-                        matches!(error, AuthError::Transport | AuthError::Unavailable),
+                        // Once I/O may have begun, even a malformed acknowledgement cannot
+                        // prove the central import did not commit. Preserve ambiguity.
+                        true,
                         error == AuthError::ResultConflict,
                     )
                     .await
@@ -426,7 +473,8 @@ impl DistributionRuntime {
             self.transfer_pending(client).await?;
             crate::guest_boundary::storage::pressure().map_err(|_| AuthError::Unavailable)?;
         }
-        let items = client
+        #[allow(unused_mut)]
+        let mut items = client
             .poll(
                 &self.boot_id,
                 &self.config.power_operation_id,
@@ -435,6 +483,10 @@ impl DistributionRuntime {
             .await?;
         self.recheck_boundary()
             .map_err(|_| AuthError::Unavailable)?;
+        #[cfg(target_os = "linux")]
+        for item in &mut items {
+            item.compute = self.compute.clone();
+        }
         let count = items.len();
         // Commit controls first; a same-batch cancelled sequence is reconciled without a message.
         for item in items
@@ -527,7 +579,83 @@ impl DistributionRuntime {
             .await
             .map_err(|_| AuthError::InvalidContext)?
             .ok_or(AuthError::InvalidContext)?;
-        super::fixture::complete(&self.store, &self.config, claimed)
+        super::fixture::complete(
+            &self.store,
+            &self.config,
+            claimed,
+            #[cfg(target_os = "linux")]
+            None,
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("distribution_fixture_{e}");
+            AuthError::InvalidContext
+        })?;
+        Ok(())
+    }
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub async fn isolated_bounded_once(&self, client: &mut WorkerClient) -> Result<(), AuthError> {
+        let mut items = client
+            .poll(
+                &self.boot_id,
+                &self.config.power_operation_id,
+                &self.config.profile_public_key,
+            )
+            .await
+            .map_err(|e| {
+                eprintln!("distribution_fixture_bounded_poll_{e:?}");
+                e
+            })?;
+        for item in &mut items {
+            item.compute = self.compute.clone();
+        }
+        let d = items
+            .iter()
+            .find(|d| d.message["type"] == "work_delivery")
+            .ok_or_else(|| {
+                eprintln!("distribution_fixture_bounded_delivery_absent");
+                AuthError::Unavailable
+            })?;
+        d.verify_profile().map_err(|e| {
+            eprintln!("distribution_fixture_bounded_profile_{e:?}");
+            AuthError::InvalidContext
+        })?;
+        if d.profile
+            .as_ref()
+            .is_none_or(|p| p["body"]["profile"]["deterministic_program_id"] != "bounded_tool_v1")
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let receipt = self.store.admit_distribution(d).await.map_err(|e| {
+            eprintln!("distribution_fixture_bounded_admit_{e:?}");
+            AuthError::InvalidContext
+        })?;
+        self.transfer(client, receipt).await.map_err(|e| {
+            eprintln!("distribution_fixture_bounded_transfer_{e:?}");
+            e
+        })?;
+        let claimed = self
+            .store
+            .isolated_claim_distribution(
+                crate::ports::state_store::ClaimNextWorkRequest {
+                    runtime_id: self.runtime.runtime_instance_id,
+                    claimed_at: timestamp().map_err(|_| AuthError::Unavailable)?,
+                    event_id: JournalEventId::generate(),
+                },
+                d,
+            )
+            .await
+            .map_err(|_| AuthError::InvalidContext)?
+            .ok_or(AuthError::InvalidContext)?;
+        let permit = self
+            .store
+            .distribution_compute_permit(d, claimed.work.work_id())
+            .await
+            .map_err(|e| {
+                eprintln!("distribution_fixture_bounded_claim_{e:?}");
+                AuthError::InvalidContext
+            })?;
+        super::fixture::complete(&self.store, &self.config, claimed, Some(permit))
             .await
             .map_err(|e| {
                 eprintln!("distribution_fixture_{e}");
@@ -568,14 +696,35 @@ impl DistributionRuntime {
     }
     pub async fn run(self, mut client: WorkerClient) -> DistributionResult<()> {
         self.reconnect(&mut client).await.map_err(|_| invalid())?;
+        #[cfg(unix)]
+        let mut termination =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|_| invalid())?;
         let mut delay = 1000u64;
         loop {
-            let result = async {
+            let exchange = async {
+                #[cfg(target_os = "linux")]
+                if let Some(c) = &self.compute {
+                    c.refresh(&mut client, &self.boot_id).await?;
+                    c.running().map_err(|_| AuthError::Unavailable)?;
+                }
                 self.transfer_pending(&mut client).await?;
                 self.poll_once(&mut client).await?;
                 Ok::<_, AuthError>(())
-            }
-            .await;
+            };
+            let drain = async {
+                loop {
+                    #[cfg(target_os = "linux")]
+                    if self.compute.as_ref().is_some_and(|c| c.should_drain()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            #[cfg(unix)]
+            let result = tokio::select! { result=exchange=>result,_=drain=>break,_=termination.recv()=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
+            #[cfg(not(unix))]
+            let result = tokio::select! { result=exchange=>result,_=drain=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
             match result {
                 Ok(()) => delay = 1000,
                 Err(AuthError::SessionExpired) => {
@@ -585,7 +734,20 @@ impl DistributionRuntime {
                 Err(_) => return Err(invalid()),
             }
             let jitter = crate::distribution::request_id()?.as_bytes()[0] as u64;
+            #[cfg(unix)]
+            tokio::select! {_=termination.recv()=>{break;},result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;},_=tokio::time::sleep(Duration::from_millis(delay+jitter))=>{}}
+            #[cfg(not(unix))]
             tokio::select! {result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;},_=tokio::time::sleep(Duration::from_millis(delay+jitter))=>{}}
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(c) = &self.compute {
+            if let Ok(cutoff) = c.cleanup_cutoff() {
+                let _ = tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(cutoff),
+                    self.transfer_pending(&mut client),
+                )
+                .await;
+            }
         }
         self.shutdown().await
     }

@@ -49,6 +49,67 @@ pub enum DistributionAdmission {
     },
 }
 impl SqliteStateStore {
+    #[cfg(target_os = "linux")]
+    pub async fn distribution_compute_permit(
+        &self,
+        delivery: &ValidatedDelivery,
+        local: WorkId,
+    ) -> DistributionResult<crate::compute::worker::WorkPermit> {
+        delivery.check_fresh()?;
+        delivery.verify_profile()?;
+        let compute = delivery.compute.clone().ok_or_else(invalid)?;
+        let p = &delivery.profile.as_ref().ok_or_else(invalid)?["body"]["profile"];
+        if p["allowed_tool_ids"] != json!(["run_shell"]) {
+            return Err(invalid());
+        }
+        let mut tx = WriteTransaction::begin(&self.runtime, "compute_work_permit")
+            .await
+            .map_err(storage)?;
+        let row=sqlx::query("SELECT r.central_work_id,r.material_digest FROM distribution_receipts r JOIN work_items w ON w.work_id=r.local_work_id WHERE r.local_work_id=? AND r.quarantined=0 AND w.state IN ('running','waiting_on_model','waiting_on_tool')").bind(local.to_string()).fetch_optional(tx.connection()).await.map_err(storage)?.ok_or_else(invalid)?;
+        if row
+            .try_get::<String, _>("central_work_id")
+            .map_err(storage)?
+            != text(p, "work_id")?
+            || row
+                .try_get::<String, _>("material_digest")
+                .map_err(storage)?
+                != text(p, "material_digest")?
+        {
+            return Err(invalid());
+        }
+        let cleanup_cutoff = compute
+            .cleanup_cutoff()
+            .map_err(|_| DistributionError::Expired)?;
+        let result = crate::compute::worker::WorkPermit {
+            cleanup_cutoff,
+            compute,
+            central_work: text(p, "work_id")?.to_owned(),
+            local_work: local,
+            grant_id: text(p, "compute_grant_id")?.to_owned(),
+            profile_cutoff: delivery.deadline.min(
+                std::time::Instant::now()
+                    + std::time::Duration::from_micros(
+                        u64::try_from(
+                            crate::distribution_contracts::primitives::timestamp_micros(text(
+                                p,
+                                "expires_at",
+                            )?)
+                            .map_err(|_| invalid())?
+                                - crate::distribution::now()?,
+                        )
+                        .map_err(|_| DistributionError::Expired)?,
+                    ),
+            ),
+            max_duration_ms: text(p, "max_tool_duration_ms")?
+                .parse()
+                .map_err(|_| invalid())?,
+        };
+        result
+            .check(local, 1)
+            .map_err(|_| DistributionError::Expired)?;
+        tx.commit().await.map_err(storage)?;
+        Ok(result)
+    }
     async fn distribution_owner(
         &self,
         tx: &mut WriteTransaction,
@@ -265,6 +326,7 @@ impl SqliteStateStore {
    .bind(id).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(text(m,"conversation_id")?).bind(sequence).bind(digest).bind(material).bind(receipt_id.to_string()).bind(string(&receipt)?).bind(user).bind(conversation).bind(admitted.message_id.to_string()).bind(admitted.work_id.to_string()).bind(accepted_event.to_string()).bind(admitted.committed_cursor.get()).bind(admitted.work_ordinal.get()).bind(text(a,"installation_id")?).bind(text(a,"generation")?.parse::<i64>().map_err(|_|invalid())?).bind(at.to_string()).execute(tx.connection()).await.map_err(storage)?;
         sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment='development' AND central_conversation_id=? AND next_sequence=?").bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
         delivery.check_fresh()?;
+        delivery.verify_profile()?;
         delivery.verify_profile()?;
         tx.commit().await.map_err(storage)?;
         Ok(DistributionAdmission::Receipt {

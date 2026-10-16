@@ -1,4 +1,7 @@
 [Unit]
+Requires=craxii-compute-watchdog.service
+BindsTo=craxii-compute-watchdog.service
+After=craxii-compute-watchdog.service
 Description=Craxii trusted outbound distribution worker
 Requires=craxii-guest-bootstrap.service
 After=craxii-guest-bootstrap.service network-online.target

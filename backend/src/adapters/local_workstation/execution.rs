@@ -96,6 +96,10 @@ pub(super) struct ExecutionRuntime {
     artifact_store: Arc<dyn ArtifactStore>,
     clock: Arc<dyn Clock>,
     config: ExecutionRuntimeConfig,
+    #[cfg(target_os = "linux")]
+    compute_permit: Mutex<Option<crate::compute::worker::WorkPermit>>,
+    #[cfg(target_os = "linux")]
+    compute_required: AtomicBool,
     leader_observer: Arc<dyn LeaderObserver>,
     #[cfg(test)]
     lifecycle_events: Mutex<Vec<&'static str>>,
@@ -267,6 +271,10 @@ impl ExecutionRuntime {
             artifact_store,
             clock,
             config,
+            #[cfg(target_os = "linux")]
+            compute_permit: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            compute_required: AtomicBool::new(false),
             leader_observer: Arc::new(WaitIdLeaderObserver),
             #[cfg(test)]
             lifecycle_events: Mutex::new(Vec::new()),
@@ -275,6 +283,58 @@ impl ExecutionRuntime {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn require_compute(&self) {
+        self.compute_required.store(true, Ordering::Release);
+    }
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub(super) fn isolated_unmetered(&self) {
+        self.compute_required.store(false, Ordering::Release);
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn attach_compute(
+        &self,
+        permit: crate::compute::worker::WorkPermit,
+    ) -> Result<(), WorkstationError> {
+        let mut current = lock(&self.compute_permit);
+        if current.is_some() {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
+        permit
+            .prepare()
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        *current = Some(permit);
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn prepare_compute(&self) -> Result<(), WorkstationError> {
+        if self.compute_required.load(Ordering::Acquire) && lock(&self.compute_permit).is_none() {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
+        if let Some(p) = lock(&self.compute_permit).as_ref() {
+            p.prepare()
+                .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        }
+        Ok(())
+    }
+    #[cfg(target_os = "linux")]
+    fn check_compute(&self, request: &ExecutionRequest) -> Result<(), WorkstationError> {
+        self.prepare_compute()?;
+        if let Some(p) = lock(&self.compute_permit).as_ref() {
+            p.check(
+                request.work_id,
+                u64::try_from(request.timeout.as_duration().as_millis()).map_err(|_| {
+                    WorkstationError::new(WorkstationErrorKind::UnsupportedCapability)
+                })?,
+            )
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        }
+        Ok(())
+    }
     pub(super) fn observe_boundary(&self) -> crate::guest_boundary::ExecutionBoundaryObservation {
         let registry = lock(&self.registry);
         let active = registry
@@ -450,7 +510,7 @@ impl ExecutionRuntime {
         {
             let mut installed = lock(&self.shutdown_deadline);
             match *installed {
-                Some(existing) => debug_assert_eq!(existing, deadline),
+                Some(existing) => *installed = Some(existing.min(deadline)),
                 None => *installed = Some(deadline),
             }
         }
@@ -469,6 +529,7 @@ impl ExecutionRuntime {
         deadline: tokio::time::Instant,
     ) -> Result<(), WorkstationError> {
         self.begin_shutdown(deadline);
+        let deadline = (*lock(&self.shutdown_deadline)).unwrap_or(deadline);
         loop {
             let notified = self.empty.notified();
             tokio::pin!(notified);
@@ -477,20 +538,26 @@ impl ExecutionRuntime {
             if empty {
                 break;
             }
-            notified.await;
+            tokio::time::timeout_at(deadline, notified)
+                .await
+                .map_err(|_| WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed))?;
         }
 
         let ownership = lock(&self.manager).take();
         if let Some(mut ownership) = ownership {
             let (sent, received) = oneshot::channel();
             let _ = ownership.sender.send(ManagerCommand::Stop(sent));
-            received
+            tokio::time::timeout_at(deadline, received)
                 .await
+                .map_err(|_| WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed))?
                 .map_err(|_| WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed))?;
             if let Some(join) = ownership.join.take() {
-                join.await.map_err(|_| {
-                    WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed)
-                })?;
+                tokio::time::timeout_at(deadline, join)
+                    .await
+                    .map_err(|_| WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed))?
+                    .map_err(|_| {
+                        WorkstationError::uncertain(WorkstationErrorKind::CleanupFailed)
+                    })?;
             }
         }
         if self.shutdown_cleanup_failed.load(Ordering::Acquire) {
@@ -506,7 +573,18 @@ impl ExecutionRuntime {
         &self,
         request_deadline: crate::ports::clock::MonotonicInstant,
     ) -> Option<Duration> {
-        let request_remaining = remaining(self.clock.as_ref(), request_deadline)?;
+        #[cfg(target_os = "linux")]
+        let funded = lock(&self.compute_permit).as_ref().map(|p| {
+            p.cleanup_cutoff()
+                .saturating_duration_since(tokio::time::Instant::now())
+        });
+        #[cfg(not(target_os = "linux"))]
+        let funded: Option<Duration> = None;
+        // Execution still stops at request.deadline/timeout. A metered admission has
+        // separately funded cleanup authority through its original sealed cutoff.
+        // This cannot start work or create a restart-relative drain grace period.
+        let request_remaining =
+            funded.or_else(|| remaining(self.clock.as_ref(), request_deadline))?;
         let shutdown_remaining = lock(&self.shutdown_deadline)
             .map(|deadline| deadline.saturating_duration_since(tokio::time::Instant::now()));
         Some(
@@ -523,6 +601,8 @@ impl ExecutionRuntime {
     }
 
     fn validate_request(&self, request: &ExecutionRequest) -> Result<(), WorkstationError> {
+        #[cfg(target_os = "linux")]
+        self.check_compute(request)?;
         if self.shutdown_cleanup_failed.load(Ordering::Acquire) {
             return Err(WorkstationError::uncertain(
                 WorkstationErrorKind::CleanupFailed,
@@ -739,6 +819,10 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
         });
     }
 
+    #[cfg(target_os = "linux")]
+    if let Err(e) = runtime.check_compute(&request) {
+        return spawn_failure_result(&request, resolved_cwd, e.kind());
+    }
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -816,6 +900,18 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
     let mut leader_terminal_observed = false;
     let mut leader_identity_stable = true;
     loop {
+        #[cfg(target_os = "linux")]
+        {
+            let expired = lock(&runtime.compute_permit)
+                .as_ref()
+                .filter(|p| p.prepare().is_err())
+                .map(|p| p.cleanup_cutoff());
+            if let Some(cutoff) = expired {
+                runtime.begin_shutdown(cutoff);
+                let _ = launch.entry.latch(TerminalCause::Cancellation);
+                break;
+            }
+        }
         match runtime.leader_observer.observe(process_group.leader_pid()) {
             Ok(LeaderObservationStatus::Terminal) => {
                 leader_terminal_observed = true;

@@ -127,3 +127,34 @@ No local test claims provider encryption or physical EC2 identity proof. No host
 mounted. VM artifacts/evidence stay outside Git. Real AMI/Nitro/encryption and EC2 reboot certification
 remain separate. No service activation, infrastructure adapter, migration or worker-wire change is
 introduced by these assets.
+
+The Stage 14 candidate adds a separate root compute watchdog before storage bootstrap and
+worker startup. Its protected policy is `/etc/craxii/compute-watchdog.json`; signed bootstrap
+funding and the consumed receipt live under `/var/lib/craxii-compute` on the OS root disk.
+The worker stages centrally signed authorization in its protected `compute-inbox`; it cannot
+mint grants or write root receipts. CLOCK_BOOTTIME and the saved absolute cutoff survive
+process restart. A fresh boot requires fresh signed power authority. Bootstrap permits never
+authorize tools. Missing authority fails closed through the fixed local poweroff path.
+
+The installer supplies binaries, directories and units without activation or funding. The
+worker remains receipt/export-only. The separate bounded-tool qualification profile requires
+real compute funding and both debug assertions and `test-failpoints`. Local installed
+qualification exercises signed tool admission, active cancellation, descendant cleanup,
+durable export recovery and independent guest poweroff. Separate independent verification
+remains required. These candidate assets grant no workstation activation or provider authority.
+Provider poweroff/billing behavior remains unqualified.
+
+Protected compute receipts use format 2. They retain the greatest boot-wide UTC minus
+CLOCK_BOOTTIME offset across bootstrap, signed renewals and process restarts. A new
+deadline is bounded by the signed effective horizon (the earlier of `expires_at` and
+`issued_at + max_elapsed_ms`) projected through that retained offset. Forward observations
+can tighten this bound; rollback cannot extend it or replenish the cumulative drift budget.
+A later signed response may reuse existing funding without extending its cutoff.
+Boot tick counters are decimal strings in the receipt, independent of frozen wire formats.
+
+Format 1 receipts lack reliable projection history and cannot resume execution on the same
+boot. They remain cryptographically checked consumed-permit history for a subsequent boot
+with a distinct freshly funded power operation and permit. Never delete a legacy receipt or
+its consumed marker to obtain a new timer. Missing or corrupt evidence fails closed. Install
+the matching worker and watchdog together; an older consumer must not resume a format 2
+receipt. These changes do not alter the signed grant, policy or bootstrap-permit contracts.

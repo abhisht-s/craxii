@@ -349,7 +349,10 @@ async fn claim_next(
             d.verify_profile().map_err(|_| invariant())?;
             cfg!(all(feature = "test-failpoints", debug_assertions))
                 && d.profile.as_ref().is_some_and(|p| {
-                    p["body"]["profile"]["deterministic_program_id"] == "terminal_text_v1"
+                    matches!(
+                        p["body"]["profile"]["deterministic_program_id"].as_str(),
+                        Some("terminal_text_v1" | "bounded_tool_v1")
+                    )
                 })
                 && d.message["body"]["material"]["work_id"]
                     == r.try_get::<String, _>("central_work_id")?
@@ -426,6 +429,10 @@ async fn claim_next(
         request.claimed_at,
     )
     .await?;
+    if let Some(d) = fixture {
+        d.check_fresh().map_err(|_| invariant())?;
+        d.verify_profile().map_err(|_| invariant())?;
+    }
     transaction.commit().await?;
     let committed_version = next.projection_version();
     Ok(Some(ClaimedWork {

@@ -1,4 +1,6 @@
 [Unit]
+Requires=craxii-compute-watchdog.service
+After=craxii-compute-watchdog.service
 Description=Craxii exact persistent disk bootstrap
 Before=craxii-distribution.service
 After=local-fs.target

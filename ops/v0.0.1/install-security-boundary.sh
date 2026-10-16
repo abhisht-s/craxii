@@ -15,7 +15,7 @@ assets=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 release_source=$1
 release_id=$2
 # Every source artifact must be an ordinary single-link binary; integrity is checked after copying.
-for binary in craxii-server craxii-guest-guard craxii-workstation-launcher craxii-workstation-reader; do
+for binary in craxii-server craxii-guest-guard craxii-workstation-launcher craxii-workstation-reader craxii-compute-watchdog; do
   [ -f "$release_source/$binary" ] && [ ! -L "$release_source/$binary" ] || fail
 done
 for unit in craxii-server.service craxii-distribution.service; do
@@ -37,6 +37,7 @@ done
 [ ! -e "/opt/craxii/releases/$release_id" ] || fail
 /usr/bin/install -d -o root -g root -m 0755 "/opt/craxii/releases/$release_id"
 /usr/bin/install -o root -g craxii-server -m 0550 "$release_source/craxii-server" "/opt/craxii/releases/$release_id/craxii-server"
+/usr/bin/install -o root -g root -m 0500 "$release_source/craxii-compute-watchdog" "/opt/craxii/releases/$release_id/craxii-compute-watchdog"
 /usr/bin/install -o root -g craxii-server -m 0550 "$release_source/craxii-guest-guard" "/opt/craxii/releases/$release_id/craxii-guest-guard"
 /usr/bin/install -o root -g craxii-server -m 4750 "$release_source/craxii-workstation-launcher" "/opt/craxii/releases/$release_id/craxii-workstation-launcher"
 /usr/bin/install -o root -g root -m 0111 "$release_source/craxii-workstation-reader" "/opt/craxii/releases/$release_id/craxii-workstation-reader"
@@ -51,6 +52,11 @@ done
 /usr/bin/install -d -o root -g craxii-server -m 0750 /etc/craxii /var/lib/craxii-worker /run/craxii-worker
 /usr/bin/install -d -o root -g root -m 0700 /var/lib/craxii-worker/bootstrap
 /usr/bin/install -d -o craxii-server -g craxii-server -m 0700 /var/lib/craxii-worker/identity
+/usr/bin/install -d -o root -g craxii-server -m 2750 /var/lib/craxii-compute
+/usr/bin/install -d -o craxii-server -g craxii-server -m 0700 /var/lib/craxii-worker/compute-inbox
+for unit in craxii-compute-watchdog.service craxii-compute-failsafe.service; do
+  /usr/bin/install -o root -g root -m 0644 "$assets/$unit" "/etc/systemd/system/$unit"
+done
 # Empty root-owned fallback targets only; preserve any existing content by refusing.
 for target in /srv/craxii-data /var/lib/craxii /srv/craxii/workspaces /home/craxii; do
   [ ! -L "$target" ] || fail
