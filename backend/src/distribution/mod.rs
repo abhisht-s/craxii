@@ -1,6 +1,7 @@
 //! Receipt-only outbound distribution. No scheduler, model provider or tool runner is composed.
 #[cfg(all(feature = "test-failpoints", debug_assertions))]
 pub(crate) mod fixture;
+pub mod model_config;
 pub mod startup;
 pub mod transport;
 use crate::distribution_contracts::{
@@ -93,10 +94,12 @@ impl ValidatedDelivery {
         let program = text(p, "deterministic_program_id")?;
         let terminal = cfg!(all(feature = "test-failpoints", debug_assertions))
             && program == "terminal_text_v1";
+        let proxy =
+            cfg!(all(feature = "test-failpoints", debug_assertions)) && program == "proxy_loop_v1";
         let tool = cfg!(all(feature = "test-failpoints", debug_assertions))
             && program == "bounded_tool_v1";
         #[cfg(target_os = "linux")]
-        let tool = tool && self.compute.is_some();
+        let tool = (tool || proxy) && self.compute.is_some();
         #[cfg(not(target_os = "linux"))]
         let tool = tool && false;
         let tools = if tool {
@@ -104,7 +107,7 @@ impl ValidatedDelivery {
         } else {
             json!([])
         };
-        let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":tools,"model_dispatch":terminal,"tool_dispatch":tool})).map_err(|_|invalid())?);
+        let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":tools,"model_dispatch":terminal || proxy,"tool_dispatch":tool})).map_err(|_|invalid())?);
         if profile["authority"] != *a
             || p["kind"] != "development_fixture"
             || p["environment"] != "development"
@@ -113,8 +116,8 @@ impl ValidatedDelivery {
             || p["allowed_tool_ids"] != tools
             || p["max_tool_duration_ms"] != if tool { "5000" } else { "1" }
             || p["config_digest"] != expected
-            || p["model_config_digest"] != expected
-            || p["price_config_digest"] != expected
+            || (!proxy
+                && (p["model_config_digest"] != expected || p["price_config_digest"] != expected))
         {
             return Err(invalid());
         }

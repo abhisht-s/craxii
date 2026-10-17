@@ -3282,3 +3282,284 @@ async fn real_agent_loop_scheduler_preserves_multi_conversation_fifo_tools_and_c
     scheduler.stop_and_join().await.unwrap();
     fixture.guard.shutdown().await;
 }
+
+#[cfg(feature = "test-failpoints")]
+struct PendingPreparedContext {
+    inner: SqliteStateStore,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+#[cfg(feature = "test-failpoints")]
+impl crate::ports::context_source_store::ContextSourceStore for PendingPreparedContext {
+    fn load_context_eligibility_snapshot(
+        &self,
+        request: crate::ports::context_source_store::ContextEligibilityRequest,
+    ) -> crate::ports::context_source_store::ContextSourceStoreFuture<
+        '_,
+        crate::ports::context_source_store::ContextEligibilitySnapshot,
+    > {
+        Box::pin(async move {
+            let snapshot = self
+                .inner
+                .load_context_eligibility_snapshot(request)
+                .await?;
+            self.entered.notify_one();
+            // Deterministic slow-read boundary after actual SQLite context retrieval.
+            self.release.notified().await;
+            Ok(snapshot)
+        })
+    }
+    fn reload_context_sources(
+        &self,
+        request: crate::ports::context_source_store::ContextReconstructionRequest,
+    ) -> crate::ports::context_source_store::ContextSourceStoreFuture<
+        '_,
+        crate::ports::context_source_store::ContextReconstructionSnapshot,
+    > {
+        self.inner.reload_context_sources(request)
+    }
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn compute_expiry_cancels_context_preparation_before_physical_attempt() {
+    for context_ready_at_cancel in [false, true] {
+        let fixture = fixture_with_observation(|root| {
+            let mut value = observation();
+            value.default_shell = "/bin/bash".into();
+            value.workspace_logical_root = root
+                .path()
+                .join("stage17-workspace")
+                .to_string_lossy()
+                .into_owned();
+            value.workspace_resolved_root = value.workspace_logical_root.clone();
+            value.execution_capabilities = ExecutionCapabilityObservation {
+                foreground_execute: true,
+                privilege_administrative: false,
+                process_group_cleanup: true,
+                cgroup_cleanup: false,
+            };
+            value
+        })
+        .await;
+        let runtime_id = RuntimeInstanceId::generate();
+        start_runtime(&fixture, runtime_id, at(T1)).await;
+        let queued = accept(&fixture, "context cancellation", at(T1)).await;
+        let claimed = fixture
+            .store
+            .claim_next_work(ClaimNextWorkRequest {
+                runtime_id,
+                claimed_at: at(T2),
+                event_id: JournalEventId::generate(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        let workspace_root = fixture._root.path().join("stage17-workspace");
+        fs::create_dir(&workspace_root).unwrap();
+        fs::write(workspace_root.join("note.txt"), "durable tool evidence\n").unwrap();
+        fs::write(
+            workspace_root.join("note-two.txt"),
+            "ordered second tool evidence\n",
+        )
+        .unwrap();
+        let artifact_store = Arc::new(
+            LocalArtifactStore::initialize(&fixture._root.path().join("stage17-artifacts"))
+                .unwrap(),
+        );
+        let clock = Arc::new(TestClock::new(
+            at(T2).to_offset_datetime(),
+            Duration::from_secs(10),
+        ));
+        let snapshot = fixture.store.load_bootstrap_snapshot().await.unwrap();
+        let workstation_clock: Arc<dyn Clock> = clock.clone();
+        let workstation_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let local_workstation = Arc::new(
+            LocalWorkstation::new(
+                &snapshot.workstation,
+                &snapshot.workspace,
+                LocalWorkstationOptions {
+                    default_shell: LogicalPathReference::absolute("/bin/bash").unwrap(),
+                    configured_workspace_root: workspace_root,
+                    read_hard_limit: HARD_FILE_READ_MAX_BYTES,
+                    artifact_store: workstation_artifacts,
+                    administrative_enabled: false,
+                    user_switch_launcher: None,
+                    credential_free_direct_execution: true,
+                    delegated_cgroup_root: None,
+                    clock: workstation_clock,
+                },
+            )
+            .unwrap(),
+        );
+        let policy = ToolSemanticPolicy {
+            read_file_default_bytes: 4_096,
+            read_file_max_bytes: 65_536,
+            run_shell_command_max_bytes: 65_536,
+            run_shell_default_timeout_ms: 60_000,
+            run_shell_max_timeout_ms: 900_000,
+        };
+        let registry = Arc::new(ToolRegistry::v0(policy).unwrap());
+        let tool_store: Arc<dyn ToolStateStore> = Arc::new(fixture.store.clone());
+        let workstation: Arc<dyn Workstation> = local_workstation.clone();
+        let preparation: Arc<dyn WorkstationPreparation> = local_workstation;
+        let tool_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let tool_clock: Arc<dyn Clock> = clock.clone();
+        let tool_execution = Arc::new(
+            ToolExecutionService::new(
+                Arc::clone(&registry),
+                Arc::new(V0AuthorityEvaluator) as Arc<dyn AuthorityEvaluator>,
+                tool_store,
+                workstation,
+                preparation,
+                tool_artifacts,
+                tool_clock,
+                ToolRuntimeLimits {
+                    read_file_default_bytes: policy.read_file_default_bytes,
+                    read_file_max_bytes: policy.read_file_max_bytes,
+                    run_shell_command_max_bytes: policy.run_shell_command_max_bytes,
+                    run_shell_default_timeout_ms: policy.run_shell_default_timeout_ms,
+                    run_shell_max_timeout_ms: policy.run_shell_max_timeout_ms,
+                    stdout_capture_bytes: 32_768,
+                    stderr_capture_bytes: 32_768,
+                    inline_model_result_bytes: 65_536,
+                    per_stream_projection_bytes: 32_768,
+                },
+            )
+            .unwrap(),
+        );
+
+        let target = stage17_target();
+        let required_capabilities = crate::domain::model::RequiredModelCapabilities {
+            text_input: true,
+            text_output: true,
+            custom_tool_calling: true,
+            streaming: true,
+            ordered_output_items: true,
+            structured_output: true,
+            reasoning_continuation: false,
+            required_output_tokens: TokenCount::try_new(512).unwrap(),
+        };
+        let selection = Arc::new(ModelSelectionPolicy::new(Arc::new(
+            ModelTargetSnapshot::try_new(
+                target.reference().model_target_id().clone(),
+                vec![target],
+            )
+            .unwrap(),
+        )));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let context_release = Arc::new(tokio::sync::Notify::new());
+        let source_store: Arc<dyn crate::ports::context_source_store::ContextSourceStore> =
+            Arc::new(PendingPreparedContext {
+                inner: fixture.store.clone(),
+                entered: entered.clone(),
+                release: context_release.clone(),
+            });
+        let context_artifacts: Arc<dyn ArtifactStore> = artifact_store.clone();
+        let estimator: Arc<dyn TokenEstimator> = Arc::new(Stage17FixedEstimator {
+            identity: TokenEstimatorIdentity::try_new("stage17_fixed", 1).unwrap(),
+        });
+        let context_clock: Arc<dyn Clock> = clock.clone();
+        let assembler = Arc::new(ContextAssembler::new(
+            source_store,
+            Some(context_artifacts),
+            estimator,
+            Arc::clone(&registry),
+            VersionedInstructionSnapshot::v0(),
+            context_clock,
+        ));
+        let provider = Arc::new(Stage17Provider::new(vec![]));
+        let gateway_store: Arc<dyn ModelStateStore> = Arc::new(fixture.store.clone());
+        let gateway_artifacts: Arc<dyn ArtifactStore> = artifact_store;
+        let gateway_provider: Arc<dyn ModelProvider> = provider.clone();
+        let gateway_clock: Arc<dyn Clock> = clock.clone();
+        let gateway = Arc::new(
+            ModelGateway::new(
+                gateway_store,
+                gateway_artifacts,
+                gateway_provider,
+                Arc::new(NoopDraftSink),
+                gateway_clock,
+                Box::new(Stage17MinimumJitter),
+                ModelGatewayLimits::default(),
+            )
+            .unwrap(),
+        );
+        let loop_store: Arc<dyn crate::application::agent_loop::AgentLoopStateStore> =
+            Arc::new(fixture.store.clone());
+        let loop_clock: Arc<dyn Clock> = clock.clone();
+        let agent_loop = Arc::new(
+            AgentLoop::new(
+                selection,
+                assembler,
+                ContextAssemblyVersions::v0(),
+                gateway,
+                tool_execution,
+                loop_store,
+                loop_clock,
+                required_capabilities,
+                AgentLoopRuntimeContext {
+                    workstation: snapshot.workstation,
+                    workspace: snapshot.workspace,
+                    authority_constraints: V0AuthorityConstraints::default(),
+                },
+                AgentLoopLimits::default(),
+            )
+            .unwrap(),
+        );
+
+        let (cancel, receive) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(
+            agent_loop
+                .start(claimed, WorkCancellation::isolated_fixture(receive))
+                .unwrap(),
+        );
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .store
+                .request_owned_work_cancellation(RequestOwnedCancellationRequest {
+                    runtime_id,
+                    requested_at: at(T3),
+                })
+                .await
+                .unwrap(),
+            vec![queued.work_id]
+        );
+        cancel.send_replace(true);
+        if context_ready_at_cancel {
+            context_release.notify_one();
+        }
+        let exit = tokio::time::timeout(Duration::from_millis(200), task).await;
+        assert!(matches!(
+            exit,
+            Ok(Ok(WorkRunnerExit::CancellationConfirmed))
+        ));
+        fixture
+            .store
+            .finish_cancellation(FinishCancellationRequest {
+                work_id: queued.work_id,
+                runtime_id,
+                confirmed_at: at(T4),
+                event_id: JournalEventId::generate(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(provider.invocation_count.load(Ordering::SeqCst), 0);
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM model_invocations WHERE work_id=?")
+                .bind(queued.work_id.to_string())
+                .fetch_one(&fixture.store.runtime.inner.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        fixture
+            .store
+            .verify_application_consistency()
+            .await
+            .unwrap();
+        fixture.guard.shutdown().await;
+    }
+}

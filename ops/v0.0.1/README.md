@@ -158,3 +158,15 @@ with a distinct freshly funded power operation and permit. Never delete a legacy
 its consumed marker to obtain a new timer. Missing or corrupt evidence fails closed. Install
 the matching worker and watchdog together; an older consumer must not resume a format 2
 receipt. These changes do not alter the signed grant, policy or bootstrap-permit contracts.
+
+
+The debug `test-failpoints` worker distribution fixture has an explicit `proxy` action for
+signed `proxy_loop_v1` qualification. Its trusted service input supplies `model_proxy`
+contract 1 pins (model ID, model/price UUIDs and digests, maximum output tokens), with no
+provider endpoint, headers or credentials. The existing root/service-protected input,
+installed worker identity, trusted SQLite, signed compute grant and guarded work claim
+are required. The preserved AgentLoop runs with only the signed `run_shell` tool set and
+the original five-second tool bound. Model waits poll existing durable controls and honor
+the independent root cutoff; they cannot renew funding. Ordinary distribution startup
+remains receipt/export-only and readiness unavailable. This fixture is not a production
+enablement switch or a live model qualification.

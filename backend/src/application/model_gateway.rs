@@ -424,7 +424,7 @@ impl ModelGateway {
                     expected_work: WorkExpectation::for_snapshot(&invocation.work),
                     manifest: invocation.context.prepared_manifest().clone(),
                     invocation: PreparedModelInvocation {
-                        attempt: attempt_reference,
+                        attempt: attempt_reference.clone(),
                         selection_reason: stored_selection_reason(invocation.selection.reason()),
                         required_capabilities: stored_required_capabilities(
                             invocation.selection.required_capabilities(),
@@ -470,7 +470,7 @@ impl ModelGateway {
                 .run_physical_attempt(
                     &mut invocation,
                     provider_attempt,
-                    attempt_id,
+                    attempt_reference,
                     started_event,
                     waiting_event,
                 )
@@ -660,10 +660,11 @@ impl ModelGateway {
         &self,
         invocation: &mut GatewayInvocation,
         provider_attempt: ProviderAttempt,
-        attempt_id: ModelInvocationId,
+        attempt_reference: ModelAttemptReference,
         started_event: JournalEventId,
         waiting_event: JournalEventId,
     ) -> PhysicalAttemptResult {
+        let attempt_id = attempt_reference.model_invocation_id();
         let attempt_no = provider_attempt.get();
         let started_mono = self.clock.monotonic_now();
         let Some(local_deadline) = started_mono.checked_add(self.limits.provider_invocation_limit)
@@ -692,7 +693,7 @@ impl ModelGateway {
         let provider_invocation = ModelProviderInvocation {
             request: invocation.context.request().clone(),
             attempt: provider_attempt,
-            control,
+            control: control.with_durable_attempt(attempt_reference),
             fixture_key: None,
         };
         let remaining = remaining_duration(effective_deadline, self.clock.as_ref());
@@ -2660,6 +2661,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct AttemptEvidence {
+        physical_id: ModelInvocationId,
         attempt_no: i64,
         request_sha256: Sha256Digest,
         retry: Option<ProviderRetryEvidence>,
@@ -2716,6 +2718,7 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(AttemptEvidence {
+                        physical_id: request.invocation.attempt.model_invocation_id(),
                         attempt_no: request.invocation.attempt.attempt_no().get(),
                         request_sha256: request.invocation.request_sha256,
                         retry: request.invocation.retry_evidence,
@@ -3300,6 +3303,56 @@ mod tests {
                 .unwrap(),
             continuation.opaque().as_bytes()
         );
+    }
+
+    struct AttemptBoundaryProbe {
+        inner: ScriptedProvider,
+        store: Arc<FakeGatewayStore>,
+    }
+    impl ModelProvider for AttemptBoundaryProbe {
+        fn provider_id(&self) -> &ProviderId {
+            self.inner.provider_id()
+        }
+        fn capabilities(&self, t: &ModelTarget) -> Result<ModelCapabilitySnapshot, ProviderError> {
+            self.inner.capabilities(t)
+        }
+        fn invoke_stream(
+            &self,
+            i: ModelProviderInvocation,
+        ) -> ModelProviderFuture<'_, Box<dyn ModelProviderStream>> {
+            let a = i
+                .control
+                .durable_attempt()
+                .expect("gateway committed attempt missing");
+            let saved = self.store.attempts();
+            assert_eq!(saved.last().unwrap().physical_id, a.model_invocation_id());
+            assert_eq!(a.logical_invocation_id(), i.request.logical_invocation_id());
+            assert_eq!(a.context_manifest_id(), i.request.context_manifest_id());
+            assert_eq!(a.attempt_no().get(), i64::from(i.attempt.get()));
+            self.inner.invoke_stream(i)
+        }
+    }
+    #[tokio::test]
+    async fn committed_physical_identity_reaches_provider_before_io() {
+        let fixture = gateway_fixture();
+        let store = Arc::new(FakeGatewayStore::default());
+        let provider = Arc::new(AttemptBoundaryProbe {
+            inner: ScriptedProvider::with_clock(
+                ProviderId::try_new("fixture").unwrap(),
+                vec![program(
+                    &fixture,
+                    1,
+                    1,
+                    success_steps(&fixture.target, "answer"),
+                )],
+                fixture.clock.clone(),
+            ),
+            store: store.clone(),
+        });
+        let gateway = build_gateway(store.clone(), provider, fixture.clock.clone());
+        let (_sender, receiver) = tokio::sync::watch::channel(false);
+        gateway.invoke(invocation(fixture, receiver)).await.unwrap();
+        assert_eq!(store.attempts().len(), 1);
     }
 
     #[tokio::test]

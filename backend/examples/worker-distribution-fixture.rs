@@ -1,7 +1,23 @@
-//! Debug-only process driver for the actual receipt-only distribution composition.
+//! Debug-only driver for signed receipt, bounded-tool and central-proxy qualification.
 #[cfg(all(feature = "test-failpoints", debug_assertions))]
 #[tokio::main]
 async fn main() {
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .with_span_events(
+                    tracing_subscriber::fmt::format::FmtSpan::NEW
+                        | tracing_subscriber::fmt::format::FmtSpan::CLOSE,
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                    m.target() == "craxii::qualification"
+                        || matches!(m.name(), "journal_transaction" | "context_assembly")
+                })),
+        )
+        .init();
     use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
     use craxii_server::ports::state_store::BootstrapStateStore;
     use craxii_server::{
@@ -89,7 +105,9 @@ async fn main() {
         } else {
             DistributionRuntime::isolated_fixture(config, text("boot_id")?.into()).await
         }
-        .map_err(|_| ())?;
+        .map_err(|_| {
+            eprintln!("distribution_fixture_open_failed");
+        })?;
         if installed && input["action"] == "local_recover" {
             runtime
                 .store
@@ -117,14 +135,19 @@ async fn main() {
             text("ca_pem")?.as_bytes(),
         )
         .map_err(|_| ())?;
-        if input["action"] == "enroll" {
+        if input["action"] == "enroll"
+            || input["action"] == "enroll_compute"
+            || input["action"] == "enroll_proxy"
+        {
             client
                 .negotiate(
                     &runtime.hello(),
                     Some((text("enrollment_id")?, text("credential")?)),
                 )
                 .await
-                .map_err(|_| ())?;
+                .map_err(|error| {
+                    eprintln!("distribution_fixture_negotiate_{error:?}");
+                })?;
             client
                 .enroll(
                     text("enrollment_id")?,
@@ -134,16 +157,90 @@ async fn main() {
                     &URL_SAFE_NO_PAD.decode(text("signature")?).map_err(|_| ())?,
                 )
                 .await
-                .map_err(|_| ())?;
-            client.renew().await.map_err(|_| ())?;
-            client.status().await.map_err(|_| ())?;
+                .map_err(|error| {
+                    eprintln!("distribution_fixture_enroll_{error:?}");
+                })?;
+            client.renew().await.map_err(|error| {
+                eprintln!("distribution_fixture_renew_{error:?}");
+            })?;
+            client.status().await.map_err(|error| {
+                eprintln!("distribution_fixture_status_{error:?}");
+            })?;
         } else {
             runtime.reconnect(&mut client).await.map_err(|e| {
                 eprintln!("distribution_fixture_reconnect_{e:?}");
             })?;
         }
+        let mut retrieved_attempt = None;
+        if input["action"] == "model_retrieve" {
+            // Read-only qualification after a real worker restart. The controller
+            // supplies the exact original request; the existing journal remains
+            // authoritative and no AgentLoop/tool execution is restarted here.
+            let mut request = input["model_request"].clone();
+            request["authority"] = client.current_authority().map_err(|_| ())?;
+            request["request_id"] =
+                json!(craxii_server::distribution::request_id().map_err(|_| ())?);
+            craxii_server::distribution_contracts::wire::decode_message(
+                &craxii_server::distribution_contracts::canonical::canonical_bytes(&request)
+                    .map_err(|_| ())?,
+            )
+            .map_err(|_| ())?;
+            let status = client.model_status(&request).await.map_err(|_| ())?;
+            if status["attempt_id"] != request["body"]["invocation"]["attempt_id"]
+                || status["output_recoverability"] != "available"
+            {
+                return Err(());
+            }
+            let mut response = client.model_result(&request).await.map_err(|_| ())?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(|_| ())? {
+                if bytes.len() + chunk.len() > 2097152 {
+                    return Err(());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.last() != Some(&b'\n') {
+                return Err(());
+            }
+            let mut terminal = false;
+            for (index, line) in bytes[..bytes.len() - 1].split(|b| *b == b'\n').enumerate() {
+                if terminal || index >= 4096 {
+                    return Err(());
+                }
+                let event = craxii_server::distribution_contracts::wire::decode_message(line)
+                    .map_err(|_| ())?;
+                let event = serde_json::to_value(event).map_err(|_| ())?;
+                let sequence = (index + 1).to_string();
+                if event["request_id"] != request["request_id"]
+                    || event["authority"] != request["authority"]
+                    || event["body"]["attempt_id"] != request["body"]["invocation"]["attempt_id"]
+                    || event["body"]["event_sequence"].as_str() != Some(sequence.as_str())
+                {
+                    return Err(());
+                }
+                terminal = event["body"]["event"]["kind"] == "completed";
+            }
+            if !terminal {
+                return Err(());
+            }
+            retrieved_attempt = Some(request["body"]["invocation"]["attempt_id"].clone());
+            runtime
+                .store
+                .reconcile_distribution_results()
+                .await
+                .map_err(|_| ())?;
+            runtime
+                .transfer_pending(&mut client)
+                .await
+                .map_err(|error| {
+                    eprintln!("distribution_fixture_export_{error:?}");
+                })?;
+        }
         #[cfg(target_os = "linux")]
-        if input["action"] == "compute_refresh" {
+        if input["action"] == "compute_refresh"
+            || input["action"] == "enroll_compute"
+            || input["action"] == "enroll_proxy"
+        {
             let compute = craxii_server::compute::worker::InstalledCompute::load(
                 text("customer_id")?,
                 text("logical_agent_id")?,
@@ -168,6 +265,24 @@ async fn main() {
                 .map_err(|e| {
                     eprintln!("distribution_fixture_bounded_{e:?}");
                 })?;
+        }
+        #[cfg(target_os = "linux")]
+        if input["action"] == "enroll_proxy" {
+            runtime
+                .isolated_proxy_ready(text("proxy_not_before")?)
+                .await
+                .map_err(|_| ())?;
+        }
+        #[cfg(target_os = "linux")]
+        if input["action"] == "proxy" || input["action"] == "enroll_proxy" {
+            let settings = craxii_server::distribution::model_config::ModelProxySettings::parse(
+                &serde_json::to_vec(&input["model_proxy"]).map_err(|_| ())?,
+            )
+            .map_err(|_| ())?;
+            client = runtime
+                .isolated_proxy_once(client, settings)
+                .await
+                .map_err(|_| ())?;
         }
         if input["action"] == "exports" {
             runtime.transfer_pending(&mut client).await.map_err(|e| {
@@ -201,8 +316,12 @@ async fn main() {
                 eprintln!("distribution_fixture_export_{e:?}");
             })?;
         } else if input["action"] != "enroll"
+            && input["action"] != "enroll_compute"
+            && input["action"] != "enroll_proxy"
             && input["action"] != "compute_refresh"
             && input["action"] != "bounded"
+            && input["action"] != "proxy"
+            && input["action"] != "model_retrieve"
         {
             runtime
                 .transfer_pending(&mut client)
@@ -237,7 +356,7 @@ async fn main() {
             .await
             .map_err(|_| ())?
             .len();
-        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":input["action"]=="bounded","exports":runtime.export_observation().await.map_err(|_|())?});
+        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":(input["action"]=="bounded"||input["action"]=="proxy"||input["action"]=="enroll_proxy"),"retrieved_attempt":retrieved_attempt,"exports":runtime.export_observation().await.map_err(|_|())?});
         runtime.shutdown().await.map_err(|_| ())?;
         Ok::<Value, ()>(result)
     };

@@ -570,6 +570,7 @@ pub struct ModelInvocationControl {
     cancellation: ProviderCancellationToken,
     absolute_deadline: MonotonicInstant,
     idle_timeout: Duration,
+    durable_attempt: Option<crate::domain::ModelAttemptReference>,
 }
 
 impl ModelInvocationControl {
@@ -588,6 +589,7 @@ impl ModelInvocationControl {
             cancellation,
             absolute_deadline,
             idle_timeout,
+            durable_attempt: None,
         })
     }
 
@@ -604,6 +606,21 @@ impl ModelInvocationControl {
     #[must_use]
     pub const fn idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    /// Set only by ModelGateway after its begin_model_invocation transaction commits.
+    /// Transport retries must retain this identity; adapters never allocate attempts.
+    pub(crate) fn with_durable_attempt(
+        mut self,
+        attempt: crate::domain::ModelAttemptReference,
+    ) -> Self {
+        self.durable_attempt = Some(attempt);
+        self
+    }
+
+    #[must_use]
+    pub const fn durable_attempt(&self) -> Option<&crate::domain::ModelAttemptReference> {
+        self.durable_attempt.as_ref()
     }
 }
 

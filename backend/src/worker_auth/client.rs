@@ -97,6 +97,7 @@ impl WorkerClient {
             .https_only(true)
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .timeout(Duration::from_secs(5))
             .connect_timeout(Duration::from_secs(2))
             .pool_max_idle_per_host(2);
@@ -152,9 +153,27 @@ impl WorkerClient {
             return Err(AuthError::InvalidContext);
         }
         let mut request = if let Some(body) = body {
-            let bytes = canonical_bytes(body).map_err(|_| AuthError::InvalidContext)?;
+            let model_challenge = path == "/v1/worker/requests/challenge"
+                && body["request"]["type"] == "model_invoke";
+            let bytes = if model_challenge {
+                crate::distribution_contracts::canonical::canonical_with_limits(
+                    body,
+                    crate::distribution_contracts::raw_json::Limits {
+                        bytes: 1081344,
+                        nodes: 36864,
+                        depth: 32,
+                    },
+                )
+            } else {
+                canonical_bytes(body)
+            }
+            .map_err(|_| AuthError::InvalidContext)?;
             if bytes.len()
-                > if path == "/v1/worker/results"
+                > if path == "/v1/worker/requests/challenge"
+                    && body["request"]["type"] == "model_invoke"
+                {
+                    1081344
+                } else if path == "/v1/worker/results"
                     || path == "/v1/worker/requests/challenge"
                         && body["request"]["type"] == "result_export"
                 {
@@ -849,6 +868,122 @@ impl WorkerClient {
         }
         Ok(proof)
     }
+    /// One authenticated model transmission. No transport or provider retry is hidden
+    /// here. The returned response owns its stream, releasing client/session ownership.
+    pub async fn open_model(&mut self, request: &Value) -> AuthResult<reqwest::Response> {
+        self.check_session()?;
+        if request["authority"] != self.current_authority()?
+            || request["type"] != "model_invoke"
+            || !self
+                .session
+                .as_ref()
+                .is_some_and(|s| s.scopes.iter().any(|v| v == "model_invoke"))
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        decode_message(&canonical_bytes(request).map_err(|_| AuthError::InvalidContext)?)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let proof = self
+            .sensitive_proof(
+                request,
+                &request["authority"],
+                field(request, "request_id")?,
+                "model_invoke",
+            )
+            .await?;
+        self.check_session()?;
+        let bytes = crate::distribution_contracts::canonical::canonical_with_limits(
+            &json!({"contract_version":1,"request":request,"proof":proof}),
+            crate::distribution_contracts::raw_json::Limits {
+                bytes: 1081344,
+                nodes: 36864,
+                depth: 32,
+            },
+        )
+        .map_err(|_| AuthError::InvalidContext)?;
+        let credential = &self
+            .session
+            .as_ref()
+            .ok_or(AuthError::SessionExpired)?
+            .credential;
+        let mut header =
+            reqwest::header::HeaderValue::from_str(&format!("CraxiiWorker {credential}"))
+                .map_err(|_| AuthError::InvalidContext)?;
+        header.set_sensitive(true);
+        // Request-specific timeout preserves the five-second authentication/control policy.
+        let response = self
+            .http
+            .post(
+                self.origin
+                    .join("/v1/worker/model-invoke")
+                    .map_err(|_| AuthError::InvalidContext)?,
+            )
+            .timeout(Duration::from_secs(30))
+            .header(reqwest::header::AUTHORIZATION, header)
+            .header("content-type", "application/json")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|_| AuthError::Transport)?;
+        if response.content_length().is_some_and(|n| n > 2097152) {
+            return Err(AuthError::InvalidContext);
+        }
+        Ok(response)
+    }
+
+    /// Read-only reconciliation of this exact physical attempt; never sends inference.
+    pub async fn model_status(&mut self, request: &Value) -> AuthResult<Value> {
+        let v = &request["body"]["invocation"];
+        let body = json!({"contract_version":1,"request_id":request["request_id"],"attempt_id":v["attempt_id"],"invocation_digest":request["body"]["invocation_digest"]});
+        self.session_exchange("/v1/worker/model-status", &body)
+            .await
+    }
+
+    /// Retrieve only the committed response of the original physical invocation.
+    /// No sensitive proof, reservation, or inference transmission is performed.
+    pub async fn model_result(&mut self, request: &Value) -> AuthResult<reqwest::Response> {
+        self.check_session()?;
+        if request["authority"] != self.current_authority()? {
+            return Err(AuthError::InvalidContext);
+        }
+        let v = &request["body"]["invocation"];
+        let body = json!({"contract_version":1,"request_id":request["request_id"],"attempt_id":v["attempt_id"],"invocation_digest":request["body"]["invocation_digest"]});
+        let credential = &self
+            .session
+            .as_ref()
+            .ok_or(AuthError::SessionExpired)?
+            .credential;
+        let mut header =
+            reqwest::header::HeaderValue::from_str(&format!("CraxiiWorker {credential}"))
+                .map_err(|_| AuthError::InvalidContext)?;
+        header.set_sensitive(true);
+        let response = self
+            .http
+            .post(
+                self.origin
+                    .join("/v1/worker/model-result")
+                    .map_err(|_| AuthError::InvalidContext)?,
+            )
+            .timeout(Duration::from_secs(5))
+            .header(reqwest::header::AUTHORIZATION, header)
+            .header("content-type", "application/json")
+            .body(canonical_bytes(&body).map_err(|_| AuthError::InvalidContext)?)
+            .send()
+            .await
+            .map_err(|_| AuthError::Transport)?;
+        if !response.status().is_success()
+            || response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                != Some("application/x-ndjson")
+            || response.content_length().is_some_and(|n| n > 2097152)
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        Ok(response)
+    }
+
     pub async fn query_result(&mut self, body: &Value) -> AuthResult<Value> {
         let s = &body["snapshot"];
         let query = json!({"work_id":s["work_id"],"export_id":s["export_id"],"export_revision":"1","export_digest":body["export_digest"]});
@@ -914,6 +1049,15 @@ fn scope_policy(value: &Value) -> bool {
             json!("result_export"),
             json!("compute_renew"),
         ]
+        || scopes
+            == &vec![
+                json!("status"),
+                json!("receipt_commit"),
+                json!("cancel"),
+                json!("result_export"),
+                json!("compute_renew"),
+                json!("model_invoke"),
+            ]
         || scopes == &vec![json!("status")]
         || scopes == &vec![json!("status"), json!("receipt_commit"), json!("cancel")]
         || scopes

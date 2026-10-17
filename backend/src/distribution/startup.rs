@@ -75,6 +75,8 @@ pub struct DistributionRuntime {
     pub store: SqliteStateStore,
     guard: SqliteRuntimeGuard,
     runtime: RuntimeBootstrapReceipt,
+    #[cfg(all(feature = "test-failpoints", debug_assertions))]
+    fixture_identity: (WorkstationIdentity, WorkspaceIdentity),
     config: DistributionConfig,
     pub boot_id: String,
     in_flight_exports: std::sync::atomic::AtomicUsize,
@@ -168,8 +170,11 @@ impl DistributionRuntime {
             })
             .await
             .map_err(|_| DistributionError::Storage)?;
-        store
-            .verify_application_consistency()
+        // Snapshot loading performs the complete application consistency verification.
+        // Reuse its immutable identities instead of replaying the same journal again
+        // before recovery; the separate post-recovery verification remains mandatory.
+        let snapshot = store
+            .load_bootstrap_snapshot()
             .await
             .map_err(|_| DistributionError::Journal)?;
         store
@@ -195,10 +200,6 @@ impl DistributionRuntime {
         let orphans = artifacts
             .scan_orphans(&keys, at)
             .map_err(|_| DistributionError::Artifacts)?;
-        let snapshot = store
-            .load_bootstrap_snapshot()
-            .await
-            .map_err(|_| DistributionError::Storage)?;
         let build = crate::bootstrap::metadata::BuildMetadata::embedded().map_err(|_| invalid())?;
         let evidence = RuntimeStartEvidence::new(RuntimeStartEvidenceInput {
             runtime_instance_id: RuntimeInstanceId::generate(),
@@ -254,6 +255,8 @@ impl DistributionRuntime {
             store,
             guard,
             runtime,
+            #[cfg(all(feature = "test-failpoints", debug_assertions))]
+            fixture_identity: (snapshot.workstation, snapshot.workspace),
             config,
             boot_id,
             in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
@@ -278,6 +281,11 @@ impl DistributionRuntime {
                 .as_array_mut()
                 .expect("hello capabilities")
                 .push(json!("compute_v1"));
+            #[cfg(all(feature = "test-failpoints", debug_assertions))]
+            hello["body"]["capabilities"]
+                .as_array_mut()
+                .expect("hello capabilities")
+                .push(json!("model_v1"));
         }
         hello
     }
@@ -582,7 +590,10 @@ impl DistributionRuntime {
         super::fixture::complete(
             &self.store,
             &self.config,
+            &self.fixture_identity,
             claimed,
+            #[cfg(target_os = "linux")]
+            None,
             #[cfg(target_os = "linux")]
             None,
         )
@@ -655,13 +666,144 @@ impl DistributionRuntime {
                 eprintln!("distribution_fixture_bounded_claim_{e:?}");
                 AuthError::InvalidContext
             })?;
-        super::fixture::complete(&self.store, &self.config, claimed, Some(permit))
-            .await
-            .map_err(|e| {
-                eprintln!("distribution_fixture_{e}");
-                AuthError::InvalidContext
-            })?;
+        super::fixture::complete(
+            &self.store,
+            &self.config,
+            &self.fixture_identity,
+            claimed,
+            Some(permit),
+            None,
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("distribution_fixture_{e}");
+            AuthError::InvalidContext
+        })?;
         Ok(())
+    }
+    /// Debug qualification scheduling only. The timestamp supplies no authority and
+    /// cannot extend the original root deadline or authorize work before grant acceptance.
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub async fn isolated_proxy_ready(&self, not_before: &str) -> Result<(), AuthError> {
+        let not_before = crate::distribution_contracts::primitives::timestamp_micros(not_before)
+            .map_err(|_| AuthError::InvalidContext)?;
+        let compute = self.compute.as_ref().ok_or(AuthError::InvalidContext)?;
+        loop {
+            if compute.should_drain() {
+                return Err(AuthError::Unavailable);
+            }
+            if compute.running().is_ok()
+                && super::now().map_err(|_| AuthError::Unavailable)? >= not_before
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub async fn isolated_proxy_once(
+        &self,
+        mut client: WorkerClient,
+        settings: super::model_config::ModelProxySettings,
+    ) -> Result<WorkerClient, AuthError> {
+        settings.validate().map_err(|_| AuthError::InvalidContext)?;
+        let mut items = client
+            .poll(
+                &self.boot_id,
+                &self.config.power_operation_id,
+                &self.config.profile_public_key,
+            )
+            .await?;
+        for d in &mut items {
+            d.compute = self.compute.clone();
+        }
+        let d = items
+            .iter()
+            .find(|d| d.message["type"] == "work_delivery")
+            .ok_or(AuthError::Unavailable)?;
+        d.verify_profile().map_err(|_| AuthError::InvalidContext)?;
+        let profile = d.profile.clone().ok_or(AuthError::InvalidContext)?;
+        if profile["body"]["profile"]["deterministic_program_id"] != "proxy_loop_v1"
+            || !settings.matches_profile(&profile["body"]["profile"])
+        {
+            return Err(AuthError::InvalidContext);
+        }
+        let admitted = self
+            .store
+            .admit_distribution(d)
+            .await
+            .map_err(|_| AuthError::InvalidContext)?;
+        let receipt = match &admitted {
+            DistributionAdmission::Receipt { receipt, .. } => receipt.clone(),
+            _ => return Err(AuthError::InvalidContext),
+        };
+        self.transfer(&mut client, admitted).await?;
+        let claimed = self
+            .store
+            .isolated_claim_distribution(
+                crate::ports::state_store::ClaimNextWorkRequest {
+                    runtime_id: self.runtime.runtime_instance_id,
+                    claimed_at: timestamp().map_err(|_| AuthError::Unavailable)?,
+                    event_id: JournalEventId::generate(),
+                },
+                d,
+            )
+            .await
+            .map_err(|_| AuthError::InvalidContext)?
+            .ok_or(AuthError::InvalidContext)?;
+        super::fixture::phase(super::fixture::ProxyPhase::Claimed);
+        super::fixture::phase(super::fixture::ProxyPhase::PermitBegin);
+        let permit = self
+            .store
+            .distribution_compute_permit(d, claimed.work.work_id())
+            .await
+            .map_err(|_| AuthError::InvalidContext)?;
+        super::fixture::phase(super::fixture::ProxyPhase::PermitReady);
+        let binding = crate::adapters::model_proxy::ProxyBinding::new(
+            receipt,
+            profile,
+            client.identity().highest_epoch.clone(),
+            settings,
+        )
+        .map_err(|_| AuthError::InvalidContext)?;
+        super::fixture::phase(super::fixture::ProxyPhase::BindingReady);
+        let compute = self.compute.clone().ok_or(AuthError::InvalidContext)?;
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+        {
+            let execution = super::fixture::complete(
+                &self.store,
+                &self.config,
+                &self.fixture_identity,
+                claimed,
+                Some(permit),
+                Some(super::fixture::ProxyFixture {
+                    client: shared.clone(),
+                    binding,
+                    compute,
+                }),
+            );
+            let controls = async {
+                let mut interval = tokio::time::interval(Duration::from_millis(500));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let mut client = shared.lock().await;
+                    // Existing durable control/receipt/export path; a transient transport
+                    // failure cannot extend compute or invent a control acknowledgment.
+                    let _ = self.poll_once(&mut client).await;
+                }
+            };
+            tokio::pin!(execution, controls);
+            tokio::select! {
+                result=&mut execution=>result.map_err(|_| AuthError::InvalidContext)?,
+                ()=&mut controls=>return Err(AuthError::Unavailable),
+            }
+        }
+        let mut client = std::sync::Arc::try_unwrap(shared)
+            .map_err(|_| AuthError::InvalidContext)?
+            .into_inner();
+        self.transfer_pending(&mut client).await?;
+        Ok(client)
     }
     #[cfg(all(feature = "test-failpoints", debug_assertions))]
     pub async fn isolated_crash_close(self) {

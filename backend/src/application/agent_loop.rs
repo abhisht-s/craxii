@@ -285,11 +285,16 @@ impl AgentLoop {
                         .await;
                 }
             };
-            let context = match self
-                .context_assembler
-                .assemble(owned.work.work_id(), &selection, &self.context_versions)
-                .await
-            {
+            // Context reads can still be pending when funded execution closes. No model
+            // identity or provider I/O exists yet, so cancel the read instead of waiting
+            // for it to finish before noticing the durable cancellation notification.
+            let preparation = tokio::select! {
+                biased;
+                () = cancellation.requested() => return WorkRunnerExit::CancellationConfirmed,
+                result = self.context_assembler.assemble(
+                    owned.work.work_id(), &selection, &self.context_versions) => result,
+            };
+            let context = match preparation {
                 Ok(value) => value,
                 Err(error) => {
                     let reason = if error.kind() == ContextAssemblyErrorKind::ContextLimitExceeded {

@@ -19,10 +19,7 @@ use crate::application::{
 use crate::domain::model::{ModelUsage, RequiredModelCapabilities};
 use crate::domain::*;
 use crate::ports::{
-    model_provider::*,
-    state_store::{BootstrapStateStore, ClaimedWork},
-    workstation::*,
-    workstation_preparation::*,
+    model_provider::*, state_store::ClaimedWork, workstation::*, workstation_preparation::*,
 };
 use std::sync::Arc;
 struct Estimate {
@@ -85,32 +82,88 @@ impl WorkstationPreparation for Denied {
         denied()
     }
 }
+#[cfg(target_os = "linux")]
+pub(crate) struct ProxyFixture {
+    pub client: Arc<tokio::sync::Mutex<crate::worker_auth::client::WorkerClient>>,
+    pub binding: crate::adapters::model_proxy::ProxyBinding,
+    pub compute: Arc<crate::compute::worker::InstalledCompute>,
+}
+// The task may hold the SQLite write coordinator while preparation is in flight.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) async fn drain_runner(
+    task: impl std::future::Future<Output = WorkRunnerExit>,
+    cancellation: impl std::future::Future<Output = Result<(), &'static str>>,
+    deadline: tokio::time::Instant,
+) -> Result<WorkRunnerExit, &'static str> {
+    // Cancellation itself writes SQLite. Keep the preparation/agent future progressing
+    // while that write waits; it may own the transaction/coordinator needed to commit
+    // cancellation. The original deadline covers both the write and runner drain.
+    tokio::time::timeout_at(deadline, async {
+        let ((), exit) = tokio::try_join!(cancellation, async { Ok(task.await) })?;
+        Ok(exit)
+    })
+    .await
+    .map_err(|_| "drain_timeout")?
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) enum ProxyPhase {
+    Claimed,
+    PermitBegin,
+    PermitReady,
+    BindingReady,
+    LoopBootstrap,
+    SnapshotReady,
+    ArtifactsReady,
+    WorkstationReady,
+    ProviderSelected,
+    LoopConstructed,
+    RunnerStarted,
+    StopObserved,
+    CancelCommitted,
+    TaskFinished,
+    ProcessesStopped,
+}
+pub(super) fn phase(phase: ProxyPhase) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    tracing::info!(target: "craxii::qualification", phase = ?phase,
+        monotonic_us = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64);
+}
 pub(crate) async fn complete(
     store: &crate::adapters::sqlite::SqliteStateStore,
     config: &super::startup::DistributionConfig,
+    identity: &(WorkstationIdentity, WorkspaceIdentity),
     claimed: ClaimedWork,
     #[cfg(target_os = "linux")] permit: Option<crate::compute::worker::WorkPermit>,
+    #[cfg(target_os = "linux")] proxy: Option<ProxyFixture>,
 ) -> Result<(), &'static str> {
-    let snapshot = store
-        .load_bootstrap_snapshot()
-        .await
-        .map_err(|_| "bootstrap")?;
+    phase(ProxyPhase::LoopBootstrap);
+    // Startup already verified the entire journal before and after recovery and loaded
+    // these immutable identities. Replaying it again after claim delays first inference
+    // and sits outside the active runner's cancellation owner. Context assembly still
+    // reads the complete current causal history through its existing source store.
+    let (workstation_identity, workspace_identity) = identity;
+    phase(ProxyPhase::SnapshotReady);
     let artifacts = Arc::new(
         LocalArtifactStore::initialize(std::path::Path::new(&config.artifact_root))
             .map_err(|_| "bootstrap")?,
     );
+    phase(ProxyPhase::ArtifactsReady);
     let clock = Arc::new(SystemClock::new());
     let store = Arc::new(store.clone());
     #[cfg(target_os = "linux")]
     let permit_monitor = permit.clone();
+    #[cfg(target_os = "linux")]
+    let proxy_client = proxy.as_ref().map(|p| p.client.clone());
     #[cfg(target_os = "linux")]
     let metered = if let Some(p) = permit {
         use crate::adapters::local_workstation::{LocalWorkstation, LocalWorkstationOptions};
         use crate::guest_boundary::storage;
         Some(Arc::new(
             LocalWorkstation::new_installed(
-                &snapshot.workstation,
-                &snapshot.workspace,
+                workstation_identity,
+                workspace_identity,
                 LocalWorkstationOptions {
                     default_shell: LogicalPathReference::absolute("/bin/bash")
                         .map_err(|_| "tool_construct")?,
@@ -136,6 +189,11 @@ pub(crate) async fn complete(
     let is_tool = metered.is_some();
     #[cfg(not(target_os = "linux"))]
     let is_tool = false;
+    #[cfg(target_os = "linux")]
+    let is_proxy = proxy.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let is_proxy = false;
+    phase(ProxyPhase::WorkstationReady);
     let capabilities = ModelCapabilitySnapshot::new(ModelCapabilitySnapshotInput {
         text_input: true,
         text_output: true,
@@ -165,6 +223,12 @@ pub(crate) async fn complete(
         provider_native_options: ProviderNativeOptions::new(false),
     })
     .map_err(|_| "construction_24")?;
+    #[cfg(target_os = "linux")]
+    let target = if let Some(p) = &proxy {
+        p.binding.target().map_err(|_| "proxy_target")?
+    } else {
+        target
+    };
     let part = ModelTextPart::try_new(
         "Synthetic terminal result.\nExact Unicode: é e\u{301}; opaque <b>text</b>.\u{0}",
     )
@@ -268,11 +332,33 @@ pub(crate) async fn complete(
     let workstation: Arc<dyn Workstation> = Arc::new(Denied);
     #[cfg(not(target_os = "linux"))]
     let preparation: Arc<dyn WorkstationPreparation> = Arc::new(Denied);
-    let provider = Arc::new(ScriptedProvider::with_clock(
+    let scripted = Arc::new(ScriptedProvider::with_clock(
         ProviderId::try_new("fixture").map_err(|_| "construction_28")?,
         vec![program],
         clock.clone(),
     ));
+    let provider: Arc<dyn ModelProvider> = {
+        #[cfg(target_os = "linux")]
+        if let Some(p) = proxy {
+            Arc::new(
+                crate::adapters::model_proxy::CentralModelProvider::new(
+                    p.client,
+                    p.binding,
+                    target.clone(),
+                    clock.clone(),
+                    p.compute,
+                )
+                .map_err(|_| "proxy_construct")?,
+            )
+        } else {
+            scripted.clone()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            scripted.clone()
+        }
+    };
+    phase(ProxyPhase::ProviderSelected);
     let policy = ToolSemanticPolicy {
         read_file_default_bytes: 4096,
         read_file_max_bytes: 65536,
@@ -280,7 +366,14 @@ pub(crate) async fn complete(
         run_shell_default_timeout_ms: if is_tool { 5000 } else { 60000 },
         run_shell_max_timeout_ms: if is_tool { 5000 } else { 900000 },
     };
-    let registry = Arc::new(ToolRegistry::v0(policy).map_err(|_| "construction_29")?);
+    let registry = ToolRegistry::v0(policy).map_err(|_| "construction_29")?;
+    let registry = Arc::new(if is_tool {
+        registry
+            .restricted_to(&["run_shell"])
+            .map_err(|_| "profile_tools")?
+    } else {
+        registry
+    });
     let tools = Arc::new(
         ToolExecutionService::new(
             registry.clone(),
@@ -351,24 +444,28 @@ pub(crate) async fn complete(
                 required_output_tokens: TokenCount::try_new(512).map_err(|_| "construction_34")?,
             },
             AgentLoopRuntimeContext {
-                workstation: snapshot.workstation,
-                workspace: snapshot.workspace,
-                authority_constraints: V0AuthorityConstraints::default(),
+                workstation: workstation_identity.clone(),
+                workspace: workspace_identity.clone(),
+                authority_constraints: V0AuthorityConstraints {
+                    tool_allowed: is_tool,
+                    administrative_allowed: false,
+                },
             },
             AgentLoopLimits {
-                model_steps_per_work: 1,
-                provider_attempts_per_work: 1,
+                model_steps_per_work: if is_proxy { 3 } else { 1 },
+                provider_attempts_per_work: if is_proxy { 3 } else { 1 },
                 tool_calls_per_work: 1,
                 work_duration: std::time::Duration::from_secs(60),
             },
         )
         .map_err(|_| "construction_34")?,
     );
+    phase(ProxyPhase::LoopConstructed);
     let (sender, receiver) = tokio::sync::watch::channel(false);
     let work_id = claimed.work.work_id();
     let runtime_id = claimed.lifecycle.runtime_owner().ok_or("runtime_owner")?;
     #[cfg(target_os = "linux")]
-    let barrier = permit_monitor.clone().map(|p| {
+    let barrier = permit_monitor.clone().filter(|_| !is_proxy).map(|p| {
         tokio::spawn(async move {
             // Context assembly and model intent commit precede this provider barrier. Release
             // only inside the original finite profile, so a real tool crosses its cutoff.
@@ -388,6 +485,7 @@ pub(crate) async fn complete(
     let task = runner
         .start(claimed, WorkCancellation::isolated_fixture(receiver))
         .map_err(|_| "construction_35")?;
+    phase(ProxyPhase::RunnerStarted);
     tokio::pin!(task);
     #[cfg(target_os = "linux")]
     let exit = if let (Some(w), Some(p)) = (metered, permit_monitor) {
@@ -396,25 +494,52 @@ pub(crate) async fn complete(
             .map_err(|_| "signal")?;
         let stopping = async {
             loop {
-                if p.prepare().is_err() {
+                let fenced = proxy_client.as_ref().is_some_and(|c| {
+                    c.try_lock().is_ok_and(|client| {
+                        matches!(
+                            client.identity().disposition,
+                            crate::worker_auth::state::Disposition::Revoked
+                                | crate::worker_auth::state::Disposition::Stale
+                                | crate::worker_auth::state::Disposition::Support
+                        )
+                    })
+                });
+                if p.prepare().is_err()
+                    || fenced
+                    || is_proxy
+                        && store
+                            .list_current_runtime_cancel_requested(runtime_id)
+                            .await
+                            .map_err(|_| "cancel_state")?
+                            .iter()
+                            .any(|w| w.work_id == work_id)
+                {
                     break;
                 }
                 tokio::select! { _=term.recv()=>break, _=tokio::time::sleep(std::time::Duration::from_millis(50))=>{} }
             }
+            Ok::<(), &'static str>(())
         };
         let exit = tokio::select! {
             result=&mut task=>result,
-            _=stopping=>{
-                store.request_owned_work_cancellation(crate::ports::state_store::RequestOwnedCancellationRequest{runtime_id,requested_at:super::timestamp().map_err(|_|"cancel_time")?}).await.map_err(|_|"cancel_commit")?;
-                w.begin_execution_shutdown(p.cleanup_cutoff());
-                sender.send_replace(true);
-                // Original funded cleanup deadline; no restart-relative grace.
-                tokio::time::timeout_at(p.cleanup_cutoff(),&mut task).await.map_err(|_|"drain_timeout")?
+            stopped=stopping=>{
+                stopped?;
+                phase(ProxyPhase::StopObserved);
+                let cancellation = async {
+                    store.request_owned_work_cancellation(crate::ports::state_store::RequestOwnedCancellationRequest{runtime_id,requested_at:super::timestamp().map_err(|_|"cancel_time")?}).await.map_err(|_|"cancel_commit")?;
+                    phase(ProxyPhase::CancelCommitted);
+                    w.begin_execution_shutdown(p.cleanup_cutoff());
+                    sender.send_replace(true);
+                    Ok(())
+                };
+                drain_runner(&mut task, cancellation, p.cleanup_cutoff()).await?
             }
         };
+        phase(ProxyPhase::TaskFinished);
         w.shutdown_executions_before(p.cleanup_cutoff())
             .await
             .map_err(|_| "cleanup")?;
+        phase(ProxyPhase::ProcessesStopped);
         let cancellation_pending = store
             .list_current_runtime_cancel_requested(runtime_id)
             .await
@@ -438,7 +563,9 @@ pub(crate) async fn complete(
     };
     #[cfg(not(target_os = "linux"))]
     let exit = {
-        let _ = (sender, work_id, runtime_id);
+        // Retain the cancellation owner until the native qualification runner exits.
+        let _sender = sender;
+        let _ = (work_id, runtime_id);
         task.await
     };
     #[cfg(target_os = "linux")]
@@ -448,7 +575,7 @@ pub(crate) async fn complete(
     if !matches!(
         exit,
         WorkRunnerExit::TerminalCommitted | WorkRunnerExit::CancellationConfirmed
-    ) || provider.invocation_count() != 1
+    ) || (!is_proxy && scripted.invocation_count() != 1)
     {
         return Err("loop_exit");
     }

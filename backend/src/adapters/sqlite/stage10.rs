@@ -351,7 +351,7 @@ async fn claim_next(
                 && d.profile.as_ref().is_some_and(|p| {
                     matches!(
                         p["body"]["profile"]["deterministic_program_id"].as_str(),
-                        Some("terminal_text_v1" | "bounded_tool_v1")
+                        Some("terminal_text_v1" | "bounded_tool_v1" | "proxy_loop_v1")
                     )
                 })
                 && d.message["body"]["material"]["work_id"]

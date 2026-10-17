@@ -636,6 +636,7 @@ async fn distribution_result_scripted_completion_and_exact_export() {
     let d = f.terminal_delivery();
     let runtime = f.runtime.as_ref().unwrap();
     let store = &runtime.store;
+    let snapshot = store.load_bootstrap_snapshot().await.unwrap();
     store.admit_distribution(&d).await.unwrap();
     let id: String = sqlx::query_scalar(
         "SELECT runtime_instance_id FROM runtime_instances WHERE state='running'",
@@ -667,9 +668,20 @@ async fn distribution_result_scripted_completion_and_exact_export() {
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
     };
-    crate::distribution::fixture::complete(store, &config, claimed)
-        .await
-        .unwrap();
+    crate::distribution::fixture::complete(
+        store,
+        &config,
+        &(snapshot.workstation, snapshot.workspace),
+        claimed,
+        // This terminal-only fixture uses the scripted provider and denied workstation;
+        // it neither authorizes installed tools nor selects the central proxy.
+        #[cfg(target_os = "linux")]
+        None,
+        #[cfg(target_os = "linux")]
+        None,
+    )
+    .await
+    .unwrap();
     let results = store.pending_distribution_results().await.unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["snapshot"]["work_state"], "completed");
@@ -1216,4 +1228,64 @@ async fn installed_quiescence_tracks_journal_receipts_exports_and_flush() {
         QuiescenceState::LocallyQuiescent
     );
     f.runtime.take().unwrap().shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn distribution_startup_verified_snapshot_rejects_corruption_before_recovery() {
+    use sqlx::{ConnectOptions, Connection};
+    for corrupt_payload in [true, false] {
+        let mut f = Fixture::new().await;
+        f.runtime.take().unwrap().shutdown().await.unwrap();
+        let mut c = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(f.root.join("state/db/craxii.sqlite3"))
+            .connect()
+            .await
+            .unwrap();
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        if corrupt_payload {
+            sqlx::query("UPDATE journal_events SET payload_sha256=? WHERE journal_offset=1")
+                .bind("a".repeat(64))
+                .execute(&mut c)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE runtime_instances SET binary_version='0.0.2'")
+                .execute(&mut c)
+                .await
+                .unwrap();
+        }
+        c.close().await.unwrap();
+        let result = DistributionRuntime::isolated_fixture(
+            DistributionConfig {
+                contract_version: 1,
+                environment: "development".into(),
+                origin: "https://localhost/".into(),
+                state_root: f.root.join("state").to_str().unwrap().into(),
+                artifact_root: f.root.join("artifacts").to_str().unwrap().into(),
+                workspace_root: f.root.join("workspace").to_str().unwrap().into(),
+                profile_public_key: URL_SAFE_NO_PAD.encode(f.key.public_key().as_ref()),
+                power_operation_id: f.power.clone(),
+                release_id: "fixture-worker".into(),
+                release_sha256: "a".repeat(64),
+            },
+            request_id().unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(DistributionError::Journal)));
+        let mut c = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(f.root.join("state/db/craxii.sqlite3"))
+            .connect()
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(after, before, "corruption reached runtime recovery/start");
+        c.close().await.unwrap();
+        std::fs::remove_dir_all(&f.root).unwrap();
+    }
 }

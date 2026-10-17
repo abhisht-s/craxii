@@ -230,6 +230,20 @@ impl ToolRegistry {
         &self.definitions
     }
 
+    /// Restrict both advertised definitions and execution lookup to trusted profile IDs.
+    pub fn restricted_to(&self, names: &[&str]) -> Result<Self, ToolRegistryError> {
+        let selected: Vec<_> = self
+            .definitions
+            .iter()
+            .filter(|d| names.contains(&d.name().as_str()))
+            .cloned()
+            .collect();
+        if selected.len() != names.len() {
+            return Err(ToolRegistryError::InvalidSemanticPolicy);
+        }
+        Self::try_new(selected)
+    }
+
     pub fn lookup(&self, name: &ToolName) -> Option<&ToolDefinition> {
         self.definitions
             .iter()
@@ -809,6 +823,26 @@ mod tests {
 
     fn registry() -> ToolRegistry {
         ToolRegistry::v0(policy()).unwrap()
+    }
+
+    #[test]
+    fn trusted_subset_restricts_advertisement_and_execution_lookup() {
+        let registry = ToolRegistry::v0(policy()).unwrap();
+        let selected = registry.restricted_to(&["run_shell"]).unwrap();
+        assert_eq!(selected.definitions().len(), 1);
+        assert!(
+            selected
+                .lookup(&ToolName::try_new("read_file").unwrap())
+                .is_none()
+        );
+        assert!(
+            selected
+                .lookup(&ToolName::try_new("run_shell").unwrap())
+                .is_some()
+        );
+        assert_ne!(selected.fingerprint(), registry.fingerprint());
+        assert!(registry.restricted_to(&["unknown"]).is_err());
+        assert!(registry.restricted_to(&["run_shell", "run_shell"]).is_err());
     }
 
     #[test]
