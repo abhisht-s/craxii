@@ -171,6 +171,25 @@ async fn main() {
                 eprintln!("distribution_fixture_reconnect_{e:?}");
             })?;
         }
+        if input["action"] == "serve" {
+            // A3 end-to-end harness: the debug-only execution step answers the first message (the release
+            // agent loop arrives in B2), then the worker's real main loop runs until SIGTERM. It sends the
+            // result to the control plane and keeps polling.
+            runtime
+                .isolated_terminal_once(&mut client)
+                .await
+                .map_err(|e| {
+                    eprintln!("distribution_fixture_terminal_{e:?}");
+                })?;
+            std::io::stdout()
+                .write_all(b"distribution_serving\n")
+                .map_err(|_| ())?;
+            std::io::stdout().flush().map_err(|_| ())?;
+            runtime.run(client).await.map_err(|e| {
+                eprintln!("distribution_fixture_run_{e:?}");
+            })?;
+            return Ok(json!({"stopped":true}));
+        }
         let mut retrieved_attempt = None;
         if input["action"] == "model_retrieve" {
             // Read-only qualification after a real worker restart. The controller
