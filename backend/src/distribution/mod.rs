@@ -4,6 +4,7 @@ pub(crate) mod fixture;
 pub mod model_config;
 pub mod startup;
 pub mod transport;
+pub use crate::distribution_contracts::environment::WorkerEnvironment;
 use crate::distribution_contracts::{
     canonical::{canonical_bytes, sha256},
     primitives::{binary, timestamp_micros},
@@ -15,6 +16,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DistributionError {
     Invalid,
+    /// The delivery's environment or owner contradicts this worker's local identity. This is permanent,
+    /// unlike one bad or stale delivery, so the worker stops instead of skipping it.
+    Identity,
     Conflict,
     Storage,
     Reconciliation,
@@ -51,6 +55,8 @@ pub(crate) fn timestamp() -> DistributionResult<crate::domain::UtcTimestamp> {
 }
 /// Constructor restricted to the authenticated client; admission rechecks after SQLite waits.
 pub struct ValidatedDelivery {
+    /// The worker's configured environment; the message was checked against it.
+    pub(crate) environment: WorkerEnvironment,
     pub(crate) message: Value,
     pub(crate) profile: Option<Value>,
     pub(crate) profile_key: String,
@@ -62,10 +68,10 @@ pub struct ValidatedDelivery {
 impl ValidatedDelivery {
     pub fn check_fresh(&self) -> DistributionResult<()> {
         #[cfg(target_os = "linux")]
-        if self.message["type"] == "work_delivery" {
-            if let Some(c) = &self.compute {
-                c.running().map_err(|_| DistributionError::Expired)?;
-            }
+        if self.message["type"] == "work_delivery"
+            && let Some(c) = &self.compute
+        {
+            c.running().map_err(|_| DistributionError::Expired)?;
         }
         let b = &self.message["body"];
         let t = now()?;
@@ -108,6 +114,8 @@ impl ValidatedDelivery {
             json!([])
         };
         let expected=sha256(&canonical_bytes(&json!({"program":program,"tools":tools,"model_dispatch":terminal || proxy,"tool_dispatch":tool})).map_err(|_|invalid())?);
+        // Fixture profiles are development-only under contract 1.0.0. Production work
+        // arrives with `ordinary` profiles (go-live plan B1).
         if profile["authority"] != *a
             || p["kind"] != "development_fixture"
             || p["environment"] != "development"
@@ -159,6 +167,7 @@ impl ValidatedDelivery {
         Ok(())
     }
     pub(crate) fn from_authenticated(
+        environment: WorkerEnvironment,
         message: Value,
         profile: Option<Value>,
         profile_key: String,
@@ -172,7 +181,7 @@ impl ValidatedDelivery {
             message["type"].as_str(),
             Some("work_delivery" | "cancel_delivery")
         ) || message["authority"] != *authority
-            || message["environment"] != "development"
+            || message["environment"] != environment.as_str()
             || message["body"]["boot_id"] != boot
             || message["body"]["power_operation_id"] != power
         {
@@ -187,6 +196,7 @@ impl ValidatedDelivery {
             return Err(DistributionError::Expired);
         }
         let result = Self {
+            environment,
             message,
             profile,
             profile_key,

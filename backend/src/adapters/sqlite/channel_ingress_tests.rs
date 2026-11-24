@@ -3743,7 +3743,7 @@ async fn distribution_populated_v7_upgrade_preserves_native_and_channel_history(
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        9
+        super::schema::MAX_SUPPORTED_SCHEMA_VERSION
     );
     let historical = sqlx::migrate::Migrator::with_migrations(
         super::schema::MIGRATOR.iter().take(7).cloned().collect(),

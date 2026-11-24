@@ -84,6 +84,7 @@ impl Fixture {
         let profile = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"execution_profile","request_id":request_id().unwrap(),"environment":"development","authority":self.authority,"body":{"profile":p,"key_id":sha256(self.key.public_key().as_ref()),"signature":URL_SAFE_NO_PAD.encode(self.key.sign(&signature_input(SignaturePurpose::ExecutionProfile,&p).unwrap()).as_ref())}});
         let message = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"work_delivery","request_id":request_id().unwrap(),"environment":"development","authority":self.authority,"body":{"delivery_id":request_id().unwrap(),"power_operation_id":self.power,"delivery_revision":"1","boot_id":self.boot,"issued_at":issued,"expires_at":expires,"admission_operation_id":request_id().unwrap(),"material":material,"material_digest":digest,"execution_authorization":{"kind":"development_fixture","profile_id":profile_id,"profile_digest":sha256(&canonical_bytes(&p).unwrap())}}});
         ValidatedDelivery::from_authenticated(
+            crate::distribution_contracts::environment::WorkerEnvironment::Development,
             message,
             Some(profile),
             URL_SAFE_NO_PAD.encode(self.key.public_key().as_ref()),
@@ -134,6 +135,7 @@ impl Fixture {
         );
         body.insert("control".into(), c);
         ValidatedDelivery::from_authenticated(
+            crate::distribution_contracts::environment::WorkerEnvironment::Development,
             message,
             None,
             URL_SAFE_NO_PAD.encode(self.key.public_key().as_ref()),
@@ -164,6 +166,7 @@ async fn distribution_atomic_receipt_replay_cancel_and_tombstone_fifo() {
         _ => panic!(),
     };
     let mut replay = ValidatedDelivery::from_authenticated(
+        crate::distribution_contracts::environment::WorkerEnvironment::Development,
         w.message.clone(),
         None,
         w.profile_key.clone(),
@@ -222,6 +225,7 @@ async fn distribution_atomic_receipt_replay_cancel_and_tombstone_fifo() {
         0
     );
     let mut conflict = ValidatedDelivery::from_authenticated(
+        crate::distribution_contracts::environment::WorkerEnvironment::Development,
         w.message.clone(),
         None,
         w.profile_key.clone(),
@@ -478,6 +482,7 @@ async fn distribution_replacement_replays_original_receipt_after_cancellation_re
     let mut message = w.message.clone();
     message["authority"] = f.authority.clone();
     let replay = ValidatedDelivery::from_authenticated(
+        crate::distribution_contracts::environment::WorkerEnvironment::Development,
         message,
         None,
         w.profile_key.clone(),
@@ -520,6 +525,7 @@ async fn distribution_replacement_replays_original_receipt_after_cancellation_re
     let mut current = c.message.clone();
     current["authority"] = f.authority.clone();
     let current = ValidatedDelivery::from_authenticated(
+        crate::distribution_contracts::environment::WorkerEnvironment::Development,
         current,
         None,
         c.profile_key.clone(),
@@ -1007,6 +1013,212 @@ async fn distribution_result_populated_v8_terminal_upgrade_reconciles_without_re
 }
 
 #[tokio::test]
+async fn configured_environment_must_match_every_delivery_and_config() {
+    use crate::distribution_contracts::environment::WorkerEnvironment;
+    let mut f = Fixture::new().await;
+    let d = f.delivery(&request_id().unwrap(), 1);
+    // A production worker refuses a development delivery before it reaches storage.
+    assert!(
+        ValidatedDelivery::from_authenticated(
+            WorkerEnvironment::Production,
+            d.message.clone(),
+            d.profile.clone(),
+            d.profile_key.clone(),
+            &f.authority,
+            &f.boot,
+            &f.power,
+        )
+        .is_err()
+    );
+    let mut config = DistributionConfig {
+        contract_version: 1,
+        environment: "production".into(),
+        origin: "https://localhost/".into(),
+        state_root: f.root.join("state").to_str().unwrap().into(),
+        artifact_root: f.root.join("artifacts").to_str().unwrap().into(),
+        workspace_root: f.root.join("workspace").to_str().unwrap().into(),
+        profile_public_key: URL_SAFE_NO_PAD.encode([0u8; 32]),
+        power_operation_id: request_id().unwrap(),
+        release_id: "fixture-worker".into(),
+        release_sha256: "a".repeat(64),
+    };
+    config.validate().unwrap();
+    assert_eq!(
+        config.worker_environment().unwrap(),
+        WorkerEnvironment::Production
+    );
+    for refused in ["test", "local", "staging", ""] {
+        config.environment = refused.into();
+        assert!(config.validate().is_err());
+        assert!(config.worker_environment().is_err());
+    }
+    // Once a development delivery owns the store, a worker restarted with another environment or owner is
+    // refused as a permanent identity mismatch (the worker stops at startup instead of skipping deliveries).
+    let store = &f.runtime.as_ref().unwrap().store;
+    store.admit_distribution(&d).await.unwrap();
+    let (customer, agent) = (
+        f.authority["customer_id"].as_str().unwrap().to_owned(),
+        f.authority["logical_agent_id"].as_str().unwrap().to_owned(),
+    );
+    store
+        .assert_distribution_identity(WorkerEnvironment::Development, &customer, &agent)
+        .await
+        .unwrap();
+    for (environment, customer, agent) in [
+        (
+            WorkerEnvironment::Production,
+            customer.as_str(),
+            agent.as_str(),
+        ),
+        (WorkerEnvironment::Development, "other", agent.as_str()),
+        (WorkerEnvironment::Development, customer.as_str(), "other"),
+    ] {
+        assert_eq!(
+            store
+                .assert_distribution_identity(environment, customer, agent)
+                .await
+                .unwrap_err(),
+            DistributionError::Identity
+        );
+    }
+    f.runtime.take().unwrap().shutdown().await.unwrap();
+    std::fs::remove_dir_all(&f.root).unwrap();
+}
+
+#[tokio::test]
+async fn populated_v9_upgrade_admits_production_without_changing_rows() {
+    use sqlx::{ConnectOptions, Connection};
+    let mut f = Fixture::new().await;
+    let d = f.delivery(&request_id().unwrap(), 1);
+    let store = &f.runtime.as_ref().unwrap().store;
+    store.admit_distribution(&d).await.unwrap();
+    store.cancel_distribution(&f.control(&d)).await.unwrap();
+    f.runtime.take().unwrap().shutdown().await.unwrap();
+    let root = std::env::temp_dir().join(format!("craxii-env-upgrade-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    for p in ["state", "artifacts", "workspace", "state/db"] {
+        std::fs::create_dir(root.join(p)).unwrap();
+        std::fs::set_permissions(root.join(p), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let database = root.join("state/db/craxii.sqlite3");
+    let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&database)
+        .create_if_missing(true)
+        .foreign_keys(false)
+        .connect()
+        .await
+        .unwrap();
+    sqlx::query("CREATE TEMP TABLE ch1_owner_seed(user_id TEXT NOT NULL)")
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    sqlx::migrate::Migrator::with_migrations(
+        super::schema::MIGRATOR.iter().take(9).cloned().collect(),
+    )
+    .run(&mut connection)
+    .await
+    .unwrap();
+    sqlx::query("ATTACH DATABASE ? AS prior")
+        .bind(f.root.join("state/db/craxii.sqlite3").to_str().unwrap())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    // A released V9 database built from the same rows; schema 10 changes no columns.
+    for t in super::schema::PRODUCT_TABLES {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO main.{t} SELECT * FROM prior.{t}"
+        )))
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    }
+    const SNAPSHOT: &str = "SELECT \
+        (SELECT json_group_array(json_array(environment,customer_id,logical_agent_id,user_id,craxii_id,highest_generation,current_installation_id)) FROM distribution_owners), \
+        (SELECT json_group_array(json_array(export_id,environment,central_work_id,work_state,state_version,export_digest,transfer_state,metadata_canonical)) FROM distribution_results)";
+    let before: (String, String) = sqlx::query_as(SNAPSHOT)
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_ne!(before.0, "[]");
+    assert_ne!(before.1, "[]");
+    connection.close().await.unwrap();
+    std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let config = DistributionConfig {
+        contract_version: 1,
+        environment: "development".into(),
+        origin: "https://localhost/".into(),
+        state_root: root.join("state").to_str().unwrap().into(),
+        artifact_root: root.join("artifacts").to_str().unwrap().into(),
+        workspace_root: f.root.join("workspace").to_str().unwrap().into(),
+        profile_public_key: URL_SAFE_NO_PAD.encode([0u8; 32]),
+        power_operation_id: request_id().unwrap(),
+        release_id: "fixture-worker".into(),
+        release_sha256: "a".repeat(64),
+    };
+    let runtime = DistributionRuntime::isolated_fixture(config, request_id().unwrap())
+        .await
+        .unwrap();
+    let pool = &runtime.store.runtime.inner.pool;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        10
+    );
+    let after: (String, String) = sqlx::query_as(SNAPSHOT).fetch_one(pool).await.unwrap();
+    assert_eq!(after, before);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM pragma_foreign_key_check")
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        0
+    );
+    // The immutability guards on results and their messages survive the rebuild.
+    let guarded = sqlx::query("DELETE FROM distribution_results")
+        .execute(pool)
+        .await;
+    assert!(
+        guarded
+            .unwrap_err()
+            .to_string()
+            .contains("immutable_result")
+    );
+    runtime.shutdown().await.unwrap();
+
+    let mut connection = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&database)
+        .foreign_keys(false)
+        .connect()
+        .await
+        .unwrap();
+    let mut outcomes = Vec::new();
+    for (environment, user) in [
+        ("production", "production-owner"),
+        ("staging", "staging-owner"),
+    ] {
+        outcomes.push(
+            sqlx::query(
+                "INSERT INTO distribution_owners(environment,customer_id,logical_agent_id,user_id,craxii_id,highest_generation,current_installation_id) \
+                 SELECT ?,customer_id,logical_agent_id,?,craxii_id,highest_generation,current_installation_id FROM distribution_owners LIMIT 1",
+            )
+            .bind(environment)
+            .bind(user)
+            .execute(&mut connection)
+            .await,
+        );
+    }
+    let refused = outcomes.pop().unwrap().unwrap_err();
+    outcomes.pop().unwrap().unwrap();
+    assert!(refused.to_string().contains("CHECK constraint failed"));
+    connection.close().await.unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(&f.root).unwrap();
+}
+
+#[tokio::test]
 async fn distribution_result_failure_and_confirmed_active_cancellation_are_truthful() {
     use crate::domain::*;
     use crate::ports::state_store::{
@@ -1189,13 +1401,21 @@ async fn installed_quiescence_tracks_journal_receipts_exports_and_flush() {
             panic!("unexpected receipt type");
         };
         rt.store
-            .acknowledge_distribution(&receipt, false)
+            .acknowledge_distribution(
+                crate::distribution_contracts::environment::WorkerEnvironment::Development,
+                &receipt,
+                false,
+            )
             .await
             .unwrap();
     }
     for receipt in rt.store.pending_distribution_controls().await.unwrap() {
         rt.store
-            .acknowledge_distribution(&receipt, true)
+            .acknowledge_distribution(
+                crate::distribution_contracts::environment::WorkerEnvironment::Development,
+                &receipt,
+                true,
+            )
             .await
             .unwrap();
     }

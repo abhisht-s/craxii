@@ -33,10 +33,12 @@ impl InstalledCompute {
         installation: &str,
         generation: &str,
         power: &str,
+        environment: &str,
     ) -> ComputeResult<Self> {
         let policy = Policy::parse(&watchdog::protected_read(Path::new(POLICY), 0)?)?;
         let b = &policy.binding;
-        if b.customer_id != customer
+        if b.environment != environment
+            || b.customer_id != customer
             || b.logical_agent_id != agent
             || b.installation_id != installation
             || b.generation != generation
@@ -163,7 +165,7 @@ impl InstalledCompute {
             None
         };
         let mut intent = if let Some(i) = saved {
-            if i.contract_version != 1 || i.attempts > 3 {
+            if i.contract_version != 1 {
                 return Err(AuthError::InvalidContext);
             }
             if i.body["grant_id"] != a.grant()["grant_id"] {
@@ -211,26 +213,34 @@ impl InstalledCompute {
         };
         crate::distribution_contracts::primitives::uuid(&intent.request_id, Some(4))
             .map_err(|_| AuthError::InvalidContext)?;
-        if intent.attempts >= 3 {
-            // Exhausting bounded send attempts must not strand authority that already
-            // committed centrally. This read-only recovery never allocates funding and
-            // never resets the persisted request/attempts or the root drain latch.
-            let response = client
-                .compute_authorization(boot, &self.policy.binding.power_operation_id)
-                .await?;
-            return self.stage(&response).map_err(|_| AuthError::InvalidContext);
-        }
-        intent.attempts += 1;
+        // The same persisted request ID is resent until it succeeds or the grant lapses.
+        // The control plane deduplicates renewals by request ID, so a resend after a lost
+        // response returns the already committed grant and never allocates new funding.
+        // The watchdog still powers the guest off when the current grant expires.
+        intent.attempts = intent.attempts.saturating_add(1);
         watchdog::atomic_write_owned(
             path,
             &serde_json::to_vec(&intent).map_err(|_| AuthError::InvalidContext)?,
             uid,
         )
         .map_err(|_| AuthError::InvalidContext)?;
-        let response = client
-            .renew_compute(&intent.request_id, &intent.body)
-            .await?;
-        self.stage(&response).map_err(|_| AuthError::InvalidContext)
+        match client.renew_compute(&intent.request_id, &intent.body).await {
+            Ok(response) => self.stage(&response).map_err(|_| AuthError::InvalidContext),
+            Err(
+                e @ (AuthError::Transport | AuthError::Unavailable | AuthError::SessionExpired),
+            ) => Err(e),
+            // A resend can be refused once the run or epoch has moved on, even though an earlier send of
+            // this request committed. Read the current grant instead: read-only, it never allocates funding.
+            // If it is still the old grant the next refresh tries again, until the watchdog's deadline.
+            Err(e) if intent.attempts > 1 => {
+                let response = client
+                    .compute_authorization(boot, &self.policy.binding.power_operation_id)
+                    .await
+                    .map_err(|_| e)?;
+                self.stage(&response).map_err(|_| AuthError::InvalidContext)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 

@@ -2,6 +2,7 @@
   "contract_version": 1,
   "provenance": "synthetic_test",
   "binding": {
+    "environment": "development",
     "customer_id": "00000001-1414-4414-8414-141414141414",
     "logical_agent_id": "00000002-1414-4414-8414-141414141414",
     "installation_id": "00000003-1414-4414-8414-141414141414",

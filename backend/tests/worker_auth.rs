@@ -122,7 +122,15 @@ fn client_rejects_plaintext_userinfo_query_fragment_and_untrusted_fixture_origin
             pending_signed: None,
             disposition: Disposition::Unbound,
         };
-        assert!(WorkerClient::new(origin, key, s).is_err());
+        assert!(
+            WorkerClient::new(
+                origin,
+                craxii_server::distribution_contracts::environment::WorkerEnvironment::Production,
+                key,
+                s
+            )
+            .is_err()
+        );
         fs::remove_dir_all(p).unwrap();
     }
 }

@@ -629,3 +629,36 @@ fn signed_elapsed_bound_and_long_boot_ticks_survive_renewal_and_restart() {
     invalid["deadline"]["sampled_ticks_us"] = 1.into();
     assert!(Receipt::parse(&serde_json::to_vec(&invalid).unwrap(), &f.p, &clock(3001)).is_err());
 }
+#[test]
+fn binding_environment_is_required_and_must_match_every_grant_and_permit() {
+    let v = fixture();
+    let p = policy(&v);
+    let bytes = canonical_bytes(&v["grant"]).unwrap();
+    assert!(RunningAuthority::verify(&bytes, &p.binding, &clock(1)).is_ok());
+    // A production worker refuses a development grant and a development bootstrap permit.
+    let mut production = policy(&v);
+    production.binding.environment = "production".into();
+    production.binding.validate().unwrap();
+    assert!(RunningAuthority::verify(&bytes, &production.binding, &clock(1)).is_err());
+    assert!(
+        Receipt::consume_bootstrap(
+            &canonical_bytes(&v["bootstrap"]).unwrap(),
+            &production,
+            &clock(0),
+            None
+        )
+        .is_err()
+    );
+    // Only contract environments are valid, and the field is required.
+    let mut b = v["binding"].clone();
+    b["environment"] = Value::String("test".into());
+    assert!(
+        serde_json::from_value::<Binding>(b)
+            .unwrap()
+            .validate()
+            .is_err()
+    );
+    let mut b = v["binding"].clone();
+    b.as_object_mut().unwrap().remove("environment");
+    assert!(serde_json::from_value::<Binding>(b).is_err());
+}

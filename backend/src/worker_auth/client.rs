@@ -3,6 +3,7 @@ use super::{
     key_store::KeyStore,
     state::{Disposition, IdentityState},
 };
+use crate::distribution_contracts::environment::WorkerEnvironment;
 use crate::distribution_contracts::{
     canonical::{canonical_bytes, sha256},
     primitives::timestamp_micros,
@@ -13,11 +14,11 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, Url};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-const AUDIENCE: &str = "craxii.worker:development";
 const MAX_RESPONSE: usize = 65536;
 /// Secrets never implement Debug or Serialize and never enter agent SQLite.
 pub struct WorkerClient {
     http: Client,
+    environment: WorkerEnvironment,
     origin: Url,
     key: KeyStore,
     state: IdentityState,
@@ -52,9 +53,65 @@ fn envelope(kind: &str, body: Value) -> AuthResult<Value> {
         .map_err(|_| AuthError::InvalidContext)?;
     Ok(v)
 }
+/// Edge proxies (Cloudflare, Caddy) answer overload, timeouts and outages with their own
+/// non-JSON pages. Those are transient and must be retried, never treated as a protocol
+/// violation that stops the worker.
+fn transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+fn response_failure(status: reqwest::StatusCode) -> AuthError {
+    if !status.is_success() && transient_status(status) {
+        AuthError::Unavailable
+    } else {
+        AuthError::InvalidContext
+    }
+}
+/// Status is classified before the body is trusted. Success bodies stay strictly bounded
+/// canonical JSON; error bodies only refine the reason when they are well-formed.
+pub(crate) fn decode_response(
+    status: reqwest::StatusCode,
+    bytes: &[u8],
+    response_limit: usize,
+) -> AuthResult<Value> {
+    let malformed = response_failure(status);
+    if !status.is_success() && bytes.len() > 4096 {
+        return Err(malformed);
+    }
+    // Shared raw decoder rejects duplicate keys and ambiguous canonical bytes.
+    let Ok(value) = crate::distribution_contracts::raw_json::parse_bounded(
+        bytes,
+        crate::distribution_contracts::raw_json::Limits {
+            bytes: response_limit,
+            nodes: if response_limit > 65536 { 32768 } else { 4096 },
+            depth: 32,
+        },
+    ) else {
+        return Err(malformed);
+    };
+    if !status.is_success() {
+        return Err(match value["reason"].as_str() {
+            Some("session_expired" | "unauthenticated") => AuthError::SessionExpired,
+            Some("revoked_authority") => AuthError::Revoked,
+            Some("stale_generation") => AuthError::Stale,
+            Some("reconciliation_required") => AuthError::ResultMissing,
+            Some("result_conflict") => AuthError::ResultConflict,
+            _ if transient_status(status) => AuthError::Unavailable,
+            _ => AuthError::InvalidContext,
+        });
+    }
+    Ok(value)
+}
+
 impl WorkerClient {
-    pub fn new(origin: &str, key: KeyStore, state: IdentityState) -> AuthResult<Self> {
-        Self::build(origin, key, state, None)
+    pub fn new(
+        origin: &str,
+        environment: WorkerEnvironment,
+        key: KeyStore,
+        state: IdentityState,
+    ) -> AuthResult<Self> {
+        Self::build(origin, environment, key, state, None)
     }
     #[cfg(all(feature = "test-failpoints", debug_assertions))]
     pub fn isolated_tls_fixture(
@@ -69,6 +126,7 @@ impl WorkerClient {
         }
         Self::build(
             origin,
+            WorkerEnvironment::Development,
             key,
             state,
             Some(reqwest::Certificate::from_pem(pem).map_err(|_| AuthError::InvalidContext)?),
@@ -76,6 +134,7 @@ impl WorkerClient {
     }
     fn build(
         origin: &str,
+        environment: WorkerEnvironment,
         key: KeyStore,
         state: IdentityState,
         root: Option<reqwest::Certificate>,
@@ -92,6 +151,7 @@ impl WorkerClient {
             return Err(AuthError::InvalidContext);
         }
         state.validate(&key)?;
+        state.require_environment(environment)?;
         state.persist(&key)?;
         let mut builder = Client::builder()
             .https_only(true)
@@ -107,12 +167,16 @@ impl WorkerClient {
         let http = builder.build().map_err(|_| AuthError::Transport)?;
         Ok(Self {
             http,
+            environment,
             origin,
             key,
             state,
             selection: None,
             session: None,
         })
+    }
+    pub fn environment(&self) -> WorkerEnvironment {
+        self.environment
     }
     pub fn public_key(&self) -> String {
         self.key.public_key()
@@ -201,44 +265,21 @@ impl WorkerClient {
         }
         let mut response = request.send().await.map_err(|_| AuthError::Transport)?;
         let status = response.status();
+        let malformed = response_failure(status);
         if response
             .content_length()
             .is_some_and(|n| n > response_limit as u64)
         {
-            return Err(AuthError::InvalidContext);
+            return Err(malformed);
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| AuthError::Transport)? {
             if bytes.len() + chunk.len() > response_limit {
-                return Err(AuthError::InvalidContext);
+                return Err(malformed);
             }
             bytes.extend_from_slice(&chunk);
         }
-        // Shared raw decoder rejects duplicate keys and ambiguous canonical bytes.
-        let value = crate::distribution_contracts::raw_json::parse_bounded(
-            &bytes,
-            crate::distribution_contracts::raw_json::Limits {
-                bytes: response_limit,
-                nodes: if response_limit > 65536 { 32768 } else { 4096 },
-                depth: 32,
-            },
-        )
-        .map_err(|_| AuthError::InvalidContext)?;
-        if !status.is_success() {
-            if bytes.len() > 4096 {
-                return Err(AuthError::InvalidContext);
-            }
-            return Err(match value["reason"].as_str() {
-                Some("session_expired" | "unauthenticated") => AuthError::SessionExpired,
-                Some("revoked_authority") => AuthError::Revoked,
-                Some("stale_generation") => AuthError::Stale,
-                Some("reconciliation_required") => AuthError::ResultMissing,
-                Some("result_conflict") => AuthError::ResultConflict,
-                _ if status.is_server_error() => AuthError::Unavailable,
-                _ => AuthError::InvalidContext,
-            });
-        }
-        Ok(value)
+        decode_response(status, &bytes, response_limit)
     }
     pub async fn negotiate(
         &mut self,
@@ -276,8 +317,8 @@ impl WorkerClient {
     fn context(&self, body: &Value, purpose: &str) -> AuthResult<()> {
         self.active()?;
         for (k, v) in [
-            ("audience", AUDIENCE),
-            ("environment", "development"),
+            ("audience", self.environment.audience()),
+            ("environment", self.environment.as_str()),
             ("customer_id", self.state.customer_id.as_str()),
             ("logical_agent_id", self.state.logical_agent_id.as_str()),
             ("installation_id", self.state.installation_id.as_str()),
@@ -687,7 +728,7 @@ impl WorkerClient {
         {
             return Err(AuthError::InvalidContext);
         }
-        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"compute_renew","request_id":id,"environment":"development","authority":authority,"body":body});
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"compute_renew","request_id":id,"environment":self.environment.as_str(),"authority":authority,"body":body});
         decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
             .map_err(|_| AuthError::InvalidContext)?;
         let proof = self
@@ -713,7 +754,7 @@ impl WorkerClient {
         if response["type"] != "compute_authorization"
             || response["authority"] != *authority
             || response["request_id"] != id
-            || response["environment"] != "development"
+            || response["environment"] != self.environment.as_str()
             || response["body"]["grant"]["authorization_epoch"] != self.state.highest_epoch
         {
             return Err(AuthError::InvalidContext);
@@ -749,17 +790,23 @@ impl WorkerClient {
                         && p["body"]["profile"]["work_id"] == message["body"]["material"]["work_id"]
                 })
                 .cloned();
-            result.push(
-                crate::distribution::ValidatedDelivery::from_authenticated(
-                    message.clone(),
-                    profile,
-                    profile_key.to_owned(),
-                    &authority,
-                    boot,
-                    power,
-                )
-                .map_err(|_| AuthError::InvalidContext)?,
-            );
+            match crate::distribution::ValidatedDelivery::from_authenticated(
+                self.environment,
+                message.clone(),
+                profile,
+                profile_key.to_owned(),
+                &authority,
+                boot,
+                power,
+            ) {
+                Ok(delivery) => result.push(delivery),
+                // A delivery whose window lapsed is skipped; the control plane issues it again.
+                Err(crate::distribution::DistributionError::Expired) => {
+                    tracing::warn!(target: "craxii::distribution", event = "delivery_skipped");
+                }
+                // Anything else (wrong environment, authority or signature) is not one bad delivery.
+                Err(_) => return Err(AuthError::InvalidContext),
+            }
         }
         Ok(result)
     }
@@ -771,7 +818,7 @@ impl WorkerClient {
         } else {
             "work_receipt"
         };
-        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":kind,"request_id":id,"environment":"development","authority":authority,"body":body});
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":kind,"request_id":id,"environment":self.environment.as_str(),"authority":authority,"body":body});
         decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
             .map_err(|_| AuthError::InvalidContext)?;
         let proof = self
@@ -842,8 +889,8 @@ impl WorkerClient {
         .map_err(|_| AuthError::InvalidContext)?;
         if signed["purpose"] != "sensitive_request"
             || signed["signature_version"] != 1
-            || signed["audience"] != AUDIENCE
-            || signed["environment"] != "development"
+            || signed["audience"] != self.environment.audience()
+            || signed["environment"] != self.environment.as_str()
             || signed["session_id"] != authority["session_id"]
             || signed["installation_id"] != authority["installation_id"]
             || signed["generation"] != authority["generation"]
@@ -855,7 +902,7 @@ impl WorkerClient {
         {
             return Err(AuthError::InvalidContext);
         }
-        let proof = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"sensitive_request_proof","request_id":id,"environment":"development","authority":authority,"body":{"signed":signed,"proof_signature":self.key.sign(SignaturePurpose::SensitiveRequest,&signed)?}});
+        let proof = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"sensitive_request_proof","request_id":id,"environment":self.environment.as_str(),"authority":authority,"body":{"signed":signed,"proof_signature":self.key.sign(SignaturePurpose::SensitiveRequest,&signed)?}});
         decode_message(&canonical_bytes(&proof).map_err(|_| AuthError::InvalidContext)?)
             .map_err(|_| AuthError::InvalidContext)?;
         let issued = timestamp_micros(field(&signed, "issued_at")?)
@@ -989,7 +1036,7 @@ impl WorkerClient {
         let query = json!({"work_id":s["work_id"],"export_id":s["export_id"],"export_revision":"1","export_digest":body["export_digest"]});
         let authority = self.current_authority()?;
         let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
-        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_query","request_id":id,"environment":"development","authority":authority,"body":query});
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_query","request_id":id,"environment":self.environment.as_str(),"authority":authority,"body":query});
         let response = self
             .session_exchange("/v1/worker/result-status", &request)
             .await?;
@@ -999,7 +1046,7 @@ impl WorkerClient {
     pub async fn send_result(&mut self, body: &Value) -> AuthResult<Value> {
         let authority = self.current_authority()?;
         let id = crate::distribution::request_id().map_err(|_| AuthError::InvalidContext)?;
-        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_export","request_id":id,"environment":"development","authority":authority,"body":body});
+        let request = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_export","request_id":id,"environment":self.environment.as_str(),"authority":authority,"body":body});
         decode_message(&canonical_bytes(&request).map_err(|_| AuthError::InvalidContext)?)
             .map_err(|_| AuthError::InvalidContext)?;
         let proof = self
@@ -1067,4 +1114,66 @@ fn scope_policy(value: &Value) -> bool {
                 json!("cancel"),
                 json!("result_export"),
             ]
+}
+
+#[cfg(test)]
+mod response_tests {
+    use super::{AuthError, decode_response};
+    use reqwest::StatusCode;
+    fn kind(status: u16, body: &[u8]) -> Result<(), AuthError> {
+        decode_response(StatusCode::from_u16(status).unwrap(), body, 16384).map(|_| ())
+    }
+    #[test]
+    fn edge_error_pages_are_retryable() {
+        let html = b"<!DOCTYPE html><html><title>502 Bad Gateway</title></html>";
+        for status in [500, 502, 503, 504, 520, 522, 524, 429, 408] {
+            assert!(
+                matches!(kind(status, html), Err(AuthError::Unavailable)),
+                "{status}"
+            );
+            assert!(
+                matches!(kind(status, b""), Err(AuthError::Unavailable)),
+                "{status}"
+            );
+            let large = vec![b'x'; 5000];
+            assert!(
+                matches!(kind(status, &large), Err(AuthError::Unavailable)),
+                "{status}"
+            );
+        }
+    }
+    #[test]
+    fn non_transient_errors_stay_strict() {
+        let html = b"<html>Forbidden</html>";
+        for status in [400, 401, 403, 404, 409] {
+            assert!(
+                matches!(kind(status, html), Err(AuthError::InvalidContext)),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            kind(401, br#"{"reason":"session_expired"}"#),
+            Err(AuthError::SessionExpired)
+        ));
+        assert!(matches!(
+            kind(403, br#"{"reason":"revoked_authority"}"#),
+            Err(AuthError::Revoked)
+        ));
+        assert!(matches!(
+            kind(503, br#"{"reason":"backend_unavailable"}"#),
+            Err(AuthError::Unavailable)
+        ));
+    }
+    #[test]
+    fn success_bodies_remain_strict_json() {
+        assert!(kind(200, br#"{"contract_version":1}"#).is_ok());
+        assert!(matches!(
+            kind(200, b"<html></html>"),
+            Err(AuthError::InvalidContext)
+        ));
+        assert!(matches!(
+            kind(200, br#"{"contract_version":1,"contract_version":1}"#),
+            Err(AuthError::InvalidContext)
+        ));
+    }
 }

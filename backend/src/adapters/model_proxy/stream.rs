@@ -73,7 +73,7 @@ impl ProxyStream {
             || v["type"] != "model_event"
             || v["request_id"] != self.request["request_id"]
             || v["authority"] != self.request["authority"]
-            || v["environment"] != "development"
+            || v["environment"] != self.request["environment"]
         {
             return Err(unknown());
         }
@@ -350,7 +350,7 @@ mod tests {
     fn q() -> Value {
         let u4 = "11111111-1111-4111-8111-111111111111";
         let u7 = "019e0000-0000-7000-8000-000000000001";
-        json!({"request_id":u4,"authority":{"customer_id":u4,"logical_agent_id":u4,"installation_id":u4,"generation":"1","session_id":u4},"body":{"invocation":{"attempt_id":u7,"logical_invocation_id":u7,"model_config_id":u4,"model_config_digest":"a".repeat(64)}}})
+        json!({"request_id":u4,"environment":"development","authority":{"customer_id":u4,"logical_agent_id":u4,"installation_id":u4,"generation":"1","session_id":u4},"body":{"invocation":{"attempt_id":u7,"logical_invocation_id":u7,"model_config_id":u4,"model_config_digest":"a".repeat(64)}}})
     }
     fn frames() -> Vec<Value> {
         let q = q();

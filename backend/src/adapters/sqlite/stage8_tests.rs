@@ -4544,7 +4544,7 @@ async fn genuine_empty_v2_migrates_to_v7_without_changing_old_fingerprints() {
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "8ed74572f4b786d60291ef64a8ef3b982fce7a3bf7df70e5b65efd9d7b2bf1c2"
+        "9d484df334845025b7b4bd72f89305c32441a64c269ac0d16ab7f5630fa74cb0"
     );
     migrated.shutdown().await;
 
@@ -4656,7 +4656,7 @@ async fn genuine_v5_writer_history_migrates_to_v7_without_journal_mutation() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        7
+        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64
     );
     assert_eq!(
         sqlx::query_as::<_, (Option<i64>, Option<i64>)>(

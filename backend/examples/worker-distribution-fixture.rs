@@ -246,7 +246,8 @@ async fn main() {
                 text("logical_agent_id")?,
                 text("installation_id")?,
                 text("generation")?,
-                &input["config"]["power_operation_id"].as_str().ok_or(())?,
+                input["config"]["power_operation_id"].as_str().ok_or(())?,
+                input["config"]["environment"].as_str().ok_or(())?,
             )
             .map_err(|_| ())?;
             compute

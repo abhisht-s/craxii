@@ -1,6 +1,7 @@
 use super::{ComputeResult, denied};
 use crate::distribution_contracts::{
     canonical::{canonical_bytes, sha256},
+    environment::WorkerEnvironment,
     primitives::{binary, decimal, timestamp_micros, uuid},
     raw_json::{CONTROL_LIMITS, parse_bounded},
     signing::{SignaturePurpose, signature_input},
@@ -12,6 +13,8 @@ use serde_json::Value;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Binding {
+    /// `development` or `production`; every grant and permit must carry the same one.
+    pub environment: String,
     pub customer_id: String,
     pub logical_agent_id: String,
     pub installation_id: String,
@@ -22,7 +25,11 @@ pub struct Binding {
     pub public_key: String,
 }
 impl Binding {
+    pub fn environment(&self) -> ComputeResult<WorkerEnvironment> {
+        WorkerEnvironment::parse(&self.environment).ok_or_else(denied)
+    }
     pub fn validate(&self) -> ComputeResult<()> {
+        self.environment()?;
         for id in [
             &self.customer_id,
             &self.logical_agent_id,
@@ -191,7 +198,10 @@ impl RunningAuthority {
         }
         let message = parse_bounded(bytes, CONTROL_LIMITS).map_err(|_| denied())?;
         validate_running_message(&message)?;
-        if message["type"] != "compute_authorization" || message["environment"] != "development" {
+        let environment = binding.environment()?;
+        if message["type"] != "compute_authorization"
+            || message["environment"] != environment.as_str()
+        {
             return Err(denied());
         }
         let g = &message["body"]["grant"];
@@ -207,9 +217,9 @@ impl RunningAuthority {
         }
         verify_signature(g, &message["body"], binding, false)?;
         binding.check(g)?;
-        if g["audience"] != "craxii.worker:development"
+        if g["audience"] != environment.audience()
             || g["boot_id"] != c.boot_id
-            || g["environment"] != "development"
+            || g["environment"] != environment.as_str()
         {
             return Err(denied());
         }
@@ -332,7 +342,7 @@ impl BootstrapAuthority {
             || expected.iter().any(|k| !obj.contains_key(*k))
             || v.as_object().ok_or_else(denied)?.len() != 3
             || p["contract_version"] != 1
-            || p["environment"] != "development"
+            || p["environment"] != binding.environment()?.as_str()
             || p["audience"] != "craxii.compute-watchdog"
             || p["permitted_scope"] != "bootstrap_only"
         {

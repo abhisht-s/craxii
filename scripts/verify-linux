@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Full Linux lint and test gate in a disposable container, run the way CI runs it:
+# a writable copy of the repository (with git metadata, without build output), as an
+# ordinary non-root user. Build caches live in two named Docker volumes that are reused.
+# Usage: scripts/verify-linux [extra cargo test arguments]
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+command -v docker >/dev/null || { echo "error: Docker is required" >&2; exit 1; }
+case "$(uname -m)" in
+  arm64 | aarch64) platform=linux/arm64 ;;
+  x86_64 | amd64) platform=linux/amd64 ;;
+  *) echo "error: unsupported local architecture" >&2; exit 1 ;;
+esac
+# Linking many large debug test binaries at once exhausts a small Docker VM, and an uncapped
+# container takes every core the VM has, so both cargo and the container are capped.
+jobs="${CRAXII_LINUX_JOBS:-2}"
+cpus="${CRAXII_LINUX_CPUS:-2}"
+
+COPYFILE_DISABLE=1 tar --no-xattrs -C "${repository_root}" --exclude=./target -cf - . |
+  docker run --rm -i --platform "${platform}" --cpus "${cpus}" \
+    -e CRAXII_LINUX_JOBS="${jobs}" \
+    -v craxii-golive-cargo:/usr/local/cargo/registry \
+    -v craxii-golive-target:/craxii-target \
+    rust:1.98-bookworm bash -c '
+set -euo pipefail
+useradd --create-home --shell /bin/bash builder
+install -d -o builder -g builder /work
+chown -R builder:builder /usr/local/cargo/registry /craxii-target
+tar -C /work -xf -
+chown -R builder:builder /work
+rustup component add clippy rustfmt >/dev/null 2>&1
+chmod -R a+rwX /usr/local/rustup /usr/local/cargo
+su builder -s /bin/bash -c "
+set -euo pipefail
+cd /work
+export PATH=/usr/local/cargo/bin:\$PATH CARGO_TARGET_DIR=/craxii-target
+git config --global --add safe.directory /work
+cargo fmt --all --check
+cargo clippy --locked -j \$CRAXII_LINUX_JOBS --keep-going -p craxii-server --all-targets --features test-failpoints -- -D warnings
+cargo test --locked -j \$CRAXII_LINUX_JOBS --no-fail-fast -p craxii-server --features test-failpoints $*
+"
+' -- "$@"

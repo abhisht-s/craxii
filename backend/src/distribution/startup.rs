@@ -6,6 +6,7 @@ use crate::adapters::{
     system_clock::SystemClock,
 };
 use crate::application::runtime::{RuntimeBootstrapReceipt, bootstrap_runtime};
+use crate::distribution_contracts::environment::WorkerEnvironment;
 use crate::domain::*;
 use crate::ports::{
     artifact_store::ArtifactStore,
@@ -37,9 +38,12 @@ pub struct DistributionConfig {
     pub release_sha256: String,
 }
 impl DistributionConfig {
+    pub fn worker_environment(&self) -> DistributionResult<WorkerEnvironment> {
+        WorkerEnvironment::parse(&self.environment).ok_or_else(invalid)
+    }
     pub fn validate(&self) -> DistributionResult<()> {
         if self.contract_version != 1
-            || self.environment != "development"
+            || WorkerEnvironment::parse(&self.environment).is_none()
             || self.release_id.is_empty()
             || self.release_id.len() > 128
         {
@@ -78,6 +82,7 @@ pub struct DistributionRuntime {
     #[cfg(all(feature = "test-failpoints", debug_assertions))]
     fixture_identity: (WorkstationIdentity, WorkspaceIdentity),
     config: DistributionConfig,
+    environment: WorkerEnvironment,
     pub boot_id: String,
     in_flight_exports: std::sync::atomic::AtomicUsize,
     boundary: Option<crate::guest_boundary::config::GuestConfig>,
@@ -132,6 +137,7 @@ impl DistributionRuntime {
         boundary: Option<crate::guest_boundary::config::GuestConfig>,
     ) -> DistributionResult<Self> {
         config.validate()?;
+        let environment = config.worker_environment()?;
         if let Some(c) = &boundary {
             crate::guest_boundary::storage::prepare_journal_open(c)
                 .map_err(|_| DistributionError::Storage)?;
@@ -211,7 +217,10 @@ impl DistributionRuntime {
             package_version: PackageVersion::try_new(build.package_version())
                 .map_err(|_| invalid())?,
             git_revision: GitRevision::try_new(build.git_revision()).map_err(|_| invalid())?,
-            schema_version: SchemaVersion::try_new(9).map_err(|_| invalid())?,
+            schema_version: SchemaVersion::try_new(
+                crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+            )
+            .map_err(|_| invalid())?,
             started_at: timestamp()?,
         });
         let runtime = bootstrap_runtime(
@@ -244,6 +253,7 @@ impl DistributionRuntime {
                     g.text("installation_id"),
                     g.text("generation"),
                     &config.power_operation_id,
+                    &config.environment,
                 )
                 .map_err(|_| DistributionError::Storage)?,
             ))
@@ -260,6 +270,7 @@ impl DistributionRuntime {
             config,
             boot_id,
             in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
+            environment,
             boundary,
             #[cfg(target_os = "linux")]
             compute,
@@ -274,7 +285,7 @@ impl DistributionRuntime {
     }
     pub fn hello(&self) -> Value {
         #[allow(unused_mut)]
-        let mut hello = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":"9","boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}});
+        let mut hello = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION.to_string(),"boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}});
         #[cfg(target_os = "linux")]
         if self.compute.is_some() {
             hello["body"]["capabilities"]
@@ -297,6 +308,7 @@ impl DistributionRuntime {
         client.status().await?;
         self.store
             .assert_distribution_identity(
+                self.environment,
                 &client.identity().customer_id,
                 &client.identity().logical_agent_id,
             )
@@ -321,7 +333,7 @@ impl DistributionRuntime {
         {
             client.send_receipt(&body, true).await?;
             self.store
-                .acknowledge_distribution(&body, true)
+                .acknowledge_distribution(self.environment, &body, true)
                 .await
                 .map_err(|_| AuthError::Unavailable)?;
         }
@@ -459,14 +471,14 @@ impl DistributionRuntime {
             } => {
                 client.send_receipt(&json!({"receipt":receipt,"duplicate":duplicate,"current_work_state":state,"work_state_revision":revision}),false).await?;
                 self.store
-                    .acknowledge_distribution(&receipt, false)
+                    .acknowledge_distribution(self.environment, &receipt, false)
                     .await
                     .map_err(|_| AuthError::Unavailable)?;
             }
             DistributionAdmission::Cancelled { control_receipt } => {
                 client.send_receipt(&control_receipt, true).await?;
                 self.store
-                    .acknowledge_distribution(&control_receipt, true)
+                    .acknowledge_distribution(self.environment, &control_receipt, true)
                     .await
                     .map_err(|_| AuthError::Unavailable)?;
             }
@@ -501,19 +513,13 @@ impl DistributionRuntime {
             .iter()
             .filter(|m| m.message["type"] == "cancel_delivery")
         {
-            self.store
-                .cancel_distribution(item)
-                .await
-                .map_err(|_| AuthError::InvalidContext)?;
+            admission_outcome(self.store.cancel_distribution(item).await.map(|_| ()))?;
         }
         for item in items
             .iter()
             .filter(|m| m.message["type"] == "work_delivery")
         {
-            self.store
-                .admit_distribution(item)
-                .await
-                .map_err(|_| AuthError::InvalidContext)?;
+            admission_outcome(self.store.admit_distribution(item).await.map(|_| ()))?;
         }
         self.transfer_pending(client).await?;
         self.store
@@ -613,9 +619,8 @@ impl DistributionRuntime {
                 &self.config.profile_public_key,
             )
             .await
-            .map_err(|e| {
+            .inspect_err(|e| {
                 eprintln!("distribution_fixture_bounded_poll_{e:?}");
-                e
             })?;
         for item in &mut items {
             item.compute = self.compute.clone();
@@ -641,9 +646,8 @@ impl DistributionRuntime {
             eprintln!("distribution_fixture_bounded_admit_{e:?}");
             AuthError::InvalidContext
         })?;
-        self.transfer(client, receipt).await.map_err(|e| {
+        self.transfer(client, receipt).await.inspect_err(|e| {
             eprintln!("distribution_fixture_bounded_transfer_{e:?}");
-            e
         })?;
         let claimed = self
             .store
@@ -837,7 +841,12 @@ impl DistributionRuntime {
         Ok(())
     }
     pub async fn run(self, mut client: WorkerClient) -> DistributionResult<()> {
-        self.reconnect(&mut client).await.map_err(|_| invalid())?;
+        if client.environment() != self.environment {
+            return Err(invalid());
+        }
+        // Connecting is part of each exchange, so an edge error while connecting (at startup or after a
+        // session expires) backs off and retries like any other transient failure.
+        let mut connected = false;
         #[cfg(unix)]
         let mut termination =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -845,6 +854,10 @@ impl DistributionRuntime {
         let mut delay = 1000u64;
         loop {
             let exchange = async {
+                if !connected {
+                    self.reconnect(&mut client).await?;
+                    connected = true;
+                }
                 #[cfg(target_os = "linux")]
                 if let Some(c) = &self.compute {
                     c.refresh(&mut client, &self.boot_id).await?;
@@ -869,9 +882,7 @@ impl DistributionRuntime {
             let result = tokio::select! { result=exchange=>result,_=drain=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
             match result {
                 Ok(()) => delay = 1000,
-                Err(AuthError::SessionExpired) => {
-                    self.reconnect(&mut client).await.map_err(|_| invalid())?;
-                }
+                Err(AuthError::SessionExpired) => connected = false,
                 Err(AuthError::Transport | AuthError::Unavailable) => delay = (delay * 2).min(5000),
                 Err(_) => return Err(invalid()),
             }
@@ -882,16 +893,37 @@ impl DistributionRuntime {
             tokio::select! {result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;},_=tokio::time::sleep(Duration::from_millis(delay+jitter))=>{}}
         }
         #[cfg(target_os = "linux")]
-        if let Some(c) = &self.compute {
-            if let Ok(cutoff) = c.cleanup_cutoff() {
-                let _ = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(cutoff),
-                    self.transfer_pending(&mut client),
-                )
-                .await;
-            }
+        if let Some(c) = &self.compute
+            && let Ok(cutoff) = c.cleanup_cutoff()
+        {
+            let _ = tokio::time::timeout_at(
+                tokio::time::Instant::from_std(cutoff),
+                self.transfer_pending(&mut client),
+            )
+            .await;
         }
         self.shutdown().await
+    }
+}
+/// One delivery that cannot be admitted must not stop the worker. Expired or unverifiable
+/// items are skipped without a receipt, so nothing unverified ever runs and the control
+/// plane redelivers or expires them. Local storage faults are retried with backoff. A
+/// quarantine conflict stays fatal: it means conflicting signed material for the same work.
+fn admission_outcome(result: DistributionResult<()>) -> Result<(), AuthError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(
+            DistributionError::Expired
+            | DistributionError::Invalid
+            | DistributionError::Reconciliation,
+        ) => {
+            tracing::warn!(target: "craxii::distribution", event = "delivery_skipped");
+            Ok(())
+        }
+        Err(DistributionError::Conflict | DistributionError::Identity) => {
+            Err(AuthError::InvalidContext)
+        }
+        Err(_) => Err(AuthError::Unavailable),
     }
 }
 pub async fn run_protected() -> DistributionResult<()> {
@@ -922,6 +954,41 @@ pub async fn run_protected() -> DistributionResult<()> {
     {
         return Err(DistributionError::Storage);
     }
-    let client = WorkerClient::new(&config.origin, key, state).map_err(|_| invalid())?;
+    let client = WorkerClient::new(&config.origin, config.worker_environment()?, key, state)
+        .map_err(|_| invalid())?;
     DistributionRuntime::open(config).await?.run(client).await
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{AuthError, DistributionError, admission_outcome};
+    #[test]
+    fn one_bad_delivery_never_stops_the_worker() {
+        for skipped in [
+            DistributionError::Expired,
+            DistributionError::Invalid,
+            DistributionError::Reconciliation,
+        ] {
+            assert!(admission_outcome(Err(skipped)).is_ok());
+        }
+        for retried in [
+            DistributionError::Storage,
+            DistributionError::Sqlite,
+            DistributionError::Journal,
+            DistributionError::Recovery,
+            DistributionError::Artifacts,
+        ] {
+            assert!(matches!(
+                admission_outcome(Err(retried)),
+                Err(AuthError::Unavailable)
+            ));
+        }
+        for fatal in [DistributionError::Conflict, DistributionError::Identity] {
+            assert!(matches!(
+                admission_outcome(Err(fatal)),
+                Err(AuthError::InvalidContext)
+            ));
+        }
+        assert!(admission_outcome(Ok(())).is_ok());
+    }
 }

@@ -1,6 +1,7 @@
 //! Pure, versioned distribution contracts. Parsing never authenticates a principal.
 pub mod canonical;
 pub mod compatibility;
+pub mod environment;
 pub mod primitives;
 pub mod raw_json;
 pub mod signing;

@@ -1,4 +1,7 @@
 //! Distribution evidence in the existing BEGIN IMMEDIATE admission/cancellation transaction.
+// Wire integers are canonical decimal strings, so stored integers are compared as exact
+// strings. Comparing the JSON value with the integer itself would never match.
+#![allow(clippy::cmp_owned)]
 use super::cancellation::{
     CancellationJournalOrigin, apply_cancellation_decision, decode_loaded_cancellation_work,
 };
@@ -11,6 +14,7 @@ use crate::distribution::{
     DistributionError, DistributionResult, ValidatedDelivery, text, timestamp,
 };
 use crate::distribution_contracts::canonical::{DigestDomain, canonical_bytes, digest_material};
+use crate::distribution_contracts::environment::WorkerEnvironment;
 use crate::domain::{
     ContentBlock, ConversationId, ConversationWorkOrdinal, CraxiiId, JournalEventId,
     MessageContent, MessageId, ProjectionVersion, UserId, WorkId, WorkspaceId,
@@ -24,7 +28,7 @@ fn invalid() -> DistributionError {
     DistributionError::Invalid
 }
 fn string(v: &Value) -> DistributionResult<String> {
-    Ok(String::from_utf8(canonical_bytes(v).map_err(|_| invalid())?).map_err(|_| invalid())?)
+    String::from_utf8(canonical_bytes(v).map_err(|_| invalid())?).map_err(|_| invalid())
 }
 fn parse(s: &str) -> DistributionResult<Value> {
     crate::distribution_contracts::raw_json::parse_bounded(
@@ -113,6 +117,7 @@ impl SqliteStateStore {
     async fn distribution_owner(
         &self,
         tx: &mut WriteTransaction,
+        configured: WorkerEnvironment,
         m: &Value,
         a: &Value,
     ) -> DistributionResult<(String, String, String)> {
@@ -123,8 +128,8 @@ impl SqliteStateStore {
         let environment = text(m, "environment")?;
         let customer = text(m, "customer_id")?;
         let agent = text(m, "logical_agent_id")?;
-        if environment != "development" {
-            return Err(invalid());
+        if environment != configured.as_str() {
+            return Err(DistributionError::Identity);
         }
         let root=sqlx::query("SELECT p.craxii_id,p.primary_conversation_id,c.owner_user_id FROM craxii_principals p JOIN conversations c ON c.conversation_id=p.primary_conversation_id").fetch_one(tx.connection()).await.map_err(storage)?;
         let user: String = root.try_get("owner_user_id").map_err(storage)?;
@@ -145,7 +150,7 @@ impl SqliteStateStore {
                 || owner.try_get::<String, _>("user_id").map_err(storage)? != user
                 || owner.try_get::<String, _>("craxii_id").map_err(storage)? != craxii
             {
-                return Err(invalid());
+                return Err(DistributionError::Identity);
             }
             let highest = owner
                 .try_get::<i64, _>("highest_generation")
@@ -157,6 +162,8 @@ impl SqliteStateStore {
                         .map_err(storage)?
                         != installation)
             {
+                // A message from an older generation (or a replaced installation) is stale, not a sign that
+                // this store belongs to someone else, so it is skipped rather than stopping the worker.
                 return Err(invalid());
             }
             if generation > highest {
@@ -170,14 +177,16 @@ impl SqliteStateStore {
     async fn distribution_conversation(
         &self,
         tx: &mut WriteTransaction,
+        environment: WorkerEnvironment,
         m: &Value,
         user: &str,
         craxii: &str,
         conversation: &str,
     ) -> DistributionResult<i64> {
+        let env = environment.as_str();
         let central = text(m, "conversation_id")?;
-        sqlx::query("INSERT INTO distribution_conversations(environment,customer_id,logical_agent_id,central_conversation_id,user_id,craxii_id,local_conversation_id) VALUES('development',?,?,?,?,?,?) ON CONFLICT(environment,central_conversation_id) DO NOTHING").bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(central).bind(user).bind(craxii).bind(conversation).execute(tx.connection()).await.map_err(storage)?;
-        let row=sqlx::query("SELECT * FROM distribution_conversations WHERE environment='development' AND central_conversation_id=?").bind(central).fetch_one(tx.connection()).await.map_err(storage)?;
+        sqlx::query("INSERT INTO distribution_conversations(environment,customer_id,logical_agent_id,central_conversation_id,user_id,craxii_id,local_conversation_id) VALUES(?,?,?,?,?,?,?) ON CONFLICT(environment,central_conversation_id) DO NOTHING").bind(env).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(central).bind(user).bind(craxii).bind(conversation).execute(tx.connection()).await.map_err(storage)?;
+        let row=sqlx::query("SELECT * FROM distribution_conversations WHERE environment=? AND central_conversation_id=?").bind(env).bind(central).fetch_one(tx.connection()).await.map_err(storage)?;
         if row.try_get::<String, _>("customer_id").map_err(storage)? != text(m, "customer_id")?
             || row
                 .try_get::<String, _>("logical_agent_id")
@@ -204,6 +213,7 @@ impl SqliteStateStore {
             &canonical_bytes(&delivery.message).map_err(|_| invalid())?,
         )
         .map_err(|_| invalid())?;
+        let env = delivery.environment.as_str();
         let b = &delivery.message["body"];
         let m = &b["material"];
         let id = text(m, "work_id")?;
@@ -215,20 +225,32 @@ impl SqliteStateStore {
         if sqlx::query_scalar::<_,i64>("SELECT (SELECT count(*) FROM distribution_receipts WHERE quarantined=1)+(SELECT count(*) FROM distribution_controls WHERE quarantined=1)").fetch_one(tx.connection()).await.map_err(storage)?!=0{return Err(DistributionError::Conflict);}
 
         let (user, craxii, conversation) = self
-            .distribution_owner(&mut tx, m, &delivery.message["authority"])
+            .distribution_owner(
+                &mut tx,
+                delivery.environment,
+                m,
+                &delivery.message["authority"],
+            )
             .await?;
-        if let Some(row)=sqlx::query("SELECT r.*,w.state,w.state_version FROM distribution_receipts r JOIN work_items w ON w.work_id=r.local_work_id WHERE r.environment='development' AND r.central_work_id=?").bind(id).fetch_optional(tx.connection()).await.map_err(storage)? {
-   if row.try_get::<String,_>("customer_id").map_err(storage)?!=text(m,"customer_id")?||row.try_get::<String,_>("logical_agent_id").map_err(storage)?!=text(m,"logical_agent_id")?||row.try_get::<String,_>("material_digest").map_err(storage)?!=digest||row.try_get::<String,_>("material_canonical").map_err(storage)?!=string(m)?{sqlx::query("UPDATE distribution_receipts SET quarantined=1 WHERE environment='development' AND central_work_id=?").bind(id).execute(tx.connection()).await.map_err(storage)?;tx.commit().await.map_err(storage)?;return Err(DistributionError::Conflict);}
+        if let Some(row)=sqlx::query("SELECT r.*,w.state,w.state_version FROM distribution_receipts r JOIN work_items w ON w.work_id=r.local_work_id WHERE r.environment=? AND r.central_work_id=?").bind(env).bind(id).fetch_optional(tx.connection()).await.map_err(storage)? {
+   if row.try_get::<String,_>("customer_id").map_err(storage)?!=text(m,"customer_id")?||row.try_get::<String,_>("logical_agent_id").map_err(storage)?!=text(m,"logical_agent_id")?||row.try_get::<String,_>("material_digest").map_err(storage)?!=digest||row.try_get::<String,_>("material_canonical").map_err(storage)?!=string(m)?{sqlx::query("UPDATE distribution_receipts SET quarantined=1 WHERE environment=? AND central_work_id=?").bind(env).bind(id).execute(tx.connection()).await.map_err(storage)?;tx.commit().await.map_err(storage)?;return Err(DistributionError::Conflict);}
    if row.try_get::<i64,_>("quarantined").map_err(storage)?!=0{return Err(DistributionError::Conflict);}
    let result=DistributionAdmission::Receipt{receipt:parse(&row.try_get::<String,_>("receipt_canonical").map_err(storage)?)?,duplicate:true,state:row.try_get("state").map_err(storage)?,revision:row.try_get::<i64,_>("state_version").map_err(storage)?.to_string()};tx.commit().await.map_err(storage)?;return Ok(result);
   }
         let next = self
-            .distribution_conversation(&mut tx, m, &user, &craxii, &conversation)
+            .distribution_conversation(
+                &mut tx,
+                delivery.environment,
+                m,
+                &user,
+                &craxii,
+                &conversation,
+            )
             .await?;
         let sequence = text(m, "conversation_sequence")?
             .parse::<i64>()
             .map_err(|_| invalid())?;
-        let controls=sqlx::query("SELECT * FROM distribution_controls WHERE environment='development' AND central_work_id=? ORDER BY control_id").bind(id).fetch_all(tx.connection()).await.map_err(storage)?;
+        let controls=sqlx::query("SELECT * FROM distribution_controls WHERE environment=? AND central_work_id=? ORDER BY control_id").bind(env).bind(id).fetch_all(tx.connection()).await.map_err(storage)?;
         if let Some(control) = controls.first() {
             if control
                 .try_get::<String, _>("customer_id")
@@ -249,9 +271,9 @@ impl SqliteStateStore {
                 return Err(DistributionError::Reconciliation);
             }
             if sequence == next {
-                sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment='development' AND central_conversation_id=? AND next_sequence=?").bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
+                sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment=? AND central_conversation_id=? AND next_sequence=?").bind(env).bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
             }
-            sqlx::query("UPDATE distribution_controls SET sequence_reconciled=1,central_conversation_id=?,central_sequence=?,target_material_canonical=? WHERE environment='development' AND central_work_id=?").bind(text(m,"conversation_id")?).bind(sequence).bind(string(m)?).bind(id).execute(tx.connection()).await.map_err(storage)?;
+            sqlx::query("UPDATE distribution_controls SET sequence_reconciled=1,central_conversation_id=?,central_sequence=?,target_material_canonical=? WHERE environment=? AND central_work_id=?").bind(text(m,"conversation_id")?).bind(sequence).bind(string(m)?).bind(env).bind(id).execute(tx.connection()).await.map_err(storage)?;
             let receipt = parse(
                 &control
                     .try_get::<String, _>("receipt_canonical")
@@ -322,9 +344,9 @@ impl SqliteStateStore {
         .map_err(storage)?;
         let a = &delivery.message["authority"];
         let receipt = json!({"work_id":id,"origin_installation_id":a["installation_id"],"receipt_id":receipt_id.to_string(),"local_work_id":admitted.work_id.to_string(),"local_message_id":admitted.message_id.to_string(),"local_conversation_id":conversation,"conversation_sequence":m["conversation_sequence"],"local_work_ordinal":admitted.work_ordinal.get().to_string(),"journal_offset":admitted.committed_cursor.get().to_string(),"origin_generation":a["generation"],"material_digest":digest,"admitted_at":at.to_string()});
-        sqlx::query("INSERT INTO distribution_receipts(environment,central_work_id,customer_id,logical_agent_id,central_conversation_id,central_sequence,material_digest,material_canonical,receipt_id,receipt_canonical,user_id,local_conversation_id,local_message_id,local_work_id,acceptance_event_id,journal_offset,local_work_ordinal,origin_installation_id,origin_generation,admitted_at) VALUES('development',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-   .bind(id).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(text(m,"conversation_id")?).bind(sequence).bind(digest).bind(material).bind(receipt_id.to_string()).bind(string(&receipt)?).bind(user).bind(conversation).bind(admitted.message_id.to_string()).bind(admitted.work_id.to_string()).bind(accepted_event.to_string()).bind(admitted.committed_cursor.get()).bind(admitted.work_ordinal.get()).bind(text(a,"installation_id")?).bind(text(a,"generation")?.parse::<i64>().map_err(|_|invalid())?).bind(at.to_string()).execute(tx.connection()).await.map_err(storage)?;
-        sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment='development' AND central_conversation_id=? AND next_sequence=?").bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
+        sqlx::query("INSERT INTO distribution_receipts(environment,central_work_id,customer_id,logical_agent_id,central_conversation_id,central_sequence,material_digest,material_canonical,receipt_id,receipt_canonical,user_id,local_conversation_id,local_message_id,local_work_id,acceptance_event_id,journal_offset,local_work_ordinal,origin_installation_id,origin_generation,admitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+   .bind(env).bind(id).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(text(m,"conversation_id")?).bind(sequence).bind(digest).bind(material).bind(receipt_id.to_string()).bind(string(&receipt)?).bind(user).bind(conversation).bind(admitted.message_id.to_string()).bind(admitted.work_id.to_string()).bind(accepted_event.to_string()).bind(admitted.committed_cursor.get()).bind(admitted.work_ordinal.get()).bind(text(a,"installation_id")?).bind(text(a,"generation")?.parse::<i64>().map_err(|_|invalid())?).bind(at.to_string()).execute(tx.connection()).await.map_err(storage)?;
+        sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment=? AND central_conversation_id=? AND next_sequence=?").bind(env).bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
         delivery.check_fresh()?;
         delivery.verify_profile()?;
         delivery.verify_profile()?;
@@ -344,6 +366,7 @@ impl SqliteStateStore {
             return Err(invalid());
         }
         delivery.check_fresh()?;
+        let env = delivery.environment.as_str();
         let b = &delivery.message["body"];
         let c = &b["control"];
         let id = text(c, "control_id")?;
@@ -356,17 +379,22 @@ impl SqliteStateStore {
         if sqlx::query_scalar::<_,i64>("SELECT (SELECT count(*) FROM distribution_receipts WHERE quarantined=1)+(SELECT count(*) FROM distribution_controls WHERE quarantined=1)").fetch_one(tx.connection()).await.map_err(storage)?!=0{return Err(DistributionError::Conflict);}
 
         let mut owner = c.clone();
-        owner["environment"] = json!("development");
+        owner["environment"] = json!(env);
         let (user, _, _) = self
-            .distribution_owner(&mut tx, &owner, &delivery.message["authority"])
+            .distribution_owner(
+                &mut tx,
+                delivery.environment,
+                &owner,
+                &delivery.message["authority"],
+            )
             .await?;
-        if let Some(row) = sqlx::query(
-            "SELECT * FROM distribution_controls WHERE environment='development' AND control_id=?",
-        )
-        .bind(id)
-        .fetch_optional(tx.connection())
-        .await
-        .map_err(storage)?
+        if let Some(row) =
+            sqlx::query("SELECT * FROM distribution_controls WHERE environment=? AND control_id=?")
+                .bind(env)
+                .bind(id)
+                .fetch_optional(tx.connection())
+                .await
+                .map_err(storage)?
         {
             if row
                 .try_get::<String, _>("control_digest")
@@ -377,7 +405,7 @@ impl SqliteStateStore {
                     .map_err(storage)?
                     != string(c)?
             {
-                sqlx::query("UPDATE distribution_controls SET quarantined=1 WHERE environment='development' AND control_id=?").bind(id).execute(tx.connection()).await.map_err(storage)?;
+                sqlx::query("UPDATE distribution_controls SET quarantined=1 WHERE environment=? AND control_id=?").bind(env).bind(id).execute(tx.connection()).await.map_err(storage)?;
                 tx.commit().await.map_err(storage)?;
                 return Err(DistributionError::Conflict);
             }
@@ -391,7 +419,14 @@ impl SqliteStateStore {
             tx.commit().await.map_err(storage)?;
             return Ok(receipt);
         }
-        let local=sqlx::query("SELECT * FROM distribution_receipts WHERE environment='development' AND central_work_id=?").bind(work).fetch_optional(tx.connection()).await.map_err(storage)?;
+        let local = sqlx::query(
+            "SELECT * FROM distribution_receipts WHERE environment=? AND central_work_id=?",
+        )
+        .bind(env)
+        .bind(work)
+        .fetch_optional(tx.connection())
+        .await
+        .map_err(storage)?;
         let at = timestamp()?;
         let mut receipt = json!({"control_id":id,"work_id":work,"control_digest":digest,"committed_at":at.to_string(),"cleanup_pending":false,"outcome":"cancelled_before_admission"});
         let mut local_id = None;
@@ -461,7 +496,7 @@ impl SqliteStateStore {
             local_id = Some(w);
             event_id = mutation.committed_cursor.map(|_| candidate.to_string());
         }
-        sqlx::query("INSERT INTO distribution_controls(environment,control_id,customer_id,logical_agent_id,central_work_id,material_digest,control_digest,control_canonical,receipt_canonical,local_work_id,cancellation_event_id,sequence_reconciled) VALUES('development',?,?,?,?,?,?,?,?,?,?,?)").bind(id).bind(text(c,"customer_id")?).bind(text(c,"logical_agent_id")?).bind(work).bind(text(c,"material_digest")?).bind(digest).bind(string(c)?).bind(string(&receipt)?).bind(&local_id).bind(event_id).bind(i64::from(local_id.is_some())).execute(tx.connection()).await.map_err(storage)?;
+        sqlx::query("INSERT INTO distribution_controls(environment,control_id,customer_id,logical_agent_id,central_work_id,material_digest,control_digest,control_canonical,receipt_canonical,local_work_id,cancellation_event_id,sequence_reconciled) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(env).bind(id).bind(text(c,"customer_id")?).bind(text(c,"logical_agent_id")?).bind(work).bind(text(c,"material_digest")?).bind(digest).bind(string(c)?).bind(string(&receipt)?).bind(&local_id).bind(event_id).bind(i64::from(local_id.is_some())).execute(tx.connection()).await.map_err(storage)?;
         delivery.check_fresh()?;
         tx.commit().await.map_err(storage)?;
         Ok(receipt)
@@ -476,22 +511,27 @@ impl SqliteStateStore {
             json!({"queued_work_count":r.try_get::<i64,_>("queued").map_err(storage)?.to_string(),"active_work_count":r.try_get::<i64,_>("active").map_err(storage)?.to_string(),"cancel_requested_count":r.try_get::<i64,_>("cancel_requested").map_err(storage)?.to_string(),"pending_receipt_ack_count":r.try_get::<i64,_>("pending_receipts").map_err(storage)?.to_string(),"pending_control_ack_count":r.try_get::<i64,_>("pending_controls").map_err(storage)?.to_string(),"pending_export_count":r.try_get::<i64,_>("pending_exports").map_err(storage)?.to_string(),"accepted_export_count":r.try_get::<i64,_>("accepted_exports").map_err(storage)?.to_string(),"unresolved_export_count":r.try_get::<i64,_>("unresolved_exports").map_err(storage)?.to_string(),"uncertain_export_count":r.try_get::<i64,_>("uncertain_exports").map_err(storage)?.to_string(),"claims_closed":true}),
         )
     }
+    /// Refuses a local store that belongs to another customer, agent or environment, so a worker restarted
+    /// with a different configuration stops at startup instead of skipping every delivery.
     pub async fn assert_distribution_identity(
         &self,
+        environment: WorkerEnvironment,
         customer: &str,
         agent: &str,
     ) -> DistributionResult<()> {
-        let rows = sqlx::query("SELECT customer_id,logical_agent_id FROM distribution_owners")
-            .fetch_all(&self.runtime.inner.pool)
-            .await
-            .map_err(storage)?;
+        let rows =
+            sqlx::query("SELECT environment,customer_id,logical_agent_id FROM distribution_owners")
+                .fetch_all(&self.runtime.inner.pool)
+                .await
+                .map_err(storage)?;
         if rows.len() > 1
             || rows.first().is_some_and(|r| {
-                r.try_get::<String, _>("customer_id").ok().as_deref() != Some(customer)
+                r.try_get::<String, _>("environment").ok().as_deref() != Some(environment.as_str())
+                    || r.try_get::<String, _>("customer_id").ok().as_deref() != Some(customer)
                     || r.try_get::<String, _>("logical_agent_id").ok().as_deref() != Some(agent)
             })
         {
-            return Err(invalid());
+            return Err(DistributionError::Identity);
         }
         Ok(())
     }
@@ -529,6 +569,7 @@ impl SqliteStateStore {
     }
     pub async fn acknowledge_distribution(
         &self,
+        environment: WorkerEnvironment,
         receipt: &Value,
         control: bool,
     ) -> DistributionResult<()> {
@@ -537,18 +578,19 @@ impl SqliteStateStore {
             .map_err(storage)?;
         let (read, update, key) = if control {
             (
-                "SELECT receipt_canonical FROM distribution_controls WHERE environment='development' AND control_id=?",
-                "UPDATE distribution_controls SET central_acknowledged=1 WHERE environment='development' AND control_id=?",
+                "SELECT receipt_canonical FROM distribution_controls WHERE environment=? AND control_id=?",
+                "UPDATE distribution_controls SET central_acknowledged=1 WHERE environment=? AND control_id=?",
                 text(receipt, "control_id")?,
             )
         } else {
             (
-                "SELECT receipt_canonical FROM distribution_receipts WHERE environment='development' AND central_work_id=?",
-                "UPDATE distribution_receipts SET central_acknowledged=1 WHERE environment='development' AND central_work_id=?",
+                "SELECT receipt_canonical FROM distribution_receipts WHERE environment=? AND central_work_id=?",
+                "UPDATE distribution_receipts SET central_acknowledged=1 WHERE environment=? AND central_work_id=?",
                 text(receipt, "work_id")?,
             )
         };
         let row = sqlx::query(read)
+            .bind(environment.as_str())
             .bind(key)
             .fetch_one(tx.connection())
             .await
@@ -563,6 +605,7 @@ impl SqliteStateStore {
             return Err(DistributionError::Conflict);
         }
         sqlx::query(update)
+            .bind(environment.as_str())
             .bind(key)
             .execute(tx.connection())
             .await

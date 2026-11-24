@@ -34,6 +34,7 @@ impl ModelComputeAuthority for crate::compute::worker::InstalledCompute {
 }
 #[derive(Clone)]
 pub struct ProxyBinding {
+    environment: crate::distribution_contracts::environment::WorkerEnvironment,
     receipt: Value,
     profile: Value,
     local_work_id: String,
@@ -64,7 +65,11 @@ impl ProxyBinding {
         .map_err(|_| invalid())?;
         settings.validate().map_err(|_| invalid())?;
         let p = &profile["body"]["profile"];
-        if !settings.matches_profile(p) {
+        let environment = profile["environment"]
+            .as_str()
+            .and_then(crate::distribution_contracts::environment::WorkerEnvironment::parse)
+            .ok_or_else(invalid)?;
+        if p["environment"] != environment.as_str() || !settings.matches_profile(p) {
             return Err(invalid());
         }
         crate::distribution_contracts::wire::validate_definition("work", "Receipt", &receipt)
@@ -82,6 +87,7 @@ impl ProxyBinding {
         crate::distribution_contracts::primitives::decimal(&epoch, "Dp").map_err(|_| invalid())?;
         let local_work_id = wire::text(&receipt, "local_work_id")?;
         Ok(Self {
+            environment,
             receipt,
             profile,
             local_work_id,

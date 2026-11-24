@@ -399,7 +399,10 @@ async fn migration_metadata_table_policy_and_empty_inventory_are_exact() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(migrations.len(), 9);
+    assert_eq!(
+        i64::try_from(migrations.len()).unwrap(),
+        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64
+    );
     for (migration, embedded) in migrations.iter().zip(MIGRATOR.iter()) {
         assert_eq!(migration.get::<i64, _>("version"), embedded.version);
         assert_eq!(
@@ -492,6 +495,11 @@ async fn empty_migration_metadata_database_migrates_forward_to_current_version_e
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
+        "distribution_results",
+        "distribution_controls",
+        "distribution_receipts",
+        "distribution_conversations",
+        "distribution_owners",
         "outbound_delivery_attempts",
         "outbound_deliveries",
         "context_manifest_sources",
@@ -540,7 +548,7 @@ async fn empty_migration_metadata_database_migrates_forward_to_current_version_e
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        8
+        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64
     );
     drop(connection);
     migrated.shutdown().await;
@@ -608,7 +616,7 @@ async fn genuine_v6_database_migrates_to_current_without_backfill_or_data_loss()
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        8
+        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64
     );
     assert_eq!(
         sqlx::query_scalar::<_, String>(
@@ -1802,13 +1810,12 @@ async fn every_named_performance_index_supports_its_frozen_query_shape() {
     .fetch_all(&mut *connection)
     .await
     .unwrap();
-    assert_eq!(
-        indexes,
-        PRODUCT_INDEXES
-            .iter()
-            .map(|value| (*value).to_owned())
-            .collect::<Vec<_>>()
-    );
+    let mut expected = PRODUCT_INDEXES
+        .iter()
+        .map(|value| (*value).to_owned())
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(indexes, expected);
 
     let probes = [
         (
@@ -1972,8 +1979,9 @@ async fn valid_contiguous_newer_metadata_is_newer_schema_not_drift() {
     sqlx::query(
         "INSERT INTO _sqlx_migrations \
          (version, description, success, checksum, execution_time) \
-         VALUES (10, 'future migration', 1, zeroblob(48), 0)",
+         VALUES (?, 'future migration', 1, zeroblob(48), 0)",
     )
+    .bind(crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64 + 1)
     .execute(&mut *connection)
     .await
     .unwrap();

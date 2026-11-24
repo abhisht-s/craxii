@@ -63,7 +63,8 @@ const PROVIDER_ID: &str = "stage18-scripted";
 const TARGET_ID: &str = "stage18-primary";
 const ESTIMATOR_ID: &str = "stage18_fixed";
 const SHELL: &str = "/bin/bash";
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 =
+    craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64;
 const T0: &str = "2026-09-01T00:00:00.000000Z";
 const REQUESTED_OUTPUT_TOKENS: i64 = 512;
 
@@ -130,7 +131,7 @@ impl Stage18Root {
     pub fn allow_disposable_workstation_identity(&self) {
         fs::set_permissions(&self.path, fs::Permissions::from_mode(0o711))
             .expect("make disposable harness root searchable");
-        fs::set_permissions(&self.workspace(), fs::Permissions::from_mode(0o777))
+        fs::set_permissions(self.workspace(), fs::Permissions::from_mode(0o777))
             .expect("share disposable harness workspace with workstation identity");
         fs::set_permissions(
             self.workspace().join("machine-note.txt"),

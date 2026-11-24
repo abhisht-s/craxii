@@ -3,7 +3,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::error::{SqliteAdapterError, SqliteFailureKind};
 
-pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 9;
+pub const MAX_SUPPORTED_SCHEMA_VERSION: i64 = 10;
 pub(super) const CORE_MIGRATION_VERSION: i64 = 1;
 pub(super) const CORE_MIGRATION_DESCRIPTION: &str = "core durable schema";
 pub(super) const JOURNAL_MIGRATION_VERSION: i64 = 2;
@@ -25,6 +25,8 @@ pub(super) const DURABLE_CHANNEL_DELIVERY_MIGRATION_VERSION: i64 = 7;
 pub(super) const DURABLE_CHANNEL_DELIVERY_MIGRATION_DESCRIPTION: &str = "durable channel delivery";
 pub(super) const DISTRIBUTION_RESULTS_MIGRATION_VERSION: i64 = 9;
 pub(super) const DISTRIBUTION_RESULTS_MIGRATION_DESCRIPTION: &str = "distribution results";
+pub(super) const PRODUCTION_ENVIRONMENT_MIGRATION_VERSION: i64 = 10;
+pub(super) const PRODUCTION_ENVIRONMENT_MIGRATION_DESCRIPTION: &str = "production environment";
 pub(super) const SQLX_CHECKSUM_LENGTH: usize = 48;
 
 pub(super) static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -496,6 +498,16 @@ pub(super) async fn classify_schema(
         Some(DISTRIBUTION_RESULTS_MIGRATION_VERSION) => {
             if migrations.len() != 9
                 || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
+                || !schema_matches(connection, PRODUCT_TABLES, V9_SCHEMA_FINGERPRINT).await?
+            {
+                Ok(DatabaseDisposition::Inconsistent)
+            } else {
+                Ok(DatabaseDisposition::Current)
+            }
+        }
+        Some(PRODUCTION_ENVIRONMENT_MIGRATION_VERSION) => {
+            if migrations.len() != 10
+                || !has_exact_objects(&objects, PRODUCT_TABLES, PRODUCT_INDEXES)
                 || !schema_matches(connection, PRODUCT_TABLES, CURRENT_SCHEMA_FINGERPRINT).await?
             {
                 Ok(DatabaseDisposition::Inconsistent)
@@ -579,6 +591,10 @@ fn valid_contiguous_history(rows: &[MigrationRow]) -> bool {
         (
             DISTRIBUTION_RESULTS_MIGRATION_VERSION,
             DISTRIBUTION_RESULTS_MIGRATION_DESCRIPTION,
+        ),
+        (
+            PRODUCTION_ENVIRONMENT_MIGRATION_VERSION,
+            PRODUCTION_ENVIRONMENT_MIGRATION_DESCRIPTION,
         ),
     ];
     if embedded_contracts.iter().any(|(version, description)| {
@@ -903,39 +919,6 @@ pub(super) fn v2_schema_fingerprint() -> &'static str {
     V2_SCHEMA_FINGERPRINT
 }
 
-#[cfg(test)]
-mod tests {
-    use std::fs;
-
-    use sqlx::{ConnectOptions, Connection};
-
-    use super::*;
-
-    #[tokio::test]
-    async fn current_structural_manifest_has_the_frozen_fingerprint() {
-        let path = std::env::temp_dir().join(format!(
-            "craxii-schema-fingerprint-{}-{}.sqlite3",
-            std::process::id(),
-            uuid::Uuid::now_v7()
-        ));
-        let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(&path)
-            .create_if_missing(true)
-            .foreign_keys(true);
-        let mut connection = options.connect().await.unwrap();
-        sqlx::query("CREATE TEMP TABLE ch1_owner_seed (user_id TEXT NOT NULL)")
-            .execute(&mut connection)
-            .await
-            .unwrap();
-        MIGRATOR.run(&mut connection).await.unwrap();
-        let manifest = structural_manifest(&mut connection).await.unwrap();
-        let actual = sha256_hex(manifest.as_bytes());
-        connection.close().await.unwrap();
-        fs::remove_file(path).unwrap();
-        assert_eq!(actual, expected_schema_fingerprint());
-    }
-}
-
 pub(super) const PRODUCT_TABLES: &[&str] = &[
     "artifacts",
     "channel_accounts",
@@ -1035,6 +1018,10 @@ pub(super) const PRODUCT_INDEXES: &[&str] = &[
 ];
 
 const CURRENT_SCHEMA_FINGERPRINT: &str =
+    "9d484df334845025b7b4bd72f89305c32441a64c269ac0d16ab7f5630fa74cb0";
+
+/// Schema 9 (distribution results), before production environments were admitted.
+const V9_SCHEMA_FINGERPRINT: &str =
     "87372507e6a10401cbb24db6c7d8d313de774e596dfc99cc9cbb993eefd8e01d";
 
 pub(super) const V8_PRODUCT_TABLES: &[&str] = &[
@@ -1141,3 +1128,36 @@ const PRODUCT_TRIGGERS: &[&str] = &[
     "distribution_result_message_update_guard",
     "distribution_result_message_delete_guard",
 ];
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use sqlx::{ConnectOptions, Connection};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn current_structural_manifest_has_the_frozen_fingerprint() {
+        let path = std::env::temp_dir().join(format!(
+            "craxii-schema-fingerprint-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let options = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let mut connection = options.connect().await.unwrap();
+        sqlx::query("CREATE TEMP TABLE ch1_owner_seed (user_id TEXT NOT NULL)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        MIGRATOR.run(&mut connection).await.unwrap();
+        let manifest = structural_manifest(&mut connection).await.unwrap();
+        let actual = sha256_hex(manifest.as_bytes());
+        connection.close().await.unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(actual, expected_schema_fingerprint());
+    }
+}

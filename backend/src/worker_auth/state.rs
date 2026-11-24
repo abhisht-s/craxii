@@ -1,4 +1,5 @@
 use super::{AuthError, AuthResult, key_store::KeyStore};
+use crate::distribution_contracts::environment::WorkerEnvironment;
 use crate::distribution_contracts::primitives::{decimal, uuid};
 use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,15 +58,29 @@ impl IdentityState {
                 ("generation", self.generation.as_str()),
                 ("key_id", self.key_id.as_str()),
                 ("public_key", key.public_key().as_str()),
-                ("audience", "craxii.worker:development"),
-                ("environment", "development"),
             ] {
                 if signed[field] != value {
                     return Err(AuthError::InvalidContext);
                 }
             }
+            let environment = signed["environment"]
+                .as_str()
+                .and_then(WorkerEnvironment::parse)
+                .ok_or(AuthError::InvalidContext)?;
+            if signed["audience"] != environment.audience() {
+                return Err(AuthError::InvalidContext);
+            }
         }
         Ok(())
+    }
+    /// A pending enrollment belongs to one environment; a client configured for another refuses it.
+    pub fn require_environment(&self, environment: WorkerEnvironment) -> AuthResult<()> {
+        match &self.pending_signed {
+            Some(signed) if signed["environment"] != environment.as_str() => {
+                Err(AuthError::InvalidContext)
+            }
+            _ => Ok(()),
+        }
     }
     pub fn load(key: &KeyStore) -> AuthResult<Option<Self>> {
         key.read_state()?
@@ -103,5 +118,46 @@ impl IdentityState {
             return Err(AuthError::InvalidContext);
         }
         key.save_state(&serde_json::to_vec(self).map_err(|_| AuthError::InvalidContext)?)
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::{Disposition, IdentityState, WorkerEnvironment};
+
+    fn state(pending: Option<serde_json::Value>) -> IdentityState {
+        IdentityState {
+            version: 1,
+            installation_id: "10000000-0000-4000-8000-000000000001".into(),
+            customer_id: "20000000-0000-4000-8000-000000000001".into(),
+            logical_agent_id: "30000000-0000-4000-8000-000000000001".into(),
+            generation: "1".into(),
+            key_id: "k".into(),
+            highest_epoch: "1".into(),
+            binding_id: None,
+            pending_signed: pending,
+            disposition: Disposition::Enrolling,
+        }
+    }
+
+    #[test]
+    fn a_pending_enrollment_is_bound_to_its_environment() {
+        let development = state(Some(serde_json::json!({"environment": "development"})));
+        assert!(
+            development
+                .require_environment(WorkerEnvironment::Development)
+                .is_ok()
+        );
+        assert!(
+            development
+                .require_environment(WorkerEnvironment::Production)
+                .is_err()
+        );
+        let unbound = state(None);
+        assert!(
+            unbound
+                .require_environment(WorkerEnvironment::Production)
+                .is_ok()
+        );
     }
 }

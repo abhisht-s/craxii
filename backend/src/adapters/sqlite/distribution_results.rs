@@ -85,6 +85,7 @@ pub(super) async fn prepare(
     if r.try_get::<i64, _>("quarantined")? != 0 {
         return Err(invalid());
     }
+    let environment: String = r.try_get("environment")?;
     let material: Value = serde_json::from_str(&r.try_get::<String, _>("material_canonical")?)
         .map_err(|_| invalid())?;
     let receipt: Value = serde_json::from_str(&r.try_get::<String, _>("receipt_canonical")?)
@@ -111,19 +112,19 @@ pub(super) async fn prepare(
     let hash = sha256(&canonical_bytes(&content).map_err(|_| invalid())?);
     let export = uuid::Uuid::now_v7().to_string();
     let upload = crate::distribution::request_id().map_err(|_| invalid())?;
-    let mut snapshot = json!({"snapshot_version":1,"environment":"development","customer_id":material["customer_id"],"logical_agent_id":material["logical_agent_id"],"work_id":material["work_id"],"conversation_id":material["conversation_id"],"origin_installation_id":receipt["origin_installation_id"],"receipt_id":receipt["receipt_id"],"local_work_id":receipt["local_work_id"],"export_id":export,"material_digest":receipt["material_digest"],"origin_generation":receipt["origin_generation"],"reply_binding":material["reply_binding"],"export_revision":"1","work_state_revision":next.projection_version().get().to_string(),"completed_at":at.to_string(),"content":content,"content_sha256":hash,"work_state":next.state().as_str(),"terminal_reason":why});
+    let mut snapshot = json!({"snapshot_version":1,"environment":environment,"customer_id":material["customer_id"],"logical_agent_id":material["logical_agent_id"],"work_id":material["work_id"],"conversation_id":material["conversation_id"],"origin_installation_id":receipt["origin_installation_id"],"receipt_id":receipt["receipt_id"],"local_work_id":receipt["local_work_id"],"export_id":export,"material_digest":receipt["material_digest"],"origin_generation":receipt["origin_generation"],"reply_binding":material["reply_binding"],"export_revision":"1","work_state_revision":next.projection_version().get().to_string(),"completed_at":at.to_string(),"content":content,"content_sha256":hash,"work_state":next.state().as_str(),"terminal_reason":why});
     if let Some(m) = &message {
         snapshot["local_message_id"] = json!(m.try_get::<String, _>("message_id")?)
     }
     let digest = digest_material(DigestDomain::Result, &snapshot).map_err(|_| invalid())?;
-    let envelope = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_export","environment":"development","request_id":upload,"authority":{"customer_id":material["customer_id"],"logical_agent_id":material["logical_agent_id"],"installation_id":receipt["origin_installation_id"],"generation":receipt["origin_generation"],"session_id":upload},"body":{"snapshot":snapshot,"export_digest":digest,"upload_id":upload}});
+    let envelope = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_export","environment":environment,"request_id":upload,"authority":{"customer_id":material["customer_id"],"logical_agent_id":material["logical_agent_id"],"installation_id":receipt["origin_installation_id"],"generation":receipt["origin_generation"],"session_id":upload},"body":{"snapshot":snapshot,"export_digest":digest,"upload_id":upload}});
     decode_message(&canonical_bytes(&envelope).map_err(|_| invalid())?).map_err(|_| invalid())?;
     snapshot
         .as_object_mut()
         .ok_or_else(invalid)?
         .remove("content");
-    sqlx::query("INSERT INTO distribution_results(export_id,upload_id,environment,central_work_id,customer_id,logical_agent_id,central_conversation_id,receipt_id,local_work_id,work_state,state_version,terminal_reason,terminal_at,terminal_event_id,assistant_message_id,native_content_sha256,metadata_canonical,wire_content_sha256,export_digest,notice_content_canonical) VALUES(?,?,'development',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
- .bind(export).bind(upload).bind(r.try_get::<String,_>("central_work_id")?).bind(r.try_get::<String,_>("customer_id")?).bind(r.try_get::<String,_>("logical_agent_id")?).bind(r.try_get::<String,_>("central_conversation_id")?).bind(r.try_get::<String,_>("receipt_id")?).bind(next.work_id().to_string()).bind(next.state().as_str()).bind(next.projection_version().get()).bind(why).bind(at.to_string()).bind(event.to_string()).bind(message.as_ref().map(|m|m.try_get::<String,_>("message_id")).transpose()?).bind(message.as_ref().map(|m|m.try_get::<String,_>("content_sha256")).transpose()?).bind(canonical(&snapshot)?).bind(hash).bind(digest).bind(if message.is_none(){Some(canonical(&content)?)}else{None}).execute(tx.connection()).await.map_err(SqliteAdapterError::from_sqlx)?;
+    sqlx::query("INSERT INTO distribution_results(export_id,upload_id,environment,central_work_id,customer_id,logical_agent_id,central_conversation_id,receipt_id,local_work_id,work_state,state_version,terminal_reason,terminal_at,terminal_event_id,assistant_message_id,native_content_sha256,metadata_canonical,wire_content_sha256,export_digest,notice_content_canonical) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+ .bind(export).bind(upload).bind(&environment).bind(r.try_get::<String,_>("central_work_id")?).bind(r.try_get::<String,_>("customer_id")?).bind(r.try_get::<String,_>("logical_agent_id")?).bind(r.try_get::<String,_>("central_conversation_id")?).bind(r.try_get::<String,_>("receipt_id")?).bind(next.work_id().to_string()).bind(next.state().as_str()).bind(next.projection_version().get()).bind(why).bind(at.to_string()).bind(event.to_string()).bind(message.as_ref().map(|m|m.try_get::<String,_>("message_id")).transpose()?).bind(message.as_ref().map(|m|m.try_get::<String,_>("content_sha256")).transpose()?).bind(canonical(&snapshot)?).bind(hash).bind(digest).bind(if message.is_none(){Some(canonical(&content)?)}else{None}).execute(tx.connection()).await.map_err(SqliteAdapterError::from_sqlx)?;
     Ok(())
 }
 async fn reconstruct(
@@ -261,7 +262,7 @@ impl SqliteStateStore {
             .map_err(SqliteAdapterError::from_sqlx)?;
         let result = reconstruct(&mut tx, &r).await?;
         let s = &result["snapshot"];
-        let envelope = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_acceptance","request_id":result["upload_id"],"environment":"development","authority":{"customer_id":s["customer_id"],"logical_agent_id":s["logical_agent_id"],"installation_id":s["origin_installation_id"],"generation":s["origin_generation"],"session_id":result["upload_id"]},"body":body});
+        let envelope = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"result_acceptance","request_id":result["upload_id"],"environment":r.try_get::<String,_>("environment")?,"authority":{"customer_id":s["customer_id"],"logical_agent_id":s["logical_agent_id"],"installation_id":s["origin_installation_id"],"generation":s["origin_generation"],"session_id":result["upload_id"]},"body":body});
         decode_message(&canonical_bytes(&envelope).map_err(|_| invalid())?)
             .map_err(|_| invalid())?;
         if body["work_id"] != s["work_id"]

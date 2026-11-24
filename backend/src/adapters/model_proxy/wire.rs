@@ -62,7 +62,7 @@ pub(super) fn invocation(
         return Err(invalid());
     }
     let p = &b.profile["body"]["profile"];
-    let mut v = json!({"invocation_version":1,"environment":"development","customer_id":authority["customer_id"],"logical_agent_id":authority["logical_agent_id"],
+    let mut v = json!({"invocation_version":1,"environment":b.environment.as_str(),"customer_id":authority["customer_id"],"logical_agent_id":authority["logical_agent_id"],
   "work_id":p["work_id"],"period_id":p["period_id"],"model_config_id":p["model_config_id"],"price_config_id":p["price_config_id"],
   "receipt_id":b.receipt["receipt_id"],"local_work_id":b.local_work_id,"logical_invocation_id":a.logical_invocation_id().to_string(),
   "attempt_id":a.model_invocation_id().to_string(),"context_manifest_id":a.context_manifest_id().to_string(),"material_digest":p["material_digest"],
@@ -80,7 +80,7 @@ pub(super) fn invocation(
     )
     .map_err(|_| invalid())?;
     let q = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"model_invoke","request_id":crate::distribution::request_id().map_err(|_|invalid())?,
-  "environment":"development","authority":authority,"body":{"invocation":v,"invocation_digest":hash,"compute_grant_id":p["compute_grant_id"],"authorization_epoch":b.epoch,"profile_id":p["profile_id"]}});
+  "environment":b.environment.as_str(),"authority":authority,"body":{"invocation":v,"invocation_digest":hash,"compute_grant_id":p["compute_grant_id"],"authorization_epoch":b.epoch,"profile_id":p["profile_id"]}});
     crate::distribution_contracts::wire::decode_message(
         &crate::distribution_contracts::canonical::canonical_bytes(&q).map_err(|_| invalid())?,
     )
