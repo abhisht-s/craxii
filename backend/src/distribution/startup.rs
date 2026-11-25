@@ -299,10 +299,9 @@ impl DistributionRuntime {
                 .as_array_mut()
                 .expect("hello capabilities")
                 .push(json!("compute_v1"));
-            // Model calls are offered when the VM's config names the model (debug test builds always offer them).
-            if self.config.model_proxy.is_some()
-                || cfg!(all(feature = "test-failpoints", debug_assertions))
-            {
+            // Model calls are offered only where something makes them: debug test builds today. Production
+            // offers them once the agent loop uses the VM config's `model_proxy` (B2).
+            if cfg!(all(feature = "test-failpoints", debug_assertions)) {
                 hello["body"]["capabilities"]
                     .as_array_mut()
                     .expect("hello capabilities")
@@ -526,6 +525,9 @@ impl DistributionRuntime {
         {
             admission_outcome(self.store.cancel_distribution(item).await.map(|_| ()))?;
         }
+        // One attempt per named grant per poll.
+        #[cfg(target_os = "linux")]
+        let mut adopted = std::collections::HashMap::<String, bool>::new();
         for item in items
             .iter()
             .filter(|m| m.message["type"] == "work_delivery")
@@ -537,10 +539,19 @@ impl DistributionRuntime {
                 && item.message["body"]["execution_authorization"]["kind"] == "ordinary"
                 && let Some(named) =
                     item.message["body"]["execution_authorization"]["compute_grant_id"].as_str()
-                && !c.adopt(client, &self.boot_id, named).await?
             {
-                tracing::warn!(target: "craxii::distribution", event = "delivery_skipped");
-                continue;
+                let ok = match adopted.get(named) {
+                    Some(ok) => *ok,
+                    None => {
+                        let ok = c.adopt(client, &self.boot_id, named).await?;
+                        adopted.insert(named.to_owned(), ok);
+                        ok
+                    }
+                };
+                if !ok {
+                    tracing::warn!(target: "craxii::distribution", event = "delivery_skipped");
+                    continue;
+                }
             }
             admission_outcome(self.store.admit_distribution(item).await.map(|_| ()))?;
         }

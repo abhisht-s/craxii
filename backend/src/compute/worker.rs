@@ -145,37 +145,32 @@ impl InstalledCompute {
         if current.grant_id().is_ok_and(|g| g == named) {
             return Ok(true);
         }
-        let response = client
+        // Only a broken session is the caller's problem (it reconnects). Anything else, a refusal or a network
+        // error, just means this delivery waits: one delivery never stops the worker.
+        let response = match client
             .compute_authorization(boot, &self.policy.binding.power_operation_id)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(
+                e @ (crate::worker_auth::AuthError::SessionExpired
+                | crate::worker_auth::AuthError::Revoked
+                | crate::worker_auth::AuthError::Stale),
+            ) => return Err(e),
+            Err(_) => return Ok(false),
+        };
         let adoptable = (|| -> ComputeResult<bool> {
             let bytes = crate::distribution_contracts::canonical::canonical_bytes(&response)
                 .map_err(|_| denied())?;
             let next =
                 RunningAuthority::verify(&bytes, &self.policy.binding, &watchdog::clock_sample()?)?;
-            let (g, h) = (next.grant(), current.grant());
-            let issued = |v: &Value| {
-                crate::distribution_contracts::primitives::timestamp_micros(
-                    v["issued_at"].as_str().unwrap_or_default(),
-                )
-                .map_err(|_| denied())
-            };
-            let (cutoff, held) = (
-                next.deadline
-                    .utc_cutoff_us
-                    .parse::<i128>()
-                    .map_err(|_| denied())?,
-                current
-                    .deadline
-                    .utc_cutoff_us
-                    .parse::<i128>()
-                    .map_err(|_| denied())?,
-            );
-            Ok(next.grant_id()? == named
-                && g["boot_id"] == h["boot_id"]
-                && issued(g)? > issued(h)?
-                && cutoff >= held
-                && (cutoff > held || g["compute_reservation_id"] == h["compute_reservation_id"]))
+            Ok(super::authorization::adoptable_successor(
+                named,
+                next.grant(),
+                &next.deadline.utc_cutoff_us,
+                current.grant(),
+                &current.deadline.utc_cutoff_us,
+            ))
         })()
         .unwrap_or(false);
         if !adoptable || self.stage(&response).is_err() {
@@ -263,17 +258,25 @@ impl InstalledCompute {
                 {
                     return Err(AuthError::InvalidContext);
                 }
+                // The retired request may still have committed a renewal (A1(a): the control plane builds a
+                // renewal of a superseded grant on the current one). Read the current grant first: read-only, it
+                // never allocates funding, and staging the grant already held is a no-op. Only then retire the
+                // intent. The watchdog already holds a newer grant, so a failed read is not fatal: the intent
+                // stays and the next refresh tries again.
+                let Ok(response) = client
+                    .compute_authorization(boot, &self.policy.binding.power_operation_id)
+                    .await
+                else {
+                    return Ok(());
+                };
+                if self.stage(&response).is_err() {
+                    return Ok(());
+                }
                 std::fs::remove_file(path).map_err(|_| AuthError::InvalidContext)?;
                 std::fs::File::open(path.parent().ok_or(AuthError::InvalidContext)?)
                     .and_then(|f| f.sync_all())
                     .map_err(|_| AuthError::InvalidContext)?;
-                // The retired request may still have committed a renewal (A1(a): the control plane builds a
-                // renewal of a superseded grant on the current one). Read the current grant: read-only, it never
-                // allocates funding, and staging the grant already held is a no-op.
-                let response = client
-                    .compute_authorization(boot, &self.policy.binding.power_operation_id)
-                    .await?;
-                return self.stage(&response).map_err(|_| AuthError::InvalidContext);
+                return Ok(());
             }
             i
         } else {

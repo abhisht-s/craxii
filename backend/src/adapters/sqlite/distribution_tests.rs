@@ -1671,3 +1671,102 @@ fn the_vm_config_may_name_the_model_and_a_malformed_one_is_refused() {
         assert!(c.validate().is_err(), "{k}");
     }
 }
+#[test]
+fn a_grant_is_adopted_only_as_a_later_named_successor_that_ends_no_earlier() {
+    use crate::compute::authorization::adoptable_successor;
+    let (boot, reservation) = (request_id().unwrap(), request_id().unwrap());
+    let held = json!({"grant_id":request_id().unwrap(),"boot_id":boot,"compute_reservation_id":reservation,"issued_at":"2026-11-25T10:00:00.000000Z"});
+    let named = request_id().unwrap();
+    let next = |issued: &str, reservation: &str| json!({"grant_id":named,"boot_id":boot,"compute_reservation_id":reservation,"issued_at":issued});
+    let (later, same_time) = ("2026-11-25T10:00:00.000001Z", "2026-11-25T10:00:00.000000Z");
+    let cutoff = "1795600000000000";
+    // A superseding grant: same cutoff and reservation, issued later.
+    assert!(adoptable_successor(
+        &named,
+        &next(later, &reservation),
+        cutoff,
+        &held,
+        cutoff
+    ));
+    // A renewal: a later cutoff, a new reservation.
+    assert!(adoptable_successor(
+        &named,
+        &next(later, &request_id().unwrap()),
+        "1795600000000001",
+        &held,
+        cutoff
+    ));
+    // Refused: another grant than the one named, another boot, not issued later, ending earlier,
+    // or the same cutoff with another reservation, or unreadable times.
+    assert!(!adoptable_successor(
+        &request_id().unwrap(),
+        &next(later, &reservation),
+        cutoff,
+        &held,
+        cutoff
+    ));
+    let mut other_boot = next(later, &reservation);
+    other_boot["boot_id"] = json!(request_id().unwrap());
+    assert!(!adoptable_successor(
+        &named,
+        &other_boot,
+        cutoff,
+        &held,
+        cutoff
+    ));
+    assert!(!adoptable_successor(
+        &named,
+        &next(same_time, &reservation),
+        cutoff,
+        &held,
+        cutoff
+    ));
+    assert!(!adoptable_successor(
+        &named,
+        &next(later, &reservation),
+        "1795599999999999",
+        &held,
+        cutoff
+    ));
+    assert!(!adoptable_successor(
+        &named,
+        &next(later, &request_id().unwrap()),
+        cutoff,
+        &held,
+        cutoff
+    ));
+    assert!(!adoptable_successor(
+        &named,
+        &next("not a time", &reservation),
+        cutoff,
+        &held,
+        cutoff
+    ));
+    assert!(!adoptable_successor(
+        &named,
+        &next(later, &reservation),
+        "x",
+        &held,
+        cutoff
+    ));
+}
+#[tokio::test]
+async fn a_production_poll_still_fails_on_a_malformed_item_that_is_not_a_profile() {
+    let mut f = Fixture::new().await;
+    let d = f.delivery(&request_id().unwrap(), 1);
+    let mut broken = d.message.clone();
+    broken["body"]["material_digest"] = json!("not a digest");
+    let id = request_id().unwrap();
+    let response =
+        json!({"contract_version":1,"request_id":id,"items":[broken],"retry_after_ms":1000});
+    use crate::distribution_contracts::environment::WorkerEnvironment;
+    assert!(
+        crate::distribution::transport::poll_response(
+            &response,
+            &id,
+            WorkerEnvironment::Production
+        )
+        .is_err()
+    );
+    f.close().await;
+}
