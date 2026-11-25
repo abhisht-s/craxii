@@ -60,3 +60,4 @@ pub use schema::{DatabaseDisposition, MAX_SUPPORTED_SCHEMA_VERSION};
 pub use state_store::SqliteStateStore;
 
 pub use distribution::DistributionAdmission;
+pub use stage10::OrdinaryAuthorization;

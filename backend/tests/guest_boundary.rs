@@ -146,6 +146,7 @@ async fn installed_open_denies_before_canonical_writes() {
         release_id: "synthetic".into(),
         release_sha256: "0".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     assert!(DistributionRuntime::open(config).await.is_err());
     assert!(!root.exists());

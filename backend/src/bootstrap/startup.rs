@@ -702,6 +702,7 @@ fn configured_agent_loop_limits(
         tool_calls_per_work: u32::try_from(agent.max_tool_calls_per_work())
             .map_err(|_| StartupError::Configuration)?,
         work_duration: std::time::Duration::from_millis(agent.max_work_item_duration_ms()),
+        repeated_failure_limit: 0,
     })
 }
 
@@ -1201,6 +1202,7 @@ mod tests {
                 provider_attempts_per_work: 5,
                 tool_calls_per_work: 4,
                 work_duration: std::time::Duration::from_secs(15 * 60),
+                repeated_failure_limit: 0,
             }
         );
     }

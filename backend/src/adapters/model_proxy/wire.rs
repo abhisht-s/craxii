@@ -48,6 +48,7 @@ pub(super) fn request(r: &ModelRequest) -> Result<Value, ProviderError> {
 pub(super) fn invocation(
     i: &ModelProviderInvocation,
     b: &ProxyBinding,
+    grant: &str,
     authority: Value,
     retry: Option<(String, String)>,
 ) -> Result<Value, ProviderError> {
@@ -61,12 +62,12 @@ pub(super) fn invocation(
     {
         return Err(invalid());
     }
-    let p = &b.profile["body"]["profile"];
+    let p = &b.bound;
     let mut v = json!({"invocation_version":1,"environment":b.environment.as_str(),"customer_id":authority["customer_id"],"logical_agent_id":authority["logical_agent_id"],
-  "work_id":p["work_id"],"period_id":p["period_id"],"model_config_id":p["model_config_id"],"price_config_id":p["price_config_id"],
+  "work_id":p.work_id,"period_id":p.period_id,"model_config_id":p.model_config_id,"price_config_id":p.price_config_id,
   "receipt_id":b.receipt["receipt_id"],"local_work_id":b.local_work_id,"logical_invocation_id":a.logical_invocation_id().to_string(),
-  "attempt_id":a.model_invocation_id().to_string(),"context_manifest_id":a.context_manifest_id().to_string(),"material_digest":p["material_digest"],
-  "attempt_ordinal":i.attempt.get().to_string(),"model_config_digest":p["model_config_digest"],"price_config_digest":p["price_config_digest"],"request":request(&i.request)?});
+  "attempt_id":a.model_invocation_id().to_string(),"context_manifest_id":a.context_manifest_id().to_string(),"material_digest":p.material_digest,
+  "attempt_ordinal":i.attempt.get().to_string(),"model_config_digest":p.model_config_digest,"price_config_digest":p.price_config_digest,"request":request(&i.request)?});
     if let Some((prior, evidence)) = retry {
         if a.retry_of().map(|x| x.to_string()) != Some(prior.clone()) {
             return Err(invalid());
@@ -80,7 +81,11 @@ pub(super) fn invocation(
     )
     .map_err(|_| invalid())?;
     let q = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"model_invoke","request_id":crate::distribution::request_id().map_err(|_|invalid())?,
-  "environment":b.environment.as_str(),"authority":authority,"body":{"invocation":v,"invocation_digest":hash,"compute_grant_id":p["compute_grant_id"],"authorization_epoch":b.epoch,"profile_id":p["profile_id"]}});
+  "environment":b.environment.as_str(),"authority":authority,"body":{"invocation":v,"invocation_digest":hash,"compute_grant_id":grant,"authorization_epoch":b.epoch}});
+    let mut q = q;
+    if let Some(profile) = &p.profile_id {
+        q["body"]["profile_id"] = json!(profile);
+    }
     crate::distribution_contracts::wire::decode_message(
         &crate::distribution_contracts::canonical::canonical_bytes(&q).map_err(|_| invalid())?,
     )

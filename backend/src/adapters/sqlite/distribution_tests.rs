@@ -53,6 +53,7 @@ impl Fixture {
                 release_id: "fixture-worker".into(),
                 release_sha256: "a".repeat(64),
                 model_proxy: None,
+                agent_limits: None,
             },
             boot.clone(),
         )
@@ -472,6 +473,7 @@ async fn distribution_replacement_replays_original_receipt_after_cancellation_re
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     f.runtime = Some(
         DistributionRuntime::isolated_fixture(config, f.boot.clone())
@@ -676,6 +678,7 @@ async fn distribution_result_scripted_completion_and_exact_export() {
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     crate::distribution::fixture::complete(
         store,
@@ -887,6 +890,7 @@ async fn distribution_result_atomic_process_crashes_and_conservative_recovery() 
             release_id: "fixture-worker".into(),
             release_sha256: "a".repeat(64),
             model_proxy: None,
+            agent_limits: None,
         };
         let runtime = DistributionRuntime::isolated_fixture(config, request_id().unwrap())
             .await
@@ -982,6 +986,7 @@ async fn distribution_result_populated_v8_terminal_upgrade_reconciles_without_re
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     std::fs::set_permissions(
         root.join("state/db/craxii.sqlite3"),
@@ -1047,6 +1052,7 @@ async fn configured_environment_must_match_every_delivery_and_config() {
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     config.validate().unwrap();
     assert_eq!(
@@ -1131,7 +1137,7 @@ async fn populated_v9_upgrade_admits_production_without_changing_rows() {
         .await
         .unwrap();
     // A released V9 database built from the same rows; schema 10 changes no columns.
-    for t in super::schema::PRODUCT_TABLES {
+    for t in super::schema::V10_PRODUCT_TABLES {
         sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO main.{t} SELECT * FROM prior.{t}"
         )))
@@ -1162,6 +1168,7 @@ async fn populated_v9_upgrade_admits_production_without_changing_rows() {
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     let runtime = DistributionRuntime::isolated_fixture(config, request_id().unwrap())
         .await
@@ -1172,7 +1179,7 @@ async fn populated_v9_upgrade_admits_production_without_changing_rows() {
             .fetch_one(pool)
             .await
             .unwrap(),
-        10
+        super::schema::MAX_SUPPORTED_SCHEMA_VERSION
     );
     let after: (String, String) = sqlx::query_as(SNAPSHOT).fetch_one(pool).await.unwrap();
     assert_eq!(after, before);
@@ -1355,6 +1362,7 @@ async fn installed_quiescence_tracks_journal_receipts_exports_and_flush() {
         release_id: "qualification-only".into(),
         release_sha256: "1".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     })
     .await
     .unwrap();
@@ -1499,6 +1507,7 @@ async fn distribution_startup_verified_snapshot_rejects_corruption_before_recove
                 release_id: "fixture-worker".into(),
                 release_sha256: "a".repeat(64),
                 model_proxy: None,
+                agent_limits: None,
             },
             request_id().unwrap(),
         )
@@ -1769,4 +1778,278 @@ async fn a_production_poll_still_fails_on_a_malformed_item_that_is_not_a_profile
         .is_err()
     );
     f.close().await;
+}
+#[tokio::test]
+async fn ordinary_work_keeps_its_authorization_and_is_claimed_only_through_the_gate() {
+    use crate::adapters::sqlite::OrdinaryAuthorization;
+    use crate::ports::state_store::{ClaimNextWorkRequest, SchedulerStateStore};
+    let mut f = Fixture::new().await;
+    let store = &f.runtime.as_ref().unwrap().store;
+    let id = request_id().unwrap();
+    let d = f.ordinary_delivery(&id, 1);
+    store.admit_distribution(&d).await.unwrap();
+    let a = &d.message["body"]["execution_authorization"];
+    let stored = sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT central_work_id,period_id,compute_grant_id,authorization_epoch FROM distribution_authorizations",
+    )
+    .fetch_all(&store.runtime.inner.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored,
+        vec![(
+            id.clone(),
+            a["period_id"].as_str().unwrap().into(),
+            a["compute_grant_id"].as_str().unwrap().into(),
+            "1".into()
+        )]
+    );
+    // A development fixture stores none.
+    store
+        .admit_distribution(&f.delivery(&request_id().unwrap(), 2))
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM distribution_authorizations")
+            .fetch_one(&store.runtime.inner.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    // The stored authorization never changes and is never removed.
+    for sql in [
+        "UPDATE distribution_authorizations SET authorization_epoch='2'",
+        "DELETE FROM distribution_authorizations",
+    ] {
+        assert!(
+            sqlx::query(sql)
+                .execute(&store.runtime.inner.pool)
+                .await
+                .is_err(),
+            "{sql}"
+        );
+    }
+    let runtime = sqlx::query_scalar::<_, String>(
+        "SELECT runtime_instance_id FROM runtime_instances WHERE state='running'",
+    )
+    .fetch_one(&store.runtime.inner.pool)
+    .await
+    .unwrap();
+    let request = || ClaimNextWorkRequest {
+        runtime_id: runtime.parse().unwrap(),
+        claimed_at: crate::distribution::timestamp().unwrap(),
+        event_id: crate::domain::JournalEventId::generate(),
+    };
+    // The plain scheduler claim never takes distribution work.
+    assert!(store.claim_next_work(request()).await.unwrap().is_none());
+    // A gate that refuses (no current grant lists it): the head waits, still queued.
+    let refuse = |_: &OrdinaryAuthorization| false;
+    assert!(
+        store
+            .claim_next_ordinary(request(), &refuse)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let local: String = sqlx::query_scalar(
+        "SELECT local_work_id FROM distribution_receipts WHERE central_work_id=?",
+    )
+    .bind(&id)
+    .fetch_one(&store.runtime.inner.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM work_items WHERE work_id=?")
+            .bind(&local)
+            .fetch_one(&store.runtime.inner.pool)
+            .await
+            .unwrap(),
+        "queued"
+    );
+    // A gate that accepts gets exactly the stored authorization, and the task is claimed.
+    let seen = std::sync::Mutex::new(None);
+    let accept = |o: &OrdinaryAuthorization| {
+        *seen.lock().unwrap() = Some(o.clone());
+        true
+    };
+    let claimed = store
+        .claim_next_ordinary(request(), &accept)
+        .await
+        .unwrap()
+        .expect("claimed");
+    assert_eq!(claimed.work.work_id().to_string(), local);
+    assert_eq!(seen.lock().unwrap().as_ref().unwrap().central_work_id, id);
+    // Only one task runs at a time: nothing else is claimed while it runs.
+    assert!(
+        store
+            .claim_next_ordinary(request(), &accept)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    f.close().await;
+}
+#[tokio::test]
+async fn an_ordinary_task_gets_its_tool_permit_material_only_while_it_runs() {
+    use crate::adapters::sqlite::OrdinaryAuthorization;
+    use crate::ports::state_store::ClaimNextWorkRequest;
+    let mut f = Fixture::new().await;
+    let store = &f.runtime.as_ref().unwrap().store;
+    let id = request_id().unwrap();
+    let d = f.ordinary_delivery(&id, 1);
+    store.admit_distribution(&d).await.unwrap();
+    let local: String = sqlx::query_scalar(
+        "SELECT local_work_id FROM distribution_receipts WHERE central_work_id=?",
+    )
+    .bind(&id)
+    .fetch_one(&store.runtime.inner.pool)
+    .await
+    .unwrap();
+    let work = crate::domain::WorkId::parse_canonical(&local).unwrap();
+    // Queued: no permit.
+    assert_eq!(
+        store.ordinary_permit_material(work).await.unwrap_err(),
+        DistributionError::Invalid
+    );
+    let runtime = sqlx::query_scalar::<_, String>(
+        "SELECT runtime_instance_id FROM runtime_instances WHERE state='running'",
+    )
+    .fetch_one(&store.runtime.inner.pool)
+    .await
+    .unwrap();
+    let accept = |_: &OrdinaryAuthorization| true;
+    store
+        .claim_next_ordinary(
+            ClaimNextWorkRequest {
+                runtime_id: runtime.parse().unwrap(),
+                claimed_at: crate::distribution::timestamp().unwrap(),
+                event_id: crate::domain::JournalEventId::generate(),
+            },
+            &accept,
+        )
+        .await
+        .unwrap()
+        .expect("claimed");
+    // Running: the central work id and the grant it arrived under.
+    let grant = d.message["body"]["execution_authorization"]["compute_grant_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        store.ordinary_permit_material(work).await.unwrap(),
+        (id, grant)
+    );
+    // A fixture task has no ordinary permit.
+    assert_eq!(
+        store
+            .ordinary_permit_material(crate::domain::WorkId::generate())
+            .await
+            .unwrap_err(),
+        DistributionError::Invalid
+    );
+    f.close().await;
+}
+#[tokio::test]
+async fn an_ordinary_model_binding_has_no_profile_and_names_the_stored_authorization() {
+    use crate::adapters::model_proxy::ProxyBinding;
+    use crate::adapters::sqlite::OrdinaryAuthorization;
+    use crate::distribution::model_config::{ModelProxySettings, ORDINARY_ESTIMATOR};
+    let mut f = Fixture::new().await;
+    let store = &f.runtime.as_ref().unwrap().store;
+    let id = request_id().unwrap();
+    let d = f.ordinary_delivery(&id, 1);
+    let DistributionAdmission::Receipt { receipt, .. } =
+        store.admit_distribution(&d).await.unwrap()
+    else {
+        panic!("receipt")
+    };
+    let a = &d.message["body"]["execution_authorization"];
+    let auth = OrdinaryAuthorization {
+        central_work_id: id.clone(),
+        period_id: a["period_id"].as_str().unwrap().into(),
+        compute_grant_id: a["compute_grant_id"].as_str().unwrap().into(),
+        authorization_epoch: "1".into(),
+    };
+    let settings: ModelProxySettings = serde_json::from_value(json!({"contract_version":1,"model_id":"agent-default","model_config_id":request_id().unwrap(),"model_config_digest":"b".repeat(64),"price_config_id":request_id().unwrap(),"price_config_digest":"c".repeat(64),"max_output_tokens":4096,"requested_output_tokens":2048,"context_window_tokens":200000})).unwrap();
+    let env = crate::distribution_contracts::environment::WorkerEnvironment::Development;
+    let binding = ProxyBinding::ordinary(env, receipt.clone(), &auth, settings.clone()).unwrap();
+    assert_eq!(
+        binding.named(),
+        (
+            id.clone(),
+            auth.period_id.clone(),
+            auth.compute_grant_id.clone(),
+            settings.model_config_id.clone(),
+            None,
+            true
+        )
+    );
+    // Another task's authorization, or a bad epoch, is refused.
+    let other = OrdinaryAuthorization {
+        central_work_id: request_id().unwrap(),
+        ..auth.clone()
+    };
+    assert!(ProxyBinding::ordinary(env, receipt.clone(), &other, settings.clone()).is_err());
+    let bad_epoch = OrdinaryAuthorization {
+        authorization_epoch: "x".into(),
+        ..auth.clone()
+    };
+    assert!(ProxyBinding::ordinary(env, receipt, &bad_epoch, settings.clone()).is_err());
+    // The ordinary target names the conservative estimator and the configured sizes.
+    let target = settings.ordinary_target().unwrap();
+    assert_eq!(
+        target.estimator(),
+        &crate::domain::TokenEstimatorIdentity::try_new(ORDINARY_ESTIMATOR, 1).unwrap()
+    );
+    assert_eq!(target.requested_output_tokens().get(), 2048);
+    assert_eq!(
+        target
+            .reference()
+            .capabilities()
+            .context_window_tokens()
+            .get(),
+        200000
+    );
+    assert_eq!(settings.call_timeout_seconds(), 600);
+    // Out-of-range settings are refused.
+    for (k, v) in [
+        ("requested_output_tokens", json!(5000)),
+        ("context_window_tokens", json!(10)),
+        ("call_timeout_seconds", json!(1)),
+    ] {
+        let mut bad = serde_json::to_value(&settings).unwrap();
+        bad[k] = v;
+        let s: ModelProxySettings = serde_json::from_value(bad).unwrap();
+        assert!(s.validate().is_err(), "{k}");
+    }
+    f.close().await;
+}
+#[test]
+fn the_vm_config_may_set_agent_limits_and_bad_values_are_refused() {
+    let base = json!({"contract_version":1,"environment":"production","origin":"https://api.craxii.com/","state_root":"/var/lib/craxii-worker/state","artifact_root":"/var/lib/craxii-worker/artifacts","workspace_root":"/srv/craxii-data/workspace","profile_public_key":URL_SAFE_NO_PAD.encode([7u8;32]),"power_operation_id":request_id().unwrap(),"release_id":"worker-1","release_sha256":"a".repeat(64)});
+    let none: DistributionConfig = serde_json::from_value(base.clone()).unwrap();
+    assert_eq!(
+        none.agent_limits(),
+        crate::distribution::startup::AgentLimits::default()
+    );
+    let mut set = base.clone();
+    set["agent_limits"] = json!({"tool_call_timeout_seconds":600,"repeated_failure_limit":0});
+    let c: DistributionConfig = serde_json::from_value(set).unwrap();
+    c.validate().unwrap();
+    assert_eq!(c.agent_limits().tool_call_timeout_ms(), 600_000);
+    assert_eq!(c.agent_limits().loop_limits().repeated_failure_limit, 0);
+    for bad in [
+        json!({"tool_call_timeout_seconds":901}),
+        json!({"task_duration_seconds":30}),
+        json!({"max_model_calls":0}),
+        json!({"repeated_failure_limit":1}),
+    ] {
+        let mut v = base.clone();
+        v["agent_limits"] = bad.clone();
+        let c: DistributionConfig = serde_json::from_value(v).unwrap();
+        assert!(c.validate().is_err(), "{bad}");
+    }
+    let mut unknown = base;
+    unknown["agent_limits"] = json!({"budget":1});
+    assert!(serde_json::from_value::<DistributionConfig>(unknown).is_err());
 }

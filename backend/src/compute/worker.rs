@@ -347,6 +347,10 @@ pub struct WorkPermit {
     pub(crate) max_duration_ms: u64,
     pub(crate) profile_cutoff: std::time::Instant,
     pub(crate) cleanup_cutoff: std::time::Instant,
+    /// Ordinary work (B2.2): a tool call may last longer than one grant. It starts while the current grant
+    /// covers the work and is checked against the grant on every tick while it runs (renewals extend it), so it
+    /// needs no single grant to outlast the whole call. A development fixture keeps the stricter rule.
+    pub(crate) checked_while_running: bool,
 }
 impl WorkPermit {
     pub fn check(&self, work: crate::domain::WorkId, duration_ms: u64) -> ComputeResult<()> {
@@ -359,8 +363,13 @@ impl WorkPermit {
         {
             return Err(denied());
         }
+        let grant_duration = if self.checked_while_running {
+            1
+        } else {
+            duration_ms
+        };
         self.compute
-            .check_work(&self.central_work, &self.grant_id, duration_ms)
+            .check_work(&self.central_work, &self.grant_id, grant_duration)
     }
     pub(crate) fn cleanup_cutoff(&self) -> tokio::time::Instant {
         tokio::time::Instant::from_std(self.cleanup_cutoff)

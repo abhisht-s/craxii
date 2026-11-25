@@ -26,10 +26,10 @@ use crate::domain::model::RequiredModelCapabilities;
 use crate::domain::{
     AgentStepNo, CleanupStatus, ContentBlock, CurrentWorkAttempt, JournalEventId, LifecycleLimit,
     Message, MessageContent, MessageId, MessageInput, MessageRole, ModelOutputFailure,
-    ModelOutputItem, ModelResponse, ModelStopReason, NormalizedError, ToolOrdinal, UtcTimestamp,
-    WorkCompletionEvidence, WorkCompletionReason, WorkFailureReason, WorkLifecycleSnapshot,
-    WorkState, WorkTransitionGuard, WorkTransitionRequest, WorkspaceIdentity, WorkstationIdentity,
-    decide_work_transition,
+    ModelOutputItem, ModelResponse, ModelStopReason, NormalizedError, ToolOrdinal, ToolResultClass,
+    UtcTimestamp, WorkCompletionEvidence, WorkCompletionReason, WorkFailureReason,
+    WorkLifecycleSnapshot, WorkState, WorkTransitionGuard, WorkTransitionRequest,
+    WorkspaceIdentity, WorkstationIdentity, decide_work_transition,
 };
 use crate::ports::clock::{Clock, MonotonicInstant};
 use crate::ports::delivery_store::{DeliveryStore, LoadDeliveryRouteRequest};
@@ -44,6 +44,12 @@ pub const MAX_MODEL_STEPS_PER_WORK: u32 = 16;
 pub const MAX_PROVIDER_ATTEMPTS_PER_WORK: u32 = 32;
 pub const MAX_TOOL_CALLS_PER_WORK: u32 = 32;
 pub const MAX_WORK_DURATION: Duration = Duration::from_secs(30 * 60);
+/// The highest limits a composition may ask for (decision 16f: the VM config sets loose limits; these ceilings
+/// only stop a misconfiguration). The `MAX_*` values above remain the defaults.
+pub const MODEL_STEPS_CEILING: u32 = 2_000;
+pub const PROVIDER_ATTEMPTS_CEILING: u32 = 6_000;
+pub const TOOL_CALLS_CEILING: u32 = 2_000;
+pub const WORK_DURATION_CEILING: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Exact state-store capabilities the loop needs; SQL and adapter types remain behind the port.
 pub trait AgentLoopStateStore: ModelStateStore + CompletionStateStore + DeliveryStore {}
@@ -56,6 +62,9 @@ pub struct AgentLoopLimits {
     pub provider_attempts_per_work: u32,
     pub tool_calls_per_work: u32,
     pub work_duration: Duration,
+    /// Loop-breaker (decision 16f): the task stops when this many tool calls in a row are the same call (same
+    /// tool and arguments) and each fails. 0 turns it off.
+    pub repeated_failure_limit: u32,
 }
 
 impl Default for AgentLoopLimits {
@@ -65,21 +74,50 @@ impl Default for AgentLoopLimits {
             provider_attempts_per_work: MAX_PROVIDER_ATTEMPTS_PER_WORK,
             tool_calls_per_work: MAX_TOOL_CALLS_PER_WORK,
             work_duration: MAX_WORK_DURATION,
+            repeated_failure_limit: 0,
         }
+    }
+}
+
+/// Consecutive identical failing tool calls within one task (the loop-breaker's count).
+#[derive(Default)]
+struct RepeatedFailures {
+    last: Option<(String, Vec<u8>)>,
+    count: u32,
+}
+impl RepeatedFailures {
+    /// Records one tool call's outcome; returns how many identical failures are now in a row.
+    fn record(&mut self, name: &str, arguments: &[u8], failed: bool) -> u32 {
+        if !failed {
+            *self = Self::default();
+            return 0;
+        }
+        let same = self
+            .last
+            .as_ref()
+            .is_some_and(|(n, a)| n == name && a.as_slice() == arguments);
+        self.count = if same {
+            self.count.saturating_add(1)
+        } else {
+            1
+        };
+        self.last = Some((name.to_owned(), arguments.to_vec()));
+        self.count
     }
 }
 
 impl AgentLoopLimits {
     fn validate(self) -> Result<Self, AgentLoopError> {
         if self.model_steps_per_work == 0
-            || self.model_steps_per_work > MAX_MODEL_STEPS_PER_WORK
+            || self.model_steps_per_work > MODEL_STEPS_CEILING
             || self.provider_attempts_per_work == 0
-            || self.provider_attempts_per_work > MAX_PROVIDER_ATTEMPTS_PER_WORK
+            || self.provider_attempts_per_work > PROVIDER_ATTEMPTS_CEILING
             || self.provider_attempts_per_work < self.model_steps_per_work
             || self.tool_calls_per_work == 0
-            || self.tool_calls_per_work > MAX_TOOL_CALLS_PER_WORK
+            || self.tool_calls_per_work > TOOL_CALLS_CEILING
             || self.work_duration.is_zero()
-            || self.work_duration > MAX_WORK_DURATION
+            || self.work_duration > WORK_DURATION_CEILING
+            || self.repeated_failure_limit == 1
         {
             return Err(AgentLoopError::InvalidComposition);
         }
@@ -222,6 +260,7 @@ impl AgentLoop {
             return WorkRunnerExit::Abnormal;
         }
 
+        let mut repeated = RepeatedFailures::default();
         let mut agent_step = match AgentStepNo::try_new(1) {
             Ok(value) => value,
             Err(_) => return WorkRunnerExit::Abnormal,
@@ -411,6 +450,7 @@ impl AgentLoop {
                                     runtime_id,
                                     work_deadline,
                                     &mut cancellation,
+                                    &mut repeated,
                                 )
                                 .await
                             {
@@ -683,6 +723,7 @@ impl AgentLoop {
         runtime_id: crate::domain::RuntimeInstanceId,
         work_deadline: MonotonicInstant,
         cancellation: &mut WorkCancellation,
+        repeated: &mut RepeatedFailures,
     ) -> ToolBatchOutcome {
         let calls = response
             .output_items()
@@ -798,11 +839,28 @@ impl AgentLoop {
                 Ok(_) if cancellation_forwarded => {
                     return ToolBatchOutcome::Terminal(WorkRunnerExit::TerminalCommitted);
                 }
-                Ok(_) => {
-                    current_work = match self.load_owned(work_item.work_id(), runtime_id).await {
-                        Ok(value) => value.lifecycle,
+                Ok(outcome) => {
+                    let owned = match self.load_owned(work_item.work_id(), runtime_id).await {
+                        Ok(value) => value,
                         Err(_) => return ToolBatchOutcome::Terminal(WorkRunnerExit::Abnormal),
                     };
+                    let in_a_row = repeated.record(
+                        call.name().as_str(),
+                        call.raw_arguments().as_bytes(),
+                        outcome.result_class != ToolResultClass::Success,
+                    );
+                    if self.limits.repeated_failure_limit != 0
+                        && in_a_row >= self.limits.repeated_failure_limit
+                    {
+                        return ToolBatchOutcome::Terminal(
+                            self.fail_owned(
+                                owned,
+                                WorkFailureReason::Limit(LifecycleLimit::ToolCalls),
+                            )
+                            .await,
+                        );
+                    }
+                    current_work = owned.lifecycle;
                 }
                 Err(error) if error.kind() == ToolExecutionServiceErrorKind::OutcomeUnknown => {
                     return ToolBatchOutcome::Terminal(WorkRunnerExit::TerminalCommitted);
@@ -919,18 +977,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_loop_breaker_counts_identical_failing_calls_in_a_row() {
+        let mut r = RepeatedFailures::default();
+        assert_eq!(r.record("run_shell", b"{\"command\":\"make\"}", true), 1);
+        assert_eq!(r.record("run_shell", b"{\"command\":\"make\"}", true), 2);
+        assert_eq!(r.record("run_shell", b"{\"command\":\"make\"}", true), 3);
+        // Different arguments start a new count; a success clears it.
+        assert_eq!(
+            r.record("run_shell", b"{\"command\":\"make test\"}", true),
+            1
+        );
+        assert_eq!(
+            r.record("run_shell", b"{\"command\":\"make test\"}", false),
+            0
+        );
+        assert_eq!(
+            r.record("run_shell", b"{\"command\":\"make test\"}", true),
+            1
+        );
+    }
+
+    #[test]
+    fn vm_config_limits_are_valid_and_the_ceilings_hold() {
+        use crate::distribution::startup::AgentLimits;
+        let limits = AgentLimits::default().loop_limits().validate().unwrap();
+        assert_eq!(limits.model_steps_per_work, 1000);
+        assert_eq!(limits.work_duration, Duration::from_secs(4 * 60 * 60));
+        assert_eq!(limits.repeated_failure_limit, 5);
+        assert_eq!(
+            AgentLimits::default().tool_call_timeout_ms(),
+            15 * 60 * 1000
+        );
+        let biggest = AgentLimits {
+            max_model_calls: Some(2000),
+            task_duration_seconds: Some(43200),
+            repeated_failure_limit: Some(0),
+            ..AgentLimits::default()
+        };
+        biggest.loop_limits().validate().unwrap();
+        for bad in [
+            AgentLoopLimits {
+                model_steps_per_work: MODEL_STEPS_CEILING + 1,
+                provider_attempts_per_work: PROVIDER_ATTEMPTS_CEILING,
+                ..limits
+            },
+            AgentLoopLimits {
+                work_duration: WORK_DURATION_CEILING + Duration::from_secs(1),
+                ..limits
+            },
+            AgentLoopLimits {
+                repeated_failure_limit: 1,
+                ..limits
+            },
+        ] {
+            assert!(matches!(
+                bad.validate(),
+                Err(AgentLoopError::InvalidComposition)
+            ));
+        }
+    }
+
+    #[test]
     fn frozen_defaults_remain_exact_and_safe_nondefault_limits_are_accepted() {
         let limits = AgentLoopLimits::default().validate().unwrap();
         assert_eq!(limits.model_steps_per_work, 16);
         assert_eq!(limits.provider_attempts_per_work, 32);
         assert_eq!(limits.tool_calls_per_work, 32);
         assert_eq!(limits.work_duration, Duration::from_secs(30 * 60));
+        assert_eq!(limits.repeated_failure_limit, 0);
 
         let configured = AgentLoopLimits {
             model_steps_per_work: 3,
             provider_attempts_per_work: 5,
             tool_calls_per_work: 4,
             work_duration: Duration::from_secs(15 * 60),
+            repeated_failure_limit: 0,
         };
         assert_eq!(configured.validate().unwrap(), configured);
         assert!(matches!(

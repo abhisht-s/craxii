@@ -4544,7 +4544,7 @@ async fn genuine_empty_v2_migrates_to_v7_without_changing_old_fingerprints() {
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "9d484df334845025b7b4bd72f89305c32441a64c269ac0d16ab7f5630fa74cb0"
+        "28057fa2faec11310ef59c4ae1250ee46f3c5c9b983a53b8adf04d38a3b69385"
     );
     migrated.shutdown().await;
 

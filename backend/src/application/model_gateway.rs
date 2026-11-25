@@ -45,7 +45,8 @@ use crate::ports::state_store::{
 };
 
 const MAX_STREAM_EVENTS: usize = 4_096;
-const MAX_PROVIDER_ATTEMPTS_PER_WORK: u32 = 32;
+// A ceiling only (decision 16f); the agent loop's limits decide the real count.
+const MAX_PROVIDER_ATTEMPTS_PER_WORK: u32 = 6_000;
 
 /// Provider-neutral, already-validated semantic delta offered to future delivery code.
 #[derive(Clone, Eq, PartialEq)]

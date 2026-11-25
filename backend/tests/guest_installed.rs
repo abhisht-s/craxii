@@ -48,6 +48,7 @@ fn config() -> DistributionConfig {
         release_id: "qualification-only".into(),
         release_sha256: "1".repeat(64),
         model_proxy: None,
+        agent_limits: None,
     };
     let policy = craxii_server::compute::watchdog::Policy::parse(
         &craxii_server::compute::watchdog::protected_read(

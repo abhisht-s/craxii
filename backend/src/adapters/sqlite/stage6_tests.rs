@@ -495,6 +495,7 @@ async fn empty_migration_metadata_database_migrates_forward_to_current_version_e
     let (root, guard) = database().await;
     let mut connection = guard.runtime().acquire().await.unwrap();
     for table in [
+        "distribution_authorizations",
         "distribution_results",
         "distribution_controls",
         "distribution_receipts",

@@ -140,7 +140,7 @@ class RecoveryCopyTests(unittest.TestCase):
                 )
                 payload = json.loads(manifest.read_text(encoding="utf-8"))
                 self.assertEqual(payload["source_schema_version"], version)
-                self.assertEqual(payload["schema_ceiling"], 7)
+                self.assertEqual(payload["schema_ceiling"], load_helper().SCHEMA_CEILING)
                 self.assertEqual(payload["database_sha256"], digest(database))
                 self.assertEqual(payload["database_bytes"], database.stat().st_size)
                 self.assertEqual(payload["database_mode"], "0600")

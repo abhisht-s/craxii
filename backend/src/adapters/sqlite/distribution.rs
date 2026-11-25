@@ -85,6 +85,7 @@ impl SqliteStateStore {
             .cleanup_cutoff()
             .map_err(|_| DistributionError::Expired)?;
         let result = crate::compute::worker::WorkPermit {
+            checked_while_running: false,
             cleanup_cutoff,
             compute,
             central_work: text(p, "work_id")?.to_owned(),
@@ -112,6 +113,50 @@ impl SqliteStateStore {
             .check(local, 1)
             .map_err(|_| DistributionError::Expired)?;
         tx.commit().await.map_err(storage)?;
+        Ok(result)
+    }
+    /// B2.2: what a running ordinary task's tool permit is built from: its central work id and the grant it
+    /// arrived under, read from the stored authorization. Refused unless the task is running.
+    pub async fn ordinary_permit_material(
+        &self,
+        local: WorkId,
+    ) -> DistributionResult<(String, String)> {
+        let row = sqlx::query("SELECT a.central_work_id,a.compute_grant_id FROM distribution_authorizations a JOIN distribution_receipts r ON r.environment=a.environment AND r.central_work_id=a.central_work_id JOIN work_items w ON w.work_id=a.local_work_id WHERE a.local_work_id=? AND r.quarantined=0 AND w.state IN ('running','waiting_on_model','waiting_on_tool')")
+            .bind(local.to_string())
+            .fetch_optional(&self.runtime.inner.pool)
+            .await
+            .map_err(storage)?
+            .ok_or_else(invalid)?;
+        Ok((
+            row.try_get("central_work_id").map_err(storage)?,
+            row.try_get("compute_grant_id").map_err(storage)?,
+        ))
+    }
+    /// B2.2: the tool permit for a running ordinary task: tool calls up to `max_duration_ms` each, the task's
+    /// own deadline, and the current grant rechecked while each call runs.
+    #[cfg(target_os = "linux")]
+    pub async fn ordinary_compute_permit(
+        &self,
+        compute: std::sync::Arc<crate::compute::worker::InstalledCompute>,
+        local: WorkId,
+        task_deadline: std::time::Instant,
+        max_duration_ms: u64,
+    ) -> DistributionResult<crate::compute::worker::WorkPermit> {
+        let (central_work, grant_id) = self.ordinary_permit_material(local).await?;
+        let cleanup_cutoff = compute
+            .cleanup_cutoff()
+            .map_err(|_| DistributionError::Expired)?;
+        let result = crate::compute::worker::WorkPermit {
+            compute,
+            central_work,
+            local_work: local,
+            grant_id,
+            max_duration_ms,
+            profile_cutoff: task_deadline,
+            cleanup_cutoff,
+            checked_while_running: true,
+        };
+        result.prepare().map_err(|_| DistributionError::Expired)?;
         Ok(result)
     }
     async fn distribution_owner(
@@ -347,6 +392,14 @@ impl SqliteStateStore {
         sqlx::query("INSERT INTO distribution_receipts(environment,central_work_id,customer_id,logical_agent_id,central_conversation_id,central_sequence,material_digest,material_canonical,receipt_id,receipt_canonical,user_id,local_conversation_id,local_message_id,local_work_id,acceptance_event_id,journal_offset,local_work_ordinal,origin_installation_id,origin_generation,admitted_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
    .bind(env).bind(id).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(text(m,"conversation_id")?).bind(sequence).bind(digest).bind(material).bind(receipt_id.to_string()).bind(string(&receipt)?).bind(user).bind(conversation).bind(admitted.message_id.to_string()).bind(admitted.work_id.to_string()).bind(accepted_event.to_string()).bind(admitted.committed_cursor.get()).bind(admitted.work_ordinal.get()).bind(text(a,"installation_id")?).bind(text(a,"generation")?.parse::<i64>().map_err(|_|invalid())?).bind(at.to_string()).execute(tx.connection()).await.map_err(storage)?;
         sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment=? AND central_conversation_id=? AND next_sequence=?").bind(env).bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
+        // B2.1: ordinary work's authorization is kept with its receipt, so the task can be claimed (and rechecked
+        // against the current grant) later, including after a restart.
+        let auth = &b["execution_authorization"];
+        if auth["kind"] == "ordinary" {
+            sqlx::query("INSERT INTO distribution_authorizations(environment,central_work_id,local_work_id,period_id,compute_grant_id,authorization_epoch) VALUES(?,?,?,?,?,?)")
+                .bind(env).bind(id).bind(admitted.work_id.to_string()).bind(text(auth, "period_id")?).bind(text(auth, "compute_grant_id")?).bind(text(auth, "authorization_epoch")?)
+                .execute(tx.connection()).await.map_err(storage)?;
+        }
         delivery.check_fresh()?;
         delivery.verify_authorization()?;
         tx.commit().await.map_err(storage)?;

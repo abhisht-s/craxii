@@ -40,8 +40,76 @@ pub struct DistributionConfig {
     /// values of the live model (B3). Nonsecret pins only; without it the worker doesn't offer model calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_proxy: Option<crate::distribution::model_config::ModelProxySettings>,
+    /// Per-task limits (decision 16f), written at provisioning (B6). Absent fields take the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_limits: Option<AgentLimits>,
+}
+/// How long and how much one agent task may run (decision 16f). Money is capped separately by the trial or plan
+/// budget; these stop runaway or stuck tasks. Every field is optional.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentLimits {
+    /// One tool call, in seconds (default and at most 900: the worker database records tool calls of up to 15
+    /// minutes; longer single calls need a table rebuild, deferred by the owner on 2026-11-25). Longer jobs run in
+    /// the background and are checked on in later calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_timeout_seconds: Option<u32>,
+    /// One task, in seconds (default 14400; at most 43200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_duration_seconds: Option<u32>,
+    /// A safety ceiling on model calls per task (default 1000; at most 2000). Not a budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_calls: Option<u32>,
+    /// The loop-breaker: identical failing tool calls in a row that stop the task (default 5; 0 turns it off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeated_failure_limit: Option<u32>,
+}
+impl AgentLimits {
+    pub fn validate(&self) -> DistributionResult<()> {
+        if self
+            .tool_call_timeout_seconds
+            .is_some_and(|v| !(1..=900).contains(&v))
+            || self
+                .task_duration_seconds
+                .is_some_and(|v| !(60..=43200).contains(&v))
+            || self
+                .max_model_calls
+                .is_some_and(|v| !(1..=2000).contains(&v))
+            || self
+                .repeated_failure_limit
+                .is_some_and(|v| v == 1 || v > 100)
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+    pub fn tool_call_timeout_ms(&self) -> u64 {
+        u64::from(self.tool_call_timeout_seconds.unwrap_or(900)) * 1000
+    }
+    /// The agent loop's limits for one task.
+    pub fn loop_limits(&self) -> crate::application::agent_loop::AgentLoopLimits {
+        use crate::application::agent_loop::{
+            AgentLoopLimits, PROVIDER_ATTEMPTS_CEILING, TOOL_CALLS_CEILING,
+        };
+        let calls = self.max_model_calls.unwrap_or(1000);
+        AgentLoopLimits {
+            model_steps_per_work: calls,
+            // Each model call may be retried by the gateway; the ceiling still bounds the total.
+            provider_attempts_per_work: calls.saturating_mul(3).min(PROVIDER_ATTEMPTS_CEILING),
+            // No separate count of tool calls: time, the loop-breaker and the model-call ceiling bound them.
+            tool_calls_per_work: TOOL_CALLS_CEILING,
+            work_duration: std::time::Duration::from_secs(u64::from(
+                self.task_duration_seconds.unwrap_or(14400),
+            )),
+            repeated_failure_limit: self.repeated_failure_limit.unwrap_or(5),
+        }
+    }
 }
 impl DistributionConfig {
+    /// The per-task limits, with defaults for anything the config leaves out.
+    pub fn agent_limits(&self) -> AgentLimits {
+        self.agent_limits.clone().unwrap_or_default()
+    }
     pub fn worker_environment(&self) -> DistributionResult<WorkerEnvironment> {
         WorkerEnvironment::parse(&self.environment).ok_or_else(invalid)
     }
@@ -72,6 +140,9 @@ impl DistributionConfig {
         }
         if let Some(m) = &self.model_proxy {
             m.validate()?;
+        }
+        if let Some(l) = &self.agent_limits {
+            l.validate()?;
         }
         Ok(())
     }

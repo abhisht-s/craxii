@@ -261,11 +261,31 @@ async fn append_work_transition(
     .await
 }
 
+/// The stored authorization of an admitted ordinary task (B2.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OrdinaryAuthorization {
+    pub central_work_id: String,
+    pub period_id: String,
+    pub compute_grant_id: String,
+    pub authorization_epoch: String,
+}
+/// What may let the claim take distribution work. Local (non-distribution) work needs none.
+pub enum ClaimAuthority<'a> {
+    None,
+    /// A live development fixture delivery (debug builds only).
+    Fixture(&'a crate::distribution::ValidatedDelivery),
+    /// Ordinary work, whose stored authorization the gate rechecks (on a VM: against the current grant).
+    Ordinary(&'a (dyn Fn(&OrdinaryAuthorization) -> bool + Send + Sync)),
+}
 async fn claim_next(
     store: &SqliteStateStore,
     request: ClaimNextWorkRequest,
-    fixture: Option<&crate::distribution::ValidatedDelivery>,
+    authority: ClaimAuthority<'_>,
 ) -> Result<Option<ClaimedWork>, SqliteAdapterError> {
+    let fixture = match authority {
+        ClaimAuthority::Fixture(d) => Some(d),
+        _ => None,
+    };
     let mut transaction = WriteTransaction::begin(&store.runtime, "claim_next_work").await?;
     let runtime =
         sqlx::query("SELECT state, craxii_id FROM runtime_instances WHERE runtime_instance_id = ?")
@@ -344,7 +364,22 @@ async fn claim_next(
     .await
     .map_err(SqliteAdapterError::from_sqlx)?;
     if let Some(r) = admitted {
-        let allowed = if let Some(d) = fixture {
+        let ordinary = sqlx::query(
+            "SELECT central_work_id,period_id,compute_grant_id,authorization_epoch FROM distribution_authorizations WHERE local_work_id=?",
+        )
+        .bind(candidate.try_get::<String, _>("work_id")?)
+        .fetch_optional(transaction.connection())
+        .await
+        .map_err(SqliteAdapterError::from_sqlx)?;
+        let allowed = if let (ClaimAuthority::Ordinary(gate), Some(o)) = (&authority, &ordinary) {
+            // The head waits (it is not skipped) while its grant doesn't cover it: work runs in arrival order.
+            gate(&OrdinaryAuthorization {
+                central_work_id: o.try_get("central_work_id")?,
+                period_id: o.try_get("period_id")?,
+                compute_grant_id: o.try_get("compute_grant_id")?,
+                authorization_epoch: o.try_get("authorization_epoch")?,
+            })
+        } else if let Some(d) = fixture {
             d.check_fresh().map_err(|_| invariant())?;
             d.verify_profile().map_err(|_| invariant())?;
             cfg!(all(feature = "test-failpoints", debug_assertions))
@@ -2031,13 +2066,27 @@ pub(super) async fn verify_stage10_consistency(
     Ok(9)
 }
 
+impl SqliteStateStore {
+    /// B2.1: the claim for a worker that runs ordinary work. `gate` rechecks an ordinary task's stored
+    /// authorization (on a VM, against the root-accepted current grant) before it is claimed.
+    pub async fn claim_next_ordinary(
+        &self,
+        request: ClaimNextWorkRequest,
+        gate: &(dyn Fn(&OrdinaryAuthorization) -> bool + Send + Sync),
+    ) -> Result<Option<ClaimedWork>, crate::ports::state_store::StateStoreError> {
+        claim_next(self, request, ClaimAuthority::Ordinary(gate))
+            .await
+            .map_err(map_port_error)
+    }
+}
+
 impl SchedulerStateStore for SqliteStateStore {
     fn claim_next_work(
         &self,
         request: ClaimNextWorkRequest,
     ) -> StateStoreFuture<'_, Option<ClaimedWork>> {
         Box::pin(async move {
-            claim_next(self, request, None)
+            claim_next(self, request, ClaimAuthority::None)
                 .await
                 .map_err(map_port_error)
         })
@@ -2232,6 +2281,6 @@ impl SqliteStateStore {
         request: ClaimNextWorkRequest,
         delivery: &crate::distribution::ValidatedDelivery,
     ) -> Result<Option<ClaimedWork>, SqliteAdapterError> {
-        claim_next(self, request, Some(delivery)).await
+        claim_next(self, request, ClaimAuthority::Fixture(delivery)).await
     }
 }
