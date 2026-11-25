@@ -1,0 +1,151 @@
+{
+  "bundle_version": "1.0.0",
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 1815,
+      "sha256": "c4e60fbdf6ea6410edbf5101b7ef11b6eac2e8db6726d9b65bb35fc464b96e1a"
+    },
+    {
+      "path": "SEMANTICS.md",
+      "bytes": 15524,
+      "sha256": "2039527ab168e30b15921b0a6331f6cf882a6283940d4da7550620aafd3c39db"
+    },
+    {
+      "path": "compatibility.md",
+      "bytes": 2359,
+      "sha256": "b330668b61e9e998f6d0f13cd02ef669448830ba6f89c06738ff9274072955b7"
+    },
+    {
+      "path": "fixtures/admission-cancel.json",
+      "bytes": 180485,
+      "sha256": "1a10e0a18cfef05bd0a0bde4c42897d6e338177f300d167adb58940c464a5338"
+    },
+    {
+      "path": "fixtures/authority-lifecycle.json",
+      "bytes": 145754,
+      "sha256": "eec79694b2a2346c47b053216a2d16afbeebc237d364fb23e161830e183d2063"
+    },
+    {
+      "path": "fixtures/budgets-model.json",
+      "bytes": 267093,
+      "sha256": "628942185dd77d937a37d3e79d069eef438841286f7b75d26145f79a4ad8eabb"
+    },
+    {
+      "path": "fixtures/canonical.json",
+      "bytes": 8496,
+      "sha256": "2153981e0a71fe24d2ac423bbb245bcf5dd09b65bee38c2f9d7ecf1d5071d69c"
+    },
+    {
+      "path": "fixtures/envelopes.json",
+      "bytes": 1866025,
+      "sha256": "c877c53d3127ebdc32a3029af953dd3a9672bf53cd95779b7af2bfb59987dc4f"
+    },
+    {
+      "path": "fixtures/legacy-regression.json",
+      "bytes": 2432,
+      "sha256": "7efba2b49160d3ba63447a634a171dd8321cbec5044745df7098f4f528a12928"
+    },
+    {
+      "path": "fixtures/limits.json",
+      "bytes": 6478,
+      "sha256": "203581fe3516c03098078b74c20e8551a29bd3b99ce2934cde86c808dac14109"
+    },
+    {
+      "path": "fixtures/negotiation.json",
+      "bytes": 19592,
+      "sha256": "85489d3f050280ab54d2781c92c993d64878ca7d4af7876fd29815ff1205e6e2"
+    },
+    {
+      "path": "fixtures/neutral-policy-lineage.json",
+      "bytes": 88522,
+      "sha256": "c1fd3f7cd778e7f050bb7efc055dea8c3c0a170736ea1b9209f8c4b55b40e988"
+    },
+    {
+      "path": "fixtures/primitives.json",
+      "bytes": 11569,
+      "sha256": "4cd6715dc6abb303843581b4d7c15c2a85647b03b1e056d2e8527a093ee7ac81"
+    },
+    {
+      "path": "fixtures/raw-invalid.json",
+      "bytes": 2181,
+      "sha256": "0e421c8d71a7aeb8c5672166cba208acfd1deb43aa5545775de0802c8fb45d91"
+    },
+    {
+      "path": "fixtures/result-delivery.json",
+      "bytes": 113071,
+      "sha256": "54d5dffecb1ff8754a99ef7e53c5741ea0486fc23135fe1b9c8fd17d25792b2b"
+    },
+    {
+      "path": "fixtures/signatures.json",
+      "bytes": 18865,
+      "sha256": "04f67688cdbd05e939d7b33cdf6873a0fa64ee56b22824d5e70c938d46dc9c05"
+    },
+    {
+      "path": "schemas/accounting.schema.json",
+      "bytes": 15908,
+      "sha256": "d765c5cfbb0b490830af7f1624b8e40e95a1491024fc45deb0fc59f20c85bd11"
+    },
+    {
+      "path": "schemas/authentication.schema.json",
+      "bytes": 25418,
+      "sha256": "7cabed6110b519d37c643927c1c4aad12a112e5d77862c7f650af9e8a3d9c796"
+    },
+    {
+      "path": "schemas/compute.schema.json",
+      "bytes": 7307,
+      "sha256": "5dd57b252d5f8475b59518fad8376aae2923c962698c41c56e44d7a57b66a921"
+    },
+    {
+      "path": "schemas/error.schema.json",
+      "bytes": 41048,
+      "sha256": "bd93e3a60ccb17544023267c2330ae0611f614606a9f19af017753b4b4a540fd"
+    },
+    {
+      "path": "schemas/execution-profile.schema.json",
+      "bytes": 12553,
+      "sha256": "20942e59c8a4e99fc00bb82576dc062e44e3ee430664791c3b811891fabe270e"
+    },
+    {
+      "path": "schemas/fixture.schema.json",
+      "bytes": 33822,
+      "sha256": "8a9b9c2190d54311252f0fe64645f9e77f5eaad02cfdcb38c50ee89f2a4697b2"
+    },
+    {
+      "path": "schemas/lifecycle.schema.json",
+      "bytes": 29616,
+      "sha256": "00008271cee301812c30a0ee8144287c9ecead9172d5dba6e3a41fea711ca017"
+    },
+    {
+      "path": "schemas/model.schema.json",
+      "bytes": 38976,
+      "sha256": "868271f3fd8dbfb3679ebd26a547d7e4d07c336796da5a9406fba3c9406da96c"
+    },
+    {
+      "path": "schemas/negotiation.schema.json",
+      "bytes": 10137,
+      "sha256": "e1a219edf88bb4f689e71b7524b28868b04ab67c02314cd77513f60e2153c3f5"
+    },
+    {
+      "path": "schemas/primitives.schema.json",
+      "bytes": 7466,
+      "sha256": "2b68501c8251c2a6d96f1ec3a81deb8b83b7188f63c2fb81b1b19b3614b6084d"
+    },
+    {
+      "path": "schemas/result.schema.json",
+      "bytes": 22655,
+      "sha256": "75dc2a3b6568a2f3820002922fe30cb2ea81954c98d696dee4271510412d31e9"
+    },
+    {
+      "path": "schemas/status.schema.json",
+      "bytes": 12107,
+      "sha256": "bebeda006f0a9fbd69a78c8302dbaaa69b6a993d5ba7e8fbc1e7eaf47ef1a00e"
+    },
+    {
+      "path": "schemas/work.schema.json",
+      "bytes": 28669,
+      "sha256": "5711cca7d1ec4e77995e79270d509956006e8afde3820146f8c09ca42ebee1f3"
+    }
+  ],
+  "bundle_digest": "5800dbae670b0cff7eb4c9e7b82572ccf81866d63afb0ca0f36490aa54b7ecdb"
+}

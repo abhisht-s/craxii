@@ -11,6 +11,9 @@ default = []
 test-failpoints = []
 
 [dependencies]
+aws-lc-rs = "1.18.1"
+base64 = "0.22.1"
+jsonschema = { version = "0.58.6", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "matched-path", "query", "tokio", "tracing", "ws"] }
 getrandom = { version = "0.4", default-features = false }
 nix = { version = "0.31", default-features = false, features = ["fs", "process", "signal", "term"] }

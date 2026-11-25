@@ -1,0 +1,11 @@
+#!/bin/sh
+# Run only inside a newly created, credential-free local VM. Never a founder/customer host.
+set -eu
+[ "$(id -u)" = 0 ] || exit 1
+[ -f /etc/craxii-v001-fixture ] && [ ! -L /etc/craxii-v001-fixture ] || exit 1
+[ "$(cat /etc/craxii-v001-fixture)" = craxii-v001-guest-boundary-disposable ] || exit 1
+[ "$(cat /sys/class/dmi/id/sys_vendor)" = QEMU ] || exit 1
+[ -f /etc/craxii-v001-fixture-instance ] && [ ! -L /etc/craxii-v001-fixture-instance ] || exit 1
+[ "$(cat /sys/class/dmi/id/product_uuid)" = "$(cat /etc/craxii-v001-fixture-instance)" ] || exit 1
+cd "$(dirname "$0")/.."
+exec /usr/bin/python3 scripts/support/v001_guest_boundary.py

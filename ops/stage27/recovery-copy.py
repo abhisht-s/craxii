@@ -28,7 +28,7 @@ SERVICE = "craxii-server.service"
 DATABASE_RELATIVE = pathlib.Path("db/craxii.sqlite3")
 LOCK_RELATIVE = pathlib.Path("locks/craxii.lock")
 MIN_SUPPORTED_SCHEMA_VERSION = 5
-SCHEMA_CEILING = 7
+SCHEMA_CEILING = 10
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MIGRATIONS = ROOT / "backend" / "migrations"
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
@@ -265,6 +265,14 @@ def _validate_migrations(connection: sqlite3.Connection) -> tuple[int, tuple[Mig
     _require(
         ("outbound_deliveries" in tables) == (schema_version >= 7),
         "delivery schema does not match migration history",
+    )
+    _require(
+        ("distribution_receipts" in tables) == (schema_version >= 8),
+        "distribution receipt schema does not match migration history",
+    )
+    _require(
+        ("distribution_results" in tables) == (schema_version >= 9),
+        "distribution result schema does not match migration history",
     )
     return schema_version, tuple(records)
 

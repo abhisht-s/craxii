@@ -1,0 +1,356 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:negotiation",
+  "title": "Craxii distribution negotiation",
+  "definitions": {
+    "Hello": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "hello",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "release_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9._-]+$",
+              "format": "craxii_utf8_128"
+            },
+            "release_sha256": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "supported_versions": {
+              "type": "array",
+              "items": {
+                "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/AdvertisedVersion"
+              },
+              "minItems": 1,
+              "maxItems": 8,
+              "uniqueItems": true
+            },
+            "capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "admission_v1",
+                  "cancel_v1",
+                  "result_v1",
+                  "status_v1",
+                  "drain_v1",
+                  "compute_v1",
+                  "model_v1",
+                  "signed_request_v1"
+                ]
+              },
+              "minItems": 0,
+              "maxItems": 32,
+              "uniqueItems": true
+            },
+            "canonicalization_versions": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "craxii.cjson/1"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 4,
+              "uniqueItems": true
+            },
+            "signature_versions": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "craxii.signature/1"
+                ]
+              },
+              "minItems": 1,
+              "maxItems": 4,
+              "uniqueItems": true
+            },
+            "sqlite_schema": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "runtime_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            }
+          },
+          "required": [
+            "release_id",
+            "release_sha256",
+            "supported_versions",
+            "capabilities",
+            "canonicalization_versions",
+            "signature_versions",
+            "sqlite_schema",
+            "boot_id",
+            "runtime_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "SelectedProtocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "selected_protocol",
+          "type": "string"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "selected_version": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+            },
+            "canonicalization_version": {
+              "const": "craxii.cjson/1",
+              "type": "string"
+            },
+            "signature_version": {
+              "const": "craxii.signature/1",
+              "type": "string"
+            },
+            "required_capabilities": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "admission_v1",
+                  "cancel_v1",
+                  "result_v1",
+                  "status_v1",
+                  "drain_v1",
+                  "compute_v1",
+                  "model_v1",
+                  "signed_request_v1"
+                ]
+              },
+              "minItems": 0,
+              "maxItems": 32,
+              "uniqueItems": true
+            },
+            "server_time": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "max_poll_wait_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 20000
+            },
+            "selection_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "selected_version",
+            "canonicalization_version",
+            "signature_version",
+            "required_capabilities",
+            "server_time",
+            "max_poll_wait_ms",
+            "selection_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    },
+    "ProtocolRejection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "protocol_rejection",
+          "type": "string"
+        },
+        "error": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_contract",
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "unsupported_version",
+                  "type": "string"
+                },
+                "disposition": {
+                  "const": "reject",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "disposition"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_contract",
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "unsupported_canonicalization",
+                  "type": "string"
+                },
+                "disposition": {
+                  "const": "reject",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "disposition"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_contract",
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "unsupported_signature",
+                  "type": "string"
+                },
+                "disposition": {
+                  "const": "reject",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "disposition"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_contract",
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "unsupported_capability",
+                  "type": "string"
+                },
+                "disposition": {
+                  "const": "reject",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "disposition"
+              ]
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "code": {
+                  "const": "invalid_contract",
+                  "type": "string"
+                },
+                "reason": {
+                  "const": "schema_invalid",
+                  "type": "string"
+                },
+                "disposition": {
+                  "const": "reject",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "code",
+                "reason",
+                "disposition"
+              ]
+            }
+          ]
+        },
+        "supported_versions": {
+          "type": "array",
+          "items": {
+            "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/AdvertisedVersion"
+          },
+          "minItems": 1,
+          "maxItems": 8,
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "type",
+        "error"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:negotiation#/definitions/Hello"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:negotiation#/definitions/SelectedProtocol"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:negotiation#/definitions/ProtocolRejection"
+    }
+  ]
+}

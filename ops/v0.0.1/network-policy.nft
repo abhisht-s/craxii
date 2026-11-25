@@ -1,0 +1,6 @@
+# Generated atomically from the validated guest config by security-boundary.py.
+# Root owns the inet craxii_guest table. Numeric UIDs/CIDRs are strictly typed.
+# IPv4 and IPv6 metadata/private-network denial applies outside service cgroups too.
+# Tool UID997 is denied FIB local/broadcast/multicast delivery, lo output and link-local
+# service ranges. Multicast is unavailable; approved non-local unicast TCP/UDP remains.
+# Installed verification compares canonical nft JSON rules, not this comment/template.

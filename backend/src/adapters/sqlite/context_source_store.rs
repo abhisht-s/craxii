@@ -544,7 +544,10 @@ mod tests {
                     diagnostic_pid: Some(DiagnosticPid::try_new(101).unwrap()),
                     package_version: PackageVersion::try_new("0.0.1").unwrap(),
                     git_revision: GitRevision::try_new("ch3-context").unwrap(),
-                    schema_version: SchemaVersion::try_new(7).unwrap(),
+                    schema_version: SchemaVersion::try_new(
+                        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64,
+                    )
+                    .unwrap(),
                     started_at: timestamp(T0),
                 }),
                 event_id: JournalEventId::generate(),
@@ -1345,6 +1348,10 @@ async fn message_source_from_event(
 ) -> Result<ContextMessageSource, ContextSourceStoreError> {
     let event = decode_event_row(event_row).map_err(|_| corrupt())?;
     enum AcceptedOrigin {
+        DistributionV3 {
+            author_user_id: crate::domain::UserId,
+            receipt_id: crate::domain::JournalEventId,
+        },
         V1 {
             device_id: crate::domain::DeviceId,
             client_message_id: crate::domain::ClientMessageId,
@@ -1370,8 +1377,15 @@ async fn message_source_from_event(
                 client_message_id: value.client_message_id.ok_or_else(corrupt)?,
             },
         ),
-        JournalEventPayload::MessageAcceptedV2(value) => {
+        JournalEventPayload::MessageAcceptedV2(value)
+        | JournalEventPayload::MessageAcceptedV3(value) => {
             let origin = match value.origin {
+                crate::domain::MessageAcceptedOriginV2::Distribution { receipt_id } => {
+                    AcceptedOrigin::DistributionV3 {
+                        author_user_id: value.author_user_id,
+                        receipt_id,
+                    }
+                }
                 crate::domain::MessageAcceptedOriginV2::Native {
                     device_id,
                     client_message_id,
@@ -1407,6 +1421,13 @@ async fn message_source_from_event(
             .ok_or_else(missing)?;
     let message = decode_message_row(&message_row).map_err(|_| corrupt())?;
     let provenance_matches = match origin {
+        AcceptedOrigin::DistributionV3 {
+            author_user_id,
+            receipt_id,
+        } => {
+            message.author_user_id() == Some(author_user_id)
+                && message.distribution_receipt_id() == Some(receipt_id)
+        }
         AcceptedOrigin::V1 {
             device_id,
             client_message_id,

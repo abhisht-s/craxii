@@ -1,0 +1,509 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:accounting",
+  "title": "Craxii distribution accounting",
+  "definitions": {
+    "EntitlementPeriod": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "starts_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "ends_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "authorization_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "currency": {
+              "const": "USD",
+              "type": "string"
+            },
+            "kind": {
+              "const": "trial",
+              "type": "string"
+            },
+            "compute_allowance_seconds": {
+              "const": "43200",
+              "type": "string"
+            },
+            "model_allowance_usd_micros": {
+              "const": "5000000",
+              "type": "string"
+            },
+            "policy_decision_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "period_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_evidence_id",
+            "starts_at",
+            "ends_at",
+            "revision",
+            "authorization_epoch",
+            "currency",
+            "kind",
+            "compute_allowance_seconds",
+            "model_allowance_usd_micros",
+            "policy_decision_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "starts_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "ends_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "authorization_epoch": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "currency": {
+              "const": "USD",
+              "type": "string"
+            },
+            "kind": {
+              "const": "paid",
+              "type": "string"
+            },
+            "compute_allowance_seconds": {
+              "const": "648000",
+              "type": "string"
+            },
+            "model_allowance_usd_micros": {
+              "const": "20000000",
+              "type": "string"
+            }
+          },
+          "required": [
+            "period_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_evidence_id",
+            "starts_at",
+            "ends_at",
+            "revision",
+            "authorization_epoch",
+            "currency",
+            "kind",
+            "compute_allowance_seconds",
+            "model_allowance_usd_micros"
+          ]
+        }
+      ]
+    },
+    "BillingEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "evidence_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "billable_period_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "provider_namespace": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "format": "craxii_utf8_64"
+        },
+        "provider_event_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "format": "craxii_utf8_512"
+        },
+        "currency": {
+          "const": "USD",
+          "type": "string"
+        },
+        "minor_units": {
+          "const": "4900",
+          "type": "string"
+        },
+        "scale": {
+          "const": 2,
+          "type": "integer"
+        },
+        "evidence_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "provenance": {
+          "type": "string",
+          "enum": [
+            "provider_signature",
+            "provider_query"
+          ]
+        },
+        "observed_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "starts_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        },
+        "ends_at": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "customer_id",
+        "billable_period_id",
+        "environment",
+        "provider_namespace",
+        "provider_event_id",
+        "currency",
+        "minor_units",
+        "scale",
+        "evidence_digest",
+        "provenance",
+        "observed_at",
+        "starts_at",
+        "ends_at"
+      ]
+    },
+    "EligibilityResult": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "decision": {
+              "const": "denied",
+              "type": "string"
+            },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "policy_unapproved",
+                "proof_missing",
+                "proof_expired",
+                "consent_required"
+              ]
+            }
+          },
+          "required": [
+            "decision",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "decision_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "policy_decision_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "proof_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "consent_receipt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "decision": {
+              "const": "eligible",
+              "type": "string"
+            },
+            "environment": {
+              "const": "development",
+              "type": "string"
+            },
+            "provenance": {
+              "const": "synthetic_test",
+              "type": "string"
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            }
+          },
+          "required": [
+            "decision_id",
+            "policy_decision_id",
+            "customer_id",
+            "proof_id",
+            "consent_receipt_id",
+            "decision",
+            "environment",
+            "provenance",
+            "issued_at",
+            "expires_at"
+          ]
+        }
+      ]
+    },
+    "SpendReservation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "amount_usd_micros": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "state": {
+              "type": "string",
+              "enum": [
+                "reserved",
+                "dispatch_intended",
+                "uncertain"
+              ]
+            }
+          },
+          "required": [
+            "reservation_id",
+            "period_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_operation_id",
+            "attempt_id",
+            "amount_usd_micros",
+            "revision",
+            "state"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "amount_usd_micros": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "state": {
+              "const": "settled",
+              "type": "string"
+            },
+            "settlement_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "actual_usd_micros": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            }
+          },
+          "required": [
+            "reservation_id",
+            "period_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_operation_id",
+            "attempt_id",
+            "amount_usd_micros",
+            "revision",
+            "state",
+            "settlement_id",
+            "evidence_id",
+            "actual_usd_micros"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "reservation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "period_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U7"
+            },
+            "amount_usd_micros": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "state": {
+              "const": "released",
+              "type": "string"
+            },
+            "release_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "reservation_id",
+            "period_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_operation_id",
+            "attempt_id",
+            "amount_usd_micros",
+            "revision",
+            "state",
+            "release_evidence_id"
+          ]
+        }
+      ]
+    },
+    "PriceCategory": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "format": "craxii_utf8_64"
+        },
+        "quantity": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "numerator": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+        },
+        "denominator": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "unit": {
+          "type": "string",
+          "enum": [
+            "token",
+            "request"
+          ]
+        },
+        "price_config_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "price_config_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        }
+      },
+      "required": [
+        "category",
+        "quantity",
+        "numerator",
+        "denominator",
+        "unit",
+        "price_config_id",
+        "price_config_digest"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/EntitlementPeriod"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/BillingEvidence"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/EligibilityResult"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/SpendReservation"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:accounting#/definitions/PriceCategory"
+    }
+  ]
+}

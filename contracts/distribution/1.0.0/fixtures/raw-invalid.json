@@ -1,0 +1,97 @@
+{
+  "fixture_version": 1,
+  "group": "raw-invalid",
+  "cases": [
+    {
+      "case_id": "raw.0",
+      "raw_utf8_hex": "7b2261223a312c2261223a327d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.1",
+      "raw_utf8_hex": "7b2261223a312c225c7530303631223a327d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.2",
+      "raw_utf8_hex": "7b226f75746572223a7b2261223a312c2261223a327d7d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.3",
+      "raw_utf8_hex": "7b226e223a2d307d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.4",
+      "raw_utf8_hex": "7b226e223a3165307d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.5",
+      "raw_utf8_hex": "7b226e223a312e307d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.6",
+      "raw_utf8_hex": "7b226e223a323134373438333634387d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.7",
+      "raw_utf8_hex": "7b226e223a393030373139393235343734303939337d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.8",
+      "raw_utf8_hex": "7b226e223a30317d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.9",
+      "raw_utf8_hex": "7b226e223a2d317d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.10",
+      "raw_utf8_hex": "7b2273223a225c7564383030227d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.11",
+      "raw_utf8_hex": "7b2273223a225c7564666666227d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.12",
+      "raw_utf8_hex": "7b22c3a9223a317d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.13",
+      "raw_utf8_hex": "7b7d20747261696c696e67",
+      "valid": false
+    },
+    {
+      "case_id": "raw.14",
+      "raw_utf8_hex": "5b747275652c5d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.bom",
+      "raw_utf8_hex": "efbbbf7b7d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.invalid_utf8",
+      "raw_utf8_hex": "7b2278223a22ff227d",
+      "valid": false
+    },
+    {
+      "case_id": "raw.valid_escapes",
+      "raw_utf8_hex": "7b202273223a20225c75643833645c7564653030222c20226e223a2030207d",
+      "valid": true,
+      "canonical_utf8_hex": "7b226e223a302c2273223a22f09f9880227d"
+    }
+  ]
+}

@@ -125,4 +125,19 @@ After focused checks pass, run the consolidated gate once:
 scripts/verify
 ```
 
-The gate checks Rust formatting/build/lints/tests, release failpoint exclusion, dependency policy, public repository structure and links, Markdown, and the native client on macOS.
+The server gate checks Rust formatting/build/lints/tests, release failpoint exclusion, dependency policy, public repository structure and links, and Markdown. Legacy native macOS UI smoke is excluded from this server scope; the separate historical client workflow remains outside it.
+
+## Distribution contract workflow
+
+`contracts/distribution/1.0.0/` is the authoritative public distribution bundle.
+It is independent of `backend/tests/fixtures/protocol-v1/` and the native runtime.
+The distribution library validates syntax and canonical bytes without composing
+a server, provider or identity service. Synthetic fixtures prove pure contracts;
+their contexts and public keys never grant deployment authority.
+
+Run `node scripts/check-distribution-contracts.mjs` and
+`cargo test --locked -p craxii-server --test distribution_contracts` while changing
+these contracts. Both implementations must evaluate the exact same bytes, hashes,
+signatures and state projections. Vendor consumers synchronize this whole directory
+including the integrity manifest, never independently edit its definitions.
+New wire semantics require explicit versioning and preserved older fixtures.

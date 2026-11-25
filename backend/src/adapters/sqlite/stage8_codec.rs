@@ -370,7 +370,7 @@ pub(super) fn encode_normalized_output(
     for item in &output.items {
         let stored = match item {
             NormalizedModelOutputItem::Text { text } => StoredNormalizedOutputItemV1::Text {
-                text: bounded_text(text, 65_536)?.to_owned(),
+                text: bounded_content_text(text, 65_536)?.to_owned(),
             },
             NormalizedModelOutputItem::ToolCall {
                 call_id,
@@ -392,11 +392,11 @@ pub(super) fn encode_normalized_output(
                 }
             }
             NormalizedModelOutputItem::Refusal { text } => StoredNormalizedOutputItemV1::Refusal {
-                text: bounded_text(text, 65_536)?.to_owned(),
+                text: bounded_content_text(text, 65_536)?.to_owned(),
             },
             NormalizedModelOutputItem::ReasoningSummary { text } => {
                 StoredNormalizedOutputItemV1::ReasoningSummary {
-                    text: bounded_text(text, 65_536)?.to_owned(),
+                    text: bounded_content_text(text, 65_536)?.to_owned(),
                 }
             }
             NormalizedModelOutputItem::ProviderOpaque {
@@ -440,7 +440,7 @@ pub(super) fn validate_normalized_output(
     for item in value.items {
         items.push(match item {
             StoredNormalizedOutputItemV1::Text { text } => NormalizedModelOutputItem::Text {
-                text: bounded_text(&text, 65_536)
+                text: bounded_content_text(&text, 65_536)
                     .map_err(|_| corrupt())?
                     .to_owned(),
             },
@@ -463,13 +463,13 @@ pub(super) fn validate_normalized_output(
                 NormalizedModelOutputItem::StructuredData { canonical_json }
             }
             StoredNormalizedOutputItemV1::Refusal { text } => NormalizedModelOutputItem::Refusal {
-                text: bounded_text(&text, 65_536)
+                text: bounded_content_text(&text, 65_536)
                     .map_err(|_| corrupt())?
                     .to_owned(),
             },
             StoredNormalizedOutputItemV1::ReasoningSummary { text } => {
                 NormalizedModelOutputItem::ReasoningSummary {
-                    text: bounded_text(&text, 65_536)
+                    text: bounded_content_text(&text, 65_536)
                         .map_err(|_| corrupt())?
                         .to_owned(),
                 }
@@ -1101,6 +1101,15 @@ fn decode_tool_result_class(value: &str) -> Result<ToolResultClass, SqliteAdapte
     }
 }
 
+// Model result text is Unicode scalar data, including escaped NUL. JSON encoding
+// preserves it safely; identifiers and diagnostic summaries retain their narrower rules.
+fn bounded_content_text(value: &str, maximum: usize) -> Result<&str, SqliteAdapterError> {
+    if !value.is_empty() && value.len() <= maximum {
+        Ok(value)
+    } else {
+        Err(invalid())
+    }
+}
 fn bounded_text(value: &str, maximum: usize) -> Result<&str, SqliteAdapterError> {
     if !value.is_empty() && value.len() <= maximum && !value.contains('\0') {
         Ok(value)

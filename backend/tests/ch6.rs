@@ -324,7 +324,10 @@ async fn ch6_admin_inspects_restart_delivery_states_without_payload_or_external_
             diagnostic_pid: Some(DiagnosticPid::try_new(std::process::id().into()).unwrap()),
             package_version: PackageVersion::try_new("0.0.1").unwrap(),
             git_revision: GitRevision::try_new("ch6-local").unwrap(),
-            schema_version: SchemaVersion::try_new(7).unwrap(),
+            schema_version: SchemaVersion::try_new(
+                craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64,
+            )
+            .unwrap(),
             started_at: T1.parse().unwrap(),
         }),
         0,
@@ -430,7 +433,10 @@ async fn ch6_admin_inspects_restart_delivery_states_without_payload_or_external_
             diagnostic_pid: Some(DiagnosticPid::try_new(std::process::id().into()).unwrap()),
             package_version: PackageVersion::try_new("0.0.1").unwrap(),
             git_revision: GitRevision::try_new("ch6-local").unwrap(),
-            schema_version: SchemaVersion::try_new(7).unwrap(),
+            schema_version: SchemaVersion::try_new(
+                craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64,
+            )
+            .unwrap(),
             started_at: T1.parse().unwrap(),
         }),
         0,

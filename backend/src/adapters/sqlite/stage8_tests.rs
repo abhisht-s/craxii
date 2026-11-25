@@ -185,7 +185,10 @@ async fn fixture_at(root: TestRoot) -> Fixture {
                 diagnostic_pid: Some(DiagnosticPid::try_new(42).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage8-test").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 started_at: T0.parse().unwrap(),
             }),
             event_id: JournalEventId::generate(),
@@ -4541,7 +4544,7 @@ async fn genuine_empty_v2_migrates_to_v7_without_changing_old_fingerprints() {
     );
     assert_eq!(
         super::schema::expected_schema_fingerprint(),
-        "8ed74572f4b786d60291ef64a8ef3b982fce7a3bf7df70e5b65efd9d7b2bf1c2"
+        "9d484df334845025b7b4bd72f89305c32441a64c269ac0d16ab7f5630fa74cb0"
     );
     migrated.shutdown().await;
 
@@ -4653,7 +4656,7 @@ async fn genuine_v5_writer_history_migrates_to_v7_without_journal_mutation() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        7
+        crate::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64
     );
     assert_eq!(
         sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
@@ -4826,7 +4829,10 @@ async fn create_stage10_recovery_runtime_with_evidence(
                 diagnostic_pid: Some(DiagnosticPid::try_new(84).unwrap()),
                 package_version: PackageVersion::try_new("0.0.1").unwrap(),
                 git_revision: GitRevision::try_new("stage10-recovery-test").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 started_at: T5.parse().unwrap(),
             }),
             event_id: started_event_id,
@@ -4866,7 +4872,10 @@ async fn append_stage10_recovery_summary(
                 cleanup_unconfirmed: recovery.cleanup_unconfirmed,
                 recovery_duration_ms: 0,
                 binary_version: PackageVersion::try_new("0.0.1").unwrap(),
-                schema_version: SchemaVersion::try_new(7).unwrap(),
+                schema_version: SchemaVersion::try_new(
+                    crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION,
+                )
+                .unwrap(),
                 recovered_at: T5.parse().unwrap(),
             },
             event_id: JournalEventId::generate(),
@@ -5717,4 +5726,99 @@ async fn crash_after_tool_process_exit_preserves_definite_observation_marker() {
 #[tokio::test]
 async fn crash_after_artifact_rename_recovers_and_reports_one_orphan() {
     verify_stage14_crash_window("after_artifact_rename_before_db_commit").await;
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn cancellation_drain_keeps_sqlite_preparation_owner_polled() {
+    use crate::application::scheduler::WorkRunnerExit;
+    let fixture = fixture().await;
+    make_fixture_journal_consistent(&fixture).await;
+    let (acquired, ready) = tokio::sync::oneshot::channel();
+    let (sender, mut receiver) = tokio::sync::watch::channel(false);
+    let preparing = async {
+        let mut tx = WriteTransaction::begin(&fixture.store.runtime, "begin_model_invocation")
+            .await
+            .unwrap();
+        sqlx::query("SELECT 1")
+            .execute(tx.connection())
+            .await
+            .unwrap();
+        acquired.send(()).unwrap();
+        // Stop is observed with the real BEGIN IMMEDIATE/coordinator still owned by this
+        // unspawned future. It must continue to be polled to release that transaction.
+        tokio::task::yield_now().await;
+        tx.commit().await.unwrap();
+        while !*receiver.borrow() {
+            receiver.changed().await.unwrap();
+        }
+        WorkRunnerExit::CancellationConfirmed
+    };
+    tokio::pin!(preparing);
+    tokio::select! {
+        biased;
+        r = ready => r.unwrap(),
+        _ = &mut preparing => panic!("preparation ended before stop observation"),
+    }
+    let cancellation = async {
+        let cancelled = fixture
+            .store
+            .request_owned_work_cancellation(RequestOwnedCancellationRequest {
+                runtime_id: fixture.runtime_id,
+                requested_at: T4.parse().unwrap(),
+            })
+            .await
+            .map_err(|_| "cancel_commit")?;
+        assert_eq!(cancelled, vec![fixture.work_id]);
+        sender.send_replace(true);
+        Ok(())
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::distribution::fixture::drain_runner(
+            &mut preparing,
+            cancellation,
+            tokio::time::Instant::now() + Duration::from_millis(200),
+        ),
+    )
+    .await;
+    assert_eq!(result, Ok(Ok(WorkRunnerExit::CancellationConfirmed)));
+    fixture
+        .store
+        .finish_cancellation(FinishCancellationRequest {
+            work_id: fixture.work_id,
+            runtime_id: fixture.runtime_id,
+            confirmed_at: T5.parse().unwrap(),
+            event_id: JournalEventId::generate(),
+        })
+        .await
+        .unwrap();
+    let mut connection = fixture.store.runtime.acquire().await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM work_items WHERE work_id=?")
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(state, "cancelled");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_invocations WHERE work_id=?")
+        .bind(fixture.work_id.to_string())
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[cfg(feature = "test-failpoints")]
+#[tokio::test]
+async fn cancellation_write_wait_is_inside_original_drain_deadline() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::distribution::fixture::drain_runner(
+            std::future::pending(),
+            std::future::pending(),
+            tokio::time::Instant::now() + Duration::from_millis(30),
+        ),
+    )
+    .await;
+    assert_eq!(result, Ok(Err("drain_timeout")));
 }

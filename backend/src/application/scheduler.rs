@@ -45,6 +45,11 @@ pub struct WorkCancellation {
 }
 
 impl WorkCancellation {
+    #[cfg(all(feature = "test-failpoints", debug_assertions))]
+    pub fn isolated_fixture(receiver: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self { receiver }
+    }
+
     #[must_use]
     pub fn is_requested(&self) -> bool {
         *self.receiver.borrow()

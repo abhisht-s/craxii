@@ -1,0 +1,931 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:lifecycle",
+  "title": "Craxii distribution lifecycle",
+  "definitions": {
+    "DrainRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "drain_request",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drain_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "lifecycle_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "resource_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "ingress_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "reason": {
+              "type": "string",
+              "enum": [
+                "idle",
+                "budget",
+                "backup",
+                "update",
+                "replace"
+              ]
+            },
+            "issued_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "expires_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            }
+          },
+          "required": [
+            "drain_id",
+            "lifecycle_operation_id",
+            "power_operation_id",
+            "resource_revision",
+            "ingress_revision",
+            "boot_id",
+            "reason",
+            "issued_at",
+            "expires_at"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "DrainAck": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "drain_ack",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drain_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "lifecycle_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "resource_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "ingress_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "drain_token": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "local_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "claims_closed": {
+              "type": "boolean"
+            },
+            "quiescent": {
+              "type": "boolean"
+            },
+            "active_work_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "queued_work_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "pending_receipt_ack_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "pending_export_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "descendant_count": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "uncommitted_state": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "drain_id",
+            "lifecycle_operation_id",
+            "power_operation_id",
+            "resource_revision",
+            "ingress_revision",
+            "boot_id",
+            "drain_token",
+            "local_revision",
+            "claims_closed",
+            "quiescent",
+            "active_work_count",
+            "queued_work_count",
+            "pending_receipt_ack_count",
+            "pending_export_count",
+            "descendant_count",
+            "uncommitted_state"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "DrainCancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "drain_cancel",
+          "type": "string"
+        },
+        "request_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "authority": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Authority"
+        },
+        "body": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "drain_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "lifecycle_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "power_operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "resource_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "ingress_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/D0"
+            },
+            "boot_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            }
+          },
+          "required": [
+            "drain_id",
+            "lifecycle_operation_id",
+            "power_operation_id",
+            "resource_revision",
+            "ingress_revision",
+            "boot_id"
+          ]
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "request_id",
+        "environment",
+        "authority",
+        "body"
+      ]
+    },
+    "PowerProjection": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "power_operation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "resource_revision": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "desired_power": {
+          "type": "string",
+          "enum": [
+            "running",
+            "stopped",
+            "quarantined"
+          ]
+        },
+        "observed_power": {
+          "type": "string",
+          "enum": [
+            "unknown",
+            "pending",
+            "running",
+            "stopping",
+            "stopped",
+            "terminated"
+          ]
+        },
+        "boot_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+        },
+        "readiness": {
+          "type": "string",
+          "enum": [
+            "unready",
+            "storage_ready",
+            "acceptance_ready",
+            "operational_ready",
+            "draining",
+            "degraded"
+          ]
+        },
+        "disposition": {
+          "type": "string",
+          "enum": [
+            "pending",
+            "delayed",
+            "degraded",
+            "support_needed",
+            "normal"
+          ]
+        }
+      },
+      "required": [
+        "customer_id",
+        "logical_agent_id",
+        "installation_id",
+        "generation",
+        "power_operation_id",
+        "resource_revision",
+        "desired_power",
+        "observed_power",
+        "readiness",
+        "disposition"
+      ]
+    },
+    "DurableJobInput": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "environment": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Environment"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "obligation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "intent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "job_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "resource_scope_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "step": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "format": "craxii_utf8_64"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-z][a-z0-9_]*$",
+          "format": "craxii_utf8_64"
+        },
+        "contract_version": {
+          "const": 1,
+          "type": "integer"
+        },
+        "request_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        }
+      },
+      "required": [
+        "environment",
+        "customer_id",
+        "obligation_id",
+        "intent_id",
+        "job_id",
+        "resource_scope_id",
+        "step",
+        "kind",
+        "contract_version",
+        "request_digest"
+      ]
+    },
+    "ResourceAuthority": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resource_scope_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "resource_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "resource_scope_id",
+            "operation_id",
+            "resource_revision"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "resource_scope_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "resource_revision": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "origin_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "job_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "job_attempt_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "job_fence": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "resource_fence": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            }
+          },
+          "required": [
+            "resource_scope_id",
+            "operation_id",
+            "resource_revision",
+            "job_id",
+            "job_attempt_id",
+            "job_fence",
+            "resource_fence"
+          ]
+        }
+      ]
+    },
+    "ExpectedCloudInstance": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "expectation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "installation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "logical_agent_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "customer_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "launch_operation_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "expected_disk_lineage_id": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+        },
+        "generation": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+        },
+        "provider": {
+          "const": "aws",
+          "type": "string"
+        },
+        "account_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "format": "craxii_utf8_128"
+        },
+        "region": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "format": "craxii_utf8_32"
+        },
+        "availability_zone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "format": "craxii_utf8_32"
+        },
+        "instance_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "format": "craxii_utf8_512"
+        },
+        "ami_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "format": "craxii_utf8_512"
+        },
+        "data_volume_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "format": "craxii_utf8_512"
+        },
+        "expected_config_digest": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+        }
+      },
+      "required": [
+        "expectation_id",
+        "installation_id",
+        "logical_agent_id",
+        "customer_id",
+        "launch_operation_id",
+        "expected_disk_lineage_id",
+        "generation",
+        "provider",
+        "account_id",
+        "region",
+        "availability_zone",
+        "instance_id",
+        "ami_id",
+        "data_volume_id",
+        "expected_config_digest"
+      ]
+    },
+    "BackupLineage": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_disk_lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "sqlite_schema": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "provider": {
+              "const": "aws",
+              "type": "string"
+            },
+            "account_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "region": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "availability_zone": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "source_volume_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "craxii_utf8_512"
+            },
+            "filesystem_uuid": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "agent_release_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "agent_release_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "contract_bundle_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "phase": {
+              "const": "pending",
+              "type": "string"
+            }
+          },
+          "required": [
+            "lineage_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_installation_id",
+            "source_disk_lineage_id",
+            "operation_id",
+            "source_generation",
+            "sqlite_schema",
+            "provider",
+            "account_id",
+            "region",
+            "availability_zone",
+            "source_volume_id",
+            "filesystem_uuid",
+            "agent_release_id",
+            "agent_release_digest",
+            "contract_bundle_digest",
+            "phase"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_disk_lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "sqlite_schema": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "provider": {
+              "const": "aws",
+              "type": "string"
+            },
+            "account_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "region": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "availability_zone": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "source_volume_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "craxii_utf8_512"
+            },
+            "filesystem_uuid": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "agent_release_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "agent_release_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "contract_bundle_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "phase": {
+              "const": "available",
+              "type": "string"
+            },
+            "snapshot_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "craxii_utf8_512"
+            },
+            "captured_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "consistency_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "completion_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "lineage_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_installation_id",
+            "source_disk_lineage_id",
+            "operation_id",
+            "source_generation",
+            "sqlite_schema",
+            "provider",
+            "account_id",
+            "region",
+            "availability_zone",
+            "source_volume_id",
+            "filesystem_uuid",
+            "agent_release_id",
+            "agent_release_digest",
+            "contract_bundle_digest",
+            "phase",
+            "snapshot_id",
+            "captured_at",
+            "consistency_evidence_id",
+            "completion_evidence_id"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "customer_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "logical_agent_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_installation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_disk_lineage_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "source_generation": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "sqlite_schema": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Dp"
+            },
+            "provider": {
+              "const": "aws",
+              "type": "string"
+            },
+            "account_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "region": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "availability_zone": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 32,
+              "format": "craxii_utf8_32"
+            },
+            "source_volume_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "craxii_utf8_512"
+            },
+            "filesystem_uuid": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Uuid"
+            },
+            "agent_release_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "format": "craxii_utf8_128"
+            },
+            "agent_release_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "contract_bundle_digest": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Digest"
+            },
+            "phase": {
+              "const": "restore_verified",
+              "type": "string"
+            },
+            "snapshot_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "format": "craxii_utf8_512"
+            },
+            "captured_at": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Timestamp"
+            },
+            "consistency_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "completion_evidence_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "restore_verification_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            }
+          },
+          "required": [
+            "lineage_id",
+            "customer_id",
+            "logical_agent_id",
+            "source_installation_id",
+            "source_disk_lineage_id",
+            "operation_id",
+            "source_generation",
+            "sqlite_schema",
+            "provider",
+            "account_id",
+            "region",
+            "availability_zone",
+            "source_volume_id",
+            "filesystem_uuid",
+            "agent_release_id",
+            "agent_release_digest",
+            "contract_bundle_digest",
+            "phase",
+            "snapshot_id",
+            "captured_at",
+            "consistency_evidence_id",
+            "completion_evidence_id",
+            "restore_verification_id"
+          ]
+        }
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/DrainRequest"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/DrainAck"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/DrainCancel"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/PowerProjection"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/DurableJobInput"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/ResourceAuthority"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/ExpectedCloudInstance"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:lifecycle#/definitions/BackupLineage"
+    }
+  ]
+}

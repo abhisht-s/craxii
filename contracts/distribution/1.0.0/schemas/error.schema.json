@@ -1,0 +1,1417 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:craxii:distribution:1.0.0:error",
+  "title": "Craxii distribution error",
+  "definitions": {
+    "SafeError": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "invalid_contract",
+              "type": "string"
+            },
+            "reason": {
+              "const": "schema_invalid",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "invalid_contract",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unsupported_version",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "invalid_contract",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unsupported_canonicalization",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "invalid_contract",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unsupported_signature",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "invalid_contract",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unsupported_capability",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unauthenticated",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reauthenticate",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "session_expired",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reauthenticate",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "unauthorized_scope",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "customer_mismatch",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "installation_mismatch",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "stale_generation",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "ownership_denied",
+              "type": "string"
+            },
+            "reason": {
+              "const": "revoked_authority",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "lease_lost",
+              "type": "string"
+            },
+            "reason": {
+              "const": "stale_lease",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "lease_lost",
+              "type": "string"
+            },
+            "reason": {
+              "const": "stale_resource_fence",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "lease_lost",
+              "type": "string"
+            },
+            "reason": {
+              "const": "stale_resource_revision",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "operation_identity_conflict",
+              "type": "string"
+            },
+            "reason": {
+              "const": "digest_conflict",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "operation_identity_conflict",
+              "type": "string"
+            },
+            "reason": {
+              "const": "result_conflict",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "operation_identity_conflict",
+              "type": "string"
+            },
+            "reason": {
+              "const": "result_revision_invalid",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "outcome_unknown",
+              "type": "string"
+            },
+            "reason": {
+              "const": "provider_effect_unknown",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "outcome_unknown",
+              "type": "string"
+            },
+            "reason": {
+              "const": "reconciliation_required",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "outcome_unknown",
+              "type": "string"
+            },
+            "reason": {
+              "const": "restored_interval_missing",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reconcile",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "database_busy",
+              "type": "string"
+            },
+            "reason": {
+              "const": "backend_unavailable",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "retry_same_identity",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "database_busy",
+              "type": "string"
+            },
+            "reason": {
+              "const": "temporary_failure",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "retry_same_identity",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "support_needed",
+              "type": "string"
+            },
+            "reason": {
+              "const": "manual_resolution",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "support",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "compute_budget_exhausted",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "model_budget_unavailable",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "entitlement_expired",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "policy_unapproved",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "proof_missing",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "proof_expired",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "consent_required",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "compute_authorization_expired",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "authorization_epoch_stale",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "dispatch_disabled",
+              "type": "string"
+            },
+            "reason": {
+              "const": "terminal_cancellation",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "terminal",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "retry_exhausted",
+              "type": "string"
+            },
+            "reason": {
+              "const": "attempt_budget_exhausted",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "support",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "not_found",
+              "type": "string"
+            },
+            "reason": {
+              "const": "not_found",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "reject",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "const": "schema_incompatible",
+              "type": "string"
+            },
+            "reason": {
+              "const": "schema_incompatible",
+              "type": "string"
+            },
+            "disposition": {
+              "const": "hold",
+              "type": "string"
+            },
+            "request_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "operation_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "work_id": {
+              "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/U4"
+            },
+            "retry_after_ms": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 30000
+            }
+          },
+          "required": [
+            "code",
+            "reason",
+            "disposition"
+          ]
+        }
+      ]
+    },
+    "Error": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "protocol": {
+          "const": "craxii.worker",
+          "type": "string"
+        },
+        "version": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Version"
+        },
+        "type": {
+          "const": "error",
+          "type": "string"
+        },
+        "body": {
+          "$ref": "urn:craxii:distribution:1.0.0:error#/definitions/SafeError"
+        },
+        "extensions": {
+          "$ref": "urn:craxii:distribution:1.0.0:primitives#/definitions/Extensions"
+        }
+      },
+      "required": [
+        "protocol",
+        "version",
+        "type",
+        "body"
+      ]
+    }
+  },
+  "anyOf": [
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:error#/definitions/Error"
+    },
+    {
+      "$ref": "urn:craxii:distribution:1.0.0:error#/definitions/SafeError"
+    }
+  ]
+}

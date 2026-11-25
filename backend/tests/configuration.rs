@@ -91,7 +91,7 @@ fn compatibility_constants_are_exact() {
     assert_eq!(ARCHITECTURE_VERSION, "V0.0.01");
     assert_eq!(PROTOCOL_VERSION, 1);
     assert_eq!(CONFIGURATION_VERSION, 1);
-    assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 7);
+    assert_eq!(MAX_SUPPORTED_SCHEMA_VERSION, 10);
 }
 
 #[test]

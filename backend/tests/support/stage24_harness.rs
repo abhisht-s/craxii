@@ -2802,7 +2802,10 @@ async fn assert_persistence_contract(
 ) -> PersistedSummary {
     let data = &export["data"];
     let preflight = &data["preflight"];
-    assert_eq!(preflight["schema_version"], 7);
+    assert_eq!(
+        preflight["schema_version"],
+        craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION
+    );
     assert_eq!(preflight["database_disposition"], "current");
     assert_eq!(preflight["work_count"], 2);
     assert_eq!(preflight["runtime_count"], 2);
@@ -3168,15 +3171,9 @@ async fn assert_sqlite_contract(database: &Path) {
             .iter()
             .map(|row| (row.get::<i64, _>("version"), row.get::<bool, _>("success")))
             .collect::<Vec<_>>(),
-        [
-            (1, true),
-            (2, true),
-            (3, true),
-            (4, true),
-            (5, true),
-            (6, true),
-            (7, true),
-        ]
+        (1..=craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION as i64)
+            .map(|version| (version, true))
+            .collect::<Vec<_>>()
     );
     let mut migration_files: Vec<String> =
         fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
@@ -3194,6 +3191,9 @@ async fn assert_sqlite_contract(database: &Path) {
             "0005_tool_terminal_outcome_evidence.sql",
             "0006_chat_channel_identity_and_ingress.sql",
             "0007_durable_channel_delivery.sql",
+            "0008_distribution_receipts.sql",
+            "0009_distribution_results.sql",
+            "0010_production_environment.sql",
         ]
     );
 }

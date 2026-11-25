@@ -1,0 +1,10 @@
+[Unit]
+Description=Craxii fixed watchdog failure poweroff
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/systemctl --no-block poweroff
+TimeoutStartSec=5s
+StandardOutput=null
+StandardError=null

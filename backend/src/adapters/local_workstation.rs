@@ -75,11 +75,86 @@ pub struct LocalWorkstation {
     capabilities: WorkstationCapabilities,
     clock: Arc<dyn Clock>,
     execution: Arc<ExecutionRuntime>,
+    guest_config: Option<crate::guest_boundary::config::GuestConfig>,
     #[cfg(test)]
     read_hook: Option<ReadHook>,
 }
 
 impl LocalWorkstation {
+    /// Installed distributed composition. Historical native and credential-free callers keep `new`.
+    /// This grants no scheduler/compute/model authority.
+    pub fn new_installed(
+        workstation: &WorkstationIdentity,
+        workspace: &WorkspaceIdentity,
+        options: LocalWorkstationOptions,
+    ) -> Result<Self, WorkstationError> {
+        crate::guest_boundary::storage::harden_worker_process()
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        let c = crate::guest_boundary::storage::load_installed()
+            .and_then(|c| {
+                crate::guest_boundary::storage::verify_installed(&c)?;
+                Ok(c)
+            })
+            .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        if options.administrative_enabled
+            || options.credential_free_direct_execution
+            || options.default_shell.canonical() != "/bin/bash"
+            || options.user_switch_launcher.as_deref()
+                != Some(Path::new("/opt/craxii/current/craxii-workstation-launcher"))
+            || options.configured_workspace_root
+                != Path::new(crate::guest_boundary::storage::WORKSPACE)
+            || options.delegated_cgroup_root.as_deref()
+                != Some(Path::new(crate::guest_boundary::storage::TOOLS_CGROUP))
+        {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
+        let mut adapter = Self::new(workstation, workspace, options)?;
+        adapter.guest_config = Some(c);
+        #[cfg(target_os = "linux")]
+        adapter.execution.require_compute();
+        Ok(adapter)
+    }
+    /// Only the owned debug Stage 13 regression fixture may inspect unchanged security
+    /// primitives without claiming customer execution or budget acceptance.
+    #[cfg(all(target_os = "linux", feature = "test-failpoints", debug_assertions))]
+    pub fn isolated_unmetered_installed(
+        workstation: &WorkstationIdentity,
+        workspace: &WorkspaceIdentity,
+        options: LocalWorkstationOptions,
+    ) -> Result<Self, WorkstationError> {
+        let adapter = Self::new_installed(workstation, workspace, options)?;
+        adapter.execution.isolated_unmetered();
+        Ok(adapter)
+    }
+    #[cfg(target_os = "linux")]
+    pub fn with_compute_permit(
+        self,
+        permit: crate::compute::worker::WorkPermit,
+    ) -> Result<Self, WorkstationError> {
+        if self.guest_config.is_none() {
+            return Err(WorkstationError::new(
+                WorkstationErrorKind::UnsupportedCapability,
+            ));
+        }
+        self.execution.attach_compute(permit)?;
+        Ok(self)
+    }
+    pub fn execution_observation(&self) -> crate::guest_boundary::ExecutionBoundaryObservation {
+        self.execution.observe_boundary()
+    }
+    fn check_guest(&self) -> Result<(), WorkstationError> {
+        #[cfg(target_os = "linux")]
+        self.execution.prepare_compute()?;
+        if let Some(c) = &self.guest_config {
+            crate::guest_boundary::storage::verify_installed(c)
+                .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+            crate::guest_boundary::storage::pressure()
+                .map_err(|_| WorkstationError::new(WorkstationErrorKind::UnsupportedCapability))?;
+        }
+        Ok(())
+    }
     /// Binds verified durable identity to one explicit configured local workspace root.
     pub fn new(
         workstation: &WorkstationIdentity,
@@ -175,6 +250,7 @@ impl LocalWorkstation {
             capabilities,
             clock,
             execution,
+            guest_config: None,
             #[cfg(test)]
             read_hook: None,
         })
@@ -649,7 +725,8 @@ impl Workstation for LocalWorkstation {
     fn read_file(&self, request: FileReadRequest) -> WorkstationFuture<'_, FileReadResult> {
         let identity = self
             .validate_identity(request.workstation_id, request.expected_generation)
-            .and_then(|()| self.validate_workspace(request.workspace_id));
+            .and_then(|()| self.validate_workspace(request.workspace_id))
+            .and_then(|()| self.check_guest());
         if let Err(error) = identity {
             return Box::pin(async move { Err(error) });
         }
@@ -709,7 +786,8 @@ impl Workstation for LocalWorkstation {
         let execution_id = request.execution_id;
         let validation = self
             .validate_identity(request.workstation_id, request.expected_generation)
-            .and_then(|()| self.validate_workspace(request.workspace_id));
+            .and_then(|()| self.validate_workspace(request.workspace_id))
+            .and_then(|()| self.check_guest());
         if let Err(error) = validation {
             return Box::pin(async move { Err(error) });
         }
@@ -835,6 +913,7 @@ impl WorkstationPreparation for LocalWorkstation {
         let validation = self
             .validate_identity(request.workstation_id, request.expected_generation)
             .and_then(|()| self.validate_workspace(request.workspace_id))
+            .and_then(|()| self.check_guest())
             .and_then(|()| {
                 let flags = self.capabilities.flags();
                 let capability_available = match request.required_capability {

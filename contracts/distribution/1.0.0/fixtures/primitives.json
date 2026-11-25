@@ -1,0 +1,516 @@
+{
+  "fixture_version": 1,
+  "group": "primitives",
+  "cases": [
+    {
+      "case_id": "primitive.u4.0",
+      "primitive": "U4",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u4.1",
+      "primitive": "U4",
+      "value": "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c01",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u4.2",
+      "primitive": "U4",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u4.3",
+      "primitive": "U4",
+      "value": "00000000-0000-0000-0000-000000000000",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u4.4",
+      "primitive": "U4",
+      "value": "11111111-1111-4111-0111-111111111101",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u7.5",
+      "primitive": "U7",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u7.6",
+      "primitive": "U7",
+      "value": "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c01",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u7.7",
+      "primitive": "U7",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u7.8",
+      "primitive": "U7",
+      "value": "00000000-0000-0000-0000-000000000000",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u7.9",
+      "primitive": "U7",
+      "value": "11111111-1111-4111-0111-111111111101",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.uuid.10",
+      "primitive": "Uuid",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.uuid.11",
+      "primitive": "Uuid",
+      "value": "01890f6c-7b3a-7cc0-98f1-2e6f7a8b9c01",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.uuid.12",
+      "primitive": "Uuid",
+      "value": "11111111-1111-4111-8111-111111111101",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.uuid.13",
+      "primitive": "Uuid",
+      "value": "00000000-0000-0000-0000-000000000000",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.uuid.14",
+      "primitive": "Uuid",
+      "value": "11111111-1111-4111-0111-111111111101",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.15",
+      "primitive": "D0",
+      "value": "0",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.d0.16",
+      "primitive": "D0",
+      "value": "1",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.d0.17",
+      "primitive": "D0",
+      "value": "9007199254740993",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.d0.18",
+      "primitive": "D0",
+      "value": "9223372036854775807",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.d0.19",
+      "primitive": "D0",
+      "value": "9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.20",
+      "primitive": "D0",
+      "value": "18446744073709551615",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.21",
+      "primitive": "D0",
+      "value": "18446744073709551616",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.22",
+      "primitive": "D0",
+      "value": "-9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.23",
+      "primitive": "D0",
+      "value": "-1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.24",
+      "primitive": "D0",
+      "value": "-0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.25",
+      "primitive": "D0",
+      "value": "01",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.26",
+      "primitive": "D0",
+      "value": "+1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.27",
+      "primitive": "D0",
+      "value": "1e2",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.d0.28",
+      "primitive": "D0",
+      "value": " 1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.29",
+      "primitive": "Dp",
+      "value": "0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.30",
+      "primitive": "Dp",
+      "value": "1",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.dp.31",
+      "primitive": "Dp",
+      "value": "9007199254740993",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.dp.32",
+      "primitive": "Dp",
+      "value": "9223372036854775807",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.dp.33",
+      "primitive": "Dp",
+      "value": "9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.34",
+      "primitive": "Dp",
+      "value": "18446744073709551615",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.35",
+      "primitive": "Dp",
+      "value": "18446744073709551616",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.36",
+      "primitive": "Dp",
+      "value": "-9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.37",
+      "primitive": "Dp",
+      "value": "-1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.38",
+      "primitive": "Dp",
+      "value": "-0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.39",
+      "primitive": "Dp",
+      "value": "01",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.40",
+      "primitive": "Dp",
+      "value": "+1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.41",
+      "primitive": "Dp",
+      "value": "1e2",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.dp.42",
+      "primitive": "Dp",
+      "value": " 1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.43",
+      "primitive": "U64",
+      "value": "0",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.44",
+      "primitive": "U64",
+      "value": "1",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.45",
+      "primitive": "U64",
+      "value": "9007199254740993",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.46",
+      "primitive": "U64",
+      "value": "9223372036854775807",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.47",
+      "primitive": "U64",
+      "value": "9223372036854775808",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.48",
+      "primitive": "U64",
+      "value": "18446744073709551615",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.u64.49",
+      "primitive": "U64",
+      "value": "18446744073709551616",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.50",
+      "primitive": "U64",
+      "value": "-9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.51",
+      "primitive": "U64",
+      "value": "-1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.52",
+      "primitive": "U64",
+      "value": "-0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.53",
+      "primitive": "U64",
+      "value": "01",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.54",
+      "primitive": "U64",
+      "value": "+1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.55",
+      "primitive": "U64",
+      "value": "1e2",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.u64.56",
+      "primitive": "U64",
+      "value": " 1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.57",
+      "primitive": "ChatId",
+      "value": "0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.58",
+      "primitive": "ChatId",
+      "value": "1",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.chatid.59",
+      "primitive": "ChatId",
+      "value": "9007199254740993",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.chatid.60",
+      "primitive": "ChatId",
+      "value": "9223372036854775807",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.chatid.61",
+      "primitive": "ChatId",
+      "value": "9223372036854775808",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.62",
+      "primitive": "ChatId",
+      "value": "18446744073709551615",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.63",
+      "primitive": "ChatId",
+      "value": "18446744073709551616",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.64",
+      "primitive": "ChatId",
+      "value": "-9223372036854775808",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.chatid.65",
+      "primitive": "ChatId",
+      "value": "-1",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.chatid.66",
+      "primitive": "ChatId",
+      "value": "-0",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.67",
+      "primitive": "ChatId",
+      "value": "01",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.68",
+      "primitive": "ChatId",
+      "value": "+1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.69",
+      "primitive": "ChatId",
+      "value": "1e2",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.chatid.70",
+      "primitive": "ChatId",
+      "value": " 1",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.71",
+      "primitive": "Timestamp",
+      "value": "2026-10-13T01:00:00.000001Z",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.timestamp.72",
+      "primitive": "Timestamp",
+      "value": "0001-01-01T00:00:00.000000Z",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.timestamp.73",
+      "primitive": "Timestamp",
+      "value": "2024-02-29T23:59:59.999999Z",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.timestamp.74",
+      "primitive": "Timestamp",
+      "value": "9999-12-31T23:59:59.999999Z",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.timestamp.75",
+      "primitive": "Timestamp",
+      "value": "2023-02-29T00:00:00.000000Z",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.76",
+      "primitive": "Timestamp",
+      "value": "0000-01-01T00:00:00.000000Z",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.77",
+      "primitive": "Timestamp",
+      "value": "2026-10-13T24:00:00.000000Z",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.78",
+      "primitive": "Timestamp",
+      "value": "2026-10-13T01:00:60.000000Z",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.79",
+      "primitive": "Timestamp",
+      "value": "2026-10-13T01:00:00.000Z",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.timestamp.80",
+      "primitive": "Timestamp",
+      "value": "2026-10-13T01:00:00.000000+00:00",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.binary32.81",
+      "primitive": "Binary32",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "valid": true
+    },
+    {
+      "case_id": "primitive.binary32.82",
+      "primitive": "Binary32",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.binary32.83",
+      "primitive": "Binary32",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAB",
+      "valid": false
+    },
+    {
+      "case_id": "primitive.binary32.84",
+      "primitive": "Binary32",
+      "value": "+++++++++++++++++++++++++++++++++++++++++++",
+      "valid": false
+    }
+  ]
+}

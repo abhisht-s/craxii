@@ -362,9 +362,11 @@ impl FrozenModelTools {
             .map_err(|_| ContextAssemblyError::new(ContextAssemblyErrorKind::ContractViolation))?;
         let frozen = Self(definitions.into_boxed_slice());
         if frozen.fingerprint() != registry.model_projection_fingerprint()
-            || frozen.len() != 2
-            || frozen.as_slice()[0].name().as_str() != "read_file"
-            || frozen.as_slice()[1].name().as_str() != "run_shell"
+            || frozen.len() == 0
+            || frozen.len() > 2
+            || frozen
+                .iter()
+                .any(|d| !matches!(d.name().as_str(), "read_file" | "run_shell"))
         {
             return Err(ContextAssemblyError::new(
                 ContextAssemblyErrorKind::ToolsetMismatch,
@@ -3448,6 +3450,18 @@ mod tests {
             VersionedInstructionSnapshot::v0(),
             clock(),
         )
+    }
+
+    #[test]
+    fn signed_builtin_subset_has_exact_frozen_projection() {
+        let registry = registry().restricted_to(&["run_shell"]).unwrap();
+        let frozen = FrozenModelTools::from_registry(&registry).unwrap();
+        assert_eq!(frozen.len(), 1);
+        assert_eq!(frozen.as_slice()[0].name().as_str(), "run_shell");
+        assert_eq!(
+            frozen.fingerprint(),
+            registry.model_projection_fingerprint()
+        );
     }
 
     #[test]

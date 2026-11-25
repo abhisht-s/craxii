@@ -1,0 +1,18 @@
+[Unit]
+Description=Craxii fixed active network policy check
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B /opt/craxii/guest/security-boundary.py verify-network
+TimeoutStartSec=10s
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+ProtectSystem=strict
+ReadWritePaths=/run
+ProtectHome=yes
+StandardOutput=null
+StandardError=null

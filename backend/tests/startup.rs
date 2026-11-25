@@ -26,6 +26,10 @@ fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
     assert!(output.stderr.is_empty());
 
     let stdout = text(&output.stdout);
+    let schema = format!(
+        "max_supported_schema_version={}",
+        craxii_server::bootstrap::compatibility::MAX_SUPPORTED_SCHEMA_VERSION
+    );
     for expected in [
         "Craxii startup",
         "event_name=\"startup\"",
@@ -37,7 +41,7 @@ fn valid_local_config_emits_pretty_startup_evidence_and_remains_unready() {
         "architecture_version=\"V0.0.01\"",
         "protocol_version=1",
         "configuration_version=1",
-        "max_supported_schema_version=7",
+        schema.as_str(),
         "configuration_fingerprint=\"sha256:",
         "health_state=\"live_unready\"",
         "live=true",

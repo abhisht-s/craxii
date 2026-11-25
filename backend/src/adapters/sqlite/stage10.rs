@@ -264,6 +264,7 @@ async fn append_work_transition(
 async fn claim_next(
     store: &SqliteStateStore,
     request: ClaimNextWorkRequest,
+    fixture: Option<&crate::distribution::ValidatedDelivery>,
 ) -> Result<Option<ClaimedWork>, SqliteAdapterError> {
     let mut transaction = WriteTransaction::begin(&store.runtime, "claim_next_work").await?;
     let runtime =
@@ -335,6 +336,38 @@ async fn claim_next(
         transaction.commit().await?;
         return Ok(None);
     };
+    let admitted = sqlx::query(
+        "SELECT central_work_id,material_digest FROM distribution_receipts WHERE local_work_id=?",
+    )
+    .bind(candidate.try_get::<String, _>("work_id")?)
+    .fetch_optional(transaction.connection())
+    .await
+    .map_err(SqliteAdapterError::from_sqlx)?;
+    if let Some(r) = admitted {
+        let allowed = if let Some(d) = fixture {
+            d.check_fresh().map_err(|_| invariant())?;
+            d.verify_profile().map_err(|_| invariant())?;
+            cfg!(all(feature = "test-failpoints", debug_assertions))
+                && d.profile.as_ref().is_some_and(|p| {
+                    matches!(
+                        p["body"]["profile"]["deterministic_program_id"].as_str(),
+                        Some("terminal_text_v1" | "bounded_tool_v1" | "proxy_loop_v1")
+                    )
+                })
+                && d.message["body"]["material"]["work_id"]
+                    == r.try_get::<String, _>("central_work_id")?
+                && d.message["body"]["material_digest"]
+                    == r.try_get::<String, _>("material_digest")?
+        } else {
+            false
+        };
+        if !allowed {
+            transaction.commit().await?;
+            return Ok(None);
+        }
+    } else if fixture.is_some() {
+        return Err(invariant());
+    }
     let candidate_work_id = WorkId::parse_canonical(&candidate.try_get::<String, _>("work_id")?)
         .map_err(|_| inconsistent())?;
     let candidate_conversation_id =
@@ -396,6 +429,10 @@ async fn claim_next(
         request.claimed_at,
     )
     .await?;
+    if let Some(d) = fixture {
+        d.check_fresh().map_err(|_| invariant())?;
+        d.verify_profile().map_err(|_| invariant())?;
+    }
     transaction.commit().await?;
     let committed_version = next.projection_version();
     Ok(Some(ClaimedWork {
@@ -446,6 +483,7 @@ async fn terminalize_work(
     .map_err(|_| conflict())?;
     let next = decision.into_next();
     let cause = latest_stream_event(&mut transaction, JournalStreamId::Work(work_id)).await?;
+    super::distribution_results::prepare(&mut transaction, &next, event_id, at).await?;
     guarded_work_update(
         &mut transaction,
         &row.lifecycle,
@@ -1309,6 +1347,14 @@ async fn recover_work_unit(
     )
     .map_err(|_| conflict())?;
     let next = decision.into_next();
+    let terminal_event = JournalEventId::generate();
+    super::distribution_results::prepare(
+        &mut transaction,
+        &next,
+        terminal_event,
+        request.recovered_at,
+    )
+    .await?;
     guarded_work_update(
         &mut transaction,
         &row.lifecycle,
@@ -1325,7 +1371,7 @@ async fn recover_work_unit(
         &mut transaction,
         &row,
         request.current_runtime_id,
-        JournalEventId::generate(),
+        terminal_event,
         cause,
         &next,
         request.recovered_at,
@@ -1990,7 +2036,11 @@ impl SchedulerStateStore for SqliteStateStore {
         &self,
         request: ClaimNextWorkRequest,
     ) -> StateStoreFuture<'_, Option<ClaimedWork>> {
-        Box::pin(async move { claim_next(self, request).await.map_err(map_port_error) })
+        Box::pin(async move {
+            claim_next(self, request, None)
+                .await
+                .map_err(map_port_error)
+        })
     }
 
     fn list_current_runtime_cancel_requested(
@@ -2172,5 +2222,16 @@ impl RecoveryStateStore for SqliteStateStore {
                 .await
                 .map_err(map_port_error)
         })
+    }
+}
+
+#[cfg(all(feature = "test-failpoints", debug_assertions))]
+impl SqliteStateStore {
+    pub async fn isolated_claim_distribution(
+        &self,
+        request: ClaimNextWorkRequest,
+        delivery: &crate::distribution::ValidatedDelivery,
+    ) -> Result<Option<ClaimedWork>, SqliteAdapterError> {
+        claim_next(self, request, Some(delivery)).await
     }
 }

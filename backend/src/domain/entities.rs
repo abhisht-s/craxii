@@ -453,6 +453,10 @@ pub enum MessageProvenance {
         author_user_id: UserId,
         inbound_delivery_id: InboundDeliveryId,
     },
+    DistributionUser {
+        author_user_id: UserId,
+        receipt_id: crate::domain::JournalEventId,
+    },
     Assistant {
         produced_by_work_id: WorkId,
     },
@@ -487,6 +491,7 @@ pub struct Message {
     device_id: Option<DeviceId>,
     client_message_id: Option<ClientMessageId>,
     inbound_delivery_id: Option<InboundDeliveryId>,
+    distribution_receipt_id: Option<crate::domain::JournalEventId>,
     provenance: MessageProvenance,
     content_sha256: Sha256Digest,
     committed_at: UtcTimestamp,
@@ -495,6 +500,12 @@ pub struct Message {
 impl Message {
     /// Validates the exact role/client/work provenance matrix.
     pub fn try_new(input: MessageInput) -> Result<Self, DomainValidationError> {
+        Self::try_new_with_distribution(input, None)
+    }
+    pub fn try_new_with_distribution(
+        input: MessageInput,
+        distribution_receipt_id: Option<crate::domain::JournalEventId>,
+    ) -> Result<Self, DomainValidationError> {
         let provenance = match (
             input.role,
             input.author_user_id,
@@ -502,6 +513,7 @@ impl Message {
             input.device_id,
             input.client_message_id,
             input.inbound_delivery_id,
+            distribution_receipt_id,
         ) {
             (
                 MessageRole::User,
@@ -509,6 +521,7 @@ impl Message {
                 None,
                 Some(device_id),
                 Some(client_message_id),
+                None,
                 None,
             ) => Some(MessageProvenance::NativeUser {
                 author_user_id,
@@ -522,16 +535,25 @@ impl Message {
                 None,
                 None,
                 Some(inbound_delivery_id),
+                None,
             ) => Some(MessageProvenance::ChannelUser {
                 author_user_id,
                 inbound_delivery_id,
             }),
-            (MessageRole::Assistant, None, Some(produced_by_work_id), None, None, None) => {
+            (MessageRole::User, Some(author_user_id), None, None, None, None, Some(receipt_id)) => {
+                Some(MessageProvenance::DistributionUser {
+                    author_user_id,
+                    receipt_id,
+                })
+            }
+            (MessageRole::Assistant, None, Some(produced_by_work_id), None, None, None, None) => {
                 Some(MessageProvenance::Assistant {
                     produced_by_work_id,
                 })
             }
-            (MessageRole::System, None, None, None, None, None) => Some(MessageProvenance::System),
+            (MessageRole::System, None, None, None, None, None, None) => {
+                Some(MessageProvenance::System)
+            }
             _ => None,
         };
         let Some(provenance) = provenance else {
@@ -552,6 +574,7 @@ impl Message {
             device_id: input.device_id,
             client_message_id: input.client_message_id,
             inbound_delivery_id: input.inbound_delivery_id,
+            distribution_receipt_id,
             provenance,
             content_sha256,
             committed_at: input.committed_at,
@@ -585,6 +608,10 @@ impl Message {
     pub const fn client_message_id(&self) -> Option<ClientMessageId> {
         self.client_message_id
     }
+    pub const fn distribution_receipt_id(&self) -> Option<crate::domain::JournalEventId> {
+        self.distribution_receipt_id
+    }
+
     pub const fn inbound_delivery_id(&self) -> Option<InboundDeliveryId> {
         self.inbound_delivery_id
     }
