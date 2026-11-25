@@ -52,6 +52,7 @@ impl Fixture {
                 power_operation_id: power.clone(),
                 release_id: "fixture-worker".into(),
                 release_sha256: "a".repeat(64),
+                model_proxy: None,
             },
             boot.clone(),
         )
@@ -470,6 +471,7 @@ async fn distribution_replacement_replays_original_receipt_after_cancellation_re
         power_operation_id: f.power.clone(),
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
+        model_proxy: None,
     };
     f.runtime = Some(
         DistributionRuntime::isolated_fixture(config, f.boot.clone())
@@ -673,6 +675,7 @@ async fn distribution_result_scripted_completion_and_exact_export() {
         power_operation_id: f.power.clone(),
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
+        model_proxy: None,
     };
     crate::distribution::fixture::complete(
         store,
@@ -883,6 +886,7 @@ async fn distribution_result_atomic_process_crashes_and_conservative_recovery() 
             power_operation_id: request_id().unwrap(),
             release_id: "fixture-worker".into(),
             release_sha256: "a".repeat(64),
+            model_proxy: None,
         };
         let runtime = DistributionRuntime::isolated_fixture(config, request_id().unwrap())
             .await
@@ -977,6 +981,7 @@ async fn distribution_result_populated_v8_terminal_upgrade_reconciles_without_re
         power_operation_id: request_id().unwrap(),
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
+        model_proxy: None,
     };
     std::fs::set_permissions(
         root.join("state/db/craxii.sqlite3"),
@@ -1041,6 +1046,7 @@ async fn configured_environment_must_match_every_delivery_and_config() {
         power_operation_id: request_id().unwrap(),
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
+        model_proxy: None,
     };
     config.validate().unwrap();
     assert_eq!(
@@ -1155,6 +1161,7 @@ async fn populated_v9_upgrade_admits_production_without_changing_rows() {
         power_operation_id: request_id().unwrap(),
         release_id: "fixture-worker".into(),
         release_sha256: "a".repeat(64),
+        model_proxy: None,
     };
     let runtime = DistributionRuntime::isolated_fixture(config, request_id().unwrap())
         .await
@@ -1347,6 +1354,7 @@ async fn installed_quiescence_tracks_journal_receipts_exports_and_flush() {
         power_operation_id: power.clone(),
         release_id: "qualification-only".into(),
         release_sha256: "1".repeat(64),
+        model_proxy: None,
     })
     .await
     .unwrap();
@@ -1490,6 +1498,7 @@ async fn distribution_startup_verified_snapshot_rejects_corruption_before_recove
                 power_operation_id: f.power.clone(),
                 release_id: "fixture-worker".into(),
                 release_sha256: "a".repeat(64),
+                model_proxy: None,
             },
             request_id().unwrap(),
         )
@@ -1507,5 +1516,158 @@ async fn distribution_startup_verified_snapshot_rejects_corruption_before_recove
         assert_eq!(after, before, "corruption reached runtime recovery/start");
         c.close().await.unwrap();
         std::fs::remove_dir_all(&f.root).unwrap();
+    }
+}
+impl Fixture {
+    /// B1: the production form of a work delivery. It names the boot's compute grant, period and epoch, and
+    /// carries no profile.
+    fn ordinary_delivery(&self, id: &str, sequence: i64) -> ValidatedDelivery {
+        let mut d = self.delivery(id, sequence);
+        d.message["body"]["execution_authorization"] = json!({"kind":"ordinary","period_id":request_id().unwrap(),"compute_grant_id":request_id().unwrap(),"authorization_epoch":"1"});
+        d.profile = None;
+        d
+    }
+}
+#[tokio::test]
+async fn ordinary_work_is_admitted_without_a_profile_and_replays_its_receipt() {
+    let mut f = Fixture::new().await;
+    let store = &f.runtime.as_ref().unwrap().store;
+    let id = request_id().unwrap();
+    let d = f.ordinary_delivery(&id, 1);
+    let DistributionAdmission::Receipt {
+        receipt,
+        duplicate,
+        state,
+        ..
+    } = store.admit_distribution(&d).await.unwrap()
+    else {
+        panic!("ordinary work must be receipted");
+    };
+    assert!(!duplicate);
+    assert_eq!(state, "queued");
+    assert_eq!(receipt["work_id"], id);
+    // The same delivery again returns the same receipt.
+    let DistributionAdmission::Receipt {
+        receipt: again,
+        duplicate,
+        ..
+    } = store.admit_distribution(&d).await.unwrap()
+    else {
+        panic!("replay must return the receipt");
+    };
+    assert!(duplicate);
+    assert_eq!(again, receipt);
+    // Ordinary work carrying a profile, or naming no grant, is refused and changes nothing.
+    let mut with_profile = f.ordinary_delivery(&request_id().unwrap(), 2);
+    with_profile.profile = f.delivery(&request_id().unwrap(), 2).profile;
+    assert_eq!(
+        store.admit_distribution(&with_profile).await.unwrap_err(),
+        DistributionError::Invalid
+    );
+    let mut unnamed = f.ordinary_delivery(&request_id().unwrap(), 2);
+    unnamed.message["body"]["execution_authorization"]["kind"] = json!("qualified_candidate");
+    assert_eq!(
+        store.admit_distribution(&unnamed).await.unwrap_err(),
+        DistributionError::Invalid
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM distribution_receipts")
+            .fetch_one(&store.runtime.inner.pool)
+            .await
+            .unwrap(),
+        1
+    );
+    f.close().await;
+}
+#[tokio::test]
+async fn production_refuses_fixture_work_and_ordinary_work_it_cannot_check() {
+    let mut f = Fixture::new().await;
+    let production = crate::distribution_contracts::environment::WorkerEnvironment::Production;
+    let mut fixture = f.delivery(&request_id().unwrap(), 1);
+    fixture.environment = production;
+    assert_eq!(
+        fixture.verify_authorization().unwrap_err(),
+        DistributionError::Invalid
+    );
+    // Without the installed compute authority there is no grant to check ordinary work against.
+    let mut ordinary = f.ordinary_delivery(&request_id().unwrap(), 1);
+    ordinary.environment = production;
+    assert_eq!(
+        ordinary.verify_authorization().unwrap_err(),
+        DistributionError::Invalid
+    );
+    // A development build admits both.
+    f.delivery(&request_id().unwrap(), 1)
+        .verify_authorization()
+        .unwrap();
+    f.ordinary_delivery(&request_id().unwrap(), 1)
+        .verify_authorization()
+        .unwrap();
+    f.close().await;
+}
+#[tokio::test]
+async fn a_production_poll_drops_development_profiles_instead_of_failing() {
+    let mut f = Fixture::new().await;
+    let d = f.delivery(&request_id().unwrap(), 1);
+    let id = request_id().unwrap();
+    let response = json!({"contract_version":1,"request_id":id,"items":[d.profile.clone().unwrap(),d.message.clone()],"retry_after_ms":1000});
+    use crate::distribution_contracts::environment::WorkerEnvironment;
+    let dev = crate::distribution::transport::poll_response(
+        &response,
+        &id,
+        WorkerEnvironment::Development,
+    )
+    .unwrap();
+    assert_eq!(dev.len(), 2);
+    let prod = crate::distribution::transport::poll_response(
+        &response,
+        &id,
+        WorkerEnvironment::Production,
+    )
+    .unwrap();
+    assert_eq!(prod.len(), 1);
+    assert_eq!(prod[0]["type"], "work_delivery");
+    f.close().await;
+}
+#[tokio::test]
+async fn ordinary_material_for_cancelled_work_is_admitted_as_cancelled() {
+    let mut f = Fixture::new().await;
+    let store = &f.runtime.as_ref().unwrap().store;
+    // The cancel arrives first; the work's material then reconciles its sequence. Its grant need not list it.
+    let work = f.ordinary_delivery(&request_id().unwrap(), 1);
+    store.cancel_distribution(&f.control(&work)).await.unwrap();
+    assert!(matches!(
+        store.admit_distribution(&work).await.unwrap(),
+        DistributionAdmission::Cancelled { .. }
+    ));
+    f.close().await;
+}
+#[test]
+fn the_vm_config_may_name_the_model_and_a_malformed_one_is_refused() {
+    let base = json!({"contract_version":1,"environment":"production","origin":"https://api.craxii.com/","state_root":"/var/lib/craxii-worker/state","artifact_root":"/var/lib/craxii-worker/artifacts","workspace_root":"/srv/craxii-data/workspace","profile_public_key":URL_SAFE_NO_PAD.encode([7u8;32]),"power_operation_id":request_id().unwrap(),"release_id":"worker-1","release_sha256":"a".repeat(64)});
+    // A config written before B1.6 still loads, and names no model.
+    let old: DistributionConfig = serde_json::from_value(base.clone()).unwrap();
+    old.validate().unwrap();
+    assert!(old.model_proxy.is_none());
+    assert!(!serde_json::to_string(&old).unwrap().contains("model_proxy"));
+    let model = json!({"contract_version":1,"model_id":"agent-default","model_config_id":request_id().unwrap(),"model_config_digest":"b".repeat(64),"price_config_id":request_id().unwrap(),"price_config_digest":"c".repeat(64),"max_output_tokens":4096});
+    let mut with = base.clone();
+    with["model_proxy"] = model.clone();
+    let named: DistributionConfig = serde_json::from_value(with).unwrap();
+    named.validate().unwrap();
+    assert_eq!(
+        named.model_proxy.as_ref().unwrap().model_id,
+        "agent-default"
+    );
+    for (k, v) in [
+        ("model_config_digest", json!("B".repeat(64))),
+        ("max_output_tokens", json!(0)),
+        ("model_id", json!("no spaces allowed")),
+    ] {
+        let mut bad = base.clone();
+        bad["model_proxy"] = model.clone();
+        bad["model_proxy"][k] = v;
+        let c: DistributionConfig = serde_json::from_value(bad).unwrap();
+        assert!(c.validate().is_err(), "{k}");
     }
 }

@@ -36,6 +36,10 @@ pub struct DistributionConfig {
     pub power_operation_id: String,
     pub release_id: String,
     pub release_sha256: String,
+    /// The model this agent uses through the central model proxy (B1.6), written at provisioning (B6) with the
+    /// values of the live model (B3). Nonsecret pins only; without it the worker doesn't offer model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_proxy: Option<crate::distribution::model_config::ModelProxySettings>,
 }
 impl DistributionConfig {
     pub fn worker_environment(&self) -> DistributionResult<WorkerEnvironment> {
@@ -65,6 +69,9 @@ impl DistributionConfig {
             if !Path::new(p).is_absolute() {
                 return Err(invalid());
             }
+        }
+        if let Some(m) = &self.model_proxy {
+            m.validate()?;
         }
         Ok(())
     }
@@ -292,11 +299,15 @@ impl DistributionRuntime {
                 .as_array_mut()
                 .expect("hello capabilities")
                 .push(json!("compute_v1"));
-            #[cfg(all(feature = "test-failpoints", debug_assertions))]
-            hello["body"]["capabilities"]
-                .as_array_mut()
-                .expect("hello capabilities")
-                .push(json!("model_v1"));
+            // Model calls are offered when the VM's config names the model (debug test builds always offer them).
+            if self.config.model_proxy.is_some()
+                || cfg!(all(feature = "test-failpoints", debug_assertions))
+            {
+                hello["body"]["capabilities"]
+                    .as_array_mut()
+                    .expect("hello capabilities")
+                    .push(json!("model_v1"));
+            }
         }
         hello
     }
@@ -519,6 +530,18 @@ impl DistributionRuntime {
             .iter()
             .filter(|m| m.message["type"] == "work_delivery")
         {
+            // A1(a): ordinary work names the grant that lists it. A grant this VM doesn't hold yet is adopted
+            // first; if it can't be, the delivery waits (no receipt) and is issued again.
+            #[cfg(target_os = "linux")]
+            if let Some(c) = &self.compute
+                && item.message["body"]["execution_authorization"]["kind"] == "ordinary"
+                && let Some(named) =
+                    item.message["body"]["execution_authorization"]["compute_grant_id"].as_str()
+                && !c.adopt(client, &self.boot_id, named).await?
+            {
+                tracing::warn!(target: "craxii::distribution", event = "delivery_skipped");
+                continue;
+            }
             admission_outcome(self.store.admit_distribution(item).await.map(|_| ()))?;
         }
         self.transfer_pending(client).await?;

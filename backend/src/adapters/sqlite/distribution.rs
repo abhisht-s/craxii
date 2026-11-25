@@ -288,7 +288,7 @@ impl SqliteStateStore {
         if sequence != next {
             return Err(DistributionError::Reconciliation);
         }
-        delivery.verify_profile()?;
+        delivery.verify_authorization()?;
         delivery.check_fresh()?;
         let row=sqlx::query("SELECT c.next_work_ordinal,c.state_version,p.default_workspace_id,je.event_id FROM conversations c JOIN craxii_principals p ON p.craxii_id=c.craxii_id JOIN journal_events je ON je.conversation_id=c.conversation_id AND je.event_type='conversation.created' WHERE c.conversation_id=?").bind(&conversation).fetch_one(tx.connection()).await.map_err(storage)?;
         let receipt_id = JournalEventId::generate();
@@ -348,8 +348,7 @@ impl SqliteStateStore {
    .bind(env).bind(id).bind(text(m,"customer_id")?).bind(text(m,"logical_agent_id")?).bind(text(m,"conversation_id")?).bind(sequence).bind(digest).bind(material).bind(receipt_id.to_string()).bind(string(&receipt)?).bind(user).bind(conversation).bind(admitted.message_id.to_string()).bind(admitted.work_id.to_string()).bind(accepted_event.to_string()).bind(admitted.committed_cursor.get()).bind(admitted.work_ordinal.get()).bind(text(a,"installation_id")?).bind(text(a,"generation")?.parse::<i64>().map_err(|_|invalid())?).bind(at.to_string()).execute(tx.connection()).await.map_err(storage)?;
         sqlx::query("UPDATE distribution_conversations SET next_sequence=next_sequence+1 WHERE environment=? AND central_conversation_id=? AND next_sequence=?").bind(env).bind(text(m,"conversation_id")?).bind(sequence).execute(tx.connection()).await.map_err(storage)?;
         delivery.check_fresh()?;
-        delivery.verify_profile()?;
-        delivery.verify_profile()?;
+        delivery.verify_authorization()?;
         tx.commit().await.map_err(storage)?;
         Ok(DistributionAdmission::Receipt {
             receipt,

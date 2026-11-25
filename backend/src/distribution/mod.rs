@@ -81,6 +81,43 @@ impl ValidatedDelivery {
         }
         Ok(())
     }
+    /// What lets the worker admit a work delivery (go-live plan B1). `ordinary` work is the production form: it
+    /// names the running boot's compute grant, period and epoch, and carries no profile. A development fixture
+    /// names a signed profile and is refused in production. Anything else is refused.
+    pub(crate) fn verify_authorization(&self) -> DistributionResult<()> {
+        match self.message["body"]["execution_authorization"]["kind"].as_str() {
+            Some("ordinary") => self.verify_ordinary(),
+            Some("development_fixture") if self.environment != WorkerEnvironment::Production => {
+                self.verify_profile()
+            }
+            _ => Err(invalid()),
+        }
+    }
+    fn verify_ordinary(&self) -> DistributionResult<()> {
+        let auth = &self.message["body"]["execution_authorization"];
+        if self.profile.is_some() {
+            return Err(invalid());
+        }
+        let period = text(auth, "period_id")?;
+        let grant = text(auth, "compute_grant_id")?;
+        let epoch = text(auth, "authorization_epoch")?;
+        let work = text(&self.message["body"]["material"], "work_id")?;
+        // The running boot's grant (installed by the root watchdog) must be for this period and epoch and list
+        // the work. A grant the worker doesn't hold yet means the delivery waits (B1.5 fetches it).
+        #[cfg(target_os = "linux")]
+        if let Some(c) = &self.compute {
+            return c
+                .check_ordinary(period, epoch, work, grant)
+                .map_err(|_| DistributionError::Expired);
+        }
+        // Without the installed compute authority there is nothing to check the grant against: only development
+        // builds and tests run like that, never production.
+        let _ = (period, grant, epoch, work);
+        if self.environment == WorkerEnvironment::Production {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub(crate) fn verify_profile(&self) -> DistributionResult<()> {
         let delivery = &self.message;
         let body = &delivery["body"];

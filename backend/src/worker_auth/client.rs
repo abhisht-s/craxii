@@ -779,7 +779,7 @@ impl WorkerClient {
         let authority = self.current_authority()?;
         let request = json!({"contract_version":1,"request_id":id,"authority":authority,"boot_id":boot,"power_operation_id":power,"max_items":4,"wait_ms":0});
         let response = self.session_exchange("/v1/worker/poll", &request).await?;
-        let items = crate::distribution::transport::poll_response(&response, &id)
+        let items = crate::distribution::transport::poll_response(&response, &id, self.environment)
             .map_err(|_| AuthError::InvalidContext)?;
         let mut result = Vec::new();
         for message in items.iter().filter(|m| m["type"] != "execution_profile") {
