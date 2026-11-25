@@ -23,3 +23,16 @@ Avoid long polling loops and repetitive progress narration for quiet commands. W
 Behavioral tests are authoritative for runtime behavior. Repository checkers should enforce straightforward structural policy only; do not build mutation-test or static-analysis machinery to prove arbitrary malicious source rewrites unless that is explicitly the purpose of the stage.
 
 When a focused check already proves a fact, reuse that result rather than proving the same fact through another equivalent command.
+
+## Linux gate (owner decision, 2026-11-25)
+
+The worker runs on x86_64 Linux VMs. On macOS, code under `#[cfg(target_os = "linux")]` is not even compiled, so the macOS suite cannot see mistakes in it.
+
+- While working: focused tests on macOS. When a plan item is finished: the full macOS suite.
+- Run `scripts/verify-linux` (Docker Desktop, capped at 2 CPUs) only at these moments, not before every commit:
+  1. before committing a change that touches Linux-only code (the sandbox, the guest VM boundary, the compute watchdog, or anything under a Linux-only `cfg`);
+  2. once per finished plan item, before pushing;
+  3. before building a worker release for the VMs. That run must be on x86_64; `scripts/verify-linux` uses the host's architecture (arm64 on Apple silicon), so the release build provides the x86_64 run.
+- Say so before starting it (it takes several minutes and loads the machine), and run `cargo fmt --all` first.
+- It passes when every Linux failure is one of the known tests that need the prepared guest VM image.
+- No hosted CI for now.
