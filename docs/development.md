@@ -127,6 +127,27 @@ scripts/verify
 
 The server gate checks Rust formatting/build/lints/tests, release failpoint exclusion, dependency policy, public repository structure and links, and Markdown. Legacy native macOS UI smoke is excluded from this server scope; the separate historical client workflow remains outside it.
 
+## Worker releases for the customer VMs
+
+Customer VMs run x86_64 Linux. A release is built only by:
+
+```sh
+scripts/build-release [--test] [--dev] OUT_DIR
+```
+
+- **Source.** It builds committed code only and refuses a checkout with uncommitted changes. `--dev` builds the working tree instead and marks the release `development`; the image bake refuses that.
+- **Build.** It builds in a pinned Rust image, fixed by its digest, for `x86_64-unknown-linux-gnu` with `--locked --release`, with no test features and with build paths removed from the binaries. On Apple silicon the container is emulated, so it is slow there.
+- **Test-hook check.** It confirms that the release binary refuses the hidden test control and contains no test failpoint name, as `scripts/check-release-failpoints.mjs` does.
+- **Tests (`--test`).** It first runs the full Linux suite on x86_64. This is the release-time Linux gate. It passes when every failing test is listed in `scripts/support/linux-guest-image-tests.txt`; those tests need the prepared guest VM image.
+- **Output.** `OUT_DIR` holds:
+  - `bin/`: the five programs the guest installer takes;
+  - `guest/`: the installer and its assets from `ops/v0.0.1`;
+  - `manifest.json`: the kind, commit, toolchain, builder image, test result, release id (the sha256 of `craxii-server`, which the installer names the release after) and every file's sha256;
+  - `release.sha256`: the release digest, which is the sha256 of the manifest.
+
+  The manifest has no timestamps, so the same build always has the same digest. Bit-for-bit reproducible binaries are not a goal yet.
+- **Resources.** The container is capped at `CRAXII_BUILD_CPUS` and cargo at `CRAXII_BUILD_JOBS`, both 2 by default.
+
 ## Distribution contract workflow
 
 `contracts/distribution/1.0.0/` is the authoritative public distribution bundle.

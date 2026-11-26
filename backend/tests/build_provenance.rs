@@ -76,6 +76,39 @@ fn unavailable_git_metadata_falls_back_to_unversioned_and_dirty() {
     );
 }
 
+#[test]
+fn exported_tree_takes_the_named_revision_and_is_clean_only_when_told() {
+    let repository = TestRepository::new();
+    fs::remove_dir_all(repository.path().join(".git")).unwrap();
+    let revision = "0123456789abcdef0123456789abcdef01234567";
+
+    let named = |clean: Option<&str>| {
+        let mut environment = vec![("CRAXII_SOURCE_REVISION", revision)];
+        environment.extend(clean.map(|value| ("CRAXII_SOURCE_CLEAN", value)));
+        TestRepository::build_metadata_with(repository.path(), &environment)
+    };
+    let expected = |dirty| EmbeddedMetadata {
+        revision: revision.to_owned(),
+        dirty,
+    };
+    assert_eq!(named(Some("1")), expected(false));
+    assert_eq!(named(None), expected(true));
+    assert_eq!(named(Some("yes")), expected(true));
+    assert_eq!(
+        TestRepository::build_metadata_with(
+            repository.path(),
+            &[
+                ("CRAXII_SOURCE_REVISION", "not-a-revision"),
+                ("CRAXII_SOURCE_CLEAN", "1")
+            ]
+        ),
+        EmbeddedMetadata {
+            revision: "unversioned".to_owned(),
+            dirty: true,
+        }
+    );
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct EmbeddedMetadata {
     revision: String,
@@ -170,9 +203,16 @@ impl TestRepository {
     }
 
     fn build_metadata_at(repository: &Path) -> EmbeddedMetadata {
+        Self::build_metadata_with(repository, &[])
+    }
+
+    fn build_metadata_with(repository: &Path, environment: &[(&str, &str)]) -> EmbeddedMetadata {
         let output = Command::new(env!("CARGO"))
             .arg("build")
             .arg("--quiet")
+            .env_remove("CRAXII_SOURCE_REVISION")
+            .env_remove("CRAXII_SOURCE_CLEAN")
+            .envs(environment.iter().copied())
             .current_dir(repository)
             .output()
             .unwrap();

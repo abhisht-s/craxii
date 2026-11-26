@@ -4,6 +4,8 @@ use crate::domain::*;
 use crate::ports::{clock::Clock, model_provider::*};
 use serde_json::Value;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
+/// How long the worker listens in silence before checking on the call (B3.6).
+const QUIET_CHECK: Duration = Duration::from_secs(10);
 
 pub(super) struct ProxyStream {
     response: reqwest::Response,
@@ -245,11 +247,25 @@ impl ProxyStream {
                 .min(self.deadline)
                 .checked_duration_since(self.clock.monotonic_now())
                 .ok_or_else(unknown)?;
-            let next = tokio::select! {biased;()=self.invocation.control.cancellation().cancelled()=>return Err(unknown()),v=tokio::time::timeout(remaining.min(Duration::from_secs(5)),self.response.chunk())=>v};
+            // B3.6: a reasoning model can think for minutes before its first word, and the control plane sends
+            // nothing meanwhile. So a quiet spell isn't a failure: every 10 s the worker rechecks its compute
+            // authority and asks whether the call is still being worked on; if it is, it keeps listening to this
+            // stream (up to the call's own deadline), and if not (a connection dropped silently, say) it recovers
+            // the answer. A connection that fails outright recovers at once.
+            let next = tokio::select! {biased;()=self.invocation.control.cancellation().cancelled()=>return Err(unknown()),v=tokio::time::timeout(remaining.min(QUIET_CHECK),self.response.chunk())=>v};
             let next = match next {
                 Ok(Ok(chunk)) => chunk,
-                _ => {
+                Ok(Err(_)) => {
                     self.recover().await?;
+                    continue;
+                }
+                Err(_) => {
+                    self.compute
+                        .check(&self.work, &self.grant)
+                        .map_err(|_| unknown())?;
+                    if !self.still_processing().await {
+                        self.recover().await?;
+                    }
                     continue;
                 }
             };
@@ -270,6 +286,23 @@ impl ProxyStream {
             }
             self.chunk.extend(chunk);
         }
+    }
+    /// Whether the control plane is still working on this call. Without an answer (no client, or the question
+    /// itself fails), the worker keeps listening; the call's deadline still bounds the wait.
+    async fn still_processing(&self) -> bool {
+        let Some(client) = self.client.clone() else {
+            return true;
+        };
+        let query = async {
+            let v = client.lock().await.model_status(&self.request).await.ok()?;
+            let s = super::status::AttemptStatus::parse(&v, &self.request).ok()?;
+            Some(s.processing())
+        };
+        tokio::time::timeout(Duration::from_secs(5), query)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(true)
     }
     async fn recover(&mut self) -> Result<(), ProviderError> {
         if self.recoveries >= 2 {
@@ -347,6 +380,13 @@ mod tests {
             Ok(())
         }
     }
+    /// Compute authority withdrawn (a grant expired, the watchdog tripped).
+    struct Deny;
+    impl ModelComputeAuthority for Deny {
+        fn check(&self, _: &str, _: &str) -> Result<(), ProviderError> {
+            Err(unknown())
+        }
+    }
     fn q() -> Value {
         let u4 = "11111111-1111-4111-8111-111111111111";
         let u7 = "019e0000-0000-7000-8000-000000000001";
@@ -376,6 +416,26 @@ mod tests {
         expired: bool,
         prefix: Vec<Value>,
     ) -> (bool, bool, usize) {
+        consume_paused(bytes, cancelled, expired, prefix, Duration::ZERO).await
+    }
+    /// Like `consume_prefix`, with the server falling silent for `pause` after its first frame.
+    async fn consume_paused(
+        bytes: Vec<u8>,
+        cancelled: bool,
+        expired: bool,
+        prefix: Vec<Value>,
+        pause: Duration,
+    ) -> (bool, bool, usize) {
+        consume_with(bytes, cancelled, expired, prefix, pause, Arc::new(Allow)).await
+    }
+    async fn consume_with(
+        bytes: Vec<u8>,
+        cancelled: bool,
+        expired: bool,
+        prefix: Vec<Value>,
+        pause: Duration,
+        compute: Arc<dyn ModelComputeAuthority>,
+    ) -> (bool, bool, usize) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let size = bytes.len();
@@ -389,7 +449,11 @@ mod tests {
             )
             .is_ok()
             {
-                for chunk in bytes.chunks(17) {
+                let first = bytes.iter().position(|b| *b == b'\n').map_or(0, |i| i + 1);
+                let _ = socket.write_all(&bytes[..first]);
+                let _ = socket.flush();
+                std::thread::sleep(pause);
+                for chunk in bytes[first..].chunks(17) {
                     if socket.write_all(chunk).is_err() {
                         break;
                     }
@@ -416,7 +480,7 @@ mod tests {
                 token,
                 clock
                     .monotonic_now()
-                    .checked_add(Duration::from_secs(2))
+                    .checked_add(Duration::from_secs(2) + pause)
                     .unwrap(),
                 Duration::from_secs(1),
             )
@@ -437,7 +501,7 @@ mod tests {
                     .unwrap()
             },
             clock,
-            compute: Arc::new(Allow),
+            compute,
             work: "work".into(),
             grant: "grant".into(),
             pending: Vec::new(),
@@ -485,6 +549,46 @@ mod tests {
     }
     async fn consume(bytes: Vec<u8>, cancelled: bool) -> (bool, bool) {
         consume_with_deadline(bytes, cancelled, false).await
+    }
+    #[tokio::test]
+    async fn a_model_thinking_longer_than_the_old_five_second_limit_still_completes() {
+        // B3.6: nothing arrives for 6 seconds (a reasoning model thinking); the stream waits, with no recovery.
+        let (completed, failed, _) = consume_paused(
+            encode(&frames()),
+            false,
+            false,
+            Vec::new(),
+            Duration::from_secs(6),
+        )
+        .await;
+        assert_eq!((completed, failed), (true, false));
+    }
+    #[tokio::test]
+    async fn a_silence_past_one_quiet_check_keeps_listening_while_the_call_is_processing() {
+        // 12 s of silence passes one 10 s check; the call is still being worked on, so the stream continues.
+        let (completed, failed, _) = consume_paused(
+            encode(&frames()),
+            false,
+            false,
+            Vec::new(),
+            Duration::from_secs(12),
+        )
+        .await;
+        assert_eq!((completed, failed), (true, false));
+    }
+    #[tokio::test]
+    async fn compute_withdrawn_during_a_silence_stops_the_call() {
+        // The quiet check rechecks compute authority; once it's gone the worker stops waiting.
+        let (completed, failed, _) = consume_with(
+            encode(&frames()),
+            false,
+            false,
+            Vec::new(),
+            Duration::from_secs(12),
+            Arc::new(Deny),
+        )
+        .await;
+        assert_eq!((completed, failed), (false, true));
     }
     #[tokio::test]
     async fn original_stream_deadline_applies_even_to_immediately_buffered_frames() {

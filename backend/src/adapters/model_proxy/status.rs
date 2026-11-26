@@ -104,7 +104,7 @@ impl AttemptStatus {
             .then(|| self.evidence_id.clone())
             .flatten()
     }
-    fn processing(&self) -> bool {
+    pub(super) fn processing(&self) -> bool {
         !self.reconciliation_required
             && matches!(self.state.as_str(), "reserved" | "dispatch_intended")
     }
@@ -116,7 +116,10 @@ pub(super) async fn recover(
     client: Arc<tokio::sync::Mutex<WorkerClient>>,
     q: &Value,
 ) -> Result<reqwest::Response, ProviderError> {
-    for _ in 0..30 {
+    // B3.6: while the control plane is still working on the call (a model thinking), keep asking, more slowly over
+    // time; the caller's own deadline ends the wait.
+    let mut pause = std::time::Duration::from_millis(100);
+    loop {
         let state = client.lock().await.model_status(q).await;
         if let Ok(v) = state {
             let s = AttemptStatus::parse(&v, q)?;
@@ -128,9 +131,9 @@ pub(super) async fn recover(
                 return Err(s.disposition());
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(std::time::Duration::from_secs(2));
     }
-    Err(unknown())
 }
 pub(super) async fn failure(
     client: Arc<tokio::sync::Mutex<WorkerClient>>,
