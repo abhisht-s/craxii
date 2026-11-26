@@ -21,6 +21,11 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_model(None).await
+    }
+    async fn with_model(
+        model_proxy: Option<crate::distribution::model_config::ModelProxySettings>,
+    ) -> Self {
         let root = std::env::var_os("CRAXII_RESULT_ATOMIC_CHILD_ROOT")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
@@ -52,7 +57,7 @@ impl Fixture {
                 power_operation_id: power.clone(),
                 release_id: "fixture-worker".into(),
                 release_sha256: "a".repeat(64),
-                model_proxy: None,
+                model_proxy,
                 agent_limits: None,
             },
             boot.clone(),
@@ -152,6 +157,34 @@ impl Fixture {
         std::fs::remove_dir_all(&self.root).unwrap();
     }
 }
+#[tokio::test]
+async fn model_calls_are_offered_only_when_the_agent_is_configured() {
+    let caps = |f: &Fixture| f.runtime.as_ref().unwrap().hello()["body"]["capabilities"].clone();
+    let plain = Fixture::new().await;
+    let offered = caps(&plain);
+    assert!(!offered.as_array().unwrap().contains(&json!("model_v1")));
+    // Off the VM (no compute authority) a development worker with the agent offers compute and model calls so
+    // it can reach the model service; on the VM compute is offered by the installed compute authority.
+    let agent = Fixture::with_model(Some(
+        crate::distribution::model_config::ModelProxySettings {
+            contract_version: 1,
+            model_id: "synthetic-agent".into(),
+            model_config_id: request_id().unwrap(),
+            model_config_digest: "a".repeat(64),
+            price_config_id: request_id().unwrap(),
+            price_config_digest: "b".repeat(64),
+            max_output_tokens: 1024,
+            context_window_tokens: None,
+            requested_output_tokens: None,
+            call_timeout_seconds: None,
+        },
+    ))
+    .await;
+    let offered = caps(&agent);
+    assert!(offered.as_array().unwrap().contains(&json!("model_v1")));
+    assert!(offered.as_array().unwrap().contains(&json!("compute_v1")));
+}
+
 #[tokio::test]
 async fn distribution_atomic_receipt_replay_cancel_and_tombstone_fifo() {
     let mut f = Fixture::new().await;

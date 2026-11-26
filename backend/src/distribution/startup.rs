@@ -23,7 +23,7 @@ use crate::worker_auth::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeSet, path::Path, time::Duration};
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DistributionConfig {
     pub contract_version: u32,
@@ -157,8 +157,8 @@ pub struct DistributionRuntime {
     pub store: SqliteStateStore,
     guard: SqliteRuntimeGuard,
     runtime: RuntimeBootstrapReceipt,
-    #[cfg(all(feature = "test-failpoints", debug_assertions))]
-    fixture_identity: (WorkstationIdentity, WorkspaceIdentity),
+    /// The workstation and workspace this worker's agent runs in (loaded at startup).
+    identity: (WorkstationIdentity, WorkspaceIdentity),
     config: DistributionConfig,
     environment: WorkerEnvironment,
     pub boot_id: String,
@@ -338,13 +338,12 @@ impl DistributionRuntime {
         } else {
             None
         };
-        // No AgentLoop, model/tool provider, executable scheduler or legacy delivery worker.
+        // The agent loop and scheduler start in `run` when the VM config names a model (B2.5).
         Ok(Self {
             store,
             guard,
             runtime,
-            #[cfg(all(feature = "test-failpoints", debug_assertions))]
-            fixture_identity: (snapshot.workstation, snapshot.workspace),
+            identity: (snapshot.workstation, snapshot.workspace),
             config,
             boot_id,
             in_flight_exports: std::sync::atomic::AtomicUsize::new(0),
@@ -362,22 +361,30 @@ impl DistributionRuntime {
         Ok(())
     }
     pub fn hello(&self) -> Value {
-        #[allow(unused_mut)]
         let mut hello = json!({"protocol":"craxii.worker","version":{"major":1,"minor":0},"type":"hello","body":{"release_id":self.config.release_id,"release_sha256":self.config.release_sha256,"supported_versions":[{"major":1,"minor":0}],"capabilities":["status_v1","signed_request_v1","admission_v1","cancel_v1","result_v1"],"canonicalization_versions":["craxii.cjson/1"],"signature_versions":["craxii.signature/1"],"sqlite_schema":crate::adapters::sqlite::MAX_SUPPORTED_SCHEMA_VERSION.to_string(),"boot_id":self.boot_id,"runtime_id":self.runtime.runtime_instance_id.to_string()}});
+        let agent = self.config.model_proxy.is_some();
         #[cfg(target_os = "linux")]
-        if self.compute.is_some() {
-            hello["body"]["capabilities"]
-                .as_array_mut()
-                .expect("hello capabilities")
-                .push(json!("compute_v1"));
-            // Model calls are offered only where something makes them: debug test builds today. Production
-            // offers them once the agent loop uses the VM config's `model_proxy` (B2).
-            if cfg!(all(feature = "test-failpoints", debug_assertions)) {
-                hello["body"]["capabilities"]
-                    .as_array_mut()
-                    .expect("hello capabilities")
-                    .push(json!("model_v1"));
-            }
+        let compute = self.compute.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let compute = false;
+        // A test build without compute authority (the Mac end-to-end harness) runs the agent ungated (the runner
+        // refuses production without compute), so it offers both to reach the model service. Never in a release.
+        let development_agent = cfg!(all(feature = "test-failpoints", debug_assertions))
+            && agent
+            && !compute
+            && self.environment != WorkerEnvironment::Production;
+        let capabilities = hello["body"]["capabilities"]
+            .as_array_mut()
+            .expect("hello capabilities");
+        if compute || development_agent {
+            capabilities.push(json!("compute_v1"));
+        }
+        // Model calls are offered where something makes them: the agent loop (the VM config's `model_proxy`),
+        // or the model fixtures of debug test builds.
+        if (compute && (agent || cfg!(all(feature = "test-failpoints", debug_assertions))))
+            || development_agent
+        {
+            capabilities.push(json!("model_v1"));
         }
         hello
     }
@@ -701,7 +708,7 @@ impl DistributionRuntime {
         super::fixture::complete(
             &self.store,
             &self.config,
-            &self.fixture_identity,
+            &self.identity,
             claimed,
             #[cfg(target_os = "linux")]
             None,
@@ -778,7 +785,7 @@ impl DistributionRuntime {
         super::fixture::complete(
             &self.store,
             &self.config,
-            &self.fixture_identity,
+            &self.identity,
             claimed,
             Some(permit),
             None,
@@ -882,7 +889,7 @@ impl DistributionRuntime {
             let execution = super::fixture::complete(
                 &self.store,
                 &self.config,
-                &self.fixture_identity,
+                &self.identity,
                 claimed,
                 Some(permit),
                 Some(super::fixture::ProxyFixture {
@@ -919,6 +926,30 @@ impl DistributionRuntime {
         self.guard.shutdown().await;
     }
     pub async fn shutdown(self) -> DistributionResult<()> {
+        match self.stop_agent(None, tokio::time::Instant::now()).await {
+            Ok(()) => self.finish().await,
+            Err(error) => {
+                self.close().await;
+                Err(error)
+            }
+        }
+    }
+    /// B2.6: a safe stop. With the agent running: stop claiming, record the runtime stopping, ask the running
+    /// task to cancel (its model call and tool get the notice), wait for it until `deadline`, and if it is still
+    /// running record it as unresolved and abort it. Results are then exported by the caller's last transfer, and
+    /// the runtime is recorded as stopped (`finish`).
+    async fn stop_agent(
+        &self,
+        scheduler: Option<crate::application::scheduler::SchedulerHandle>,
+        deadline: tokio::time::Instant,
+    ) -> DistributionResult<()> {
+        use crate::ports::state_store::{
+            ClassifyShutdownWorkRequest, RecoveryStateStore, RequestOwnedCancellationRequest,
+            SchedulerStateStore,
+        };
+        if let Some(s) = &scheduler {
+            s.stop_claiming_and_wait().await;
+        }
         let at = timestamp()?;
         self.store
             .begin_runtime_stopping(BeginRuntimeStoppingRequest {
@@ -935,6 +966,48 @@ impl DistributionRuntime {
             })
             .await
             .map_err(|_| DistributionError::Storage)?;
+        if let Some(mut s) = scheduler {
+            let cancelled = self
+                .store
+                .request_owned_work_cancellation(RequestOwnedCancellationRequest {
+                    runtime_id: self.runtime.runtime_instance_id,
+                    requested_at: at,
+                })
+                .await;
+            if cancelled.is_ok() {
+                s.begin_shutdown();
+            }
+            let classify = || {
+                self.store
+                    .classify_unresolved_shutdown_work(ClassifyShutdownWorkRequest {
+                        runtime_id: self.runtime.runtime_instance_id,
+                        classified_at: timestamp().unwrap_or(at),
+                    })
+            };
+            // As the runtime's own shutdown: runners are aborted only once their work is classified, and a
+            // failure to classify leaves the runtime `stopping` (not stopped) for the next boot's recovery.
+            let mut classified = false;
+            if let Ok(false) = s.join_before(deadline).await {
+                if s.prepare_deadline_and_wait().await.is_ok() {
+                    classify().await.map_err(|_| DistributionError::Storage)?;
+                    classified = true;
+                    let _ = s.abort_runners_and_join().await;
+                } else {
+                    let _ = s.join_to_completion().await;
+                }
+            }
+            if !classified {
+                classify().await.map_err(|_| DistributionError::Storage)?;
+            }
+        }
+        Ok(())
+    }
+    /// Closes the store without recording the runtime stopped (its work wasn't all accounted for).
+    async fn close(self) {
+        self.guard.shutdown().await;
+    }
+    /// Records the runtime stopped and closes the store.
+    async fn finish(self) -> DistributionResult<()> {
         self.store
             .finish_runtime_graceful(FinishRuntimeRequest {
                 runtime_instance_id: self.runtime.runtime_instance_id,
@@ -945,10 +1018,80 @@ impl DistributionRuntime {
         self.guard.shutdown().await;
         Ok(())
     }
-    pub async fn run(self, mut client: WorkerClient) -> DistributionResult<()> {
+    /// B2.5: the agent for ordinary work, when the VM config names a model: a scheduler that claims tasks the
+    /// current grant covers and runs each in its own agent loop.
+    fn start_agent(
+        &self,
+        client: std::sync::Arc<tokio::sync::Mutex<WorkerClient>>,
+    ) -> DistributionResult<
+        Option<(
+            crate::application::scheduler::SchedulerHandle,
+            tokio::sync::watch::Receiver<bool>,
+        )>,
+    > {
+        use std::sync::Arc;
+        if self.config.model_proxy.is_none() {
+            return Ok(None);
+        }
+        let store = Arc::new(self.store.clone());
+        let runner = Arc::new(super::runner::OrdinaryRunner::new(
+            store.clone(),
+            self.config.clone(),
+            self.environment,
+            self.identity.clone(),
+            client,
+            #[cfg(target_os = "linux")]
+            self.compute.clone(),
+        )?);
+        #[cfg(target_os = "linux")]
+        let gate: Arc<
+            dyn Fn(&crate::adapters::sqlite::OrdinaryAuthorization) -> bool + Send + Sync,
+        > = if let Some(c) = self.compute.clone() {
+            Arc::new(move |a| {
+                c.check_ordinary(
+                    &a.period_id,
+                    &a.authorization_epoch,
+                    &a.central_work_id,
+                    &a.compute_grant_id,
+                )
+                .is_ok()
+            })
+        } else {
+            Arc::new(|_| true)
+        };
+        // Off the VM (development builds only: the runner refuses production without compute) nothing to check.
+        #[cfg(not(target_os = "linux"))]
+        let gate: Arc<
+            dyn Fn(&crate::adapters::sqlite::OrdinaryAuthorization) -> bool + Send + Sync,
+        > = Arc::new(|_| true);
+        let (fatal, failed) = tokio::sync::watch::channel(false);
+        crate::application::scheduler::start_scheduler(
+            Arc::new(super::runner::OrdinaryClaimStore { store, gate }),
+            runner,
+            Arc::new(crate::adapters::system_clock::SystemClock::new()),
+            crate::bootstrap::health::Health::new(),
+            fatal,
+            crate::application::scheduler::SchedulerStart {
+                runtime_instance_id: self.runtime.runtime_instance_id,
+                readiness: crate::application::scheduler::SchedulerReadiness::ReadyAfterInitialScan,
+            },
+        )
+        .map(|handle| Some((handle, failed)))
+        .map_err(|_| invalid())
+    }
+    pub async fn run(self, client: WorkerClient) -> DistributionResult<()> {
         if client.environment() != self.environment {
             return Err(invalid());
         }
+        // Shared with the agent's model calls. Each step below holds it for one exchange with the control plane
+        // only, so a model call waits at most that long to open.
+        let shared = std::sync::Arc::new(tokio::sync::Mutex::new(client));
+        // The agent starts after the first successful exchange, so its first model call has a live session.
+        let mut agent: Option<(
+            crate::application::scheduler::SchedulerHandle,
+            tokio::sync::watch::Receiver<bool>,
+        )> = None;
+        let mut fatal = false;
         // Connecting is part of each exchange, so an edge error while connecting (at startup or after a
         // session expires) backs off and retries like any other transient failure.
         let mut connected = false;
@@ -960,16 +1103,16 @@ impl DistributionRuntime {
         loop {
             let exchange = async {
                 if !connected {
-                    self.reconnect(&mut client).await?;
+                    self.reconnect(&mut *shared.lock().await).await?;
                     connected = true;
                 }
                 #[cfg(target_os = "linux")]
                 if let Some(c) = &self.compute {
-                    c.refresh(&mut client, &self.boot_id).await?;
+                    c.refresh(&mut *shared.lock().await, &self.boot_id).await?;
                     c.running().map_err(|_| AuthError::Unavailable)?;
                 }
-                self.transfer_pending(&mut client).await?;
-                self.poll_once(&mut client).await?;
+                self.transfer_pending(&mut *shared.lock().await).await?;
+                self.poll_once(&mut *shared.lock().await).await?;
                 Ok::<_, AuthError>(())
             };
             let drain = async {
@@ -981,15 +1124,42 @@ impl DistributionRuntime {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             };
+            // A scheduler that stopped on a fatal error can't run work: stop the worker like any fatal error.
+            let failed = async {
+                match agent.as_mut() {
+                    Some((_, failed)) => {
+                        let _ = failed.wait_for(|f| *f).await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
             #[cfg(unix)]
-            let result = tokio::select! { result=exchange=>result,_=drain=>break,_=termination.recv()=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
+            let result = tokio::select! { result=exchange=>result,_=drain=>break,_=failed=>{fatal=true;break;},_=termination.recv()=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
             #[cfg(not(unix))]
-            let result = tokio::select! { result=exchange=>result,_=drain=>break,result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
+            let result = tokio::select! { result=exchange=>result,_=drain=>break,_=failed=>{fatal=true;break;},result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;} };
             match result {
-                Ok(()) => delay = 1000,
+                Ok(()) => {
+                    delay = 1000;
+                    if agent.is_none() {
+                        match self.start_agent(shared.clone()) {
+                            Ok(started) => agent = started,
+                            Err(_) => {
+                                fatal = true;
+                                break;
+                            }
+                        }
+                    }
+                }
                 Err(AuthError::SessionExpired) => connected = false,
                 Err(AuthError::Transport | AuthError::Unavailable) => delay = (delay * 2).min(5000),
-                Err(_) => return Err(invalid()),
+                Err(_) => {
+                    fatal = true;
+                    break;
+                }
+            }
+            // New work or cancels may have arrived: let the scheduler look.
+            if let Some((s, _)) = &agent {
+                s.notifier().wake();
             }
             let jitter = crate::distribution::request_id()?.as_bytes()[0] as u64;
             #[cfg(unix)]
@@ -997,17 +1167,37 @@ impl DistributionRuntime {
             #[cfg(not(unix))]
             tokio::select! {result=tokio::signal::ctrl_c()=>{result.map_err(|_|invalid())?;break;},_=tokio::time::sleep(Duration::from_millis(delay+jitter))=>{}}
         }
+        // Stop safely: running work gets up to 20 s (less if the compute cleanup cutoff is sooner), then what
+        // finished or was cancelled is exported (up to 5 s more), then the stop is recorded. The whole stop stays
+        // under the service's 30 s stop timeout.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         #[cfg(target_os = "linux")]
-        if let Some(c) = &self.compute
-            && let Ok(cutoff) = c.cleanup_cutoff()
-        {
-            let _ = tokio::time::timeout_at(
-                tokio::time::Instant::from_std(cutoff),
-                self.transfer_pending(&mut client),
-            )
-            .await;
+        let deadline = self
+            .compute
+            .as_ref()
+            .and_then(|c| c.cleanup_cutoff().ok())
+            .map_or(deadline, |cutoff| {
+                deadline.min(tokio::time::Instant::from_std(cutoff))
+            });
+        let stopped = self.stop_agent(agent.map(|(s, _)| s), deadline).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut guard = shared.lock().await;
+            self.transfer_pending(&mut guard).await
+        })
+        .await;
+        // The stop is recorded only when every owned task was accounted for; otherwise the runtime stays
+        // `stopping` and the next boot's recovery finishes the job.
+        let result = match stopped {
+            Ok(()) => self.finish().await,
+            Err(error) => {
+                self.close().await;
+                Err(error)
+            }
+        };
+        if fatal {
+            return Err(invalid());
         }
-        self.shutdown().await
+        result
     }
 }
 /// One delivery that cannot be admitted must not stop the worker. Expired or unverifiable

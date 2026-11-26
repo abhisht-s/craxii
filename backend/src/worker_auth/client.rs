@@ -33,6 +33,14 @@ struct Session {
     deadline: Instant,
     scopes: Vec<String>,
 }
+impl WorkerClient {
+    /// Test builds only: the current session credential, so a local end-to-end harness can stand in for the
+    /// boot flow that issues the first compute grant (B7). Never compiled into a release.
+    #[cfg(feature = "test-failpoints")]
+    pub fn fixture_session_credential(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.credential.as_str())
+    }
+}
 impl std::fmt::Debug for WorkerClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WorkerClient([REDACTED])")

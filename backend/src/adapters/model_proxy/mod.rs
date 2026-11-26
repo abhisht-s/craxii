@@ -16,6 +16,13 @@ fn invalid() -> ProviderError {
         ProviderOutcomeCertainty::DefinitelyNotSent,
     )
 }
+/// Nothing was sent (no live session yet, or the shared client stayed busy): safe to retry.
+fn not_sent() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::TemporarilyUnavailable,
+        ProviderOutcomeCertainty::DefinitelyNotSent,
+    )
+}
 fn unknown() -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::ProviderOutcomeUnknown,
@@ -264,8 +271,10 @@ impl ModelProvider for CentralModelProvider {
                 .checked_add(remaining)
                 .ok_or_else(invalid)?;
             let mut transmitted_request = None;
+            // Waiting for the shared client (busy with one poll-loop exchange at most) doesn't count against the
+            // 5 s to open the call.
+            let mut client = tokio::select! {biased;()=i.control.cancellation().cancelled()=>return Err(ProviderError::new(ProviderErrorKind::Cancelled,ProviderOutcomeCertainty::DefinitelyNotSent)),r=tokio::time::timeout(remaining,self.client.lock())=>r.map_err(|_|not_sent())?};
             let open = async {
-                let mut client = self.client.lock().await;
                 let retry =
                     if let Some(prior) = i.control.durable_attempt().and_then(|a| a.retry_of()) {
                         let previous = self
@@ -291,7 +300,7 @@ impl ModelProvider for CentralModelProvider {
                     &i,
                     &self.binding,
                     &grant,
-                    client.current_authority().map_err(|_| invalid())?,
+                    client.current_authority().map_err(|_| not_sent())?,
                     retry,
                 )?;
                 {
@@ -313,10 +322,11 @@ impl ModelProvider for CentralModelProvider {
             let (q, response) = match opened {
                 Ok(result) => result?,
                 Err(_) => (
-                    transmitted_request.ok_or_else(unknown)?,
+                    transmitted_request.ok_or_else(not_sent)?,
                     Err(crate::worker_auth::AuthError::Transport),
                 ),
             };
+            drop(client);
             let response = match response {
                 Ok(response)
                     if response.status().is_success()

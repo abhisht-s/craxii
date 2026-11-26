@@ -2,6 +2,7 @@
 #[cfg(all(feature = "test-failpoints", debug_assertions))]
 pub(crate) mod fixture;
 pub mod model_config;
+pub(crate) mod runner;
 pub mod startup;
 pub mod transport;
 pub use crate::distribution_contracts::environment::WorkerEnvironment;

@@ -273,6 +273,10 @@ pub struct OrdinaryAuthorization {
 pub enum ClaimAuthority<'a> {
     None,
     /// A live development fixture delivery (debug builds only).
+    #[cfg_attr(
+        not(all(feature = "test-failpoints", debug_assertions)),
+        allow(dead_code)
+    )]
     Fixture(&'a crate::distribution::ValidatedDelivery),
     /// Ordinary work, whose stored authorization the gate rechecks (on a VM: against the current grant).
     Ordinary(&'a (dyn Fn(&OrdinaryAuthorization) -> bool + Send + Sync)),

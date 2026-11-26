@@ -132,6 +132,30 @@ impl SqliteStateStore {
             row.try_get("compute_grant_id").map_err(storage)?,
         ))
     }
+    /// B2.5: a claimed ordinary task's original committed receipt and stored authorization.
+    pub async fn ordinary_task(
+        &self,
+        local: WorkId,
+    ) -> DistributionResult<(Value, crate::adapters::sqlite::OrdinaryAuthorization)> {
+        let row = sqlx::query("SELECT r.receipt_canonical,a.central_work_id,a.period_id,a.compute_grant_id,a.authorization_epoch FROM distribution_authorizations a JOIN distribution_receipts r ON r.environment=a.environment AND r.central_work_id=a.central_work_id WHERE a.local_work_id=? AND r.quarantined=0")
+            .bind(local.to_string())
+            .fetch_optional(&self.runtime.inner.pool)
+            .await
+            .map_err(storage)?
+            .ok_or_else(invalid)?;
+        Ok((
+            parse(
+                &row.try_get::<String, _>("receipt_canonical")
+                    .map_err(storage)?,
+            )?,
+            crate::adapters::sqlite::OrdinaryAuthorization {
+                central_work_id: row.try_get("central_work_id").map_err(storage)?,
+                period_id: row.try_get("period_id").map_err(storage)?,
+                compute_grant_id: row.try_get("compute_grant_id").map_err(storage)?,
+                authorization_epoch: row.try_get("authorization_epoch").map_err(storage)?,
+            },
+        ))
+    }
     /// B2.2: the tool permit for a running ordinary task: tool calls up to `max_duration_ms` each, the task's
     /// own deadline, and the current grant rechecked while each call runs.
     #[cfg(target_os = "linux")]
