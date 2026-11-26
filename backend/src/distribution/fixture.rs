@@ -456,6 +456,7 @@ pub(crate) async fn complete(
                 provider_attempts_per_work: if is_proxy { 3 } else { 1 },
                 tool_calls_per_work: 1,
                 work_duration: std::time::Duration::from_secs(60),
+                repeated_failure_limit: 0,
             },
         )
         .map_err(|_| "construction_34")?,

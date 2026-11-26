@@ -58,18 +58,35 @@ impl InstalledCompute {
         )?
         .worker_authority(&self.policy, &c)
     }
+    /// Work may run while the root-accepted current grant lists it (A1(a)). `grant` is the grant the work was
+    /// admitted or started under: new messages supersede grants within the same window, and renewals replace them,
+    /// so in-flight work is never tied to one grant id. The current grant is always bound to this boot's policy.
     #[cfg(target_os = "linux")]
     pub fn check_work(&self, work: &str, grant: &str, duration_ms: u64) -> ComputeResult<()> {
         let a = self.current()?;
-        if a.grant_id()? != grant {
-            return Err(denied());
-        }
+        crate::distribution_contracts::primitives::uuid(grant, Some(4)).map_err(|_| denied())?;
         a.check_work(
             &watchdog::clock_sample()?,
             work,
             duration_ms,
             self.policy.margins_us()? / 1000,
         )
+    }
+    /// B1 ordinary work: the delivery's period and epoch are this boot's, and the current grant lists the work.
+    #[cfg(target_os = "linux")]
+    pub fn check_ordinary(
+        &self,
+        period: &str,
+        epoch: &str,
+        work: &str,
+        grant: &str,
+    ) -> ComputeResult<()> {
+        if self.policy.binding.period_id != period
+            || self.policy.binding.authorization_epoch != epoch
+        {
+            return Err(denied());
+        }
+        self.check_work(work, grant, 1)
     }
     #[cfg(target_os = "linux")]
     pub fn running(&self) -> ComputeResult<()> {
@@ -108,6 +125,68 @@ impl InstalledCompute {
             state,
             Ok(watchdog::Action::Running | watchdog::Action::BootstrapOnly)
         )
+    }
+    /// A1(a): a delivery names a grant this VM doesn't hold yet (a superseding grant listing new work, or a
+    /// renewal). Fetch the control plane's current grant (read-only), verify it is the named one, signed for this
+    /// boot's binding, issued later and ending no earlier (a same-cutoff successor must also keep the reservation),
+    /// stage it for the root watchdog, and wait briefly for the watchdog to accept it. Returns false when the grant
+    /// can't be adopted; the delivery then waits and the control plane issues it again.
+    #[cfg(target_os = "linux")]
+    pub async fn adopt(
+        &self,
+        client: &mut crate::worker_auth::client::WorkerClient,
+        boot: &str,
+        named: &str,
+    ) -> Result<bool, crate::worker_auth::AuthError> {
+        let current = match self.current() {
+            Ok(a) => a,
+            Err(_) => return Ok(false),
+        };
+        if current.grant_id().is_ok_and(|g| g == named) {
+            return Ok(true);
+        }
+        // Only a broken session is the caller's problem (it reconnects). Anything else, a refusal or a network
+        // error, just means this delivery waits: one delivery never stops the worker.
+        let response = match client
+            .compute_authorization(boot, &self.policy.binding.power_operation_id)
+            .await
+        {
+            Ok(r) => r,
+            Err(
+                e @ (crate::worker_auth::AuthError::SessionExpired
+                | crate::worker_auth::AuthError::Revoked
+                | crate::worker_auth::AuthError::Stale),
+            ) => return Err(e),
+            Err(_) => return Ok(false),
+        };
+        let adoptable = (|| -> ComputeResult<bool> {
+            let bytes = crate::distribution_contracts::canonical::canonical_bytes(&response)
+                .map_err(|_| denied())?;
+            let next =
+                RunningAuthority::verify(&bytes, &self.policy.binding, &watchdog::clock_sample()?)?;
+            Ok(super::authorization::adoptable_successor(
+                named,
+                next.grant(),
+                &next.deadline.utc_cutoff_us,
+                current.grant(),
+                &current.deadline.utc_cutoff_us,
+            ))
+        })()
+        .unwrap_or(false);
+        if !adoptable || self.stage(&response).is_err() {
+            return Ok(false);
+        }
+        // The root watchdog reads its inbox every 100 ms.
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if self
+                .current()
+                .is_ok_and(|a| a.grant_id().is_ok_and(|g| g == named))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
     /// Persist exact signed bytes for root acceptance. A staged response has no local authority.
     #[cfg(target_os = "linux")]
@@ -178,6 +257,20 @@ impl InstalledCompute {
                         .map_err(|_| AuthError::InvalidContext)?
                 {
                     return Err(AuthError::InvalidContext);
+                }
+                // The retired request may still have committed a renewal (A1(a): the control plane builds a
+                // renewal of a superseded grant on the current one). Read the current grant first: read-only, it
+                // never allocates funding, and staging the grant already held is a no-op. Only then retire the
+                // intent. The watchdog already holds a newer grant, so a failed read is not fatal: the intent
+                // stays and the next refresh tries again.
+                let Ok(response) = client
+                    .compute_authorization(boot, &self.policy.binding.power_operation_id)
+                    .await
+                else {
+                    return Ok(());
+                };
+                if self.stage(&response).is_err() {
+                    return Ok(());
                 }
                 std::fs::remove_file(path).map_err(|_| AuthError::InvalidContext)?;
                 std::fs::File::open(path.parent().ok_or(AuthError::InvalidContext)?)
@@ -254,6 +347,10 @@ pub struct WorkPermit {
     pub(crate) max_duration_ms: u64,
     pub(crate) profile_cutoff: std::time::Instant,
     pub(crate) cleanup_cutoff: std::time::Instant,
+    /// Ordinary work (B2.2): a tool call may last longer than one grant. It starts while the current grant
+    /// covers the work and is checked against the grant on every tick while it runs (renewals extend it), so it
+    /// needs no single grant to outlast the whole call. A development fixture keeps the stricter rule.
+    pub(crate) checked_while_running: bool,
 }
 impl WorkPermit {
     pub fn check(&self, work: crate::domain::WorkId, duration_ms: u64) -> ComputeResult<()> {
@@ -266,8 +363,13 @@ impl WorkPermit {
         {
             return Err(denied());
         }
+        let grant_duration = if self.checked_while_running {
+            1
+        } else {
+            duration_ms
+        };
         self.compute
-            .check_work(&self.central_work, &self.grant_id, duration_ms)
+            .check_work(&self.central_work, &self.grant_id, grant_duration)
     }
     pub(crate) fn cleanup_cutoff(&self) -> tokio::time::Instant {
         tokio::time::Instant::from_std(self.cleanup_cutoff)

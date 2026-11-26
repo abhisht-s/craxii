@@ -16,6 +16,13 @@ fn invalid() -> ProviderError {
         ProviderOutcomeCertainty::DefinitelyNotSent,
     )
 }
+/// Nothing was sent (no live session yet, or the shared client stayed busy): safe to retry.
+fn not_sent() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::TemporarilyUnavailable,
+        ProviderOutcomeCertainty::DefinitelyNotSent,
+    )
+}
 fn unknown() -> ProviderError {
     ProviderError::new(
         ProviderErrorKind::ProviderOutcomeUnknown,
@@ -25,18 +32,46 @@ fn unknown() -> ProviderError {
 /// Trusted current compute gate, rechecked before transmission and every stream read.
 pub trait ModelComputeAuthority: Send + Sync {
     fn check(&self, work: &str, grant: &str) -> Result<(), ProviderError>;
+    /// The grant a call for ordinary work names (B2.3): the VM's current root-accepted grant, since the grant the
+    /// work arrived under may since have been renewed into a new window. Without installed compute (development
+    /// builds), the stored grant.
+    fn current_grant(&self, work: &str, stored: &str) -> Result<String, ProviderError> {
+        self.check(work, stored)?;
+        Ok(stored.to_owned())
+    }
 }
 #[cfg(target_os = "linux")]
 impl ModelComputeAuthority for crate::compute::worker::InstalledCompute {
     fn check(&self, work: &str, grant: &str) -> Result<(), ProviderError> {
         self.check_work(work, grant, 1).map_err(|_| invalid())
     }
+    fn current_grant(&self, work: &str, stored: &str) -> Result<String, ProviderError> {
+        self.check(work, stored)?;
+        let current = self.current().map_err(|_| invalid())?;
+        current.grant_id().map(str::to_owned).map_err(|_| invalid())
+    }
+}
+/// What a model call is bound to: the task, its period, the grant, and the model and price pins.
+#[derive(Clone)]
+pub(super) struct Bound {
+    pub(super) work_id: String,
+    pub(super) material_digest: String,
+    pub(super) period_id: String,
+    pub(super) compute_grant_id: String,
+    pub(super) model_config_id: String,
+    pub(super) model_config_digest: String,
+    pub(super) price_config_id: String,
+    pub(super) price_config_digest: String,
+    /// A development fixture's signed profile; ordinary work has none.
+    pub(super) profile_id: Option<String>,
+    /// Ordinary work names the VM's current grant at call time; a fixture names its profile's grant.
+    pub(super) current_grant: bool,
 }
 #[derive(Clone)]
 pub struct ProxyBinding {
     environment: crate::distribution_contracts::environment::WorkerEnvironment,
     receipt: Value,
-    profile: Value,
+    bound: Bound,
     local_work_id: String,
     epoch: String,
     settings: crate::distribution::model_config::ModelProxySettings,
@@ -86,12 +121,78 @@ impl ProxyBinding {
         }
         crate::distribution_contracts::primitives::decimal(&epoch, "Dp").map_err(|_| invalid())?;
         let local_work_id = wire::text(&receipt, "local_work_id")?;
+        let bound = Bound {
+            work_id: wire::text(p, "work_id")?,
+            material_digest: wire::text(p, "material_digest")?,
+            period_id: wire::text(p, "period_id")?,
+            compute_grant_id: wire::text(p, "compute_grant_id")?,
+            model_config_id: wire::text(p, "model_config_id")?,
+            model_config_digest: wire::text(p, "model_config_digest")?,
+            price_config_id: wire::text(p, "price_config_id")?,
+            price_config_digest: wire::text(p, "price_config_digest")?,
+            profile_id: Some(wire::text(p, "profile_id")?),
+            current_grant: false,
+        };
         Ok(Self {
             environment,
             receipt,
-            profile,
+            bound,
             local_work_id,
             epoch,
+            settings,
+        })
+    }
+    /// What the binding names, for tests: work, period, grant, model config, profile, current-grant flag.
+    #[cfg(test)]
+    pub(crate) fn named(&self) -> (String, String, String, String, Option<String>, bool) {
+        let b = &self.bound;
+        (
+            b.work_id.clone(),
+            b.period_id.clone(),
+            b.compute_grant_id.clone(),
+            b.model_config_id.clone(),
+            b.profile_id.clone(),
+            b.current_grant,
+        )
+    }
+    /// B2.3: an ordinary task's binding, with no profile. The receipt is the original committed SQLite receipt
+    /// and `authorization` its stored ordinary authorization; the model and price pins are the VM config's.
+    pub fn ordinary(
+        environment: crate::distribution_contracts::environment::WorkerEnvironment,
+        receipt: Value,
+        authorization: &crate::adapters::sqlite::OrdinaryAuthorization,
+        settings: crate::distribution::model_config::ModelProxySettings,
+    ) -> Result<Self, ProviderError> {
+        settings.validate().map_err(|_| invalid())?;
+        crate::distribution_contracts::wire::validate_definition("work", "Receipt", &receipt)
+            .map_err(|_| invalid())?;
+        if receipt["work_id"] != authorization.central_work_id.as_str() {
+            return Err(invalid());
+        }
+        crate::distribution_contracts::primitives::decimal(
+            &authorization.authorization_epoch,
+            "Dp",
+        )
+        .map_err(|_| invalid())?;
+        let local_work_id = wire::text(&receipt, "local_work_id")?;
+        let bound = Bound {
+            work_id: authorization.central_work_id.clone(),
+            material_digest: wire::text(&receipt, "material_digest")?,
+            period_id: authorization.period_id.clone(),
+            compute_grant_id: authorization.compute_grant_id.clone(),
+            model_config_id: settings.model_config_id.clone(),
+            model_config_digest: settings.model_config_digest.clone(),
+            price_config_id: settings.price_config_id.clone(),
+            price_config_digest: settings.price_config_digest.clone(),
+            profile_id: None,
+            current_grant: true,
+        };
+        Ok(Self {
+            environment,
+            receipt,
+            bound,
+            local_work_id,
+            epoch: authorization.authorization_epoch.clone(),
             settings,
         })
     }
@@ -145,10 +246,14 @@ impl ModelProvider for CentralModelProvider {
     ) -> ModelProviderFuture<'_, Box<dyn ModelProviderStream>> {
         Box::pin(async move {
             self.capabilities(i.request.target())?;
-            let p = &self.binding.profile["body"]["profile"];
-            let work = wire::text(p, "work_id")?;
-            let grant = wire::text(p, "compute_grant_id")?;
-            self.compute.check(&work, &grant)?;
+            let work = self.binding.bound.work_id.clone();
+            let stored = &self.binding.bound.compute_grant_id;
+            let grant = if self.binding.bound.current_grant {
+                self.compute.current_grant(&work, stored)?
+            } else {
+                self.compute.check(&work, stored)?;
+                stored.clone()
+            };
             if i.control.cancellation().is_cancelled() {
                 return Err(invalid());
             }
@@ -157,15 +262,19 @@ impl ModelProvider for CentralModelProvider {
                 .absolute_deadline()
                 .checked_duration_since(self.clock.monotonic_now())
                 .ok_or_else(invalid)?
-                .min(Duration::from_secs(30));
+                .min(Duration::from_secs(u64::from(
+                    self.binding.settings.call_timeout_seconds(),
+                )));
             let deadline = self
                 .clock
                 .monotonic_now()
                 .checked_add(remaining)
                 .ok_or_else(invalid)?;
             let mut transmitted_request = None;
+            // Waiting for the shared client (busy with one poll-loop exchange at most) doesn't count against the
+            // 5 s to open the call.
+            let mut client = tokio::select! {biased;()=i.control.cancellation().cancelled()=>return Err(ProviderError::new(ProviderErrorKind::Cancelled,ProviderOutcomeCertainty::DefinitelyNotSent)),r=tokio::time::timeout(remaining,self.client.lock())=>r.map_err(|_|not_sent())?};
             let open = async {
-                let mut client = self.client.lock().await;
                 let retry =
                     if let Some(prior) = i.control.durable_attempt().and_then(|a| a.retry_of()) {
                         let previous = self
@@ -190,13 +299,15 @@ impl ModelProvider for CentralModelProvider {
                 let q = wire::invocation(
                     &i,
                     &self.binding,
-                    client.current_authority().map_err(|_| invalid())?,
+                    &grant,
+                    client.current_authority().map_err(|_| not_sent())?,
                     retry,
                 )?;
                 {
+                    // Kept only for a retry of the latest attempts; attempt ids are time-ordered (UUIDv7).
                     let mut requests = self.requests.lock().await;
-                    if requests.len() >= 3 {
-                        return Err(unknown());
+                    while requests.len() >= 8 {
+                        requests.pop_first();
                     }
                     requests.insert(
                         wire::text(&q["body"]["invocation"], "attempt_id")?,
@@ -211,10 +322,11 @@ impl ModelProvider for CentralModelProvider {
             let (q, response) = match opened {
                 Ok(result) => result?,
                 Err(_) => (
-                    transmitted_request.ok_or_else(unknown)?,
+                    transmitted_request.ok_or_else(not_sent)?,
                     Err(crate::worker_auth::AuthError::Transport),
                 ),
             };
+            drop(client);
             let response = match response {
                 Ok(response)
                     if response.status().is_success()

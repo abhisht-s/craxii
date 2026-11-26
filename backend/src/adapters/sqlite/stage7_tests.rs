@@ -207,7 +207,7 @@ async fn current_manifest_schema_and_zero_product_rows_are_exact() {
     let root = TestRoot::new();
     let guard = SqliteRuntimeGuard::start(root.path(), 2).await.unwrap();
     let mut connection = guard.runtime().acquire().await.unwrap();
-    assert_eq!(PRODUCT_TABLES.len(), 29);
+    assert_eq!(PRODUCT_TABLES.len(), 30);
     assert_eq!(PRODUCT_INDEXES.len(), 63);
     for table in PRODUCT_TABLES {
         assert_eq!(count(guard.runtime(), table).await, 0, "{table}");
@@ -241,7 +241,7 @@ async fn current_manifest_schema_and_zero_product_rows_are_exact() {
             .fetch_one(&mut *connection)
             .await
             .unwrap(),
-        5
+        7
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_schema WHERE type = 'view'")
@@ -259,7 +259,7 @@ async fn current_manifest_schema_and_zero_product_rows_are_exact() {
     );
     assert_eq!(
         expected_schema_fingerprint(),
-        "9d484df334845025b7b4bd72f89305c32441a64c269ac0d16ab7f5630fa74cb0"
+        "28057fa2faec11310ef59c4ae1250ee46f3c5c9b983a53b8adf04d38a3b69385"
     );
     assert_eq!(
         v1_schema_fingerprint(),

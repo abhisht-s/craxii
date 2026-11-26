@@ -175,12 +175,15 @@ async fn main() {
             // A3 end-to-end harness: the debug-only execution step answers the first message (the release
             // agent loop arrives in B2), then the worker's real main loop runs until SIGTERM. It sends the
             // result to the control plane and keeps polling.
-            runtime
-                .isolated_terminal_once(&mut client)
-                .await
-                .map_err(|e| {
-                    eprintln!("distribution_fixture_terminal_{e:?}");
-                })?;
+            // B2: with `agent`, the release agent loop does the work instead (the VM config names `model_proxy`).
+            if input["agent"] != true {
+                runtime
+                    .isolated_terminal_once(&mut client)
+                    .await
+                    .map_err(|e| {
+                        eprintln!("distribution_fixture_terminal_{e:?}");
+                    })?;
+            }
             std::io::stdout()
                 .write_all(b"distribution_serving\n")
                 .map_err(|_| ())?;
@@ -376,7 +379,13 @@ async fn main() {
             .await
             .map_err(|_| ())?
             .len();
-        let result = json!({"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":(input["action"]=="bounded"||input["action"]=="proxy"||input["action"]=="enroll_proxy"),"retrieved_attempt":retrieved_attempt,"exports":runtime.export_observation().await.map_err(|_|())?});
+        // B2.8: the end-to-end harness issues the boot compute grant for this session (B7 does it at boot).
+        let session = if input["reveal_session"] == true {
+            json!(client.fixture_session_credential())
+        } else {
+            Value::Null
+        };
+        let result = json!({"session_credential":session,"key_id":client.key_id(),"pending_receipts":pending,"pending_controls":controls,"execution_enabled":(input["action"]=="bounded"||input["action"]=="proxy"||input["action"]=="enroll_proxy"),"retrieved_attempt":retrieved_attempt,"exports":runtime.export_observation().await.map_err(|_|())?});
         runtime.shutdown().await.map_err(|_| ())?;
         Ok::<Value, ()>(result)
     };

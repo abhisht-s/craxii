@@ -3194,6 +3194,7 @@ async fn assert_sqlite_contract(database: &Path) {
             "0008_distribution_receipts.sql",
             "0009_distribution_results.sql",
             "0010_production_environment.sql",
+            "0011_ordinary_authorization.sql",
         ]
     );
 }

@@ -33,6 +33,14 @@ struct Session {
     deadline: Instant,
     scopes: Vec<String>,
 }
+impl WorkerClient {
+    /// Test builds only: the current session credential, so a local end-to-end harness can stand in for the
+    /// boot flow that issues the first compute grant (B7). Never compiled into a release.
+    #[cfg(feature = "test-failpoints")]
+    pub fn fixture_session_credential(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.credential.as_str())
+    }
+}
 impl std::fmt::Debug for WorkerClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WorkerClient([REDACTED])")
@@ -779,7 +787,7 @@ impl WorkerClient {
         let authority = self.current_authority()?;
         let request = json!({"contract_version":1,"request_id":id,"authority":authority,"boot_id":boot,"power_operation_id":power,"max_items":4,"wait_ms":0});
         let response = self.session_exchange("/v1/worker/poll", &request).await?;
-        let items = crate::distribution::transport::poll_response(&response, &id)
+        let items = crate::distribution::transport::poll_response(&response, &id, self.environment)
             .map_err(|_| AuthError::InvalidContext)?;
         let mut result = Vec::new();
         for message in items.iter().filter(|m| m["type"] != "execution_profile") {

@@ -421,3 +421,35 @@ mod tick_decimal {
         }
     }
 }
+/// A1(a): whether a verified grant may replace the one this VM holds. It must be the grant the delivery names,
+/// for the same boot, issued later, and end no earlier (the root watchdog's own rule); a successor ending at the
+/// same instant is a superseding grant, which must keep the reservation (same window and money). Cutoffs are the
+/// effective UTC cutoffs in microseconds. Pure, so it is tested on every platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn adoptable_successor(
+    named: &str,
+    next: &Value,
+    next_cutoff: &str,
+    held: &Value,
+    held_cutoff: &str,
+) -> bool {
+    let micros = |v: &Value| {
+        crate::distribution_contracts::primitives::timestamp_micros(
+            v["issued_at"].as_str().unwrap_or_default(),
+        )
+        .ok()
+    };
+    let (Some(issued), Some(prior), Ok(cutoff), Ok(held_until)) = (
+        micros(next),
+        micros(held),
+        next_cutoff.parse::<i128>(),
+        held_cutoff.parse::<i128>(),
+    ) else {
+        return false;
+    };
+    next["grant_id"] == named
+        && next["boot_id"] == held["boot_id"]
+        && issued > prior
+        && cutoff >= held_until
+        && (cutoff > held_until || next["compute_reservation_id"] == held["compute_reservation_id"])
+}

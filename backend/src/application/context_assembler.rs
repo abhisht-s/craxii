@@ -842,15 +842,53 @@ impl ContextAssembler {
                 return Err(ContextAssemblyError::new(ContextAssemblyErrorKind::Source));
             }
         };
-        let result = span.in_scope(|| {
-            self.assemble_snapshot(
-                snapshot,
-                selection,
-                versions,
-                ContextManifestId::generate(),
-                LogicalInvocationId::generate(),
-            )
-        });
+        // B2.7: a long conversation keeps its newest turns. If the whole history doesn't fit the model's context,
+        // leave out the fewest oldest whole earlier turns that makes it fit (found by bisection); only if the
+        // current work alone doesn't fit does assembly fail with the context limit.
+        let (manifest_id, invocation_id) = (
+            ContextManifestId::generate(),
+            LogicalInvocationId::generate(),
+        );
+        let attempt = |omit: usize| {
+            span.in_scope(|| {
+                self.assemble_snapshot(
+                    snapshot.clone(),
+                    selection,
+                    versions,
+                    manifest_id,
+                    invocation_id,
+                    omit,
+                )
+            })
+        };
+        let too_large = |r: &Result<ContextAssemblyResult, ContextAssemblyError>| matches!(r, Err(e) if e.kind() == ContextAssemblyErrorKind::ContextLimitExceeded);
+        let mut result = attempt(0);
+        let turns = snapshot.prior_works.len();
+        if too_large(&result) && turns > 0 {
+            let all = attempt(turns);
+            // Only "too large" moves the search; any other failure is the answer as it stands.
+            if all.is_err() {
+                result = all;
+            } else {
+                // The smallest omission that fits lies in (0, turns]; `fit` holds the best result found.
+                let (mut lo, mut hi, mut fit) = (1usize, turns, all);
+                while lo < hi {
+                    let mid = lo + (hi - lo) / 2;
+                    let tried = attempt(mid);
+                    if too_large(&tried) {
+                        lo = mid + 1;
+                    } else if tried.is_err() {
+                        // A failure other than size (which leaving out more turns can't cause) stops the search.
+                        fit = tried;
+                        break;
+                    } else {
+                        hi = mid;
+                        fit = tried;
+                    }
+                }
+                result = fit;
+            }
+        }
         match &result {
             Ok(assembled) => {
                 span.record(
@@ -1264,8 +1302,11 @@ impl ContextAssembler {
         versions: &ContextAssemblyVersions,
         context_manifest_id: ContextManifestId,
         logical_invocation_id: LogicalInvocationId,
+        omit_prior: usize,
     ) -> Result<ContextAssemblyResult, ContextAssemblyError> {
         validate_snapshot(&snapshot)?;
+        // B2.7: the oldest `omit_prior` whole earlier turns are left out (never the current work's own sources).
+        let omitted = omit_prior as u64;
         if versions.prompt_version() != self.instructions.version() {
             return Err(ContextAssemblyError::new(
                 ContextAssemblyErrorKind::InvalidVersions,
@@ -1286,7 +1327,7 @@ impl ContextAssembler {
         render_capability_sources(&mut builder, &snapshot)?;
         render_tool_sources(&mut builder, &self.tool_registry, &canonical_tools)?;
 
-        for prior_work in &snapshot.prior_works {
+        for prior_work in snapshot.prior_works.iter().skip(omit_prior) {
             let message = exactly_one_prior_message(&snapshot, prior_work)?;
             render_message(
                 &mut builder,
@@ -1332,7 +1373,21 @@ impl ContextAssembler {
             selection,
         )?;
 
-        if builder.paired_tool_ids.len() != snapshot.observed_tool_results.len() {
+        // Every tool result of a rendered work (the kept earlier turns and the current work) must be paired; the
+        // results of turns left out by trimming are left out with them.
+        let rendered_works = snapshot
+            .prior_works
+            .iter()
+            .skip(omit_prior)
+            .map(|work| work.work_id)
+            .chain(std::iter::once(snapshot.active_work.work_id))
+            .collect::<Vec<_>>();
+        let expected_tool_results = snapshot
+            .observed_tool_results
+            .iter()
+            .filter(|tool| rendered_works.contains(&tool.work_id))
+            .count();
+        if builder.paired_tool_ids.len() != expected_tool_results {
             return Err(ContextAssemblyError::new(
                 ContextAssemblyErrorKind::ToolPairing,
             ));
@@ -1477,6 +1532,7 @@ impl ContextAssembler {
             requested_output_tokens,
             utilization_basis_points,
             transformed_source_count,
+            omitted_source_count: omitted,
             request_sha256: rendered_request_sha256,
             sources: &finished.sources,
         });
@@ -1507,7 +1563,7 @@ impl ContextAssembler {
             manifest_sha256,
             rendered_request_sha256,
             rendered_request_artifact_id: None,
-            omitted_source_count: 0,
+            omitted_source_count: omitted,
             transformed_source_count,
             sources: finished.sources.to_vec(),
             created_at,
@@ -2776,6 +2832,7 @@ struct ManifestHashInput<'a> {
     requested_output_tokens: u64,
     utilization_basis_points: u16,
     transformed_source_count: u64,
+    omitted_source_count: u64,
     request_sha256: Sha256Digest,
     sources: &'a [PreparedContextSource],
 }
@@ -2806,7 +2863,7 @@ fn semantic_manifest_hash(input: ManifestHashInput<'_>) -> Sha256Digest {
         "input_event_ids": input.input_event_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "logical_invocation_id": input.logical_invocation_id.to_string(),
         "maximum_journal_offset": input.maximum_journal_offset.get(),
-        "omitted_source_count": 0,
+        "omitted_source_count": input.omitted_source_count,
         "prompt_fingerprint": input.prompt_fingerprint.to_string(),
         "prompt_version": input.prompt_version,
         "provider_native_options": {
@@ -2871,6 +2928,7 @@ fn semantic_manifest_hash_from_prepared(
         requested_output_tokens: manifest.reserved_output_tokens,
         utilization_basis_points: manifest.utilization_basis_points,
         transformed_source_count: manifest.transformed_source_count,
+        omitted_source_count: manifest.omitted_source_count,
         request_sha256: manifest.rendered_request_sha256,
         sources,
     })
@@ -3782,25 +3840,23 @@ mod tests {
         );
         assert_eq!(exact_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 
+        // B2.7: one byte over the ceiling no longer fails the work. The oldest whole earlier turn is left out
+        // (and recorded), and the request fits again. The estimator runs only for attempts that fit the byte
+        // ceiling: at most the bisection's few attempts, never once per turn.
         let oversized_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let oversized = assemble_with_counting_estimator(
             large_request_snapshot(255, Some("x".repeat(tail_length + 1))),
             &selection,
-            TokenEstimatorIdentity::try_new("mismatched_v1", 1).unwrap(),
+            estimator.clone(),
             oversized_calls.clone(),
-            true,
+            false,
         )
         .await
-        .unwrap_err();
-        assert_eq!(
-            oversized.kind(),
-            ContextAssemblyErrorKind::ContextLimitExceeded
-        );
-        assert_eq!(oversized_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let evidence = oversized.limit_evidence().unwrap();
-        assert_eq!(evidence.request_serialized_bytes, 16_777_217);
-        assert_eq!(evidence.request_byte_limit, 16_777_216);
-        assert_eq!(evidence.estimated_input_tokens, 0);
+        .unwrap();
+        assert_eq!(oversized.prepared_manifest().omitted_source_count, 1);
+        assert!(oversized.budget().request_serialized_bytes <= MAX_CANONICAL_MODEL_REQUEST_BYTES);
+        let estimated = oversized_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!((1..=10).contains(&estimated), "{estimated}");
 
         let escaped_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let escaped = assemble_with_counting_estimator(
@@ -4434,6 +4490,92 @@ mod tests {
                 .kind(),
             ContextAssemblyErrorKind::EstimatorFailure
         );
+    }
+
+    #[tokio::test]
+    async fn a_trimmed_history_keeps_the_newest_turns_and_reconstructs_exactly() {
+        // More full earlier turns than one request can carry: the oldest are left out, the newest kept.
+        let snapshot = large_request_snapshot(257, None);
+        let work_id = snapshot.active_work.work_id;
+        let store = Arc::new(MutableSourceStore(Mutex::new(snapshot.clone())));
+        let (selection, estimator) = target(2_000_000_000, 1, false);
+        let assembler = test_assembler(store, estimator, 1);
+        let result = assembler
+            .assemble(work_id, &selection, &ContextAssemblyVersions::v0())
+            .await
+            .unwrap();
+        let omitted = result.prepared_manifest().omitted_source_count;
+        assert!((1..257).contains(&omitted), "{omitted}");
+        assert!(result.budget().request_serialized_bytes <= MAX_CANONICAL_MODEL_REQUEST_BYTES);
+        // Exactly the kept earlier turns are rendered (the current message is its own kind of source).
+        let user_messages = result
+            .prepared_manifest()
+            .sources
+            .iter()
+            .filter(|source| source.kind == ContextSourceKind::UserMessage)
+            .count() as u64;
+        assert_eq!(user_messages, 257 - omitted);
+        // The recorded manifest (with its omission count) reconstructs exactly.
+        assembler.verify_reconstruction(&result).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trimming_leaves_out_the_tool_calls_of_omitted_turns() {
+        // The oldest turn used a tool; trimming leaves out its call and result with it.
+        let mut snapshot = large_request_snapshot(257, None);
+        let oldest = snapshot.prior_works[0].work_id;
+        let mut call = model_source(
+            &snapshot,
+            oldest,
+            1,
+            vec![NormalizedModelOutputItem::ToolCall {
+                call_id: "oldest-call".to_owned(),
+                tool_name: ToolName::try_new("read_file").unwrap(),
+                arguments_json: "{\"path\":\"README.md\"}".to_owned(),
+            }],
+            false,
+        );
+        call.stop_reason = "tool_continuation".to_owned();
+        let call_id = call.model_invocation_id;
+        snapshot.completed_model_outputs.push(call);
+        snapshot
+            .observed_tool_results
+            .push(ContextToolResultSource {
+                tool_execution_id: ToolExecutionId::generate(),
+                work_id: oldest,
+                conversation_id: snapshot.active_work.conversation_id,
+                work_ordinal: ConversationWorkOrdinal::try_new(1).unwrap(),
+                source_model_invocation_id: call_id,
+                agent_step_no: AgentStepNo::try_new(1).unwrap(),
+                tool_ordinal: ToolOrdinal::try_new(1).unwrap(),
+                provider_tool_call_id: "oldest-call".to_owned(),
+                tool_name: ToolName::try_new("read_file").unwrap(),
+                state: ToolExecutionState::Completed,
+                result: Some(json!({"fields": [], "result_kind": "success", "summary": "read"})),
+                stdout_counts: None,
+                stderr_counts: None,
+                stdout_artifact: None,
+                stderr_artifact: None,
+                truncated: false,
+                journal_offset: crate::domain::JournalOffset::try_new(2).unwrap(),
+            });
+        let work_id = snapshot.active_work.work_id;
+        let store = Arc::new(MutableSourceStore(Mutex::new(snapshot)));
+        let (selection, estimator) = target(2_000_000_000, 1, false);
+        let assembler = test_assembler(store, estimator, 1);
+        let result = assembler
+            .assemble(work_id, &selection, &ContextAssemblyVersions::v0())
+            .await
+            .unwrap();
+        assert!(result.prepared_manifest().omitted_source_count >= 1);
+        assert!(
+            !result
+                .prepared_manifest()
+                .sources
+                .iter()
+                .any(|source| source.kind == ContextSourceKind::ObservedToolResult)
+        );
+        assembler.verify_reconstruction(&result).await.unwrap();
     }
 
     #[tokio::test]
