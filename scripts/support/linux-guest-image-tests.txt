@@ -26,7 +26,6 @@ test adapters::telegram::tests::ch6_cancel_composes_scheduler_process_cleanup_ac
 test authenticated_http_machine_inspection_failures_idempotency_replay_and_cold_continuity ... FAILED
 test cancellation_after_visible_delta_abandons_without_transport_affecting_work ... FAILED
 test cancellation_and_graceful_shutdown_preserve_definite_and_uncertain_boundaries ... FAILED
-test cargo_rebuilds_truthful_repository_wide_dirty_provenance ... FAILED
 test ch6_admin_inspects_restart_delivery_states_without_payload_or_external_ids ... FAILED
 test ch6_telegram_credential_is_absent_from_model_tool_state_artifacts_logs_admin_and_recovery ... FAILED
 test clean_shutdown_closes_synced_live_connection_1001_and_joins_transport ... FAILED
@@ -40,7 +39,6 @@ test error_filter_suppresses_startup_info_without_failing_startup ... FAILED
 test explicit_disabled_telegram_loads_no_telegram_credential_and_preserves_startup ... FAILED
 test fifo_follower_isolated_from_crashed_predecessor_and_progresses_after_recovery ... FAILED
 test full_local_deterministic_product_composition_repeats ... FAILED
-test linked_worktree_uses_its_git_state_and_common_metadata ... FAILED
 test live_route_still_requires_stage11_bearer_authentication ... FAILED
 test missing_provider_credential_remains_live_unready ... FAILED
 test mixed_text_tool_is_abandoned_before_safe_tool_progress_and_new_invocation_draft ... FAILED
@@ -56,5 +54,4 @@ test scripted_gateway_draft_reconciles_to_durable_commit_and_reconnect_replays_n
 test stage24_harness::regression_tests::panic_path_guard_kills_and_reaps_owned_runtime_child ... FAILED
 test synthetic_credential_is_absent_from_stage25_scenario_persistence_and_evidence ... FAILED
 test systemd_runtime_credential_shape_starts_with_exact_configured_name ... FAILED
-test unavailable_git_metadata_falls_back_to_unversioned_and_dirty ... FAILED
 test valid_local_config_emits_pretty_startup_evidence_and_remains_unready ... FAILED
