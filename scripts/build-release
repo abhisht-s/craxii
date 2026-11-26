@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Builds a Craxii worker release for the customer VMs (x86_64 Linux) and records exactly what was built.
+#
+# Usage: scripts/build-release [--test] [--dev] OUT_DIR
+#   --test  first run the full Linux test suite on x86_64 (the release-time Linux gate). It passes when every
+#           failing test is on scripts/support/linux-guest-image-tests.txt: those need the prepared VM image.
+#   --dev   build the working tree, uncommitted changes included. The release is marked "development"; the
+#           image bake refuses it. Without --dev the checkout must be clean and the release is HEAD exactly.
+#
+# Source: a git checkout, or an exported tree (no .git) with its commit in CRAXII_SOURCE_COMMIT (the bake).
+# Output, in OUT_DIR (which must not exist yet):
+#   bin/            craxii-server, craxii-guest-guard, craxii-workstation-launcher, craxii-workstation-reader,
+#                   craxii-compute-watchdog
+#   guest/          the installer and the guest assets it installs (from ops/v0.0.1)
+#   manifest.json   kind, commit, toolchain, builder image, test result, release id and every file's sha256
+#   release.sha256  the sha256 of manifest.json: the release digest
+# The release id is the sha256 of craxii-server; the installer names the release directory after it.
+#
+# The build runs in a pinned image (by digest), always for linux/amd64 (emulated on Apple silicon, so slow
+# there), by scripts/support/build-release-inside. The container is capped at CRAXII_BUILD_CPUS (default 2)
+# and cargo at CRAXII_BUILD_JOBS (default 2); the bake machine raises both.
+set -euo pipefail
+
+builder_image='rust:1.98.0-bookworm@sha256:4e4a7e7939c17991ab35f2b8c2e67593980f771d28f6b1254b1850f860fd0c7f'
+
+fail() { printf 'build-release: %s\n' "$1" >&2; exit 1; }
+test_suite=false dev=false
+while [ "$#" -gt 1 ]; do
+  case "$1" in
+    --test) test_suite=true ;;
+    --dev) dev=true ;;
+    *) fail "unknown option $1" ;;
+  esac
+  shift
+done
+[ "$#" -eq 1 ] && [ -n "$1" ] && [ "${1#-}" = "$1" ] || fail 'usage: scripts/build-release [--test] [--dev] OUT_DIR'
+out=$1
+[ ! -e "$out" ] || fail "$out already exists; a release is never written over another"
+jobs="${CRAXII_BUILD_JOBS:-2}" cpus="${CRAXII_BUILD_CPUS:-2}"
+[[ "$jobs" =~ ^[1-9][0-9]?$ && "$cpus" =~ ^[1-9][0-9]?$ ]] || fail 'CRAXII_BUILD_JOBS and CRAXII_BUILD_CPUS must be whole numbers from 1 to 99'
+command -v docker >/dev/null || fail 'Docker is required'
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repository_root"
+kind=release
+"$dev" && kind=development
+
+# What is built, and the commit it is recorded as.
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  commit=$(git rev-parse HEAD)
+  if [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+    "$dev" || fail 'the checkout has uncommitted changes; commit them, or use --dev for a development build'
+    mode=worktree
+  else
+    mode=commit
+  fi
+else
+  commit="${CRAXII_SOURCE_COMMIT:-}"
+  mode=exported
+fi
+[[ "$commit" =~ ^[0-9a-f]{40}$ ]] || fail 'no source commit (a git checkout, or CRAXII_SOURCE_COMMIT for an exported tree)'
+source_tree() {
+  case "$mode" in
+    commit) git archive --format=tar HEAD ;;
+    worktree) git ls-files -z --cached --others --exclude-standard | COPYFILE_DISABLE=1 tar --null -T - -cf - ;;
+    exported) COPYFILE_DISABLE=1 tar --exclude=./target -cf - . ;;
+  esac
+}
+
+mkdir -p "$out"
+out="$(cd "$out" && pwd)"
+printf 'build-release: building the %s of %s for x86_64 Linux%s\n' "$kind" "$commit" "$("$test_suite" && echo ', after the Linux tests' || true)" >&2
+
+# The cargo download cache and the test build are reused between runs; the release itself always builds fresh.
+source_tree | docker run --rm -i --platform linux/amd64 --cpus "$cpus" \
+  -e CRAXII_JOBS="$jobs" -e CRAXII_TEST_SUITE="$test_suite" -e CRAXII_KIND="$kind" -e CRAXII_COMMIT="$commit" -e CRAXII_BUILDER_IMAGE="$builder_image" \
+  -v craxii-release-cargo:/usr/local/cargo/registry -v craxii-release-tests:/test-target -v "$out:/out" \
+  "$builder_image" bash -c '
+set -euo pipefail
+useradd --create-home --shell /bin/bash builder
+install -d -o builder -g builder /work
+tar -C /work -xf -
+chown -R builder:builder /work /usr/local/cargo/registry /test-target /out
+chmod -R a+rwX /usr/local/rustup /usr/local/cargo
+su builder -s /bin/bash -w CRAXII_JOBS,CRAXII_TEST_SUITE,CRAXII_KIND,CRAXII_COMMIT,CRAXII_BUILDER_IMAGE -c "export PATH=/usr/local/cargo/bin:\$PATH CARGO_HOME=/usr/local/cargo RUSTUP_HOME=/usr/local/rustup && cd /work && bash scripts/support/build-release-inside"
+'
+[ -s "$out/release.sha256" ] || fail 'the build did not produce a release'
+printf 'build-release: %s %s in %s\n' "$kind" "$(cat "$out/release.sha256")" "$out" >&2

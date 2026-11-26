@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# The part of scripts/build-release that runs inside the pinned builder container, as an ordinary user, in a
+# copy of the source at /work. It writes the release to /out. Run it only through scripts/build-release.
+set -euo pipefail
+
+fail() { printf 'build-release: %s\n' "$1" >&2; exit 1; }
+[ "$(uname -m)" = x86_64 ] || fail 'not running on x86_64'
+for v in CRAXII_JOBS CRAXII_TEST_SUITE CRAXII_KIND CRAXII_COMMIT CRAXII_BUILDER_IMAGE; do [ -n "${!v:-}" ] || fail "$v is not set"; done
+binaries=(craxii-server craxii-guest-guard craxii-workstation-launcher craxii-workstation-reader craxii-compute-watchdog)
+guest_assets=(install-security-boundary.sh bootstrap-data-volume.py security-boundary.py network-policy.nft sysctl.conf
+  guest-bootstrap.schema.json compute-watchdog.schema.json craxii-guest-bootstrap.service craxii-guest-network-check.service
+  craxii-compute-watchdog.service craxii-compute-failsafe.service craxii-distribution.service)
+export CARGO_INCREMENTAL=0
+# The toolchain is the pinned image's, which must be the one rust-toolchain.toml names. Naming it directly keeps
+# rustup from fetching the file's extra components (rustfmt, clippy), which a build doesn't use.
+channel=$(sed -n 's/^channel = "\([0-9.]*\)"$/\1/p' rust-toolchain.toml)
+[ -n "$channel" ] || fail 'rust-toolchain.toml names no channel'
+export RUSTUP_TOOLCHAIN="$channel"
+case "$(rustc --version)" in "rustc $channel "*) ;; *) fail "the builder image's Rust is not $channel" ;; esac
+
+tested=not_run
+if [ "$CRAXII_TEST_SUITE" = true ]; then
+  # The full suite, as scripts/verify-linux runs it, here on x86_64. Only the known guest-image tests may fail.
+  # Debug info off keeps the test build within the bake machine's disk and memory.
+  set +e
+  CARGO_PROFILE_DEV_DEBUG=0 CARGO_TARGET_DIR=/test-target cargo test --locked -j "$CRAXII_JOBS" --no-fail-fast -p craxii-server --features test-failpoints >/tmp/tests.log 2>&1
+  status=$?
+  set -e
+  { grep -E '^test .* FAILED$' /tmp/tests.log || true; } | LC_ALL=C sort -u >/tmp/failed
+  LC_ALL=C sort -u scripts/support/linux-guest-image-tests.txt >/tmp/known
+  # Every test program that started must report a result (one that crashes reports none), and the failures
+  # those results count must be exactly the failing tests listed.
+  started=$(grep -cE '^ *(Running|Doc-tests) ' /tmp/tests.log || true)
+  results=$(grep -c '^test result:' /tmp/tests.log || true)
+  counted=$(sed -n 's/^test result: [A-Za-z]*\. [0-9]* passed; \([0-9]*\) failed;.*/\1/p' /tmp/tests.log | awk '{n += $1} END {print n + 0}')
+  listed=$(grep -cE '^test .* FAILED$' /tmp/tests.log || true)
+  if [ "$results" -lt 1 ] || [ "$started" -ne "$results" ] || [ "$counted" -ne "$listed" ] || { [ "$status" -ne 0 ] && [ "$listed" -eq 0 ]; }; then
+    tail -n 40 /tmp/tests.log >&2
+    fail "the Linux tests did not run to completion ($started test programs started, $results reported; $counted failures counted, $listed listed)"
+  fi
+  unexpected=$(LC_ALL=C comm -23 /tmp/failed /tmp/known)
+  if [ -n "$unexpected" ]; then
+    printf '%s\n' "$unexpected" >&2
+    fail 'Linux tests failed that are not known guest-image tests'
+  fi
+  printf 'build-release: Linux tests passed (%s test binaries; %s known guest-image failures)\n' "$results" "$(wc -l </tmp/failed | tr -d ' ')" >&2
+  tested=passed
+fi
+
+# The release: no test features, a fresh target directory, and build paths kept out of the binaries. There is
+# no git here, so the build names its commit itself, and only a release build of a committed tree is clean.
+export CRAXII_SOURCE_REVISION="$CRAXII_COMMIT"
+if [ "$CRAXII_KIND" = release ]; then export CRAXII_SOURCE_CLEAN=1; else unset CRAXII_SOURCE_CLEAN; fi
+export CARGO_TARGET_DIR=/work/target RUSTFLAGS='--remap-path-prefix=/work=/craxii-worker --remap-path-prefix=/usr/local/cargo=/cargo'
+bin_args=()
+for b in "${binaries[@]}"; do bin_args+=(--bin "$b"); done
+cargo build --locked --release -j "$CRAXII_JOBS" -p craxii-server "${bin_args[@]}"
+release=/work/target/release
+
+# No test-only control surface (as scripts/check-release-failpoints.mjs checks): the hidden control flag is
+# refused, and neither its protocol nor any failpoint name appears in the binary.
+set +e
+probe=$(printf 'CRAXII_TEST_CONTROL_V1\n' | timeout 10 "$release/craxii-server" --test-failpoint-control-v1 2>&1 >/dev/null)
+status=$?
+set -e
+[ "$status" -eq 1 ] && [ "$probe" = 'craxii fatal: invalid_cli' ] || fail 'the release binary answered the hidden test control'
+mapfile -t failpoints < <(sed -n '/requiredFailpoints = \[/,/\];/p' scripts/check-release-failpoints.mjs | grep -o "'[a-z_]*'" | tr -d "'")
+[ "${#failpoints[@]}" -ge 10 ] || fail 'could not read the failpoint names'
+for name in CRAXII_TEST_CONTROL_V1 "${failpoints[@]}"; do
+  if grep -qaF "$name" "$release/craxii-server"; then fail "the release binary contains test hook $name"; fi
+done
+
+install -d -m 0755 /out/bin /out/guest
+for b in "${binaries[@]}"; do
+  case "$(file -b "$release/$b")" in
+    'ELF 64-bit LSB pie executable, x86-64,'*) ;;
+    *) fail "$b is not an x86-64 executable" ;;
+  esac
+  install -m 0755 "$release/$b" "/out/bin/$b"
+done
+for a in "${guest_assets[@]}"; do install -m 0644 "ops/v0.0.1/$a" "/out/guest/$a"; done
+chmod 0755 /out/guest/install-security-boundary.sh
+
+# The record: fixed field order, files sorted, no timestamps, so the same build always has the same digest.
+cd /out
+{
+  printf '{\n'
+  printf '  "schema": "craxii-worker-release/1",\n'
+  printf '  "kind": "%s",\n' "$CRAXII_KIND"
+  printf '  "worker_commit": "%s",\n' "$CRAXII_COMMIT"
+  printf '  "target": "x86_64-unknown-linux-gnu",\n'
+  printf '  "toolchain": "%s",\n' "$(rustc --version | cut -d' ' -f1-2)"
+  printf '  "builder_image": "%s",\n' "$CRAXII_BUILDER_IMAGE"
+  printf '  "linux_tests": "%s",\n' "$tested"
+  printf '  "release_id": "%s",\n' "$(sha256sum bin/craxii-server | cut -d' ' -f1)"
+  printf '  "files": [\n'
+  find bin guest -type f | LC_ALL=C sort | while read -r f; do
+    printf '    {"path": "%s", "sha256": "%s", "bytes": %s}\n' "$f" "$(sha256sum "$f" | cut -d' ' -f1)" "$(stat -c %s "$f")"
+  done | sed '$!s/$/,/'
+  printf '  ]\n}\n'
+} >manifest.json
+sha256sum manifest.json | cut -d' ' -f1 >release.sha256

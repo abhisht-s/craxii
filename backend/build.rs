@@ -4,6 +4,8 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
+    println!("cargo:rerun-if-env-changed=CRAXII_SOURCE_REVISION");
+    println!("cargo:rerun-if-env-changed=CRAXII_SOURCE_CLEAN");
     println!("cargo:rerun-if-changed=migrations");
 
     let manifest_dir = PathBuf::from(
@@ -48,7 +50,18 @@ fn git_metadata(manifest_dir: &Path) -> (String, bool) {
 
     match (revision, status) {
         (Some(revision), Some(status)) => (revision, !status.is_empty()),
-        _ => ("unversioned".to_owned(), true),
+        // An exported tree (scripts/build-release) has no git: it names its commit instead, and only a release
+        // build of a committed tree says it is clean.
+        _ => match env::var("CRAXII_SOURCE_REVISION")
+            .ok()
+            .and_then(|value| normalize_revision(&value))
+        {
+            Some(revision) => (
+                revision,
+                env::var("CRAXII_SOURCE_CLEAN").as_deref() != Ok("1"),
+            ),
+            None => ("unversioned".to_owned(), true),
+        },
     }
 }
 
