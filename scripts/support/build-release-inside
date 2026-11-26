@@ -45,7 +45,7 @@ if [ "$CRAXII_TEST_SUITE" = true ]; then
     fail "the Linux tests did not run to completion ($started test programs started; $counted failures counted, $listed listed)"
   fi
   [ -z "$unexpected" ] || fail "$(printf '%s\n' "$unexpected" | wc -l | tr -d ' ') Linux tests failed that are not known guest-image tests (listed above)"
-  printf 'build-release: Linux tests passed (%s test binaries; %s known guest-image failures)\n' "$results" "$(wc -l </tmp/failed | tr -d ' ')" >&2
+  printf 'build-release: Linux tests passed (%s test programs; %s known guest-image failures)\n' "$started" "$(wc -l </tmp/failed | tr -d ' ')" >&2
   tested=passed
 fi
 
