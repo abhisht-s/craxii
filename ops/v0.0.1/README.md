@@ -15,7 +15,9 @@ worker signature by itself proves neither encryption nor attachment authority.
 
 The installed root initializer has no device argument, environment override or fixture selector.
 It resolves one exact EBS serial/model match, verifies 80 GiB, rejects root ancestry/partitions,
-holders/swap/foreign mounts/UUID clones and reads the whole blank disk before the first format.
+holders/swap/foreign mounts/UUID clones and checks the disk is blank before the first format: no
+signatures, and 16 spread 1 MiB sample reads, both ends included, all zero (decision 43: a new EBS
+volume reads as zeros, and only the launch's own volume, by serial, is accepted).
 Only `initialize_blank` permits that format. A root-only flock serializes mutations. Atomic receipt
 publication fsyncs the file and parent before `mke2fs` runs. The block descriptor stays pinned while
 mke2fs obtains its own exclusive claim. Every recorded `format_intended` is inspection-only on
@@ -37,7 +39,11 @@ The workspace ACL gives the worker observation access. There is no recursive ado
 Only exact owned fstab entries are reconciled; noauto and bootstrap ordering prevent UUID-only boot
 selection before physical identity checks.
 
-The root installer leaves services stopped/unenabled. Distribution runs as craxii-server with
+The root installer starts nothing. It enables the metadata guard (only root reaches the instance
+metadata service, from early boot) and the distribution worker, which at boot pulls in, in order:
+root first boot (`first-boot.py kit`: user data and AWS's identity traded at the control plane for
+the starting kit and a one-use enrollment credential), the watchdog, disk setup, and a fresh
+credential (`first-boot.py credential`); the worker then enrolls once and deletes the handoff (B6.6). Distribution runs as craxii-server with
 CAP_KILL; the fixed setuid launcher transitions to craxii, clears groups/caps/FDs/env, sets child NNP
 and bounds descriptors/core dumps. Parent NNP remains disabled so the launcher can operate. Installed
 LocalWorkstation composition has no administrative/direct-execution profile. Historical native

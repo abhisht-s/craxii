@@ -1,5 +1,6 @@
 //! Authentication-only distribution client. No scheduler, customer SQLite, or provider credentials.
 pub mod client;
+pub mod handoff;
 pub mod key_store;
 pub mod state;
 use std::fmt;

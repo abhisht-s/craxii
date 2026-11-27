@@ -323,29 +323,40 @@ pub fn verify_installed(c: &GuestConfig) -> BoundaryResult<()> {
             return Err(LayoutUnavailable);
         }
     }
-    for filename in [
-        "worker.pk8",
-        "identity.created",
-        "identity.json",
-        "distribution.json",
-    ] {
+    // B6.6: before a new VM's first enrollment (root first boot's handoff present, no identity yet) the worker's key
+    // and identity don't exist; the worker creates them, then runs this check in full before it starts its runtime.
+    let first_enrollment = std::fs::symlink_metadata(format!("{IDENTITY}/identity.json")).is_err()
+        && std::fs::symlink_metadata(format!("{IDENTITY}/enrollment.json")).is_ok();
+    let required: &[&str] = if first_enrollment {
+        &["distribution.json"]
+    } else {
+        &[
+            "worker.pk8",
+            "identity.created",
+            "identity.json",
+            "distribution.json",
+        ]
+    };
+    for filename in required {
         read_protected(&format!("{IDENTITY}/{filename}"), worker, 0o600, 16384)?;
     }
-    let identity: serde_json::Value = serde_json::from_slice(&read_protected(
-        &format!("{IDENTITY}/identity.json"),
-        worker,
-        0o600,
-        16384,
-    )?)
-    .map_err(|_| LayoutUnavailable)?;
-    for field in [
-        "customer_id",
-        "logical_agent_id",
-        "installation_id",
-        "generation",
-    ] {
-        if identity[field] != c.value()[field] {
-            return Err(LayoutUnavailable);
+    if !first_enrollment {
+        let identity: serde_json::Value = serde_json::from_slice(&read_protected(
+            &format!("{IDENTITY}/identity.json"),
+            worker,
+            0o600,
+            16384,
+        )?)
+        .map_err(|_| LayoutUnavailable)?;
+        for field in [
+            "customer_id",
+            "logical_agent_id",
+            "installation_id",
+            "generation",
+        ] {
+            if identity[field] != c.value()[field] {
+                return Err(LayoutUnavailable);
+            }
         }
     }
     let marker = crate::distribution_contracts::raw_json::parse_bounded(

@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 
 CONFIG = Path('/etc/craxii/guest-bootstrap.json')
 INTENTS = Path('/var/lib/craxii-worker/bootstrap')
@@ -23,6 +22,16 @@ GUARD = '/opt/craxii/current/craxii-guest-guard'
 MAX = 16384
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
 CODES = {'guest_config_invalid', 'disk_identity_mismatch', 'disk_not_blank', 'disk_in_use', 'lineage_mismatch', 'disk_probe_unavailable', 'disk_format_uncertain', 'layout_unavailable', 'isolation_unavailable'}
+
+SAMPLE_BYTES = 1048576
+SAMPLES = 16
+def sample_regions(size):
+    """Where the blank check reads: SAMPLES regions of SAMPLE_BYTES, evenly spread, the first at 0 and the last ending
+    at the disk's end."""
+    require(isinstance(size, int) and size > 0, 'disk_probe_unavailable')
+    length = min(SAMPLE_BYTES, size)
+    span = size - length
+    return sorted({(span * i // (SAMPLES - 1), length) for i in range(SAMPLES)})
 
 class Hold(Exception):
     def __init__(self, code):
@@ -223,14 +232,12 @@ class LinuxHost:
         fd = os.open(d['path'], os.O_RDONLY | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             require(os.fstat(fd).st_rdev == os.makedev(*map(int,d['maj:min'].split(':'))), 'disk_identity_mismatch')
-            left = self.size
-            end = time.monotonic() + 1800
-            while left:
-                require(time.monotonic() < end, 'disk_probe_unavailable')
-                chunk = os.read(fd, min(left, 1048576))
-                require(chunk, 'disk_probe_unavailable')
-                require(chunk == bytes(len(chunk)), 'disk_not_blank')
-                left -= len(chunk)
+            # Decision 43: a new EBS volume reads as zeros (AWS), and only this launch's own volume is accepted (its id
+            # is the serial). Spread sample reads, both ends included, check that instead of reading all of it.
+            for offset, length in sample_regions(self.size):
+                chunk = os.pread(fd, length, offset)
+                require(len(chunk) == length, 'disk_probe_unavailable')
+                require(chunk == bytes(length), 'disk_not_blank')
         finally:
             os.close(fd)
     def format_once(self, d):

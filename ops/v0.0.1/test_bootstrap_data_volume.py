@@ -101,6 +101,31 @@ class BootstrapBarriers(unittest.TestCase):
         self.c['mode']='adopt_existing';self.host.filesystem=True;self.host.layout_ok=False
         with self.assertRaises(b.Hold):self.engine().run()
         self.assertEqual(self.host.effects,[])
+    def test_blank_check_samples_both_ends_and_spread_regions(self):
+        gib=1073741824
+        regions=b.sample_regions(80*gib)
+        self.assertEqual(len(regions),16)
+        self.assertEqual(regions[0],(0,1048576));self.assertEqual(regions[-1],(80*gib-1048576,1048576))
+        gaps=[regions[i+1][0]-regions[i][0] for i in range(15)]
+        self.assertLessEqual(max(gaps)-min(gaps),1)
+        self.assertEqual(b.sample_regions(4096),[(0,4096)])
+        for bad in (0,-1,1.5):
+            with self.assertRaises(b.Hold):b.sample_regions(bad)
+    def test_blank_check_reads_only_samples_and_refuses_any_nonzero(self):
+        with tempfile.NamedTemporaryFile() as disk:
+            disk.truncate(64*1048576);disk.flush()
+            reads=[]
+            real=b.os.pread
+            def pread(fd,n,offset):reads.append((offset,n));return real(fd,n,offset)
+            class Real(b.LinuxHost):
+                def __init__(self):self.size=64*1048576
+                def check_use(self,d,formatting=False):pass
+            d={'path':disk.name,'maj:min':'%d:%d'%(b.os.major(b.os.stat(disk.name).st_dev),b.os.minor(b.os.stat(disk.name).st_dev))}
+            with patch.object(b,'command',return_value=(b'{"signatures":[]}',0)),patch.object(b.os,'pread',side_effect=pread),patch.object(b.os,'fstat',return_value=type('S',(),{'st_rdev':b.os.makedev(*map(int,d['maj:min'].split(':')))})()):
+                Real().blank(d)
+                self.assertEqual(reads,b.sample_regions(64*1048576))
+                disk.seek(63*1048576+5);disk.write(b'x');disk.flush()
+                with self.assertRaises(b.Hold):Real().blank(d)
     def test_duplicate_receipt_material_is_rejected(self):
         with self.assertRaises(b.Hold):b.decode(b'{"phase":1,"phase":2}')
 

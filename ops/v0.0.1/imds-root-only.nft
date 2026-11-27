@@ -1,0 +1,11 @@
+# B6.6: only root reaches the instance metadata service, from early boot, so no other local user can read the
+# launch's user data (its single-use launch number) and race the real first boot. (cloud-init's world-readable
+# instance data can include AWS's identity document; without the launch number it enrolls nothing.) Loaded by
+# craxii-imds-guard.service; the guest's own policy (table craxii_guest) later also denies it to the worker and agent.
+table inet craxii_imds {
+ chain output {
+  type filter hook output priority -200; policy accept;
+  ip daddr 169.254.169.254 meta skuid != 0 drop
+  ip6 daddr fd00:ec2::254 meta skuid != 0 drop
+ }
+}

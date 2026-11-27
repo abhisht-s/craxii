@@ -1,5 +1,6 @@
 #!/bin/sh
-# Image/isolated guest installation only. No cloud action and no service activation.
+# Image/isolated guest installation only. No cloud action and nothing started; the worker is enabled to start at
+# boot (B6.6), which first fetches the VM's kit.
 set -eu
 umask 077
 fail() { printf '%s\n' isolation_unavailable >&2; exit 1; }
@@ -46,7 +47,7 @@ actual=$(/usr/bin/sha256sum "/opt/craxii/releases/$release_id/craxii-server")
 [ ! -e /opt/craxii/current ] && [ ! -L /opt/craxii/current ] || fail
 /bin/ln -s "releases/$release_id" /opt/craxii/current
 /usr/bin/install -d -o root -g root -m 0755 /opt/craxii/guest
-for asset in bootstrap-data-volume.py security-boundary.py guest-bootstrap.schema.json; do
+for asset in bootstrap-data-volume.py security-boundary.py guest-bootstrap.schema.json first-boot.py imds-root-only.nft; do
   /usr/bin/install -o root -g root -m 0555 "$assets/$asset" "/opt/craxii/guest/$asset"
 done
 /usr/bin/install -d -o root -g craxii-server -m 0750 /etc/craxii /var/lib/craxii-worker /run/craxii-worker
@@ -54,7 +55,7 @@ done
 /usr/bin/install -d -o craxii-server -g craxii-server -m 0700 /var/lib/craxii-worker/identity
 /usr/bin/install -d -o root -g craxii-server -m 2750 /var/lib/craxii-compute
 /usr/bin/install -d -o craxii-server -g craxii-server -m 0700 /var/lib/craxii-worker/compute-inbox
-for unit in craxii-compute-watchdog.service craxii-compute-failsafe.service; do
+for unit in craxii-compute-watchdog.service craxii-compute-failsafe.service craxii-imds-guard.service craxii-first-boot.service craxii-first-boot-credential.service; do
   /usr/bin/install -o root -g root -m 0644 "$assets/$unit" "/etc/systemd/system/$unit"
 done
 # Empty root-owned fallback targets only; preserve any existing content by refusing.
@@ -86,7 +87,9 @@ for binary in sudo su pkexec systemctl busctl crontab at newuidmap newgidmap mou
   if [ -n "$location" ]; then /usr/bin/setfacl -m u:craxii:--- "$location"; fi
 done
 /usr/bin/systemctl daemon-reload
-/usr/bin/systemd-analyze verify /etc/systemd/system/craxii-distribution.service /etc/systemd/system/craxii-guest-bootstrap.service /etc/systemd/system/craxii-guest-network-check.service >/dev/null 2>&1 || fail
-# No service is started/enabled. Per-installation config, quotas and firewall must be prepared and
-# rechecked by the root pre-start gate. Incomplete image policy remains unavailable.
-printf '%s\n' guest_assets_installed_unready
+/usr/bin/systemd-analyze verify /etc/systemd/system/craxii-distribution.service /etc/systemd/system/craxii-guest-bootstrap.service /etc/systemd/system/craxii-guest-network-check.service \
+  /etc/systemd/system/craxii-imds-guard.service /etc/systemd/system/craxii-first-boot.service /etc/systemd/system/craxii-first-boot-credential.service >/dev/null 2>&1 || fail
+# Nothing is started here. B6.6: at boot the metadata service is closed to every non-root user, then the worker
+# starts, pulling in first boot (its kit), the watchdog, disk setup and a fresh enrollment credential, in order.
+/usr/bin/systemctl enable craxii-imds-guard.service craxii-distribution.service >/dev/null 2>&1 || fail
+printf '%s\n' guest_assets_installed_enabled

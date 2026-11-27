@@ -82,6 +82,27 @@ impl IdentityState {
             _ => Ok(()),
         }
     }
+    /// B6.6: a new installation's identity before its first enrollment, named by its guest config.
+    pub fn unbound(
+        customer_id: &str,
+        logical_agent_id: &str,
+        installation_id: &str,
+        generation: &str,
+        key: &KeyStore,
+    ) -> Self {
+        Self {
+            version: 1,
+            installation_id: installation_id.to_owned(),
+            customer_id: customer_id.to_owned(),
+            logical_agent_id: logical_agent_id.to_owned(),
+            generation: generation.to_owned(),
+            key_id: key.key_id(),
+            highest_epoch: "1".to_owned(),
+            binding_id: None,
+            pending_signed: None,
+            disposition: Disposition::Unbound,
+        }
+    }
     pub fn load(key: &KeyStore) -> AuthResult<Option<Self>> {
         key.read_state()?
             .map(|b| {
