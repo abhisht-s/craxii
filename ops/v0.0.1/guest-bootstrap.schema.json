@@ -40,7 +40,10 @@
       "const": 1
     },
     "environment": {
-      "const": "development"
+      "enum": [
+        "development",
+        "production"
+      ]
     },
     "bootstrap_operation_id": {
       "type": "string",
