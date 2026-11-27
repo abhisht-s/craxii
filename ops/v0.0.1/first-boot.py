@@ -60,9 +60,14 @@ OPENER = urllib.request.build_opener(
     urllib.request.ProxyHandler({}), NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
 
 
+# Its own name: Cloudflare's browser check bans Python's default one ("Python-urllib", error 1010), which kept the
+# first real VM from ever reaching first boot.
+USER_AGENT = 'craxii-first-boot/1'
+
+
 def http(method, url, headers=None, body=None, limit=65536, timeout=10):
     """(status, body) for one request; raises OSError-like errors on transport failure."""
-    request = urllib.request.Request(url, data=body, headers=headers or {}, method=method)
+    request = urllib.request.Request(url, data=body, headers={'User-Agent': USER_AGENT, **(headers or {})}, method=method)
     try:
         with OPENER.open(request, timeout=timeout) as response:
             data = response.read(limit + 1)
@@ -302,6 +307,7 @@ if __name__ == '__main__':
     except Failure as failure:
         print(f'first_boot_failed {failure.code}', file=sys.stderr)
         sys.exit(1)
-    except Exception:
-        print('first_boot_failed internal_error', file=sys.stderr)
+    except Exception as error:
+        # The unexpected: its type's name only (never a message, which could carry a value).
+        print(f'first_boot_failed internal_error {type(error).__name__}', file=sys.stderr)
         sys.exit(1)

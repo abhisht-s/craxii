@@ -350,4 +350,4 @@ def main():
 if __name__=='__main__':
     try: main()
     except b.Hold as e: print(e.code,file=sys.stderr);sys.exit(1)
-    except BaseException: print('isolation_unavailable',file=sys.stderr);sys.exit(1)
+    except BaseException as e: print('isolation_unavailable',type(e).__name__,file=sys.stderr);sys.exit(1)

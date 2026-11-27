@@ -14,6 +14,7 @@ spec = importlib.util.spec_from_file_location('first_boot', Path(__file__).with_
 f = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(f)
 REAL_KIT_FILES = f.kit_files
+REAL_HTTP = f.http
 
 INSTALLATION = '3f1c5a2e-9b7d-4e41-8c2a-6d0f4b8e1a96'
 USER_DATA = {'contract_version': 1, 'installation_id': INSTALLATION, 'launch_nonce': 'N' * 43, 'api_origin': 'https://api.craxii.test'}
@@ -199,6 +200,18 @@ class FirstBoot(unittest.TestCase):
         with self.assertRaises(f.Failure) as caught:
             f.run('credential')
         self.assertEqual(caught.exception.code, 'identity_invalid')
+
+    def test_requests_carry_their_own_name_not_pythons(self):
+        sent = []
+        class Response:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n): return b'ok'
+        with patch.object(f.OPENER, 'open', side_effect=lambda request, timeout: (sent.append(request), Response())[1]):
+            REAL_HTTP('POST', 'https://api.craxii.test/v1/worker/first-boot', {'content-type': 'application/json'}, b'{}')
+        self.assertEqual(sent[0].get_header('User-agent'), 'craxii-first-boot/1')
+        self.assertEqual(sent[0].get_header('Content-type'), 'application/json')
 
 
 if __name__ == '__main__':

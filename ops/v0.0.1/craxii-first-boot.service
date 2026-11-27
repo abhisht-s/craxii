@@ -17,4 +17,6 @@ TimeoutStartSec=15min
 UMask=0077
 LimitCORE=0
 StandardOutput=null
-StandardError=journal
+# Failure codes (never content) also reach the serial console, which only the AWS account can read: the VM has no
+# login, and its journal doesn't outlive it.
+StandardError=journal+console

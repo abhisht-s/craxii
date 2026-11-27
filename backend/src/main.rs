@@ -5,8 +5,9 @@ async fn main() -> ExitCode {
     if std::env::args().nth(1).as_deref() == Some("distribution") {
         return match craxii_server::distribution::startup::run_protected().await {
             Ok(()) => ExitCode::SUCCESS,
-            Err(_) => {
-                eprintln!("distribution_unavailable");
+            // Which kind of failure (a fixed name, never content): it reaches the VM's serial console.
+            Err(error) => {
+                eprintln!("distribution_unavailable {error:?}");
                 ExitCode::FAILURE
             }
         };

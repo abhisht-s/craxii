@@ -454,5 +454,6 @@ if __name__=='__main__':
         main()
     except Hold as e:
         print(e.code,file=sys.stderr); sys.exit(1)
-    except BaseException:
-        print('layout_unavailable',file=sys.stderr); sys.exit(1)
+    except BaseException as e:
+        # The unexpected: its type's name only (never a message, which could carry a path or value).
+        print('layout_unavailable',type(e).__name__,file=sys.stderr); sys.exit(1)
