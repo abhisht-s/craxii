@@ -15,9 +15,9 @@ worker signature by itself proves neither encryption nor attachment authority.
 
 The installed root initializer has no device argument, environment override or fixture selector.
 It resolves one exact EBS serial/model match, verifies 80 GiB, rejects root ancestry/partitions,
-holders/swap/foreign mounts/UUID clones and checks the disk is blank before the first format: no
-signatures, and 16 spread 1 MiB sample reads, both ends included, all zero (decision 43: a new EBS
-volume reads as zeros, and only the launch's own volume, by serial, is accepted).
+holders/swap/foreign mounts/UUID clones and checks the disk is unused before the first format: it is
+the launch's own new volume (by serial) and neither wipefs nor blkid finds any signature. Its bytes are
+not checked: a new encrypted EBS volume reads as random data where never written (decision 44).
 Only `initialize_blank` permits that format. A root-only flock serializes mutations. Atomic receipt
 publication fsyncs the file and parent before `mke2fs` runs. The block descriptor stays pinned while
 mke2fs obtains its own exclusive claim. Every recorded `format_intended` is inspection-only on

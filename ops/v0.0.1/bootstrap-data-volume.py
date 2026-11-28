@@ -23,16 +23,6 @@ MAX = 16384
 ENV = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C', 'LC_ALL': 'C'}
 CODES = {'guest_config_invalid', 'disk_identity_mismatch', 'disk_not_blank', 'disk_in_use', 'lineage_mismatch', 'disk_probe_unavailable', 'disk_format_uncertain', 'layout_unavailable', 'isolation_unavailable'}
 
-SAMPLE_BYTES = 1048576
-SAMPLES = 16
-def sample_regions(size):
-    """Where the blank check reads: SAMPLES regions of SAMPLE_BYTES, evenly spread, the first at 0 and the last ending
-    at the disk's end."""
-    require(isinstance(size, int) and size > 0, 'disk_probe_unavailable')
-    length = min(SAMPLE_BYTES, size)
-    span = size - length
-    return sorted({(span * i // (SAMPLES - 1), length) for i in range(SAMPLES)})
-
 class Hold(Exception):
     def __init__(self, code):
         self.code = code if code in CODES else 'layout_unavailable'
@@ -226,20 +216,22 @@ class LinuxHost:
             info = path.stat()
             require((info.st_rdev if stat.S_ISBLK(info.st_mode) else info.st_dev) != os.makedev(*map(int, d['maj:min'].split(':'))), 'disk_in_use')
     def blank(self, d):
+        # Decision 44: unused by provenance, not by its bytes. Only this launch's own new volume is ever selected (its
+        # id is the serial; the fleet created it with no snapshot), and it must carry no signature of any kind: no
+        # file system, partition table, RAID or crypto header (wipefs, then blkid's full probe). A new encrypted EBS
+        # volume reads as random bytes where never written, so its content is not checked.
         self.check_use(d, True)
-        signatures, _ = command(['/usr/sbin/wipefs', '--no-act', '--json', d['path']])
-        require(decode(signatures, 1048576).get('signatures') == [], 'disk_not_blank')
         fd = os.open(d['path'], os.O_RDONLY | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             require(os.fstat(fd).st_rdev == os.makedev(*map(int,d['maj:min'].split(':'))), 'disk_identity_mismatch')
-            # Decision 43: a new EBS volume reads as zeros (AWS), and only this launch's own volume is accepted (its id
-            # is the serial). Spread sample reads, both ends included, check that instead of reading all of it.
-            for offset, length in sample_regions(self.size):
-                chunk = os.pread(fd, length, offset)
-                require(len(chunk) == length, 'disk_probe_unavailable')
-                require(chunk == bytes(length), 'disk_not_blank')
         finally:
             os.close(fd)
+        signatures, _ = command(['/usr/sbin/wipefs', '--no-act', '--json', d['path']])
+        require(decode(signatures, 1048576).get('signatures') == [], 'disk_not_blank')
+        # blkid exits 2, printing nothing, when it finds nothing at all (exit 2 is also "can't open": then it fails closed
+        # at the identity recheck that follows).
+        found, status = command(['/usr/sbin/blkid', '-p', '-o', 'export', d['path']], allowed=(0, 2))
+        require(status == 2 and not found.strip(), 'disk_not_blank')
     def format_once(self, d):
         try:
             require(select(self,self.c)==d,'disk_identity_mismatch')
@@ -412,7 +404,7 @@ class Bootstrap:
         self.host.verify_filesystem(d)
         if fresh or (old is not None and old['phase']=='format_intended'):
             self.host.verify_complete_format(d)
-        # No second mkfs after ANY durable intent, including an all-zero disk.
+        # No second mkfs after ANY durable intent, including a disk with no signature.
         if fresh or (old is not None and old['phase']!='layout_verified'):
             atomic_record(path,{**identity,'phase':'filesystem_verified'},replace=True)
         self.host.layout(d,self.c['mode']=='initialize_blank')
