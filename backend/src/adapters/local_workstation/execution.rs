@@ -781,9 +781,10 @@ async fn supervise_inner(runtime: &ExecutionRuntime, launch: Launch) -> Executio
     // state after fork.
     unsafe {
         command.as_std_mut().pre_exec(move || {
+            // Decision 45 (B6.9): the guest config's hardening.nofile.
             let nofile = nix::libc::rlimit {
-                rlim_cur: 1024,
-                rlim_max: 1024,
+                rlim_cur: 16384,
+                rlim_max: 16384,
             };
             let core = nix::libc::rlimit {
                 rlim_cur: 0,
@@ -1786,11 +1787,12 @@ impl ExecutionCgroup {
             let path = root.join(execution_id.to_string());
             std::fs::create_dir(&path).map_err(|_| WorkstationErrorKind::SpawnFailed)?;
             // Missing/enforcement-incapable controllers refuse before spawn. No unlimited fallback.
+            // Decision 45 (B6.9): the guest config's resources (about 6 GiB, 4096 tasks, both CPUs).
             let limits = [
-                ("pids.max", "64"),
-                ("memory.max", "268435456"),
+                ("pids.max", "4096"),
+                ("memory.max", "6442450944"),
                 ("memory.swap.max", "0"),
-                ("cpu.max", "100000 100000"),
+                ("cpu.max", "200000 100000"),
             ];
             for (name, value) in limits {
                 let control = path.join(name);
@@ -2159,7 +2161,7 @@ fn user_switch_launcher_probe_command(execution_id: ExecutionId) -> String {
             "/usr/bin/grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status && ",
             "/usr/bin/grep -Eq '^NoNewPrivs:[[:space:]]*1$' /proc/self/status && ",
             "/usr/bin/grep -Fq '/{}' /proc/self/cgroup && ",
-            "test \"$(umask)\" = 0077 && test \"$(ulimit -n)\" = 1024 && ",
+            "test \"$(umask)\" = 0077 && test \"$(ulimit -n)\" = 16384 && ",
             "test \"$(ulimit -c)\" = 0 && ",
             "test \"$HOME\" = /home/craxii && test \"$USER\" = craxii && ",
             "test \"$LOGNAME\" = craxii && test \"$SHELL\" = /bin/bash && ",

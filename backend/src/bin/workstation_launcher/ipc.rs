@@ -1,6 +1,7 @@
 //! Installed tool IPC policy. Applied after privilege drop, before any untrusted instruction.
-//! Filesystem Landlock does not mediate Unix socket connections. Deny their creation instead,
-//! including socketpair (a datagram pair can be reconnected), and alternate FD acquisition.
+//! Decision 45 (B6.9): Unix sockets are allowed (Landlock doesn't mediate their connections, so other services'
+//! sockets are guarded by their file permissions; the worker exposes none). Every other family, and alternate FD
+//! acquisition, stays denied.
 use nix::libc;
 
 /// The installed guest is x86_64 only. Reject compat/x32 ABIs rather than interpreting their
@@ -31,13 +32,16 @@ pub fn restrict() -> Result<(), ()> {
         // These APIs are denied only after this fixed policy has been installed.
         op(EQ, 0, 1, libc::SYS_seccomp as u32),
         op(RET, 0, 0, DENY),
-        op(EQ, 8, 0, libc::SYS_prctl as u32),
+        op(EQ, 9, 0, libc::SYS_prctl as u32),
         op(EQ, 2, 0, libc::SYS_socket as u32),
         op(EQ, 1, 0, libc::SYS_socketpair as u32),
         op(RET, 0, 0, ALLOW),
         op(LD, 0, 0, 16), // low word of seccomp_data.args[0]; kernel domain is int
-        op(EQ, 2, 0, libc::AF_INET as u32),
-        op(EQ, 1, 0, libc::AF_INET6 as u32),
+        // Decision 45 (B6.9): Unix sockets too (the worker exposes none; other services' sockets are guarded by their
+        // file permissions). Netlink, packet, vsock and every other family stay denied.
+        op(EQ, 3, 0, libc::AF_INET as u32),
+        op(EQ, 2, 0, libc::AF_INET6 as u32),
+        op(EQ, 1, 0, libc::AF_UNIX as u32),
         op(RET, 0, 0, DENY),
         op(RET, 0, 0, ALLOW),
         op(LD, 0, 0, 16), // prctl option, also an int
@@ -89,17 +93,28 @@ pub fn verify_stdio() -> Result<(), ()> {
 /// This fixed operation accepts no command or path and grants no execution authority.
 pub fn probe() -> Result<(), ()> {
     restrict()?;
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    // Another family (netlink) is still denied by the filter.
+    let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM, 0) };
     if fd != -1 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM) {
         return Err(());
     }
     let mut pair = [-1; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, pair.as_mut_ptr()) } != -1
-        || std::io::Error::last_os_error().raw_os_error() != Some(libc::EPERM)
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            0,
+            pair.as_mut_ptr(),
+        )
+    } != 0
     {
         return Err(());
     }
-    for family in [libc::AF_INET, libc::AF_INET6] {
+    unsafe {
+        libc::close(pair[0]);
+        libc::close(pair[1]);
+    }
+    for family in [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6] {
         let fd = unsafe { libc::socket(family, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
         if fd < 0 {
             return Err(());

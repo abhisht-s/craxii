@@ -264,7 +264,12 @@ pub fn verify_installed(c: &GuestConfig) -> BoundaryResult<()> {
                     128,
                 )?
                 .trim()
-                    != "167772160"
+                    != (c
+                        .text("size_bytes")
+                        .parse::<u64>()
+                        .map_err(|_| DiskIdentityMismatch)?
+                        / 512)
+                        .to_string()
                 || bounded(
                     entry
                         .path()
@@ -389,12 +394,30 @@ pub fn verify_installed(c: &GuestConfig) -> BoundaryResult<()> {
     {
         return Err(IsolationUnavailable);
     }
-    for (name, expected) in [
-        ("pids.max", "64"),
-        ("memory.max", "268435456"),
-        ("memory.swap.max", "0"),
-        ("cpu.max", "100000 100000"),
-    ] {
+    // Decision 45: the agent's limits as the verified guest config gives them.
+    let r = &c.value()["resources"];
+    let number = |key: &str| {
+        r[key]
+            .as_u64()
+            .map(|v| v.to_string())
+            .ok_or(IsolationUnavailable)
+    };
+    let limits = [
+        ("pids.max", number("pids")?),
+        (
+            "memory.max",
+            r["memory_bytes"]
+                .as_str()
+                .ok_or(IsolationUnavailable)?
+                .to_owned(),
+        ),
+        ("memory.swap.max", "0".to_owned()),
+        (
+            "cpu.max",
+            format!("{} {}", number("cpu_quota_us")?, number("cpu_period_us")?),
+        ),
+    ];
+    for (name, expected) in limits {
         if bounded(&format!("{TOOLS_CGROUP}/{name}"), 128)?.trim() != expected {
             return Err(IsolationUnavailable);
         }

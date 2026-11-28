@@ -143,7 +143,8 @@ class LinuxHost:
     """Installed probes. Test injection exists only through direct unittest construction."""
     def __init__(self, config):
         self.c = config
-        self.size = 85899345920
+        # 20 GiB (trials) or 80 GiB, as the guest config says (decision 45; the schema allows exactly those).
+        self.size = int(config['size_bytes'])
         self.data = DATA
         import pwd, grp
         self.worker = pwd.getpwnam('craxii-server').pw_uid

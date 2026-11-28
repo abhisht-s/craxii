@@ -1,4 +1,8 @@
 """Bounded installed-launcher IPC regression. Root controls must prove endpoints separately."""
+# OUT OF DATE since decision 45 (B6.9): the tool UID may now create Unix sockets (socket/socketpair AF_UNIX), so the
+# EPERM-at-creation expectations below no longer hold. Root-only endpoints must instead be refused by their file
+# permissions, the journald logging sockets are reachable by design, and netlink/vsock/x32/seccomp stay EPERM. Rewrite
+# and re-qualify on the QEMU guest before this suite is next run.
 import ctypes
 import errno
 import os

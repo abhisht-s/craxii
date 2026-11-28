@@ -37,9 +37,10 @@ Restart=on-failure
 RestartSec=3s
 UMask=0077
 LimitCORE=0
-LimitNOFILE=4096
-TasksMax=256
-MemoryMax=2G
+# Decision 45 (B6.9): the worker plus the agent's ~6 GiB and 4096 tasks, on an 8 GiB VM.
+LimitNOFILE=65536
+TasksMax=4352
+MemoryMax=7G
 MemorySwapMax=0
 IPAddressDeny=169.254.169.254
 IPAddressDeny=fd00:ec2::254

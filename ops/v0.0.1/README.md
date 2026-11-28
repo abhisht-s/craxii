@@ -14,7 +14,7 @@ A future trusted infrastructure composer owns physical provider observations; a 
 worker signature by itself proves neither encryption nor attachment authority.
 
 The installed root initializer has no device argument, environment override or fixture selector.
-It resolves one exact EBS serial/model match, verifies 80 GiB, rejects root ancestry/partitions,
+It resolves one exact EBS serial/model match, verifies its size (20 GiB trial or 80 GiB, from the config), rejects root ancestry/partitions,
 holders/swap/foreign mounts/UUID clones and checks the disk is unused before the first format: it is
 the launch's own new volume (by serial) and neither wipefs nor blkid finds any signature. Its bytes are
 not checked: a new encrypted EBS volume reads as random data where never written (decision 44).
@@ -52,17 +52,20 @@ and writes a boot/config-bound protected receipt. Rust rechecks mounts/paths/key
 canonical writes and new admissions. A one-shot journal creation sentinel holds after an interrupted
 first open instead of creating a second empty journal. No model/tool runner is added to distribution.
 
-Profile 1 sets aggregate untrusted pids64, memory256MiB, swap0, CPU1core; per-execution controllers
-must exist and enforce before spawn. Existing command/output/time/grace bounds remain. NOFILE1024,
-CORE0, model ext4 block quota64GiB/inodes1000000, scratch tmpfs256MiB each/inodes65536, and trusted
-free reserves4GiB/65536 inodes are explicit protective settings, not entitlements. Missing controllers,
+Profile 1 (decision 45, B6.9) sets aggregate untrusted pids4096, memory6GiB, swap0, CPU2cores, from the
+guest config; per-execution controllers must exist and enforce before spawn. Existing command/output/time/grace
+bounds remain. NOFILE16384, CORE0, model ext4 block quota 12GiB on a 20GiB disk (leaving room above the 4GiB reserve after ext4's overhead) or 64GiB on 80GiB /inodes1000000,
+scratch tmpfs1GiB each/inodes65536, and trusted free reserves4GiB/65536 inodes are explicit protective settings,
+not entitlements. Missing controllers,
 quota formats or guards remain unavailable. The image must include the kernel's quota modules.
 UID-level nft IPv4/IPv6 metadata/private-network denial also applies outside execution cgroups;
-model loopback is denied to close protected-proxy paths. No protected local guest service is exposed.
-The model UID997 cannot reach FIB routes of type local, broadcast or multicast in either family,
-including guest primary/public addresses, IPv4-mapped aliases, limited/directed broadcasts and
-multicast loop delivery to wildcard listeners. Every lo output route and IPv4/IPv6 link-local
-service range (169.254/16 and fe80::/10) is also denied. Multicast is explicitly unavailable to tools:
+model loopback is allowed (decision 45: DNS goes to the local resolver); the worker exposes no loopback listener.
+Outbound TCP 25/465/587 is dropped and new outbound connections are capped (20/s, burst 100). DNS lookups leave
+as systemd-resolved, so they don't count toward the cap; private names resolve, but their addresses stay denied.
+The model UID997 cannot reach FIB routes of type broadcast or multicast in either family, including
+IPv4-mapped aliases, limited/directed broadcasts and multicast loop delivery to wildcard listeners. The
+guest's own private address falls inside the denied private ranges. IPv4/IPv6 link-local service ranges
+(169.254/16 and fe80::/10) are also denied. Multicast is explicitly unavailable to tools:
 any group can have a privileged local subscriber. Approved non-local unicast TCP/UDP still works.
 The inet OUTPUT filter runs at priority -150 before local loop delivery reaches INPUT. Active kernel
 expressions, table activation, family, chain identity, hook, priority and order must match exactly.
@@ -87,8 +90,8 @@ The unit runs `guest-check-ipc` through the same launcher/drop/filter before wor
 Tool stdin must be /dev/null and stdout/stderr must be capture pipes. Higher inherited descriptors
 are closed on exec, including activation sockets and io_uring rings. Trusted worker journal
 diagnostics remain outside the tool filter. Tools must use bounded stdout/stderr for diagnostics;
-direct syslog/journald and local Unix socket clients (including SSH agents, Docker, local database
-sockets and socketpair-based workloads) are unavailable in this installed profile. Use approved
+Unix sockets are available (decision 45): other services' sockets are guarded by their own file permissions
+(snapd is masked; the worker exposes none); netlink, packet, vsock and other families stay denied. Use approved
 TCP/UDP networking under the existing UID firewall. This adds no administrative tool capability.
 The boundary assumes trusted launcher/worker/kernel and root-owned installation; kernel/root
 compromise and a privileged service deliberately exposed on an approved IP endpoint remain outside
@@ -102,7 +105,7 @@ persistent workspace/home writes and only that execution's scratch; shared temp-
 other executions' temp access are denied, including path-resolution aliases. Processes inherit the
 policy. Scratch is ephemeral and cannot spill onto the root or persistent filesystem. Commands that
 hardcode shared temp files may receive a permission denial; they must use their assigned temp path.
-Each tmpfs has a shared 256MiB/65536-inode ceiling, not a per-task allocation or a persistent entitlement.
+Each tmpfs has a shared 1GiB/65536-inode ceiling, not a per-task allocation or a persistent entitlement.
 Cleanup requires an empty execution cgroup and is bounded by the caller's remaining deadline. Missing
 proof, an exhausted deadline, or hostile directory permissions produce OutcomeUnknown/cleanup pending,
 block dispatch and prevent idle claims. Root pre-start refuses any surviving model UID process before
