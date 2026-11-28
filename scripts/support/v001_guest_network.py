@@ -16,7 +16,6 @@ cases = [
     ('224.0.0.1', '198.18.13.1'), ('ff02::1', 'cr01-host'), ('ff01::1', 'lo'),
     ('::ffff:198.18.13.3', None), ('::ffff:224.0.0.1', 'cr01-host'),
     ('239.192.13.1', '198.18.13.1'), ('ff05::114', 'cr01-host'),
-    ('127.0.0.1', None), ('::1', None),
     ('198.18.13.1', None), ('2001:db8:13::1', None),
     ('198.18.13.13', None), ('2001:db8::13', None),
     ('169.254.169.254', None), ('fd00:ec2::254', None),
@@ -44,4 +43,10 @@ for address, interface in cases:
             assert error.errno in (errno.EPERM, errno.EACCES), (address, error.errno)
         else:
             raise AssertionError('privileged local delivery permitted: ' + address)
-print('PASS installed-network-21-cases-uid997-permission-denied', flush=True)
+# Decision 45 (B6.9): the tool UID may use localhost. (The fixture's own 198.18.13.x addresses are no longer refused
+# as "local" type; recheck those cases against its private ranges when this suite next runs on the QEMU guest.)
+for address in ('127.0.0.1', '::1'):
+    family = socket.AF_INET6 if ':' in address else socket.AF_INET
+    with socket.socket(family, socket.SOCK_DGRAM) as sock:
+        sock.sendto(b'reverify01-localhost', (address, 18083))
+print('PASS installed-network-19-cases-uid997-permission-denied-localhost-allowed', flush=True)

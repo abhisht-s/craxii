@@ -40,7 +40,10 @@
       "const": 1
     },
     "environment": {
-      "const": "development"
+      "enum": [
+        "development",
+        "production"
+      ]
     },
     "bootstrap_operation_id": {
       "type": "string",
@@ -98,7 +101,10 @@
       "maxLength": 128
     },
     "size_bytes": {
-      "const": "85899345920"
+      "enum": [
+        "21474836480",
+        "85899345920"
+      ]
     },
     "volume_type": {
       "const": "gp3"
@@ -306,7 +312,7 @@
           "const": 0
         },
         "nofile": {
-          "const": 1024
+          "const": 16384
         },
         "term_grace_ms": {
           "const": 5000
@@ -350,22 +356,25 @@
           "const": 1
         },
         "pids": {
-          "const": 64
+          "const": 4096
         },
         "memory_bytes": {
-          "const": "268435456"
+          "const": "6442450944"
         },
         "cpu_quota_us": {
-          "const": 100000
+          "const": 200000
         },
         "cpu_period_us": {
           "const": 100000
         },
         "temp_bytes": {
-          "const": "268435456"
+          "const": "1073741824"
         },
         "disk_quota_bytes": {
-          "const": "68719476736"
+          "enum": [
+            "12884901888",
+            "68719476736"
+          ]
         },
         "inode_quota": {
           "const": 1000000
@@ -425,5 +434,53 @@
         }
       }
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "size_bytes": {
+            "const": "21474836480"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "resources": {
+            "type": "object",
+            "properties": {
+              "disk_quota_bytes": {
+                "const": "12884901888"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "type": "object",
+        "properties": {
+          "size_bytes": {
+            "const": "85899345920"
+          }
+        }
+      },
+      "then": {
+        "type": "object",
+        "properties": {
+          "resources": {
+            "type": "object",
+            "properties": {
+              "disk_quota_bytes": {
+                "const": "68719476736"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
 }

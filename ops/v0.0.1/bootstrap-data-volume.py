@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 import tempfile
-import time
 
 CONFIG = Path('/etc/craxii/guest-bootstrap.json')
 INTENTS = Path('/var/lib/craxii-worker/bootstrap')
@@ -144,7 +143,8 @@ class LinuxHost:
     """Installed probes. Test injection exists only through direct unittest construction."""
     def __init__(self, config):
         self.c = config
-        self.size = 85899345920
+        # 20 GiB (trials) or 80 GiB, as the guest config says (decision 45; the schema allows exactly those).
+        self.size = int(config['size_bytes'])
         self.data = DATA
         import pwd, grp
         self.worker = pwd.getpwnam('craxii-server').pw_uid
@@ -217,22 +217,22 @@ class LinuxHost:
             info = path.stat()
             require((info.st_rdev if stat.S_ISBLK(info.st_mode) else info.st_dev) != os.makedev(*map(int, d['maj:min'].split(':'))), 'disk_in_use')
     def blank(self, d):
+        # Decision 44: unused by provenance, not by its bytes. Only this launch's own new volume is ever selected (its
+        # id is the serial; the fleet created it with no snapshot), and it must carry no signature of any kind: no
+        # file system, partition table, RAID or crypto header (wipefs, then blkid's full probe). A new encrypted EBS
+        # volume reads as random bytes where never written, so its content is not checked.
         self.check_use(d, True)
-        signatures, _ = command(['/usr/sbin/wipefs', '--no-act', '--json', d['path']])
-        require(decode(signatures, 1048576).get('signatures') == [], 'disk_not_blank')
         fd = os.open(d['path'], os.O_RDONLY | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
             require(os.fstat(fd).st_rdev == os.makedev(*map(int,d['maj:min'].split(':'))), 'disk_identity_mismatch')
-            left = self.size
-            end = time.monotonic() + 1800
-            while left:
-                require(time.monotonic() < end, 'disk_probe_unavailable')
-                chunk = os.read(fd, min(left, 1048576))
-                require(chunk, 'disk_probe_unavailable')
-                require(chunk == bytes(len(chunk)), 'disk_not_blank')
-                left -= len(chunk)
         finally:
             os.close(fd)
+        signatures, _ = command(['/usr/sbin/wipefs', '--no-act', '--json', d['path']])
+        require(decode(signatures, 1048576).get('signatures') == [], 'disk_not_blank')
+        # blkid exits 2, printing nothing, when it finds nothing at all (exit 2 is also "can't open": then it fails closed
+        # at the identity recheck that follows).
+        found, status = command(['/usr/sbin/blkid', '-p', '-o', 'export', d['path']], allowed=(0, 2))
+        require(status == 2 and not found.strip(), 'disk_not_blank')
     def format_once(self, d):
         try:
             require(select(self,self.c)==d,'disk_identity_mismatch')
@@ -405,7 +405,7 @@ class Bootstrap:
         self.host.verify_filesystem(d)
         if fresh or (old is not None and old['phase']=='format_intended'):
             self.host.verify_complete_format(d)
-        # No second mkfs after ANY durable intent, including an all-zero disk.
+        # No second mkfs after ANY durable intent, including a disk with no signature.
         if fresh or (old is not None and old['phase']!='layout_verified'):
             atomic_record(path,{**identity,'phase':'filesystem_verified'},replace=True)
         self.host.layout(d,self.c['mode']=='initialize_blank')
@@ -447,5 +447,6 @@ if __name__=='__main__':
         main()
     except Hold as e:
         print(e.code,file=sys.stderr); sys.exit(1)
-    except BaseException:
-        print('layout_unavailable',file=sys.stderr); sys.exit(1)
+    except BaseException as e:
+        # The unexpected: its type's name only (never a message, which could carry a path or value).
+        print('layout_unavailable',type(e).__name__,file=sys.stderr); sys.exit(1)

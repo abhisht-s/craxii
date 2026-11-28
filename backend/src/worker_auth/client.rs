@@ -289,6 +289,13 @@ impl WorkerClient {
         }
         decode_response(status, &bytes, response_limit)
     }
+    /// B6.6: deletes the first-boot enrollment handoff once bound.
+    pub fn remove_enrollment_handoff(&self) -> AuthResult<()> {
+        if self.state.disposition != Disposition::Bound {
+            return Err(AuthError::InvalidContext);
+        }
+        self.key.remove_enrollment_handoff()
+    }
     pub async fn negotiate(
         &mut self,
         hello: &Value,

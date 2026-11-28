@@ -3,8 +3,12 @@ Requires=craxii-compute-watchdog.service
 BindsTo=craxii-compute-watchdog.service
 After=craxii-compute-watchdog.service
 Description=Craxii trusted outbound distribution worker
-Requires=craxii-guest-bootstrap.service
-After=craxii-guest-bootstrap.service network-online.target
+# A worker that keeps failing stops being restarted (each start before enrollment asks for a new credential); the
+# watchdog then powers the VM off when its paid time ends.
+StartLimitIntervalSec=10min
+StartLimitBurst=10
+Requires=craxii-guest-bootstrap.service craxii-first-boot-credential.service
+After=craxii-guest-bootstrap.service craxii-first-boot-credential.service network-online.target
 Wants=network-online.target
 RequiresMountsFor=/srv/craxii-data /var/lib/craxii /srv/craxii/workspaces /home/craxii
 
@@ -33,11 +37,18 @@ Restart=on-failure
 RestartSec=3s
 UMask=0077
 LimitCORE=0
-LimitNOFILE=4096
-TasksMax=256
-MemoryMax=2G
+# Decision 45 (B6.9): the worker plus the agent's ~6 GiB and 4096 tasks, on an 8 GiB VM.
+LimitNOFILE=65536
+TasksMax=4352
+MemoryMax=7G
 MemorySwapMax=0
 IPAddressDeny=169.254.169.254
 IPAddressDeny=fd00:ec2::254
 StandardOutput=null
-StandardError=journal
+# Failure codes (never content) also reach the serial console, which only the AWS account can read: the VM has no
+# login, and its journal doesn't outlive it.
+StandardError=journal+console
+
+# B6.6: started at boot; it pulls in first boot, the watchdog and disk setup in order.
+[Install]
+WantedBy=multi-user.target

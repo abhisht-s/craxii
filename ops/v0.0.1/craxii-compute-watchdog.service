@@ -3,6 +3,9 @@ Description=Craxii independent funded running watchdog
 StartLimitIntervalSec=10s
 StartLimitBurst=3
 Before=craxii-guest-bootstrap.service craxii-distribution.service
+# First boot places the policy, guest config and permit this reads.
+Requires=craxii-first-boot.service
+After=craxii-first-boot.service
 OnFailure=craxii-compute-failsafe.service
 
 [Service]

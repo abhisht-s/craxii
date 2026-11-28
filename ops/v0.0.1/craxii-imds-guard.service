@@ -1,0 +1,19 @@
+[Unit]
+Description=Craxii metadata service for root only
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target
+Wants=network-pre.target
+# Without it nothing after it starts, so the VM would run unwatched: it powers off instead.
+OnFailure=craxii-compute-failsafe.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+ExecStart=/usr/sbin/nft --file /opt/craxii/guest/imds-root-only.nft
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

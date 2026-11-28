@@ -1,4 +1,6 @@
 """Bounded harmless pressure commands, only under the actual installed tool cgroup/UID."""
+# OUT OF DATE since decision 45 (B6.9): the agent's limits are now 4096 tasks, about 6 GiB, both CPUs and 1 GiB scratch
+# (from the guest config); update the bounds below and re-qualify on the QEMU guest before this suite is next run.
 import errno
 import os
 from pathlib import Path

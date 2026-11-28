@@ -102,19 +102,18 @@ def nft_material(c):
         lines.extend([f' meta skuid {p.pw_uid} ip daddr 169.254.169.254 drop',f' meta skuid {p.pw_uid} ip6 daddr fd00:ec2::254 drop'])
         for net in networks:
             lines.append(f' meta skuid {p.pw_uid} {"ip" if net.version==4 else "ip6"} daddr {net} drop')
-    # No protected localhost proxies/control services are available to tool UID.
-    lines.extend([f' meta skuid {model.pw_uid} ip daddr 127.0.0.0/8 drop',f' meta skuid {model.pw_uid} ip6 daddr ::1 drop'])
-    # OUTPUT precedes local broadcast/multicast loop delivery to INPUT. Those packets are
-    # not FIB type local and need their own routing-class denials, in both IP families.
-    # Multicast is unavailable to installed tools: even a non-local group can have a local
-    # privileged subscriber. Approved non-local unicast TCP/UDP remains available.
-    for kind in ('local','broadcast','multicast'):
+    # Decision 45 (B6.9): the tool UID may use localhost (its DNS goes to the local resolver); the worker exposes no
+    # loopback listener. OUTPUT precedes local broadcast/multicast loop delivery to INPUT, so those routing classes
+    # are denied here in both IP families: even a non-local group can have a local privileged subscriber.
+    for kind in ('broadcast','multicast'):
         lines.append(f' meta skuid {model.pw_uid} fib daddr type {kind} drop')
-    # Also cover routes sent through lo regardless of routing type, and protected link-local
-    # service ranges. These are protocol classes, never fixture endpoint addresses.
-    lines.extend([f' meta skuid {model.pw_uid} oifname "lo" drop',
-                  f' meta skuid {model.pw_uid} ip daddr 169.254.0.0/16 drop',
-                  f' meta skuid {model.pw_uid} ip6 daddr fe80::/10 drop',' }','}'])
+    # Protected link-local service ranges (protocol classes, never fixture endpoint addresses); no outbound mail; new
+    # outbound connections capped (20 a second, bursts up to 100; localhost isn't outbound), so the VM can't be used
+    # to flood anyone.
+    lines.extend([f' meta skuid {model.pw_uid} ip daddr 169.254.0.0/16 drop',
+                  f' meta skuid {model.pw_uid} ip6 daddr fe80::/10 drop',
+                  f' meta skuid {model.pw_uid} tcp dport {{ 25, 465, 587 }} drop',
+                  f' meta skuid {model.pw_uid} oifname != "lo" ct state new limit rate over 20/second burst 100 packets drop',' }','}'])
     return '\n'.join(lines)+'\n'
 
 def network_verify(c):
@@ -132,18 +131,21 @@ def network_verify(c):
     rules=[r['expr'] for r in rule_records]
     # Explicit expected matches. A required prefix may be encoded as addr/len in nft JSON.
     expected=[]
-    for name,addresses in [('craxii',['169.254.169.254','fd00:ec2::254',*c['private_networks']]),('craxii-server',['169.254.169.254','fd00:ec2::254',*c['private_networks']]),('craxii',['127.0.0.0/8','::1'])]:
+    for name,addresses in [('craxii',['169.254.169.254','fd00:ec2::254',*c['private_networks']]),('craxii-server',['169.254.169.254','fd00:ec2::254',*c['private_networks']])]:
         uid=account(name).pw_uid
         for addr in addresses:
             net=ipaddress.ip_network(addr,strict=True)
             right=str(net.network_address) if net.prefixlen==net.max_prefixlen else {'prefix':{'addr':str(net.network_address),'len':net.prefixlen}}
             expected.append([{'match':{'op':'==','left':{'meta':{'key':'skuid'}},'right':uid}}, {'match':{'op':'==','left':{'payload':{'protocol':'ip' if net.version==4 else 'ip6','field':'daddr'}},'right':right}}, {'drop':None}])
     uid={'match':{'op':'==','left':{'meta':{'key':'skuid'}},'right':997}}
-    for kind in ('local','broadcast','multicast'):
+    for kind in ('broadcast','multicast'):
         expected.append([uid, {'match':{'op':'==','left':{'fib':{'result':'type','flags':['daddr']}},'right':kind}}, {'drop':None}])
-    expected.append([uid, {'match':{'op':'==','left':{'meta':{'key':'oifname'}},'right':'lo'}}, {'drop':None}])
     for protocol,addr,length in [('ip','169.254.0.0',16),('ip6','fe80::',10)]:
         expected.append([uid, {'match':{'op':'==','left':{'payload':{'protocol':protocol,'field':'daddr'}},'right':{'prefix':{'addr':addr,'len':length}}}}, {'drop':None}])
+    # Decision 45: no outbound mail; new connections capped.
+    expected.append([uid, {'match':{'op':'==','left':{'payload':{'protocol':'tcp','field':'dport'}},'right':{'set':[25,465,587]}}}, {'drop':None}])
+    expected.append([uid, {'match':{'op':'!=','left':{'meta':{'key':'oifname'}},'right':'lo'}}, {'match':{'op':'in','left':{'ct':{'key':'state'}},'right':'new'}},
+                     {'limit':{'rate':20,'burst':100,'per':'second','inv':True}}, {'drop':None}])
     b.require(rules==expected,'isolation_unavailable')
     chains=[x['chain'] for x in value.get('nftables',[]) if 'chain' in x]
     b.require(len(chains)==1 and chains[0].get('family')=='inet' and chains[0].get('table')=='craxii_guest' and chains[0].get('name')=='output' and chains[0].get('type')=='filter' and chains[0].get('hook')=='output' and chains[0].get('prio')==-150 and chains[0].get('policy')=='accept','isolation_unavailable')
@@ -185,7 +187,8 @@ def verify(c):
         if Path(p).exists():
             m=Path(p).stat(); b.require(m.st_uid==0 and m.st_mode&0o007==0,'isolation_unavailable')
     b.require(not Path('/var/lib/systemd/linger/craxii').exists(),'isolation_unavailable')
-    for unit in ['cron.service','atd.service','user@'+str(model.pw_uid)+'.service']:
+    # snapd too (decision 45): its socket is open to every user, and the agent may now use Unix sockets.
+    for unit in ['cron.service','atd.service','user@'+str(model.pw_uid)+'.service','snapd.socket','snapd.service','snapd.seeded.service']:
         out,_=b.command(['/usr/bin/systemctl','is-enabled',unit],allowed=(0,1,3,4))
         b.require(out.strip()==b'masked','isolation_unavailable')
     # Root storage cannot supply another model-writable scratch or owned file (for example mail).
@@ -237,7 +240,9 @@ def prepare(c):
     (ROOT/'cgroup.subtree_control').write_text('+cpu +memory +pids')
     tools=ROOT/'tools'
     if not tools.exists(): tools.mkdir()
-    for name,value in [('pids.max','64'),('memory.max','268435456'),('memory.swap.max','0'),('cpu.max','100000 100000')]:
+    # Decision 45: the agent's limits come from the verified guest config.
+    r=c['resources']
+    for name,value in [('pids.max',str(r['pids'])),('memory.max',r['memory_bytes']),('memory.swap.max','0'),('cpu.max',f"{r['cpu_quota_us']} {r['cpu_period_us']}")]:
         (tools/name).write_text(value)
         b.require((tools/name).read_text().strip()==value,'isolation_unavailable')
     (tools/'cgroup.subtree_control').write_text('+cpu +memory +pids')
@@ -255,7 +260,9 @@ def prepare(c):
 
 def configure(c):
     host=b.LinuxHost(c); disk=b.select(host,c);host.verify_filesystem(disk);host.verify_layout(disk)
-    b.command(['/usr/sbin/setquota','--user','craxii','67108864','67108864','1000000','1000000','/srv/craxii-data'])
+    # The agent's storage quota follows the data disk's size (decision 45): KiB blocks and inodes from the guest config.
+    blocks,inodes=str(int(c['resources']['disk_quota_bytes'])//1024),str(c['resources']['inode_quota'])
+    b.command(['/usr/sbin/setquota','--user','craxii',blocks,blocks,inodes,inodes,'/srv/craxii-data'])
     # Internal ext4 quota files are created by mkfs; no quotacheck over an active journal.
     b.command(['/usr/sbin/quotaon','--user','/srv/craxii-data'],allowed=(0,1))
     policy=Path('/etc/craxii/network-policy.nft')
@@ -276,7 +283,7 @@ def configure(c):
         b.require(len(existing)<=1,'isolation_unavailable')
         if existing:
             b.require(existing[0]['fs']=='tmpfs','isolation_unavailable')
-            b.command(['/usr/bin/mount','-o','remount,rw,nosuid,nodev,size=268435456,nr_inodes=65536',target])
+            b.command(['/usr/bin/mount','-o',f"remount,rw,nosuid,nodev,size={int(c['resources']['temp_bytes'])},nr_inodes=65536",target])
         else:
             # Ubuntu services may already have root-owned PrivateTmp directories. Preserve
             # them underneath the new mount; never erase or hide preexisting model data.
@@ -284,7 +291,7 @@ def configure(c):
             model=account('craxii')
             owned,_=b.command(['/usr/bin/find',target,'-xdev','(','-uid',str(model.pw_uid),'-o','-gid',str(model.pw_gid),')','-print'])
             b.require(not owned.strip(),'isolation_unavailable')
-            b.command(['/usr/bin/mount','-t','tmpfs','-o','rw,nosuid,nodev,size=268435456,nr_inodes=65536,mode=1777','tmpfs',target])
+            b.command(['/usr/bin/mount','-t','tmpfs','-o',f"rw,nosuid,nodev,size={int(c['resources']['temp_bytes'])},nr_inodes=65536,mode=1777",'tmpfs',target])
         scratch=Path(target)/'craxii-tools'
         if not scratch.exists():
             scratch.mkdir(mode=0o1773)
@@ -350,4 +357,4 @@ def main():
 if __name__=='__main__':
     try: main()
     except b.Hold as e: print(e.code,file=sys.stderr);sys.exit(1)
-    except BaseException: print('isolation_unavailable',file=sys.stderr);sys.exit(1)
+    except BaseException as e: print('isolation_unavailable',type(e).__name__,file=sys.stderr);sys.exit(1)

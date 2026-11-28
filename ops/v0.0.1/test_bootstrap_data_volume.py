@@ -1,5 +1,6 @@
 """Pure fault barriers complement, and never replace, actual Linux kernel acceptance."""
 import copy
+import os
 import importlib.util
 import json
 from pathlib import Path
@@ -49,7 +50,7 @@ class BootstrapBarriers(unittest.TestCase):
         self.host.devices.insert(0,foreign)
         self.assertEqual(b.select(self.host,self.c)['maj:min'],'8:16')
     def test_refusals_have_no_format_or_receipt(self):
-        for changed in ('identity','size','model','ambiguous','root','used','nonzero','clone'):
+        for changed in ('identity','size','model','ambiguous','root','used','signature','clone'):
             with self.subTest(changed=changed):
                 h=Host()
                 if changed=='identity':h.disk['serial']='vol00000000000000002'
@@ -58,7 +59,7 @@ class BootstrapBarriers(unittest.TestCase):
                 if changed=='ambiguous':h.devices.append(copy.deepcopy(h.disk))
                 if changed=='root':h.root=True
                 if changed=='used':h.used=True
-                if changed=='nonzero':h.blank_ok=False
+                if changed=='signature':h.blank_ok=False
                 if changed=='clone':
                     foreign=copy.deepcopy(h.disk);foreign.update(serial='vol00000000000000002',uuid=self.c['filesystem_uuid'],**{'maj:min':'8:32'});h.devices.append(foreign)
                 with self.assertRaises(b.Hold):b.Bootstrap(h,self.c,self.root).run()
@@ -101,6 +102,33 @@ class BootstrapBarriers(unittest.TestCase):
         self.c['mode']='adopt_existing';self.host.filesystem=True;self.host.layout_ok=False
         with self.assertRaises(b.Hold):self.engine().run()
         self.assertEqual(self.host.effects,[])
+    def test_blank_is_decided_by_signatures_never_by_content(self):
+        # A new encrypted EBS volume reads as random bytes where never written (decision 44): that is still blank.
+        with tempfile.NamedTemporaryFile() as disk:
+            disk.write(os.urandom(4*1048576));disk.flush()
+            d={'path':disk.name,'maj:min':'%d:%d'%(b.os.major(b.os.stat(disk.name).st_dev),b.os.minor(b.os.stat(disk.name).st_dev))}
+            class Real(b.LinuxHost):
+                def __init__(self):pass
+                def check_use(self,d,formatting=False):pass
+            rdev=type('S',(),{'st_rdev':b.os.makedev(*map(int,d['maj:min'].split(':')))})()
+            # The exact probes (wipefs never writing, blkid's full low-level probe). The random bytes reach no real tool
+            # here: that wipefs and blkid report nothing on such a disk was checked on Ubuntu 24.04 (decision 44).
+            expected={'/usr/sbin/wipefs':['/usr/sbin/wipefs','--no-act','--json',d['path']],'/usr/sbin/blkid':['/usr/sbin/blkid','-p','-o','export',d['path']]}
+            def tools(answers):
+                def command(argv,**kwargs):
+                    self.assertEqual(argv,expected[argv[0]])
+                    return answers[argv[0]]
+                return command
+            reads=[]
+            with patch.object(b.os,'fstat',return_value=rdev),patch.object(b.os,'pread',side_effect=lambda *a:reads.append(a)):
+                with patch.object(b,'command',side_effect=tools({'/usr/sbin/wipefs':(b'{"signatures":[]}',0),'/usr/sbin/blkid':(b'',2)})):
+                    Real().blank(d)
+                self.assertEqual(reads,[],'content is never read')
+                for answers in ({'/usr/sbin/wipefs':(b'{"signatures":[{"type":"ext4"}]}',0),'/usr/sbin/blkid':(b'',2)},
+                                {'/usr/sbin/wipefs':(b'{"signatures":[]}',0),'/usr/sbin/blkid':(b'TYPE=crypto_LUKS\n',0)}):
+                    with self.subTest(answers=sorted(answers)),patch.object(b,'command',side_effect=tools(answers)):
+                        with self.assertRaises(b.Hold) as caught:Real().blank(d)
+                        self.assertEqual(caught.exception.code,'disk_not_blank')
     def test_duplicate_receipt_material_is_rejected(self):
         with self.assertRaises(b.Hold):b.decode(b'{"phase":1,"phase":2}')
 

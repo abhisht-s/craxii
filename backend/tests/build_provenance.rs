@@ -210,6 +210,8 @@ impl TestRepository {
         let output = Command::new(env!("CARGO"))
             .arg("build")
             .arg("--quiet")
+            // The probe builds into its own target directory, whatever the outer test run uses.
+            .env_remove("CARGO_TARGET_DIR")
             .env_remove("CRAXII_SOURCE_REVISION")
             .env_remove("CRAXII_SOURCE_CLEAN")
             .envs(environment.iter().copied())

@@ -7,9 +7,9 @@ use serde_json::Value;
 use std::net::IpAddr;
 use std::sync::OnceLock;
 pub const VERSION: u32 = 1;
-pub const SCHEMA_SHA256: &str = "b99ae1fe8965f34974b90e323cc79d9b68c48b79df3384fd8d6f7bc0b1560102";
+pub const SCHEMA_SHA256: &str = "e8497ea0211bd171a63375ac5bf0ab78f28afbd031b619a1808d4cb221760fa5";
 pub const FIXTURES_SHA256: &str =
-    "87f5b3bad1ef0182d7a2c54ba1c5d2300bf00fc81c86dd81956ce1032db7211e";
+    "6df244fa6ea3e7d94e0fc2c6d25035b4bd8c82e6dc48382d8fc6cbca0b8a3084";
 pub const LIMITS: Limits = Limits {
     bytes: 16384,
     nodes: 4096,

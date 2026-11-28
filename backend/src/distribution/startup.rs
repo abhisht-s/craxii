@@ -18,7 +18,11 @@ use crate::ports::{
     },
 };
 use crate::worker_auth::{
-    AuthError, client::WorkerClient, key_store::KeyStore, state::IdentityState,
+    AuthError,
+    client::WorkerClient,
+    handoff::EnrollmentHandoff,
+    key_store::KeyStore,
+    state::{Disposition, IdentityState},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1221,13 +1225,13 @@ fn admission_outcome(result: DistributionResult<()>) -> Result<(), AuthError> {
         Err(_) => Err(AuthError::Unavailable),
     }
 }
+/// The root first-boot step's one-time enrollment handoff (B6.6), next to the worker's identity.
+const ENROLLMENT_HANDOFF: &str = "/var/lib/craxii-worker/identity/enrollment.json";
 pub async fn run_protected() -> DistributionResult<()> {
     crate::guest_boundary::storage::harden_worker_process()
         .map_err(|_| DistributionError::Storage)?;
     let guest =
         crate::guest_boundary::storage::load_installed().map_err(|_| DistributionError::Storage)?;
-    crate::guest_boundary::storage::verify_installed(&guest)
-        .map_err(|_| DistributionError::Storage)?;
     // Trusted OS-root key/config descriptor checks precede all content/runtime composition.
     let uid = unsafe { nix::libc::geteuid() };
     let name = std::ffi::CString::new("craxii").map_err(|_| invalid())?;
@@ -1236,12 +1240,36 @@ pub async fn run_protected() -> DistributionResult<()> {
         return Err(invalid());
     }
     let model_uid = unsafe { (*user).pw_uid };
-    let key = KeyStore::open(uid, model_uid, false).map_err(|_| invalid())?;
+    // B6.6 (decision 37): on a new VM's first boot the root first-boot step leaves a one-time enrollment handoff.
+    // Until the worker is bound it may create its key (never replacing one), and its identity starts unbound from
+    // the guest config; it enrolls once the runtime is open, then deletes the handoff.
+    let first_boot = std::fs::symlink_metadata(ENROLLMENT_HANDOFF).is_ok();
+    if !first_boot {
+        crate::guest_boundary::storage::verify_installed(&guest)
+            .map_err(|_| DistributionError::Storage)?;
+    }
+    let key = KeyStore::open(uid, model_uid, first_boot).map_err(|_| invalid())?;
     let config = key.distribution_config().map_err(|_| invalid())?;
     config.validate()?;
-    let state = IdentityState::load(&key)
-        .map_err(|_| invalid())?
-        .ok_or_else(invalid)?;
+    let handoff = if first_boot {
+        Some(
+            EnrollmentHandoff::parse(&key.enrollment_handoff().map_err(|_| invalid())?)
+                .map_err(|_| invalid())?,
+        )
+    } else {
+        None
+    };
+    let mut state = match (IdentityState::load(&key).map_err(|_| invalid())?, &handoff) {
+        (Some(state), _) => state,
+        (None, Some(_)) => IdentityState::unbound(
+            guest.text("customer_id"),
+            guest.text("logical_agent_id"),
+            guest.text("installation_id"),
+            guest.text("generation"),
+            &key,
+        ),
+        (None, None) => return Err(invalid()),
+    };
     if state.customer_id != guest.text("customer_id")
         || state.logical_agent_id != guest.text("logical_agent_id")
         || state.installation_id != guest.text("installation_id")
@@ -1249,9 +1277,46 @@ pub async fn run_protected() -> DistributionResult<()> {
     {
         return Err(DistributionError::Storage);
     }
-    let client = WorkerClient::new(&config.origin, config.worker_environment()?, key, state)
+    let resume = match &handoff {
+        Some(handoff) => crate::worker_auth::handoff::settle_pending(&mut state, handoff),
+        None => false,
+    };
+    // Records the identity (the installed checks need it), then the installed layout is verified in full.
+    let mut client = WorkerClient::new(&config.origin, config.worker_environment()?, key, state)
         .map_err(|_| invalid())?;
-    DistributionRuntime::open(config).await?.run(client).await
+    if first_boot {
+        crate::guest_boundary::storage::verify_installed(&guest)
+            .map_err(|_| DistributionError::Storage)?;
+    }
+    let runtime = DistributionRuntime::open(config).await?;
+    if let Some(handoff) = handoff {
+        if client.identity().disposition != Disposition::Bound {
+            let enrollment = (
+                handoff.enrollment_id.as_str(),
+                handoff.enrollment_credential.as_str(),
+            );
+            if !resume {
+                client
+                    .negotiate(&runtime.hello(), Some(enrollment))
+                    .await
+                    .map_err(|_| DistributionError::Identity)?;
+            }
+            client
+                .enroll(
+                    enrollment.0,
+                    enrollment.1,
+                    &handoff.expected_instance_ref,
+                    &handoff.document,
+                    &handoff.signature,
+                )
+                .await
+                .map_err(|_| DistributionError::Identity)?;
+        }
+        client
+            .remove_enrollment_handoff()
+            .map_err(|_| DistributionError::Storage)?;
+    }
+    runtime.run(client).await
 }
 
 #[cfg(test)]

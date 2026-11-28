@@ -1,0 +1,22 @@
+[Unit]
+Description=Craxii first boot: starting kit and enrollment credential
+Requires=craxii-imds-guard.service
+After=craxii-imds-guard.service network-online.target
+Wants=network-online.target
+Before=craxii-compute-watchdog.service
+# A VM that can't get its kit never runs unwatched: it powers off.
+OnFailure=craxii-compute-failsafe.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -B /opt/craxii/guest/first-boot.py kit
+TimeoutStartSec=15min
+UMask=0077
+LimitCORE=0
+StandardOutput=null
+# Failure codes (never content) also reach the serial console, which only the AWS account can read: the VM has no
+# login, and its journal doesn't outlive it.
+StandardError=journal+console

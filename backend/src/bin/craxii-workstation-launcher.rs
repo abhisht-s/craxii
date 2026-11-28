@@ -342,9 +342,10 @@ mod linux {
     }
 
     fn drop_to_workstation(identity: Identity) -> Result<(), ()> {
+        // Decision 45 (B6.9): the guest config's hardening.nofile.
         let nofile = libc::rlimit {
-            rlim_cur: 1024,
-            rlim_max: 1024,
+            rlim_cur: 16384,
+            rlim_max: 16384,
         };
         let core = libc::rlimit {
             rlim_cur: 0,

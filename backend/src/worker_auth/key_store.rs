@@ -233,6 +233,29 @@ impl KeyStore {
         let bytes = signature_input(purpose, signed).map_err(|_| AuthError::InvalidContext)?;
         Ok(URL_SAFE_NO_PAD.encode(self.key.sign(&bytes).as_ref()))
     }
+    /// B6.6: the root first-boot step's one-time enrollment handoff (`enrollment.json`), held to the same rules as
+    /// the worker's own files: its owner, 0600, one link, bounded.
+    pub fn enrollment_handoff(&self) -> AuthResult<Vec<u8>> {
+        let mut file = open_at(&self.directory, "enrollment.json", nix::libc::O_RDONLY, 0)?;
+        regular(&file, self.service_uid, 32768)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)
+            .map_err(|_| AuthError::UnsafeStorage)?;
+        Ok(bytes)
+    }
+    /// B6.6: deletes the handoff once the worker is bound (gone already is fine).
+    pub fn remove_enrollment_handoff(&self) -> AuthResult<()> {
+        let handoff = name("enrollment.json")?;
+        // SAFETY: fixed name in the held protected directory; removes only that entry.
+        if unsafe { nix::libc::unlinkat(self.directory.as_raw_fd(), handoff.as_ptr(), 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() != Some(nix::libc::ENOENT)
+        {
+            return Err(AuthError::UnsafeStorage);
+        }
+        self.directory
+            .sync_all()
+            .map_err(|_| AuthError::UnsafeStorage)
+    }
     pub(super) fn read_state(&self) -> AuthResult<Option<Vec<u8>>> {
         let state_name = name("identity.json")?;
         let mut stat = std::mem::MaybeUninit::<nix::libc::stat>::uninit();

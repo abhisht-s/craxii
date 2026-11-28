@@ -9,7 +9,8 @@ for v in CRAXII_JOBS CRAXII_TEST_SUITE CRAXII_KIND CRAXII_COMMIT CRAXII_BUILDER_
 binaries=(craxii-server craxii-guest-guard craxii-workstation-launcher craxii-workstation-reader craxii-compute-watchdog)
 guest_assets=(install-security-boundary.sh bootstrap-data-volume.py security-boundary.py network-policy.nft sysctl.conf
   guest-bootstrap.schema.json compute-watchdog.schema.json craxii-guest-bootstrap.service craxii-guest-network-check.service
-  craxii-compute-watchdog.service craxii-compute-failsafe.service craxii-distribution.service)
+  craxii-compute-watchdog.service craxii-compute-failsafe.service craxii-distribution.service
+  first-boot.py imds-root-only.nft craxii-imds-guard.service craxii-first-boot.service craxii-first-boot-credential.service)
 export CARGO_INCREMENTAL=0
 # The toolchain is the pinned image's, which must be the one rust-toolchain.toml names. Naming it directly keeps
 # rustup from fetching the file's extra components (rustfmt, clippy), which a build doesn't use.
@@ -28,22 +29,24 @@ if [ "$CRAXII_TEST_SUITE" = true ]; then
   set -e
   { grep -E '^test .* FAILED$' /tmp/tests.log || true; } | LC_ALL=C sort -u >/tmp/failed
   LC_ALL=C sort -u scripts/support/linux-guest-image-tests.txt >/tmp/known
-  # Every test program that started must report a result (one that crashes reports none), and the failures
-  # those results count must be exactly the failing tests listed.
+  # Every test program that started must report a result before the next one starts: one that crashes reports
+  # none. (A failing test's saved output can hold extra result lines from a test program it ran itself, so
+  # programs are matched to results in order, not counted against them.) The failures the results count must
+  # be exactly the failing tests listed.
   started=$(grep -cE '^ *(Running|Doc-tests) ' /tmp/tests.log || true)
-  results=$(grep -c '^test result:' /tmp/tests.log || true)
+  silent=$(awk '/^ *(Running|Doc-tests) /{if (program != "" && !reported) print program; program = $0; reported = 0; next} /^test result:/{reported = 1} END{if (program != "" && !reported) print program}' /tmp/tests.log)
   counted=$(sed -n 's/^test result: [A-Za-z]*\. [0-9]* passed; \([0-9]*\) failed;.*/\1/p' /tmp/tests.log | awk '{n += $1} END {print n + 0}')
   listed=$(grep -cE '^test .* FAILED$' /tmp/tests.log || true)
-  if [ "$results" -lt 1 ] || [ "$started" -ne "$results" ] || [ "$counted" -ne "$listed" ] || { [ "$status" -ne 0 ] && [ "$listed" -eq 0 ]; }; then
-    tail -n 40 /tmp/tests.log >&2
-    fail "the Linux tests did not run to completion ($started test programs started, $results reported; $counted failures counted, $listed listed)"
-  fi
   unexpected=$(LC_ALL=C comm -23 /tmp/failed /tmp/known)
-  if [ -n "$unexpected" ]; then
-    printf '%s\n' "$unexpected" >&2
-    fail 'Linux tests failed that are not known guest-image tests'
+  # Say everything that is wrong, not just the first thing.
+  [ -z "$silent" ] || printf '%s\n' "$silent" | sed 's/^ */build-release: no result from: /' >&2
+  [ -z "$unexpected" ] || printf '%s\n' "$unexpected" >&2
+  if [ "$started" -lt 1 ] || [ -n "$silent" ] || [ "$counted" -ne "$listed" ] || { [ "$status" -ne 0 ] && [ "$listed" -eq 0 ]; }; then
+    tail -n 40 /tmp/tests.log >&2
+    fail "the Linux tests did not run to completion ($started test programs started; $counted failures counted, $listed listed)"
   fi
-  printf 'build-release: Linux tests passed (%s test binaries; %s known guest-image failures)\n' "$results" "$(wc -l </tmp/failed | tr -d ' ')" >&2
+  [ -z "$unexpected" ] || fail "$(printf '%s\n' "$unexpected" | wc -l | tr -d ' ') Linux tests failed that are not known guest-image tests (listed above)"
+  printf 'build-release: Linux tests passed (%s test programs; %s known guest-image failures)\n' "$started" "$(wc -l </tmp/failed | tr -d ' ')" >&2
   tested=passed
 fi
 
