@@ -1,0 +1,14 @@
+[Unit]
+Description=Craxii package installs for the agent
+
+# Decision 46 (B6.9): only the agent's group may connect; the helper also checks the peer's UID.
+[Socket]
+ListenStream=/run/craxii-apt.sock
+SocketUser=root
+SocketGroup=craxii
+SocketMode=0660
+Accept=yes
+MaxConnections=2
+
+[Install]
+WantedBy=sockets.target

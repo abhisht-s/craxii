@@ -1,0 +1,21 @@
+[Unit]
+Description=Craxii package install for the agent
+
+# One connection, one install, as root; the helper allows only plain names from Ubuntu's archive (decision 46).
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -I -B /opt/craxii/guest/apt-helper.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+StateDirectory=craxii-apt
+StateDirectoryMode=0700
+RuntimeMaxSec=1800
+# Root, outside the agent's cgroup: bounded too.
+MemoryMax=1536M
+TasksMax=512
+Nice=10
+IOWeight=50
+UMask=0022
+LimitCORE=0

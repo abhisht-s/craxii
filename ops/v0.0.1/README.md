@@ -89,10 +89,19 @@ The unit runs `guest-check-ipc` through the same launcher/drop/filter before wor
 
 Tool stdin must be /dev/null and stdout/stderr must be capture pipes. Higher inherited descriptors
 are closed on exec, including activation sockets and io_uring rings. Trusted worker journal
-diagnostics remain outside the tool filter. Tools must use bounded stdout/stderr for diagnostics;
+diagnostics remain outside the tool filter. Tools must use bounded stdout/stderr for diagnostics.
 Unix sockets are available (decision 45): other services' sockets are guarded by their own file permissions
 (snapd is masked; the worker exposes none); netlink, packet, vsock and other families stay denied. Use approved
 TCP/UDP networking under the existing UID firewall. This adds no administrative tool capability.
+Package installs (decision 46): the agent runs `apt-install PACKAGE...`, which asks a root helper
+(craxii-apt.socket, one craxii-apt@ instance per connection, peer UID checked) to install plain names from Ubuntu's
+signed archive: at most 20, a blocklist, a dry run refused if it would remove anything or upgrade a protected package.
+Closed by default: every .deb is downloaded and read first and refused if it would place services, init scripts,
+cron, apt/PAM/sudo/sysctl/module/udev/network/loader/tmpfiles configuration, or if its maintainer scripts divert files
+or touch such settings; too large is refused; a few an hour. The install runs with services refused and is always
+neutralised, even after a timeout: setuid/setgid bits and file capabilities removed from every changed file, sensitive
+system files restored, the ACL denies reapplied, newly agent-writable paths closed. A crash or power-off part-way is
+finished by the root pre-start (`apt-helper.py recover`) before the worker runs.
 The boundary assumes trusted launcher/worker/kernel and root-owned installation; kernel/root
 compromise and a privileged service deliberately exposed on an approved IP endpoint remain outside
 this policy. Image qualification must keep privileged logging/control services on non-local network
