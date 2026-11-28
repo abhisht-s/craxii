@@ -10,7 +10,8 @@ binaries=(craxii-server craxii-guest-guard craxii-workstation-launcher craxii-wo
 guest_assets=(install-security-boundary.sh bootstrap-data-volume.py security-boundary.py network-policy.nft sysctl.conf
   guest-bootstrap.schema.json compute-watchdog.schema.json craxii-guest-bootstrap.service craxii-guest-network-check.service
   craxii-compute-watchdog.service craxii-compute-failsafe.service craxii-distribution.service
-  first-boot.py imds-root-only.nft craxii-imds-guard.service craxii-first-boot.service craxii-first-boot-credential.service)
+  first-boot.py imds-root-only.nft craxii-imds-guard.service craxii-first-boot.service craxii-first-boot-credential.service
+  apt-helper.py apt-install craxii-apt.socket craxii-apt@.service)
 export CARGO_INCREMENTAL=0
 # The toolchain is the pinned image's, which must be the one rust-toolchain.toml names. Naming it directly keeps
 # rustup from fetching the file's extra components (rustfmt, clippy), which a build doesn't use.

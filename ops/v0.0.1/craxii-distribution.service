@@ -32,6 +32,8 @@ CapabilityBoundingSet=CAP_KILL CAP_SETUID CAP_SETGID CAP_SETPCAP
 NoNewPrivileges=no
 KillMode=control-group
 KillSignal=SIGTERM
+# The root pre-start may finish an interrupted package install first (decision 46).
+TimeoutStartSec=10min
 TimeoutStopSec=30s
 Restart=on-failure
 RestartSec=3s

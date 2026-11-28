@@ -208,6 +208,9 @@ def verify(c):
     network_verify(c)
 
 def prepare(c):
+    # Decision 46: first finish neutralising a package install that a crash or power-off interrupted.
+    if Path('/var/lib/craxii-apt/pending').exists():
+        b.command(['/usr/bin/python3','-I','-B','/opt/craxii/guest/apt-helper.py','recover'],timeout=480)
     verify(c)
     host=b.LinuxHost(c); disk=b.select(host,c)
     host.verify_filesystem(disk); host.verify_layout(disk)
